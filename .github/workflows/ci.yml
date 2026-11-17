@@ -38,7 +38,7 @@ jobs:
         run: |
           oxl build ./cli -o /tmp/oxttp
           oxl build ./tui -o /tmp/oxttp-tui
-          /tmp/oxttp
+          /tmp/oxttp --version
           /tmp/oxttp-tui
 
       # `oxl test` honors only its first package-dir arg and silently
