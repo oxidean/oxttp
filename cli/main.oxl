@@ -3,11 +3,11 @@ package main
 // oxttp — drop-in xh-compatible HTTP client CLI.
 // Surface contract: docs/corpus/corpus-xh.md. The flag/request-item
 // surface lands through ox-agent work items; this is the scaffold.
-import "github.com/oxidean/oxttp/core/http"
+import "github.com/oxidean/oxttp/core/model"
 
 import "github.com/oxidean/oxttp/shared/version"
 
 fn main() {
-    r := http.new("GET", "http://localhost")
+    r := model.Req{method: "GET", url: "http://localhost", headers: nil, body: model.Body.Empty, timeout_ms: 0, follow: false, max_redirects: 0}
     println("oxttp " + version.get() + " " + r.method + " " + r.url)
 }

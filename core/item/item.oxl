@@ -1,0 +1,460 @@
+package item
+
+// REQUEST_ITEM grammar — corpus: docs/corpus/corpus-xh.md section 3.
+// Source-verified against xh src/request_items.rs + utils.rs::unescape
+// @ 8b21cc07; quirks recorded in
+// .ox-agent/context/references/xh-request-item-grammar.md.
+//
+// Byte-wise scanning is equivalent to upstream's char_indices scan:
+// every separator byte is ASCII, and a UTF-8 continuation byte can
+// never equal an ASCII separator, so skipping a backslash + one byte
+// can't produce a false match inside a multi-byte char.
+import "std/encoding/json"
+
+import "std/errors"
+
+import "std/strings"
+
+// Item is the parsed form of one REQUEST_ITEM positional. The variant
+// set mirrors xh's RequestItem enum 1:1 — ten variants covering the
+// twelve syntax forms in the corpus table.
+enum Item {
+    HttpHeader { key: str, value: str },
+    HttpHeaderFromFile { key: str, value: str },
+    HttpHeaderToUnset { key: str },
+    UrlParam { key: str, value: str },
+    UrlParamFromFile { key: str, value: str },
+    DataField { key: str, raw_key: str, value: str },
+    DataFieldFromFile { key: str, raw_key: str, value: str },
+    JsonField { raw_key: str, raw_value: str, value: own json.Json },
+    JsonFieldFromFile { raw_key: str, value: str },
+    FormFile { key: str, file_name: str, file_type: str, has_type: bool, file_name_header: str, has_fname: bool },
+}
+
+// PartParams is the result of the `key@file;type=T;filename=F` suffix
+// scan. Leftover `;type=`/`;filename=` stays inside `value`.
+struct PartParams {
+    value: str,
+    file_type: str,
+    has_type: bool,
+    file_name_header: str,
+    has_fname: bool,
+}
+
+// Split is the separator-scan result: raw slices plus a found flag
+// (oxl returns single values or [T, err] pairs — no 3+ tuples).
+struct Split { raw_key: str, sep: str, value: str, ok: bool }
+
+// split walks left-to-right; at each position tries every sep in
+// upstream SEPS order (==@, =@, :=@, :@, ==, :=, =, @, :) — longest
+// match wins per position, earliest position wins overall. A
+// backslash consumes the next char unconditionally — it can never
+// start a separator (upstream split(), request_items.rs L45).
+fn split(s: str) -> Split {
+    sp := mkslice(str, 9)
+    sp[0] = "==@"
+    sp[1] = "=@"
+    sp[2] = ":=@"
+    sp[3] = ":@"
+    sp[4] = "=="
+    sp[5] = ":="
+    sp[6] = "="
+    sp[7] = "@"
+    sp[8] = ":"
+    i := 0
+    for i < len(s) {
+        if byteat(s, i) == 92 {
+            i = i + 2
+            continue
+        }
+        j := 0
+        for j < 9 {
+            n := len(sp[j])
+            if i + n <= len(s) && substr(s, i, i + n) == sp[j] {
+                return Split{raw_key: substr(s, 0, i), sep: sp[j], value: substr(s, i + n, len(s)), ok: true}
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return Split{raw_key: "", sep: "", value: "", ok: false}
+}
+
+// unescape mirrors utils.rs::unescape: backslash + special char gives
+// the literal char; backslash + any other char keeps both; a trailing
+// backslash is literal. `special` is parameterized — the request-item
+// path uses "=@:;\\"; nested-JSON key paths (S6) add '[' and ']'.
+fn unescape(s: str, special: str) -> str {
+    out := ""
+    i := 0
+    for i < len(s) {
+        c := byteat(s, i)
+        if c == 92 && i + 1 < len(s) {
+            n := substr(s, i + 1, i + 2)
+            if find(special, n) >= 0 {
+                out = out + n
+            } else {
+                out = out + substr(s, i, i + 2)
+            }
+            i = i + 2
+            continue
+        }
+        out = out + substr(s, i, i + 1)
+        i = i + 1
+    }
+    return out
+}
+
+// rfind scans for the rightmost occurrence (no std rfind).
+fn rfind(s: str, sub: str) -> int {
+    n := len(sub)
+    if n == 0 || len(s) < n {
+        return -1
+    }
+    i := len(s) - n
+    for i >= 0 {
+        if substr(s, i, i + n) == sub {
+            return i
+        }
+        i = i - 1
+    }
+    return -1
+}
+
+// parse_part_params mirrors request_items.rs::parse_part_params:
+// repeatedly split on the rightmost occurrence of either live delim;
+// each delim is consumed once; text = pre each round.
+fn parse_part_params(s: str) -> PartParams {
+    pp := PartParams{value: s, file_type: "", has_type: false, file_name_header: "", has_fname: false}
+    type_live := true
+    fname_live := true
+    for type_live || fname_live {
+        best := -1
+        which := -1
+        if type_live {
+            p := rfind(pp.value, ";type=")
+            if p > best {
+                best = p
+                which = 0
+            }
+        }
+        if fname_live {
+            p := rfind(pp.value, ";filename=")
+            if p > best {
+                best = p
+                which = 1
+            }
+        }
+        if which < 0 {
+            break
+        }
+        if which == 0 {
+            pp.file_type = substr(pp.value, best + 6, len(pp.value))
+            pp.has_type = true
+            type_live = false
+        } else {
+            pp.file_name_header = substr(pp.value, best + 10, len(pp.value))
+            pp.has_fname = true
+            fname_live = false
+        }
+        pp.value = substr(pp.value, 0, best)
+    }
+    return pp
+}
+
+// rust_quote renders a string the way Rust {:?} prints it for the
+// InvalidValue error text: wrapped in quotes, escaping \\ \" \n \r \t.
+fn rust_quote(s: str) -> str {
+    out := "\""
+    i := 0
+    for i < len(s) {
+        c := byteat(s, i)
+        if c == 34 {
+            out = out + "\\\""
+        } else if c == 92 {
+            out = out + "\\\\"
+        } else if c == 10 {
+            out = out + "\\n"
+        } else if c == 13 {
+            out = out + "\\r"
+        } else if c == 9 {
+            out = out + "\\t"
+        } else {
+            out = out + substr(s, i, i + 1)
+        }
+        i = i + 1
+    }
+    return out + "\""
+}
+
+fn invalid_value(s: str) -> err {
+    return errors.new("Invalid value for '[REQUEST_ITEM]...': " + rust_quote(s))
+}
+
+// parse runs the upstream FromStr: sep scan first; on a match,
+// key/value are unescaped over "=@:;\\" except where upstream keeps
+// raw keys (JsonField/JsonFieldFromFile carry raw_key, DataField*
+// carry both). Only when the scan finds nothing does the trailing-;
+// empty-header rule apply — and its key is NOT unescaped upstream.
+fn parse(s: str) -> [Item, err] {
+    special := "=@:;\\"
+    sp := split(s)
+    if sp.ok {
+        raw_key := sp.raw_key
+        sep := sp.sep
+        value := sp.value
+        key := unescape(raw_key, special)
+        uval := unescape(value, special)
+        if sep == "==" {
+            return Item.UrlParam{key: key, value: uval}, nil
+        }
+        if sep == "=" {
+            return Item.DataField{key: key, raw_key: raw_key, value: uval}, nil
+        }
+        if sep == ":=" {
+            if !json_valid(uval) {
+                return Item.HttpHeaderToUnset{key: ""}, invalid_value(s)
+            }
+            return Item.JsonField{raw_key: raw_key, raw_value: uval, value: json.jparse(uval)}, nil
+        }
+        if sep == "@" {
+            pp := parse_part_params(uval)
+            return Item.FormFile{key: key, file_name: pp.value, file_type: pp.file_type, has_type: pp.has_type, file_name_header: pp.file_name_header, has_fname: pp.has_fname}, nil
+        }
+        if sep == ":" {
+            if len(uval) == 0 {
+                return Item.HttpHeaderToUnset{key: key}, nil
+            }
+            return Item.HttpHeader{key: key, value: uval}, nil
+        }
+        if sep == "==@" {
+            return Item.UrlParamFromFile{key: key, value: uval}, nil
+        }
+        if sep == "=@" {
+            return Item.DataFieldFromFile{key: key, raw_key: raw_key, value: uval}, nil
+        }
+        if sep == ":=@" {
+            return Item.JsonFieldFromFile{raw_key: raw_key, value: uval}, nil
+        }
+        if sep == ":@" {
+            return Item.HttpHeaderFromFile{key: key, value: uval}, nil
+        }
+    }
+    if strings.endswith(s, ";") {
+        // upstream: HttpHeader(header.to_owned(), "") — deliberately
+        // NOT unescaped ("technically too permissive", code comment)
+        return Item.HttpHeader{key: substr(s, 0, len(s) - 1), value: ""}, nil
+    }
+    return Item.HttpHeaderToUnset{key: ""}, invalid_value(s)
+}
+
+// --- JSON syntax validation ---
+// jparse swallows malformed input into jnull(), indistinguishable
+// from a literal `null`, so `:=` needs its own validator to reproduce
+// upstream's parse-time error. RFC 8259 grammar over bytes.
+fn jv_lit(s: str, i: int, lit: str) -> int {
+    if i + len(lit) > len(s) || substr(s, i, i + len(lit)) != lit {
+        return -1
+    }
+    return i + len(lit)
+}
+
+fn is_dig(c: int) -> bool {
+    return c >= 48 && c <= 57
+}
+
+fn is_hexdig(c: int) -> bool {
+    return c >= 48 && c <= 57 || c >= 97 && c <= 102 || c >= 65 && c <= 70
+}
+
+fn jv_ws(s: str, i0: int) -> int {
+    i := i0
+    for i < len(s) {
+        c := byteat(s, i)
+        if c == 32 || c == 9 || c == 10 || c == 13 {
+            i = i + 1
+        } else {
+            break
+        }
+    }
+    return i
+}
+
+// jv_str returns the index after the closing quote, or -1.
+fn jv_str(s: str, i0: int) -> int {
+    i := i0 + 1
+    for i < len(s) {
+        c := byteat(s, i)
+        if c == 34 {
+            return i + 1
+        }
+        if c == 92 {
+            i = i + 1
+            if i >= len(s) {
+                return -1
+            }
+            e := byteat(s, i)
+            if e == 117 {
+                // \uXXXX — JSON grammar accepts any 4 hex digits
+                if i + 4 >= len(s) {
+                    return -1
+                }
+                k := 0
+                for k < 4 {
+                    if !is_hexdig(byteat(s, i + 1 + k)) {
+                        return -1
+                    }
+                    k = k + 1
+                }
+                i = i + 5
+                continue
+            }
+            if e == 34 || e == 92 || e == 47 || e == 98 || e == 102 || e == 110 || e == 114 || e == 116 {
+                i = i + 1
+                continue
+            }
+            return -1
+        }
+        if c < 32 {
+            return -1
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// jv_num: -?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?
+fn jv_num(s: str, i0: int) -> int {
+    i := i0
+    if byteat(s, i) == 45 {
+        i = i + 1
+    }
+    if i >= len(s) {
+        return -1
+    }
+    c := byteat(s, i)
+    if c == 48 {
+        i = i + 1
+    } else if c >= 49 && c <= 57 {
+        for i < len(s) && is_dig(byteat(s, i)) {
+            i = i + 1
+        }
+    } else {
+        return -1
+    }
+    if i < len(s) && byteat(s, i) == 46 {
+        i = i + 1
+        if i >= len(s) || !is_dig(byteat(s, i)) {
+            return -1
+        }
+        for i < len(s) && is_dig(byteat(s, i)) {
+            i = i + 1
+        }
+    }
+    if i < len(s) && (byteat(s, i) == 101 || byteat(s, i) == 69) {
+        i = i + 1
+        if i < len(s) && (byteat(s, i) == 43 || byteat(s, i) == 45) {
+            i = i + 1
+        }
+        if i >= len(s) || !is_dig(byteat(s, i)) {
+            return -1
+        }
+        for i < len(s) && is_dig(byteat(s, i)) {
+            i = i + 1
+        }
+    }
+    return i
+}
+
+// jv_val returns the index one past the parsed value, or -1.
+fn jv_val(s: str, i0: int, depth: int) -> int {
+    if depth > 128 {
+        // serde_json::from_str recursion limit is 128 — match it
+        return -1
+    }
+    i := jv_ws(s, i0)
+    if i >= len(s) {
+        return -1
+    }
+    c := byteat(s, i)
+    if c == 34 {
+        return jv_str(s, i)
+    }
+    if c == 45 || is_dig(c) {
+        return jv_num(s, i)
+    }
+    if c == 116 {
+        return jv_lit(s, i, "true")
+    }
+    if c == 102 {
+        return jv_lit(s, i, "false")
+    }
+    if c == 110 {
+        return jv_lit(s, i, "null")
+    }
+    if c == 123 {
+        i = jv_ws(s, i + 1)
+        if i < len(s) && byteat(s, i) == 125 {
+            return i + 1
+        }
+        for true {
+            i = jv_ws(s, i)
+            if i >= len(s) || byteat(s, i) != 34 {
+                return -1
+            }
+            i = jv_str(s, i)
+            if i < 0 {
+                return -1
+            }
+            i = jv_ws(s, i)
+            if i >= len(s) || byteat(s, i) != 58 {
+                return -1
+            }
+            i = jv_val(s, i + 1, depth + 1)
+            if i < 0 {
+                return -1
+            }
+            i = jv_ws(s, i)
+            if i >= len(s) {
+                return -1
+            }
+            cc := byteat(s, i)
+            if cc == 125 {
+                return i + 1
+            }
+            if cc != 44 {
+                return -1
+            }
+            i = i + 1
+        }
+    }
+    if c == 91 {
+        i = jv_ws(s, i + 1)
+        if i < len(s) && byteat(s, i) == 93 {
+            return i + 1
+        }
+        for true {
+            i = jv_val(s, i, depth + 1)
+            if i < 0 {
+                return -1
+            }
+            i = jv_ws(s, i)
+            if i >= len(s) {
+                return -1
+            }
+            cc := byteat(s, i)
+            if cc == 93 {
+                return i + 1
+            }
+            if cc != 44 {
+                return -1
+            }
+            i = i + 1
+        }
+    }
+    return -1
+}
+
+fn json_valid(s: str) -> bool {
+    return jv_val(s, 0, 0) == len(s)
+}
