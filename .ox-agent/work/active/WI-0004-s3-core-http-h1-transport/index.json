@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "id": "WI-0004",
+  "title": "S3 core/http h1 transport",
+  "state": "intake",
+  "profile": "normal",
+  "current_stage": "intake",
+  "created_at": "2026-11-17T16:04:05Z"
+}
