@@ -1,0 +1,50 @@
+package session
+
+// xh session model — corpus docs/corpus/corpus-xh.md section 4.4.
+// File shape (pretty JSON): { "__meta__": {about, xh}, "auth":
+// {type, raw_auth}, "cookies": [...], "headers": [{name,value}] }.
+// Types only — no IO. session_path is the pure naming rule.
+import "std/errors"
+
+import "github.com/oxidean/oxttp/core/model"
+
+struct SessMeta { about: str, xh: str }
+
+struct SessAuth { type: str, raw_auth: str }
+
+// expires is empty unless the server sent an Expires attribute.
+struct SessCookie {
+    name: str,
+    value: str,
+    expires: str,
+    path: str,
+    domain: str,
+    secure: bool,
+}
+
+struct Session {
+    meta: own SessMeta,
+    auth: own SessAuth,
+    cookies: []SessCookie,
+    headers: []model.Header,
+}
+
+// session_path resolves the corpus naming rule (session.rs
+// path_from_url ~L374): a name containing a path separator is a
+// literal file path; otherwise the file lives under
+// <host>[_<port>]/<name>.json — port joins only when explicitly
+// present (url.port() hides scheme defaults). Host ".", "..", or
+// missing errors like upstream.
+fn session_path(name: str, host: str, port: int) -> [str, err] {
+    if find(name, "/") >= 0 {
+        return name, nil
+    }
+    if host == "." || host == ".." || len(host) == 0 {
+        return "", errors.new("couldn't extract host from url")
+    }
+    dir := host
+    if port > 0 {
+        dir = host + "_" + itoa(port)
+    }
+    return dir + "/" + name + ".json", nil
+}

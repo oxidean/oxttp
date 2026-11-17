@@ -1,0 +1,77 @@
+package term
+
+// Screen/Key abstractions — the TUI's port (decision 0005: the stty
+// raw-mode + ANSI driver lives behind these so a future termios
+// driver or a headless test driver swaps in). Types only; input
+// decode + render land in S8.
+// Key vocabulary: docs/corpus/corpus-posting.md section 3
+// (ctrl/alt/shift/meta/super modifiers, named keys enter..f12) and
+// section 4 (SGR mouse: clicks + scroll).
+
+// (No bitwise-& in oxl v0.15.0 — modifiers ride as bool fields on
+// KeyEvent rather than a bitset int.)
+
+// Named-key codes (corpus §3 list, case-insensitive parse upstream).
+let KeyEnter = 1
+let KeyTab = 2
+let KeySpace = 3
+let KeyBackspace = 4
+let KeyDelete = 5
+let KeyInsert = 6
+let KeyEscape = 7
+let KeyUp = 8
+let KeyDown = 9
+let KeyLeft = 10
+let KeyRight = 11
+let KeyHome = 12
+let KeyEnd = 13
+let KeyPgUp = 14
+let KeyPgDown = 15
+// f1..f12 = KeyF1 + (n-1)
+let KeyF1 = 100
+
+// Mouse kinds (SGR): 0 press, 1 release, 2 drag, 3 scroll-up,
+// 4 scroll-down — decoded in S8; kept here so action dispatch is
+// driver-independent.
+let MousePress = 0
+let MouseRelease = 1
+let MouseDrag = 2
+let MouseScrollUp = 3
+let MouseScrollDown = 4
+
+// Key is one decoded input unit: a rune (printable text), a named
+// key, or a mouse event at cell coords.
+enum Key {
+    Rune { ch: str },
+    Named { code: int },
+    Mouse { kind: int, x: int, y: int, button: int },
+}
+
+// KeyEvent pairs a key with the modifiers held during it — the
+// corpus modifier set is exactly these five (section 3 key format).
+struct KeyEvent {
+    key: Key,
+    ctrl: bool,
+    alt: bool,
+    shift: bool,
+    meta: bool,
+    sup: bool,
+}
+
+// Style attrs for set_cell (SGR): bold/underline/reverse etc. land in
+// S8; the port exposes the attr bits now so renderers typecheck.
+let AttrBold = 1
+let AttrDim = 2
+let AttrItalic = 4
+let AttrUnderline = 8
+let AttrReverse = 16
+
+// Screen is the cell-buffer port the TUI renders into: size in
+// cells, set_cell writes one cell (fg/bg are palette ids — S8 maps
+// them to SGR), present flushes, cursor positions + hides.
+interface Screen {
+    size() -> [int, int]
+    set_cell(x: int, y: int, ch: str, fg: int, bg: int, attr: int)
+    present() -> err
+    cursor(x: int, y: int, show: bool)
+}

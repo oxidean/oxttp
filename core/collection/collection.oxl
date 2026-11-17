@@ -1,0 +1,107 @@
+package collection
+
+// .posting.yaml request-file schema — verbatim clone of
+// docs/corpus/corpus-posting.md section 5.2 (17 top-level keys,
+// decision 0010). Types only: no IO, no defaults — parse/serialize
+// land in S10.
+
+import "std/encoding/json"
+import "github.com/oxidean/oxttp/core/model"
+
+// PBody: exactly one of content / form_data / multipart / file
+// (corpus: >1 = parse error; part needs exactly one of value|file).
+// The has_ markers keep "key omitted" distinct from "key: ''" so the
+// parser can enforce the exactly-one rule at load time.
+struct PBody {
+    content: str,
+    has_content: bool,
+    form_data: []model.KV,
+    has_form_data: bool,
+    multipart: []model.Part,
+    has_multipart: bool,
+    file: str,
+    has_file: bool,
+    content_type: str,
+}
+
+struct PGraphQL {
+    query: str,
+    variables: own json.Json,
+    operation_name: str,
+}
+
+struct PProto { files: []str, import_paths: []str }
+
+struct PGrpc {
+    method: str,
+    message: str,
+    authority: str,
+    proto: own PProto,
+}
+
+struct PWebsocket { message: str, binary: bool }
+
+// auth.type: basic | digest | bearer_token | oauth2 — blocks hold
+// per-type fields verbatim (corpus §5.2 auth row).
+struct PBasic { username: str, password: str }
+struct PBearer { token: str }
+struct POAuth2 {
+    grant_type: str,
+    authorization_url: str,
+    token_url: str,
+    client_id: str,
+    client_secret: str,
+    scope: str,
+    redirect_uri: str,
+    client_auth: str,
+}
+
+struct PAuth {
+    type: str,
+    basic: own PBasic,
+    digest: own PBasic,
+    bearer_token: own PBearer,
+    oauth2: own POAuth2,
+}
+
+struct PScripts { setup: str, on_request: str, on_response: str }
+
+// options block — corpus defaults (follow_redirects true, verify_ssl
+// true, attach_cookies true, substitute_body_variables true, timeout
+// 5s) are applied by the parser, not here.
+struct POptions {
+    follow_redirects: bool,
+    verify_ssl: bool,
+    attach_cookies: bool,
+    substitute_body_variables: bool,
+    proxy_url: str,
+    timeout: float,
+}
+
+// path_params rows are {name,value} only — always enabled (corpus).
+struct PathParam { name: str, value: str }
+
+// variable_scope { variables: {NAME: template} } — ordered KV list
+// (std collections.Map is int-payload only).
+struct PVarScope { variables: []model.KV }
+
+// captures: map VAR -> jsonpath — ordered KV list, same reason.
+struct PRequest {
+    name: str,
+    description: str,
+    kind: str,
+    method: str,
+    url: str,
+    headers: []model.KV,
+    params: []model.KV,
+    path_params: []PathParam,
+    body: own PBody,
+    graphql: own PGraphQL,
+    grpc: own PGrpc,
+    websocket: own PWebsocket,
+    auth: own PAuth,
+    scripts: own PScripts,
+    options: own POptions,
+    captures: []model.KV,
+    variable_scope: own PVarScope,
+}

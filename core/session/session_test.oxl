@@ -1,0 +1,44 @@
+package session
+
+// session_path naming matrix — corpus §4.4 + session.rs path_from_url.
+import "std/testing"
+
+import "std/errors"
+
+fn test_session_path() {
+    [p, e] = session_path("mysess", "example.com", 0)
+    testing.expect(e == nil, "plain name")
+    testing.expect_streq(p, "example.com/mysess.json", "host dir")
+
+    [p2, e2] = session_path("s", "example.com", 8080)
+    testing.expect(e2 == nil, "port")
+    testing.expect_streq(p2, "example.com_8080/s.json", "host_port dir")
+
+    [p3, e3] = session_path("a/b/c", "example.com", 0)
+    testing.expect(e3 == nil, "literal path")
+    testing.expect_streq(p3, "a/b/c", "separator = literal")
+
+    [p4, e4] = session_path("./rel.json", "example.com", 0)
+    testing.expect_streq(p4, "./rel.json", "leading ./ is literal")
+}
+
+fn test_session_path_bad_host() {
+    [p, e] = session_path("s", ".", 0)
+    testing.expect(e != nil, "host .")
+    testing.expect_streq(errors.msg(e), "couldn't extract host from url", "dot err")
+
+    [p2, e2] = session_path("s", "..", 0)
+    testing.expect(e2 != nil, "host ..")
+
+    [p3, e3] = session_path("s", "", 0)
+    testing.expect(e3 != nil, "host missing")
+}
+
+fn test_session_types() {
+    s := Session{meta: nil, auth: nil, cookies: nil, headers: nil}
+    testing.expect(s.auth == nil, "auth optional")
+    c := SessCookie{name: "sid", value: "1", expires: "", path: "/", domain: "example.com", secure: true}
+    testing.expect(c.secure, "cookie secure")
+    a := SessAuth{type: "basic", raw_auth: "u:p"}
+    testing.expect_streq(a.raw_auth, "u:p", "raw_auth")
+}

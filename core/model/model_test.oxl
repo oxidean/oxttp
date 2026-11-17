@@ -1,0 +1,56 @@
+package model
+
+// Domain type surface tests — construction + the one behavioral fn
+// (status_class boundaries, corpus §4.15 + xh exit-code table §8).
+import "std/testing"
+
+import "std/encoding/json"
+
+fn test_status_class() {
+    testing.expect_eq(status_class(200), 0, "200 success")
+    testing.expect_eq(status_class(299), 0, "299 success")
+    testing.expect_eq(status_class(300), 1, "300 redirect")
+    testing.expect_eq(status_class(301), 1, "301 redirect")
+    testing.expect_eq(status_class(399), 1, "399 redirect")
+    testing.expect_eq(status_class(400), 2, "400 error")
+    testing.expect_eq(status_class(404), 2, "404 error")
+    testing.expect_eq(status_class(500), 2, "500 error")
+}
+
+fn test_req_resp_surface() {
+    h := mkslice(Header, 1)
+    h[0].name = "accept"
+    h[0].value = "application/json"
+    r := Req{method: "POST", url: "http://localhost:8080/x", headers: h, body: Body.Raw{ctype: "application/json", text: "{}"}, timeout_ms: 0, follow: false, max_redirects: 10}
+    testing.expect_streq(r.method, "POST", "req method")
+    testing.expect_streq(r.headers[0].name, "accept", "hdr order")
+    b := r.body as Body.Raw
+    testing.expect_streq(b.ctype, "application/json", "raw ctype")
+
+    rp := Resp{status: 200, reason: "OK", headers: h, body: nil, elapsed_ms: 1.5, remote: "127.0.0.1:8080", trace: nil}
+    testing.expect_eq(rp.status, 200, "resp status")
+    testing.expect(rp.trace == nil, "trace optional")
+
+    jr := Req{method: "POST", url: "u", headers: nil, body: Body.Json{j: json.jparse("{\"a\":1}")}, timeout_ms: 0, follow: false, max_redirects: 0}
+    jb := jr.body as Body.Json
+    testing.expect(jb.j.kind == 4, "json body kind")
+}
+
+fn test_kv_part() {
+    fs := new(mkslice(KV, 1))
+    fs[0] = KV{name: "a", value: "1", enabled: true}
+    fb := Body.Form{fields: fs}
+    fpl := fb as Body.Form
+    testing.expect_eq(len(fpl.fields), 1, "form fields")
+    mp := Body.Multipart{parts: new(mkslice(Part, 0))}
+    mpl := mp as Body.Multipart
+    testing.expect_eq(len(mpl.parts), 0, "multipart empty")
+    fd := Body.FileBody{path: "/x", ctype: "text/plain", filename: "x"}
+    fdl := fd as Body.FileBody
+    testing.expect_streq(fdl.path, "/x", "file body")
+
+    kv := KV{name: "a", value: "1", enabled: false}
+    testing.expect(!kv.enabled, "disabled row saved-not-sent")
+    p := Part{name: "f", value: "", file: "/tmp/x", filename: "x.txt", content_type: "text/plain", enabled: true, is_file: true}
+    testing.expect(p.is_file, "file part")
+}

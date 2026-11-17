@@ -1,0 +1,91 @@
+package model
+
+// Transport-agnostic domain model for outgoing HTTP — corpus:
+// docs/corpus/corpus-xh.md (request/response shapes) and
+// docs/corpus/corpus-posting.md section 4.15 (status classes, trace).
+// Apps never see sockets; transports satisfy core/http.Transport.
+import "std/encoding/json"
+
+// Header is one wire header. Requests/responses carry an ordered list
+// — repeated names are legal and order is preserved.
+struct Header { name: str, value: str }
+
+// KV is a name/value/enabled row — posting headers/params/parts and
+// session/config maps all share this shape. enabled=false rows are
+// saved but never sent.
+struct KV { name: str, value: str, enabled: bool }
+
+// Part is one multipart part (posting schema: name, value|file,
+// filename, content_type, enabled — exactly one of value|file).
+struct Part {
+    name: str,
+    value: str,
+    file: str,
+    filename: str,
+    content_type: str,
+    enabled: bool,
+    is_file: bool,
+}
+
+// Body covers the xh Body kinds (request_items.rs ~L190): Json/Form/
+// Multipart/Raw/File — Empty is the no-body case upstream tracks
+// implicitly. Json carries a parsed tree; Raw carries text bytes.
+enum Body {
+    Empty,
+    Raw { ctype: str, text: str },
+    Json { j: own json.Json },
+    Form { fields: own []KV },
+    Multipart { parts: own []Part },
+    FileBody { path: str, ctype: str, filename: str },
+}
+
+// Req is one outgoing request. timeout_ms 0 = no timeout (xh --timeout
+// default 0 = none); max_redirects applies only when follow is set
+// (xh default 10 with --follow).
+struct Req {
+    method: str,
+    url: str,
+    headers: []Header,
+    body: Body,
+    timeout_ms: int,
+    follow: bool,
+    max_redirects: int,
+}
+
+// Trace is the per-stage timing posting shows in its Trace tab
+// (corpus §4.14: connect, tls handshake, send headers, send body,
+// receive headers, receive body, response closed).
+struct Trace {
+    connect_ms: float,
+    tls_ms: float,
+    send_headers_ms: float,
+    send_body_ms: float,
+    recv_headers_ms: float,
+    recv_body_ms: float,
+    closed_ms: float,
+}
+
+// Resp is one received response. body is raw bytes (latin1/UTF-8
+// display handling is the printer's concern).
+struct Resp {
+    status: int,
+    reason: str,
+    headers: []Header,
+    body: []byte,
+    elapsed_ms: float,
+    remote: str,
+    trace: own Trace,
+}
+
+// status_class: <300 success(0), <400 redirect(1), else error(2) —
+// posting §4.15 StatusClass; xh check-status exits 3/4/5 on the same
+// boundaries.
+fn status_class(status: int) -> int {
+    if status < 300 {
+        return 0
+    }
+    if status < 400 {
+        return 1
+    }
+    return 2
+}
