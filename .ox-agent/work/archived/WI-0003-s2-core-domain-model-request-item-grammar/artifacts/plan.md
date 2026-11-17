@@ -1,7 +1,7 @@
 # WI-0003 implementation plan - S2 core domain model + grammar
 
 Spec: `artifacts/spec.md` (contracts + acceptance criteria).
-Layout: ADR-0012. Grammar: `context/references/xh-request-item-grammar.md`.
+Layout: ADR-0016. Grammar: `context/references/xh-request-item-grammar.md`.
 
 ## Stages
 

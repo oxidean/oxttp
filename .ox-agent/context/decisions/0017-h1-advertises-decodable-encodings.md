@@ -1,4 +1,4 @@
-# 0014 — h1 transport advertises only decodable content-encodings
+# 0017 — h1 transport advertises only decodable content-encodings
 
 Status: accepted (2026-11-17, WI-0004 brainstorm)
 

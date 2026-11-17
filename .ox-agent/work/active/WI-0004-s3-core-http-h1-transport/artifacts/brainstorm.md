@@ -1,7 +1,7 @@
 # WI-0004 brainstorm - S3 core/http h1 transport
 
 Scope: one stage of the WI-0001 plan. ADR-settled calls (0003 own
-transport behind the port, 0006 explicit degradation, 0012 layout)
+transport behind the port, 0006 explicit degradation, 0016 layout)
 are not reopened — this brainstorm covers stage-level design.
 
 ## Q1 - Response reader architecture

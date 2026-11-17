@@ -1,4 +1,4 @@
-# 0015 — wire encoding lives in core/http, not the apps
+# 0018 — wire encoding lives in core/http, not the apps
 
 Status: accepted (2026-11-17, WI-0004 brainstorm)
 
@@ -12,7 +12,7 @@ pre-flattened model field.
 The transport also synthesizes the wire-only headers the domain does
 not model: `Host` (from the URL authority, incl. non-default port),
 `Content-Length` (from rendered bytes), `Accept-Encoding` (default
-per ADR-0014), and `Connection`. Explicitly supplied headers always
+per ADR-0017), and `Connection`. Explicitly supplied headers always
 win over synthesized ones — a caller that sets Content-Length takes
 responsibility for it.
 

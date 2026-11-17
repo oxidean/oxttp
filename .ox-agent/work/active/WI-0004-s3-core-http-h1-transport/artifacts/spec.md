@@ -1,7 +1,7 @@
 # WI-0004 spec - S3: core/http HTTP/1.1 transport
 
-Upstream: WI-0001 plan.md S3, WI-0001 spec, ADRs 0001/0003/0006/0012/
-0014/0015. Corpus: `docs/corpus/corpus-xh.md` §4.5-4.6, §8.
+Upstream: WI-0001 plan.md S3, WI-0001 spec, ADRs 0001/0003/0006/0016/
+0017/0018. Corpus: `docs/corpus/corpus-xh.md` §4.5-4.6, §8.
 Std surface: `context/references/std-net-transport-surface.md`.
 Design: `artifacts/brainstorm.md` (all Q resolved to option A).
 
@@ -20,7 +20,7 @@ and digest (S7), sessions/cookies (S7), connection pooling/reuse
 (v0.1 closes each conn), Expect: 100-continue (cli never sends it
 yet), HTTP/2-3, `--all` intermediate-hop visibility (needs a model
 hop-chain — S7 model extension), `Accept-Encoding` br/zstd (no std
-decoders — ADR-0014), request-body compression `--compress` (S6/S7).
+decoders — ADR-0017), request-body compression `--compress` (S6/S7).
 
 ## Package contract (`core/http`)
 
@@ -87,7 +87,7 @@ fn send(req: ref model.Req) -> [model.Resp, err]
    `Host` = `u.host` verbatim first (caller-supplied Host wins, sent
    in caller position instead), caller headers in order, then
    synthesized defaults for absent names — `Accept-Encoding:
-   gzip, deflate` (ADR-0014), `Connection: close` (see Deviations),
+   gzip, deflate` (ADR-0017), `Connection: close` (see Deviations),
    `Content-Length: <n>` when rendered body non-empty (caller CL
    wins). No TE/chunked request bodies in v0.1.
 4. Dial: `timeout_ms<=0` → `net.dial` (std 30s connect cap); `>0` →
@@ -125,7 +125,7 @@ fn send(req: ref model.Req) -> [model.Resp, err]
 
 ## Deviations (recorded, never silent)
 
-1. `Accept-Encoding: gzip, deflate` (not corpus's four) — ADR-0014;
+1. `Accept-Encoding: gzip, deflate` (not corpus's four) — ADR-0017;
    br/zstd responses → explicit error.
 2. `Connection: close` (corpus: keep-alive) — v0.1 single-shot, no
    pool; honest unframed-body fallback; a close-honoring server may

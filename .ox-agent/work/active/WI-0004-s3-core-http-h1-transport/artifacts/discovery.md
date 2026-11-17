@@ -74,6 +74,6 @@ headers, chunked, redirects, compressed bodies.
 ## Settled (cite, do not re-litigate)
 
 - 0003: own h1 transport, behind `core/http` port; apps never see
-  sockets. 0006: degrade explicitly. 0012: package layout core/http.
+  sockets. 0006: degrade explicitly. 0016: package layout core/http.
 - S3 scope per plan: serialization, decode, redirects, gzip/deflate,
   timeouts. Proxy env, auth kinds, session cookies are S7.

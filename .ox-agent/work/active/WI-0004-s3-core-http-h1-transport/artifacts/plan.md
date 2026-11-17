@@ -2,8 +2,8 @@
 
 Spec: `artifacts/spec.md` (contracts, deviations, AC1-6).
 Std surface: `context/references/std-net-transport-surface.md`.
-ADRs: 0014 (accept-encoding scope), 0015 (wire encoding in
-transport), 0016 (connection close).
+ADRs: 0017 (accept-encoding scope), 0018 (wire encoding in
+transport), 0019 (connection close).
 
 ## Stages
 
