@@ -1,0 +1,402 @@
+package main
+
+// Table-conformance matrix for the 58-flag corpus surface —
+// WI-0005 spec.md "cli/spec_test.oxl". Corpus:
+// docs/corpus/corpus-xh.md sections 1, 4 (all flag rows).
+import "std/strings"
+
+import "std/testing"
+
+import "github.com/oxidean/oxttp/shared/args"
+
+// av builds argv (post-argv0) from a newline-joined literal.
+fn av(s: str) -> []str {
+    if len(s) == 0 {
+        return mkslice(str, 0)
+    }
+    parts := strings.split(s, "\n")
+    out := mkslice(str, 0)
+    cur := parts
+    for cur != nil {
+        out = push(out, cur.v)
+        cur = cur.next
+    }
+    return out
+}
+
+// ev builds envpairs ("K=V" list) likewise.
+fn ev(s: str) -> []str {
+    return av(s)
+}
+
+// p parses argv against the real oxttp table.
+fn p(argv: str) -> own args.Matches {
+    return args.parse(spec("oxttp"), av(argv), ev(""))
+}
+
+// pe parses argv plus envpairs.
+fn pe(argv: str, env: str) -> own args.Matches {
+    return args.parse(spec("oxttp"), av(argv), ev(env))
+}
+
+// okf asserts argv parses and flag `name` is present.
+fn okf(argv: str, name: str) {
+    m := p(argv)
+    testing.expect(m.ok == 1, argv + " should parse: " + m.diag)
+    testing.expect(args.get_flag(m, name), argv + " missing " + name)
+}
+
+fn test_table_shape() {
+    s := spec("oxttp")
+    names := "json,form,multipart,raw,pretty,format-options,style,response-charset,response-mime,print,headers,body,meta,verbose,debug,all,history-print,quiet,stream,compress,output,download,continue,session,session-read-only,auth-type,auth,bearer,ignore-netrc,unstable-m-sig-id,unstable-m-sig-key,unstable-m-sig-alg,unstable-m-sig-comp,offline,check-status,follow,max-redirects,timeout,proxy,verify,cert,cert-key,ssl,native-tls,default-scheme,https,http-version,resolve,interface,ipv4,ipv6,unix-socket,ignore-stdin,curl,curl-long,generate,help,version"
+    want := strings.split(names, ",")
+    testing.expect_eq(len(s.opts), 58, "58 option rows")
+    i := 0
+    for i < len(s.opts) {
+        found := false
+        cur := want
+        for cur != nil {
+            if s.opts[i].name == cur.v {
+                found = true
+            }
+            cur = cur.next
+        }
+        testing.expect(found, "unexpected row " + s.opts[i].name)
+        i = i + 1
+    }
+    cur := want
+    for cur != nil {
+        found := false
+        j := 0
+        for j < len(s.opts) {
+            if s.opts[j].name == cur.v {
+                found = true
+            }
+            j = j + 1
+        }
+        testing.expect(found, "missing corpus flag " + cur.v)
+        cur = cur.next
+    }
+    testing.expect_eq(len(s.poss), 2, "two positional slots")
+    testing.expect_streq(s.poss[0].metavar, "<[METHOD] URL>", "murl metavar")
+    testing.expect(s.poss[0].required == 1, "murl required")
+    testing.expect_streq(s.poss[1].metavar, "[REQUEST_ITEM]...", "rest metavar")
+    testing.expect(s.poss[1].variadic == 1, "rest variadic")
+}
+
+fn test_hidden() {
+    s := spec("oxttp")
+    want := strings.split("bearer,unstable-m-sig-id,unstable-m-sig-key,unstable-m-sig-alg,unstable-m-sig-comp,native-tls,default-scheme", ",")
+    nh := 0
+    i := 0
+    for i < len(s.opts) {
+        o := s.opts[i]
+        if o.hidden != 0 {
+            nh = nh + 1
+            found := false
+            cur := want
+            for cur != nil {
+                if o.name == cur.v {
+                    found = true
+                }
+                cur = cur.next
+            }
+            testing.expect(found, "unexpected hidden " + o.name)
+        }
+        i = i + 1
+    }
+    testing.expect_eq(nh, 7, "7 hidden flags")
+}
+
+fn test_usage_and_help() {
+    s := spec("oxttp")
+    u := args.usage_line(s)
+    testing.expect_streq(u, "Usage: oxttp [OPTIONS] <[METHOD] URL> [REQUEST_ITEM]...", "usage line")
+    h := args.help(s, 0)
+    testing.expect(find(h, "-j, --json") >= 0, "help json")
+    testing.expect(find(h, "-f, --form") >= 0, "help form")
+    testing.expect(find(h, "--raw <RAW>") >= 0, "help raw")
+    testing.expect(find(h, "--pretty <STYLE>") >= 0, "help pretty")
+    testing.expect(find(h, "-p, --print <FORMAT>") >= 0, "help print")
+    testing.expect(find(h, "-h, --headers") >= 0, "help -h headers")
+    testing.expect(find(h, "-v, --verbose") >= 0, "help verbose")
+    testing.expect(find(h, "-q, --quiet") >= 0, "help quiet")
+    testing.expect(find(h, "-x, --compress") >= 0, "help compress")
+    testing.expect(find(h, "-o, --output <FILE>") >= 0, "help output")
+    testing.expect(find(h, "-d, --download") >= 0, "help download")
+    testing.expect(find(h, "-c, --continue") >= 0, "help continue")
+    testing.expect(find(h, "--session <FILE>") >= 0, "help session")
+    testing.expect(find(h, "-A, --auth-type") >= 0, "help auth-type")
+    testing.expect(find(h, "-a, --auth <USER[:PASS] | TOKEN>") >= 0, "help auth")
+    testing.expect(find(h, "--check-status") >= 0, "help check-status")
+    testing.expect(find(h, "-F, --follow") >= 0, "help follow")
+    testing.expect(find(h, "--max-redirects <NUM>") >= 0, "help max-redirects")
+    testing.expect(find(h, "--timeout <SEC>") >= 0, "help timeout")
+    testing.expect(find(h, "--proxy <PROTOCOL:URL>") >= 0, "help proxy")
+    testing.expect(find(h, "--verify <VERIFY>") >= 0, "help verify")
+    testing.expect(find(h, "--ssl <VERSION>") >= 0, "help ssl")
+    testing.expect(find(h, "--https") >= 0, "help https")
+    testing.expect(find(h, "--http-version <VERSION>") >= 0, "help http-version")
+    testing.expect(find(h, "--resolve <HOST:ADDRESS>") >= 0, "help resolve")
+    testing.expect(find(h, "-4, --ipv4") >= 0, "help ipv4")
+    testing.expect(find(h, "-6, --ipv6") >= 0, "help ipv6")
+    testing.expect(find(h, "--unix-socket <FILE>") >= 0, "help unix-socket")
+    testing.expect(find(h, "-I, --ignore-stdin") >= 0, "help ignore-stdin")
+    testing.expect(find(h, "--curl") >= 0, "help curl")
+    testing.expect(find(h, "--generate <KIND>") >= 0, "help generate")
+    testing.expect(find(h, "--help") >= 0, "help help")
+    testing.expect(find(h, "-V, --version") >= 0, "help version")
+    testing.expect(find(h, "<[METHOD] URL>") >= 0, "help murl")
+    testing.expect(find(h, "[REQUEST_ITEM]...") >= 0, "help rest")
+    testing.expect(find(h, "Arguments:") >= 0, "help args section")
+    testing.expect(find(h, "Options:") >= 0, "help opts section")
+    // hidden rows absent
+    testing.expect(find(h, "--bearer") < 0, "bearer hidden")
+    testing.expect(find(h, "m-sig") < 0, "m-sig hidden")
+    testing.expect(find(h, "native-tls") < 0, "native-tls hidden")
+    testing.expect(find(h, "default-scheme") < 0, "default-scheme hidden")
+    testing.expect(find(h, "--no-") < 0, "no- forms hidden")
+    hl := args.help(s, 1)
+    testing.expect(find(hl, "[possible values: all, colors, format, none]") >= 0, "long pretty values")
+    testing.expect(find(hl, "[possible values: 1.0, 1.1, 2, 2-prior-knowledge, 3-prior-knowledge]") >= 0, "long http-version values")
+    testing.expect(find(hl, "[aliases: 1]") >= 0, "long http-version alias")
+    testing.expect(find(hl, "[aliases: ssl2.3]") >= 0, "long ssl alias")
+    testing.expect(find(hl, "[env: REQUESTS_CA_BUNDLE,CURL_CA_BUNDLE]") >= 0, "long verify env")
+    testing.expect(find(hl, "[possible values: basic, bearer, digest]") >= 0, "long auth-type values")
+}
+
+fn test_flags_parse() {
+    okf("--json\nexample.org", "json")
+    okf("--form\nexample.org", "form")
+    okf("--multipart\nexample.org", "multipart")
+    okf("--headers\nexample.org", "headers")
+    okf("--body\nexample.org", "body")
+    okf("--meta\nexample.org", "meta")
+    okf("--debug\nexample.org", "debug")
+    okf("--all\nexample.org", "all")
+    okf("--stream\nexample.org", "stream")
+    okf("--download\nexample.org", "download")
+    okf("--offline\nexample.org", "offline")
+    okf("--check-status\nexample.org", "check-status")
+    okf("--follow\nexample.org", "follow")
+    okf("--ignore-netrc\nexample.org", "ignore-netrc")
+    okf("--https\nexample.org", "https")
+    okf("--native-tls\nexample.org", "native-tls")
+    okf("--ipv4\nexample.org", "ipv4")
+    okf("--ipv6\nexample.org", "ipv6")
+    okf("--ignore-stdin\nexample.org", "ignore-stdin")
+    okf("--curl\nexample.org", "curl")
+    okf("--curl-long\nexample.org", "curl-long")
+    okf("--bearer\ntok\nexample.org", "bearer")
+    okf("--default-scheme\nftp\nexample.org", "default-scheme")
+    m := p("--unstable-m-sig-id\ni\n--unstable-m-sig-key\nk\nexample.org")
+    testing.expect(m.ok == 1, "m-sig id+key parse")
+    testing.expect(args.present(m, "unstable-m-sig-id"), "m-sig id present")
+    // counts
+    m2 := p("-vv\n-q\n-x\n-xx\nexample.org")
+    testing.expect_eq(args.get_count(m2, "verbose"), 2, "vv count")
+    testing.expect_eq(args.get_count(m2, "quiet"), 1, "q count")
+    testing.expect_eq(args.get_count(m2, "compress"), 3, "x count 3")
+    // string kinds
+    testing.expect_streq(args.get_str(p("--raw\nchunk\nexample.org"), "raw"), "chunk", "raw value")
+    testing.expect_streq(args.get_str(p("--output\nf\nexample.org"), "output"), "f", "output value")
+    testing.expect_streq(args.get_str(p("--session\ns\nexample.org"), "session"), "s", "session value")
+    testing.expect_streq(args.get_str(p("--session-read-only\ns\nexample.org"), "session-read-only"), "s", "session-ro value")
+    testing.expect_streq(args.get_str(p("--auth\nu:p\nexample.org"), "auth"), "u:p", "auth value")
+    testing.expect_streq(args.get_str(p("--cert\nc.pem\nexample.org"), "cert"), "c.pem", "cert value")
+    testing.expect_streq(args.get_str(p("--cert-key\nk.pem\nexample.org"), "cert-key"), "k.pem", "cert-key value")
+    testing.expect_streq(args.get_str(p("--interface\neth0\nexample.org"), "interface"), "eth0", "interface value")
+    testing.expect_streq(args.get_str(p("--unix-socket\n/s\nexample.org"), "unix-socket"), "/s", "unix-socket value")
+    testing.expect_streq(args.get_str(p("--response-mime\napplication/json\nexample.org"), "response-mime"), "application/json", "response-mime value")
+    testing.expect_streq(args.get_str(p("--response-charset\nutf8\nexample.org"), "response-charset"), "utf8", "charset raw value")
+    // numeric + enum kinds
+    testing.expect_eq(args.get_int(p("--max-redirects=20\nexample.org"), "max-redirects"), 20, "max-redirects 20")
+    testing.expect_streq(args.get_enum(p("--pretty\ncolors\nexample.org"), "pretty"), "colors", "pretty colors")
+    testing.expect_streq(args.get_enum(p("--style\nmonokai\nexample.org"), "style"), "monokai", "style monokai")
+    testing.expect_streq(args.get_enum(p("--auth-type\ndigest\nexample.org"), "auth-type"), "digest", "auth-type digest")
+    testing.expect_streq(args.get_enum(p("--ssl\ntls1.2\nexample.org"), "ssl"), "tls1.2", "ssl tls1.2")
+    testing.expect_streq(args.get_enum(p("--ssl\nssl2.3\nexample.org"), "ssl"), "auto", "ssl alias")
+    testing.expect_streq(args.get_enum(p("--http-version\n1\nexample.org"), "http-version"), "1.0", "hv alias")
+    testing.expect_streq(args.get_enum(p("--http-version\n3-prior-knowledge\nexample.org"), "http-version"), "3-prior-knowledge", "hv3")
+    testing.expect(p("--generate\nman\nexample.org").ok == 0, "generate+pos conflict")
+    mg := p("--generate\ncomplete-zsh")
+    testing.expect(mg.ok == 1, "generate alone ok")
+    testing.expect_streq(args.get_enum(mg, "generate"), "complete-zsh", "generate val")
+    ma := p("--unstable-m-sig-id\ni\n--unstable-m-sig-key\nk\n--unstable-m-sig-alg\nrsa-pss-sha512\nexample.org")
+    testing.expect(ma.ok == 1, "m-sig alg parse")
+    testing.expect_streq(args.get_enum(ma, "unstable-m-sig-alg"), "rsa-pss-sha512", "m-sig alg val")
+    // repeats
+    pl := args.get_list(p("--proxy\nhttp:a\n--proxy\nall:b\nexample.org"), "proxy")
+    testing.expect_eq(len(pl), 2, "proxy repeat 2")
+    rl := args.get_list(p("--resolve\nh:1.2.3.4\n--resolve\nx:::1\nexample.org"), "resolve")
+    testing.expect_eq(len(rl), 2, "resolve repeat 2")
+    fl := args.get_list(p("--format-options\njson.indent:2\n--format-options\njson.format:true\nexample.org"), "format-options")
+    testing.expect_eq(len(fl), 2, "format-options repeat")
+    mc := p("--unstable-m-sig-id\ni\n--unstable-m-sig-key\nk\n--unstable-m-sig-comp\n@method\n--unstable-m-sig-comp\n@path\nexample.org")
+    testing.expect_eq(len(args.get_list(mc, "unstable-m-sig-comp")), 2, "m-sig-comp repeat")
+}
+
+fn test_shorts() {
+    okf("-j\nexample.org", "json")
+    m := p("-jf\nexample.org")
+    testing.expect(args.get_flag(m, "form") && !args.get_flag(m, "json"), "-jf form last")
+    okf("-h\nexample.org", "headers")
+    okf("-b\nexample.org", "body")
+    okf("-m\nexample.org", "meta")
+    okf("-d\nexample.org", "download")
+    okf("-F\nexample.org", "follow")
+    okf("-4\nexample.org", "ipv4")
+    okf("-6\nexample.org", "ipv6")
+    okf("-I\nexample.org", "ignore-stdin")
+    okf("-S\nexample.org", "stream")
+    testing.expect_streq(args.get_str(p("-of\nexample.org"), "output"), "f", "-o attached")
+    testing.expect_streq(args.get_str(p("-o=f\nexample.org"), "output"), "f", "-o= attached")
+    testing.expect_streq(args.get_str(p("-pHB\nexample.org"), "print"), "HB", "-p attached")
+    testing.expect_streq(args.get_str(p("-P\nh\nexample.org"), "history-print"), "h", "-P next")
+    testing.expect_streq(args.get_enum(p("-sauto\nexample.org"), "style"), "auto", "-s attached")
+    testing.expect_streq(args.get_str(p("-a\nu:p\nexample.org"), "auth"), "u:p", "-a next")
+    testing.expect_streq(args.get_enum(p("-A\nbearer\nexample.org"), "auth-type"), "bearer", "-A next")
+    mc := p("-do=f\n-c\nexample.org")
+    testing.expect(mc.ok == 1, "-do=f -c ok")
+    testing.expect(args.get_flag(mc, "download"), "-d flag")
+    testing.expect_streq(args.get_str(mc, "output"), "f", "-o val")
+    testing.expect(args.get_flag(mc, "continue"), "-c flag")
+    m2 := p("-z\nexample.org")
+    testing.expect(m2.ok == 0, "unknown short")
+    testing.expect(find(m2.diag, "unexpected argument '-z' found") >= 0, "unknown short msg")
+}
+
+fn test_negations() {
+    m := p("--json\n--no-json\nexample.org")
+    testing.expect(!args.get_flag(m, "json"), "json negated")
+    testing.expect_eq(args.state(m, "json"), -1, "json state -1")
+    m2 := p("--no-json\n--json\nexample.org")
+    testing.expect(args.get_flag(m2, "json"), "json re-set")
+    testing.expect_eq(args.state(m, "check-status"), 0, "check-status unset")
+    testing.expect_eq(args.state(p("--check-status\nexample.org"), "check-status"), 1, "check-status on")
+    testing.expect_eq(args.state(p("--no-check-status\nexample.org"), "check-status"), -1, "check-status neg")
+    testing.expect_eq(args.state(p("--stream\n--no-stream\nexample.org"), "stream"), -1, "stream neg")
+    testing.expect_eq(args.get_count(p("-vv\n--no-verbose\nexample.org"), "verbose"), 0, "no-verbose reset")
+    testing.expect_eq(args.get_count(p("-vv\n--no-verbose\n-v\nexample.org"), "verbose"), 1, "count after reset")
+    testing.expect_streq(args.get_str(p("--raw\nx\n--no-raw\nexample.org"), "raw"), "", "no-raw clears")
+    testing.expect_eq(len(args.get_list(p("--proxy\na\n--proxy\nb\n--no-proxy\nexample.org"), "proxy")), 0, "no-proxy clears")
+    mh := p("--no-help\nexample.org")
+    testing.expect(mh.ok == 1 && len(mh.act) == 0, "no-help legal")
+    testing.expect(p("--no-version\nexample.org").ok == 1, "no-version legal")
+    testing.expect(p("--no-bearer\nexample.org").ok == 1, "no-bearer legal")
+    testing.expect(p("--no-native-tls\nexample.org").ok == 1, "no-native-tls legal")
+    testing.expect(p("--no-json=v\nexample.org").ok == 0, "no-x value bad")
+}
+
+fn test_overrides_conflicts_requires() {
+    m := p("--form\n--json\nexample.org")
+    testing.expect(args.get_flag(m, "json") && !args.get_flag(m, "form"), "json wins")
+    m2 := p("--json\n--form\nexample.org")
+    testing.expect(args.get_flag(m2, "form") && !args.get_flag(m2, "json"), "form wins")
+    m3 := p("--form\n--json\n--multipart\nexample.org")
+    testing.expect(args.get_flag(m3, "multipart") && !args.get_flag(m3, "json") && !args.get_flag(m3, "form"), "multipart wins")
+    m4 := p("--multipart\n--no-form\nexample.org")
+    testing.expect(args.get_flag(m4, "multipart"), "multipart + no-form")
+    // conflicts
+    c := p("--multipart\n--raw\nx\nexample.org")
+    testing.expect(c.ok == 0, "multipart+raw conflict")
+    testing.expect(find(c.diag, "the argument '--raw' cannot be used with '--multipart'") >= 0, "raw blamed")
+    c2 := p("--raw\nx\n--multipart\nexample.org")
+    testing.expect(find(c2.diag, "the argument '--multipart' cannot be used with '--raw'") >= 0, "multipart blamed")
+    c3 := p("--multipart\n--compress\nexample.org")
+    testing.expect(c3.ok == 0, "multipart+compress conflict")
+    testing.expect(find(c3.diag, "--compress") >= 0, "compress blamed")
+    c4 := p("--session\ns\n--session-read-only\nr\nexample.org")
+    testing.expect(find(c4.diag, "the argument '--session-read-only' cannot be used with '--session'") >= 0, "session pair")
+    c5 := p("--generate\nman\nexample.org")
+    testing.expect(c5.ok == 0, "generate+pos conflict")
+    testing.expect(find(c5.diag, "<[METHOD] URL>") >= 0, "positional blamed")
+    // requires
+    r := p("--continue\nexample.org")
+    testing.expect(r.ok == 0, "continue requires")
+    testing.expect(find(r.diag, "--download") >= 0, "needs download")
+    testing.expect(find(r.diag, "--output") >= 0, "needs output")
+    r2 := p("--continue\n--download\nexample.org")
+    testing.expect(find(r2.diag, "--output") >= 0, "output only")
+    testing.expect(p("-c\n-d\n-o\nf\nexample.org").ok == 1, "requires satisfied")
+    r3 := p("--unstable-m-sig-id\ni\nexample.org")
+    testing.expect(find(r3.diag, "--unstable-m-sig-key") >= 0, "id requires key")
+    r4 := p("--unstable-m-sig-key\nk\nexample.org")
+    testing.expect(find(r4.diag, "--unstable-m-sig-id") >= 0, "key requires id")
+    r5 := p("--unstable-m-sig-alg\ned25519\n--unstable-m-sig-key\nk\nexample.org")
+    testing.expect(find(r5.diag, "--unstable-m-sig-id") >= 0, "alg->key->id chain")
+}
+
+fn test_env() {
+    m := pe("example.org", "REQUESTS_CA_BUNDLE=/ca.pem")
+    testing.expect_streq(args.get_str(m, "verify"), "/ca.pem", "verify env")
+    testing.expect(args.src_env(m, "verify"), "verify src env")
+    m2 := pe("--verify\nno\nexample.org", "REQUESTS_CA_BUNDLE=/ca.pem")
+    testing.expect_streq(args.get_str(m2, "verify"), "no", "argv beats env")
+    m3 := pe("example.org", "CURL_CA_BUNDLE=/curl.pem\nREQUESTS_CA_BUNDLE=/req.pem")
+    testing.expect_streq(args.get_str(m3, "verify"), "/req.pem", "env order")
+    m4 := pe("example.org", "CURL_CA_BUNDLE=/curl.pem")
+    testing.expect_streq(args.get_str(m4, "verify"), "/curl.pem", "curl fallback")
+    m5 := pe("--no-verify\nexample.org", "REQUESTS_CA_BUNDLE=/ca.pem")
+    testing.expect(!args.present(m5, "verify"), "negation blocks env")
+    m6 := pe("example.org", "XH_HTTPIE_COMPAT_MODE=\nNO_COLOR=1")
+    testing.expect(m6.ok == 1, "unrelated envs harmless")
+}
+
+fn test_positionals() {
+    m := p("get\nexample.org\na=1\nh:v")
+    testing.expect(m.ok == 1, "pos parse")
+    testing.expect_eq(args.npos(m), 4, "npos 4")
+    testing.expect_streq(args.pos_str(m, "murl"), "get", "murl")
+    it := args.pos_all(m, "rest")
+    testing.expect_eq(len(it), 3, "rest 3")
+    testing.expect_streq(it[0], "example.org", "rest0 url")
+    testing.expect_streq(it[2], "h:v", "rest2 item")
+    testing.expect_streq(args.pos_at(m, 3), "h:v", "pos_at 3")
+    m2 := p("-j\nget\nexample.org\n--form\na=1")
+    testing.expect(args.get_flag(m2, "form"), "interspersed opt")
+    testing.expect_streq(args.pos_str(m2, "murl"), "get", "interspersed pos")
+    m3 := p("")
+    testing.expect(m3.ok == 0, "empty argv errors")
+    testing.expect(find(m3.diag, "the following required arguments were not provided:") >= 0, "req msg")
+    testing.expect(find(m3.diag, "<[METHOD] URL>") >= 0, "req meta")
+    m4 := p("--json\n--\n--form\nx")
+    testing.expect(args.get_flag(m4, "json"), "-- keeps prior")
+    testing.expect_streq(args.pos_at(m4, 0), "--form", "pos --form")
+    m5 := p("-\nexample.org")
+    testing.expect_streq(args.pos_at(m5, 0), "-", "lone dash")
+}
+
+fn test_diagnostics() {
+    m := p("--bogus\nexample.org")
+    testing.expect(m.ok == 0, "unknown long")
+    testing.expect(find(m.diag, "unexpected argument '--bogus' found") >= 0, "unknown msg")
+    testing.expect(find(m.diag, "Usage: oxttp [OPTIONS] <[METHOD] URL> [REQUEST_ITEM]...") >= 0, "usage line")
+    testing.expect(find(m.diag, "For more information, try '--help'.") >= 0, "footer")
+    m2 := p("--jso\nexample.org")
+    testing.expect(find(m2.diag, "tip: a similar argument exists: '--json'") >= 0, "tip json")
+    m3 := p("--raw")
+    testing.expect(find(m3.diag, "a value is required for '--raw <RAW>' but none was supplied") >= 0, "missing value")
+    m4 := p("--json=yes\nexample.org")
+    testing.expect(find(m4.diag, "unexpected value 'yes' for '--json' found") >= 0, "flag value")
+    m5 := p("--max-redirects=-1\nexample.org")
+    testing.expect(find(m5.diag, "invalid value '-1' for '--max-redirects <NUM>': invalid digit found in string") >= 0, "uint msg")
+    m6 := p("--pretty=bogus\nexample.org")
+    testing.expect(find(m6.diag, "invalid value 'bogus' for '--pretty <STYLE>'") >= 0, "enum msg")
+    testing.expect(find(m6.diag, "[possible values: all, colors, format, none]") >= 0, "enum possibles")
+    m7 := p("--timeout\n-1\nexample.org")
+    testing.expect(m7.ok == 0, "flag-shaped value not consumed")
+}
+
+fn test_actions() {
+    m := p("--help")
+    testing.expect(m.ok == 1 && m.act == "help_short", "help act")
+    m2 := p("--help\n--bogus")
+    testing.expect(m2.ok == 1 && m2.act == "help_short", "help short-circuits")
+    m3 := p("--bogus\n--help")
+    testing.expect(m3.ok == 0, "error before help")
+    testing.expect(p("-V").act == "version", "-V version")
+    testing.expect(p("--version").act == "version", "--version")
+    m4 := p("--help\nexample.org")
+    testing.expect(m4.act == "help_short", "help skips required")
+}

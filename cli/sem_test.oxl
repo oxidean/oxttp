@@ -1,0 +1,341 @@
+package main
+
+// Semantic-pass matrix — WI-0005 spec.md "cli/sem_test.oxl":
+// method/URL resolution, process_relations, corpus value parsers,
+// construct_url, deferral routing, effective getters, env behavior.
+import "std/testing"
+
+import "github.com/oxidean/oxttp/shared/args"
+
+// r resolves argv with no env.
+fn r(argv: str) -> own Out {
+    return resolve(p(argv), ev(""))
+}
+
+// re resolves argv plus envpairs.
+fn re(argv: str, env: str) -> own Out {
+    return resolve(pe(argv, env), ev(env))
+}
+
+// rb resolves argv under a different bin name.
+fn rb(bin: str, argv: str) -> own Out {
+    return resolve(args.parse(spec(bin), av(argv), ev("")), ev(""))
+}
+
+// diag asserts a code-2 clap-shaped error containing msg.
+fn diag(o: ref Out, msg: str) {
+    testing.expect_eq(o.code, 2, "expected exit-2 diag, got sout=" + o.stdout + " serr=" + o.stderr)
+    testing.expect(find(o.stderr, "error: " + msg) >= 0, "missing msg: " + msg + " in " + o.stderr)
+    testing.expect(find(o.stderr, "Usage: oxttp [OPTIONS] <[METHOD] URL> [REQUEST_ITEM]...") >= 0, "usage in diag")
+    testing.expect(find(o.stderr, "For more information, try '--help'.") >= 0, "footer in diag")
+}
+
+// defer asserts a code-1 app error containing msg.
+fn deferr(o: ref Out, msg: str) {
+    testing.expect_eq(o.code, 1, "expected exit-1 deferral, got code")
+    testing.expect(find(o.stderr, "oxttp: error: " + msg) >= 0, "missing deferral: " + msg + " in " + o.stderr)
+}
+
+fn test_method_url() {
+    o := r("example.org")
+    deferr(o, "request execution is unsupported in this build")
+    testing.expect_streq(o.intent.method, "", "no method")
+    testing.expect_streq(o.intent.url, "http://example.org/", "default url")
+    o2 := r("get\nexample.org")
+    testing.expect_streq(o2.intent.method, "GET", "method GET")
+    testing.expect_streq(o2.intent.url_raw, "example.org", "raw url")
+    o3 := r("purge\nexample.org")
+    testing.expect_streq(o3.intent.method, "PURGE", "PURGE upper")
+    o4 := r("127.0.0.1")
+    testing.expect_streq(o4.intent.method, "", "digits not method")
+    testing.expect_streq(o4.intent.url, "http://127.0.0.1/", "ip url")
+    o5 := r("post\nexample.org\na=1\nh:v")
+    testing.expect_streq(o5.intent.method, "POST", "post method")
+    testing.expect_eq(len(o5.intent.items), 2, "2 items")
+    testing.expect_eq(o5.intent.ikinds[0], 5, "a=1 is DataField")
+    testing.expect_eq(o5.intent.ikinds[1], 0, "h:v is HttpHeader")
+}
+
+fn test_help_literal() {
+    o := r("help")
+    testing.expect_eq(o.code, 0, "help exit 0")
+    testing.expect(find(o.stdout, "Options:") >= 0, "long help options")
+    testing.expect(find(o.stdout, "[possible values: all, colors, format, none]") >= 0, "long suffixes")
+    testing.expect(find(o.stdout, "Each option can be reset with a --no-OPTION argument.") >= 0, "long trailer")
+    o2 := r("help\nextra")
+    testing.expect_eq(o2.code, 0, "help with extra still help")
+}
+
+fn test_missing_url() {
+    o := r("get")
+    diag(o, "Missing <URL>")
+    o2 := r("localhost")
+    diag(o2, "Missing <URL>")
+}
+
+fn test_item_errors() {
+    o := r("example.org\nbadword")
+    diag(o, "Invalid value for '[REQUEST_ITEM]...': \"badword\"")
+    o2 := r("example.org\nk:=bad")
+    diag(o2, "Invalid value for '[REQUEST_ITEM]...':")
+    o3 := r("example.org\na=b\ngood:h")
+    testing.expect_eq(len(o3.intent.items), 2, "valid items ok")
+}
+
+fn test_relations() {
+    o := r("-v\nexample.org")
+    testing.expect(o.intent.all == 1, "verbose implies all")
+    testing.expect_eq(o.intent.verbose, 1, "verbose 1")
+    o2 := r("--curl-long\nexample.org")
+    testing.expect(o2.intent.curl == 1 && o2.intent.curl_long == 1, "curl-long implies curl")
+    o3 := r("--bearer\ntok\nexample.org")
+    testing.expect_streq(o3.intent.auth_type, "bearer", "bearer sets type")
+    testing.expect_streq(o3.intent.auth, "tok", "bearer sets auth")
+    o4 := r("--https\nexample.org")
+    deferr(o4, "https URLs are unsupported in this build (only http:// is supported)")
+    testing.expect(o4.intent.https == 1, "https flag")
+    testing.expect_streq(o4.intent.url, "https://example.org/", "https url")
+    o5 := r("-d\nexample.org")
+    testing.expect(o5.intent.follow == 1, "download implies follow")
+    testing.expect_eq(o5.intent.check_eff, 1, "download forces check-status")
+    o6 := r("--session-read-only\nf.json\nexample.org")
+    testing.expect_streq(o6.intent.session, "f.json", "ro->session")
+    testing.expect(o6.intent.session_ro == 1, "ro flag")
+    o7 := r("--session\ns.json\nexample.org")
+    testing.expect_streq(o7.intent.session, "s.json", "session")
+    testing.expect(o7.intent.session_ro == 0, "not ro")
+    // body_type
+    testing.expect_eq(r("--json\nexample.org").intent.body_type, 0, "json body type")
+    testing.expect_eq(r("--form\nexample.org").intent.body_type, 1, "form body type")
+    testing.expect_eq(r("--multipart\nexample.org").intent.body_type, 2, "multipart body type")
+    testing.expect_eq(r("example.org").intent.body_type, 0, "default json")
+    // raw + body items conflict
+    rc := r("--raw\nx\nexample.org\na=b")
+    diag(rc, "Request body (from --raw) and request data (key=value) cannot be mixed.")
+    rc2 := r("--raw\nx\nexample.org\nh:v")
+    testing.expect_eq(rc2.code, 1, "raw+header ok (deferral)")
+    rc3 := r("--raw\nx\nexample.org\nk:=1")
+    diag(rc3, "Request body (from --raw)")
+    rc4 := r("--raw\nx\nexample.org")
+    testing.expect_eq(rc4.code, 1, "raw alone ok")
+}
+
+fn test_check_status() {
+    testing.expect_eq(r("example.org").intent.check_eff, 1, "default on")
+    testing.expect_eq(r("--check-status\nexample.org").intent.check_status, 1, "explicit on")
+    testing.expect_eq(r("--no-check-status\nexample.org").intent.check_status, -1, "explicit off")
+    testing.expect_eq(r("--no-check-status\nexample.org").intent.check_eff, 0, "eff off")
+    testing.expect_eq(r("-d\nexample.org").intent.check_eff, 1, "download forces")
+    o := re("example.org", "XH_HTTPIE_COMPAT_MODE=1")
+    testing.expect(o.intent.compat == 1, "compat env")
+    testing.expect_eq(o.intent.check_eff, 0, "compat default off")
+    o2 := re("--check-status\nexample.org", "XH_HTTPIE_COMPAT_MODE=1")
+    testing.expect_eq(o2.intent.check_eff, 1, "explicit beats compat")
+    o3 := rb("https", "example.org")
+    testing.expect(o3.intent.compat == 1, "https bin compat")
+    testing.expect(o3.intent.https == 1, "https bin https")
+    o4 := rb("xhs", "example.org")
+    testing.expect(o4.intent.https == 1, "xhs https")
+    testing.expect(o4.intent.compat == 0, "xhs not compat")
+    o5 := rb("http", "example.org")
+    testing.expect(o5.intent.compat == 1, "http bin compat")
+    testing.expect(o5.intent.https == 0, "http not https")
+}
+
+fn test_value_timeout() {
+    o := r("--timeout\nabc\nexample.org")
+    diag(o, "invalid value 'abc' for '--timeout <SEC>': Connection timeout is not a valid number")
+    o2 := r("--timeout=-1\nexample.org")
+    diag(o2, "invalid value '-1' for '--timeout <SEC>': Connection timeout is negative")
+    o3 := r("--timeout=1e30\nexample.org")
+    diag(o3, "invalid value '1e30' for '--timeout <SEC>': Connection timeout is too big")
+    o4 := r("--timeout=nan\nexample.org")
+    diag(o4, "invalid value 'nan' for '--timeout <SEC>': Connection timeout is not a valid number")
+    o5 := r("--timeout\n1.5\nexample.org")
+    testing.expect_eq(o5.code, 1, "good timeout parses")
+    testing.expect(o5.intent.has_timeout == 1, "has_timeout")
+    testing.expect(o5.intent.timeout > 1.4 && o5.intent.timeout < 1.6, "timeout 1.5")
+    // dead occurrence still validates (upstream token-time check)
+    o6 := r("--timeout=bad\n--timeout=1\nexample.org")
+    diag(o6, "invalid value 'bad' for '--timeout <SEC>': Connection timeout is not a valid number")
+}
+
+fn test_value_print() {
+    o := r("--print\nHx\nexample.org")
+    diag(o, "invalid value 'Hx' for '--print <FORMAT>': 'x' is not a valid value")
+    o2 := r("--history-print\nmb\nexample.org")
+    testing.expect_eq(o2.code, 1, "history-print ok")
+    testing.expect_streq(o2.intent.history_print, "mb", "hist raw")
+    o3 := r("--print\nHBhbm\nexample.org")
+    testing.expect_eq(o3.code, 1, "all chars ok")
+}
+
+fn test_value_format_options() {
+    o := r("--format-options\nbogus\nexample.org")
+    diag(o, "invalid value 'bogus' for '--format-options <FORMAT_OPTIONS>': Format options consist of a key and a value, separated by a \":\".")
+    o2 := r("--format-options\njson.sort_keys:true\nexample.org")
+    diag(o2, "invalid value 'json.sort_keys:true' for '--format-options <FORMAT_OPTIONS>': Unsupported option 'json.sort_keys'")
+    o3 := r("--format-options\nunknown.k:1\nexample.org")
+    diag(o3, "invalid value 'unknown.k:1' for '--format-options <FORMAT_OPTIONS>': Unknown option 'unknown.k'")
+    o4 := r("--format-options\njson.indent:x\nexample.org")
+    diag(o4, "invalid value 'json.indent:x' for '--format-options <FORMAT_OPTIONS>': Invalid value 'x' in 'json.indent:x'")
+    o5 := r("--format-options\njson.format:maybe\nexample.org")
+    diag(o5, "invalid value 'json.format:maybe' for '--format-options <FORMAT_OPTIONS>': Invalid value 'maybe' in 'json.format:maybe'")
+    o6 := r("--format-options\nJSON.INDENT:2\n--format-options\nheaders.sort:true,json.indent:4\nexample.org")
+    testing.expect_eq(o6.code, 1, "merged ok")
+    fo := o6.intent.fmt_opts
+    testing.expect_eq(len(fo), 2, "2 merged keys")
+    testing.expect_streq(fo[0], "json.indent=4", "json.indent last wins")
+    testing.expect_streq(fo[1], "headers.sort=true", "headers.sort")
+}
+
+fn test_value_proxy() {
+    o := r("--proxy\nnocolon\nexample.org")
+    diag(o, "invalid value 'nocolon' for '--proxy <PROTOCOL:URL>': The value passed to --proxy should be formatted as <PROTOCOL>:<PROXY_URL>")
+    o2 := r("--proxy\nftp://x\nexample.org")
+    diag(o2, "invalid value 'ftp://x' for '--proxy <PROTOCOL:URL>': Invalid proxy URL '//x' for protocol 'ftp': relative URL without a base")
+    o2b := r("--proxy\nftp:http://x\nexample.org")
+    diag(o2b, "invalid value 'ftp:http://x' for '--proxy <PROTOCOL:URL>': Unknown protocol to set a proxy for: ftp")
+    o3 := r("--proxy\nhttp:proxy.host:8080\nexample.org")
+    diag(o3, "invalid value 'http:proxy.host:8080' for '--proxy <PROTOCOL:URL>': Invalid proxy URL 'proxy.host:8080' for protocol 'http': relative URL without a base")
+    o4 := r("--proxy\nhttp:http://h:1\n--proxy\nall:socks5://u:p@h\nexample.org")
+    testing.expect_eq(o4.code, 1, "good proxies")
+    testing.expect_eq(len(o4.intent.proxies), 2, "2 proxies")
+}
+
+fn test_value_resolve() {
+    o := r("--resolve\nh:1:2\nexample.org")
+    diag(o, "invalid value 'h:1:2' for '--resolve <HOST:ADDRESS>': Value should be formatted as <HOST>:<ADDRESS> (not <HOST>:<PORT>:<ADDRESS>)")
+    o2 := r("--resolve\nnocolon\nexample.org")
+    diag(o2, "invalid value 'nocolon' for '--resolve <HOST:ADDRESS>': Value should be formatted as <HOST>:<ADDRESS>")
+    o3 := r("--resolve\nh:zzz\nexample.org")
+    diag(o3, "invalid value 'h:zzz' for '--resolve <HOST:ADDRESS>': Invalid address 'zzz'")
+    o4 := r("--resolve\nh:1.2.3.4\n--resolve\nx:[::1]\n--resolve\ny:::1\nexample.org")
+    testing.expect_eq(o4.code, 1, "good resolves")
+    testing.expect_eq(len(o4.intent.resolves), 3, "3 resolves")
+}
+
+fn test_value_charset() {
+    o := r("--response-charset\nutf8\nexample.org")
+    testing.expect_eq(o.code, 1, "utf8 ok")
+    testing.expect_streq(o.intent.response_charset, "UTF-8", "utf8 canonical")
+    o2 := r("--response-charset\nlatin1\nexample.org")
+    testing.expect_streq(o2.intent.response_charset, "windows-1252", "latin1 canonical")
+    o3 := r("--response-charset\nu16\nexample.org")
+    testing.expect_streq(o3.intent.response_charset, "UTF-16LE", "u16 canonical")
+    o4 := r("--response-charset\nbogus-enc\nexample.org")
+    diag(o4, "invalid value 'bogus-enc' for '--response-charset <ENCODING>': bogus-enc is not a supported encoding, please refer to https://encoding.spec.whatwg.org/#names-and-labels")
+    o5 := r("--response-charset\nUTF-16\nexample.org")
+    testing.expect_streq(o5.intent.response_charset, "UTF-16LE", "utf16 canonical")
+}
+
+fn test_value_msig_verify() {
+    o := r("--unstable-m-sig-id\ni\n--unstable-m-sig-key\nk\n--unstable-m-sig-comp\n@Method, @Path;x=y \nexample.org")
+    deferr(o, "This binary was built without message signature support. Enable the `http-message-signatures` feature.")
+    testing.expect_eq(len(o.intent.m_sig_comps), 2, "2 comps")
+    testing.expect_streq(o.intent.m_sig_comps[0], "@method", "comp0 lower")
+    testing.expect_streq(o.intent.m_sig_comps[1], "@path;x=y", "comp1 params kept")
+    v := r("--verify\nNO\nexample.org")
+    testing.expect_streq(v.intent.verify, "no", "verify NO->no")
+    v2 := r("--verify\nYes\nexample.org")
+    testing.expect_streq(v2.intent.verify, "yes", "verify Yes->yes")
+    v3 := r("--verify\n/ca.pem\nexample.org")
+    testing.expect_streq(v3.intent.verify, "/ca.pem", "verify path")
+    v4 := re("example.org", "REQUESTS_CA_BUNDLE=/env.pem")
+    testing.expect_streq(v4.intent.verify, "/env.pem", "env verify canon")
+}
+
+fn test_construct_url() {
+    testing.expect_streq(r(":").intent.url, "http://localhost/", "bare colon")
+    testing.expect_streq(r(":3000").intent.url, "http://localhost:3000/", "colon port")
+    testing.expect_streq(r(":/p").intent.url, "http://localhost/p", "colon path")
+    testing.expect_streq(r(":3000/p").intent.url, "http://localhost:3000/p", "colon port path")
+    testing.expect_streq(r("://example.org/x").intent.url, "http://example.org/x", "schemeless paste")
+    testing.expect_streq(r("example.org").intent.url, "http://example.org/", "bare host")
+    testing.expect_streq(r("example.org:8080/p?q=1").intent.url, "http://example.org:8080/p?q=1", "host port path query")
+    testing.expect_streq(r("http://x/y").intent.url, "http://x/y", "http as-is")
+    testing.expect_streq(r("get\nexample.org\na==b").intent.url, "http://example.org/", "params not in url yet")
+    o := r("--default-scheme\nftp\nexample.org")
+    testing.expect_streq(o.intent.url, "ftp://example.org/", "default scheme")
+    deferr(o, "ftp URLs are unsupported in this build (only http:// is supported)")
+    o2 := r("http://")
+    diag(o2, "Invalid <URL>: empty host")
+    o3 := r("http://h:abc/")
+    diag(o3, "Invalid <URL>: invalid port number")
+    o4 := r("http://h:99999/")
+    diag(o4, "Invalid <URL>: invalid port number")
+    o5 := r("https://example.org")
+    deferr(o5, "https URLs are unsupported in this build (only http:// is supported)")
+}
+
+fn test_deferrals() {
+    deferr(r("--generate\nman"), "--generate is unsupported in this build")
+    deferr(r("--unstable-m-sig-id\ni\n--unstable-m-sig-key\nk\nexample.org"), "This binary was built without message signature support. Enable the `http-message-signatures` feature.")
+    deferr(r("--http-version\n3-prior-knowledge\nexample.org"), "This binary was built without support for HTTP/3. Enable the `http3` feature.")
+    o := r("--http-version\n2-prior-knowledge\nexample.org")
+    deferr(o, "request execution is unsupported in this build")
+    o2 := r("--offline\nexample.org")
+    deferr(o2, "request execution is unsupported in this build")
+    o3 := r("--curl\nexample.org")
+    deferr(o3, "request execution is unsupported in this build")
+}
+
+fn test_effective_getters() {
+    // effective method: explicit wins, else body->POST/empty->GET
+    testing.expect_streq(r("get\nexample.org").intent.method, "GET", "explicit")
+    testing.expect_streq(r("example.org").intent.eff_method, "GET", "empty->GET")
+    testing.expect_streq(r("example.org\na=b").intent.eff_method, "POST", "data->POST")
+    testing.expect_streq(r("example.org\nh:v").intent.eff_method, "GET", "header only->GET")
+    testing.expect_streq(r("--multipart\nexample.org").intent.eff_method, "POST", "multipart->POST")
+    testing.expect_streq(r("--raw\nx\nexample.org").intent.eff_method, "POST", "raw->POST")
+    // max-redirects: 10 under follow else raw value
+    testing.expect_eq(r("-F\nexample.org").intent.eff_redirects, 10, "follow default 10")
+    testing.expect_eq(r("-F\n--max-redirects=3\nexample.org").intent.eff_redirects, 3, "explicit 3")
+    testing.expect_eq(r("--max-redirects=3\nexample.org").intent.eff_redirects, 3, "no-follow keeps 3")
+    testing.expect_eq(r("example.org").intent.eff_redirects, 0, "no-follow unset 0")
+    // resolved print set (is_terminal=false)
+    d := r("example.org")
+    testing.expect(d.intent.print_set.res_b == 1 && d.intent.print_set.res_h == 0, "non-tty default b")
+    v := r("-v\nexample.org")
+    testing.expect(v.intent.print_set.req_h == 1 && v.intent.print_set.req_b == 1 &&
+        v.intent.print_set.res_h == 1 && v.intent.print_set.res_b == 1 && v.intent.print_set.res_m == 0,
+        "-v HhBb")
+    v2 := r("-vv\nexample.org")
+    testing.expect(v2.intent.print_set.res_m == 1, "-vv adds m")
+    q := r("-q\nexample.org")
+    testing.expect(q.intent.print_set.req_h == 0 && q.intent.print_set.res_b == 0, "-q none")
+    of := r("--offline\nexample.org")
+    testing.expect(of.intent.print_set.req_h == 1 && of.intent.print_set.req_b == 1 &&
+        of.intent.print_set.res_h == 0 && of.intent.print_set.res_b == 0, "--offline HB")
+    hd := r("-h\nexample.org")
+    testing.expect(hd.intent.print_set.res_h == 1 && hd.intent.print_set.res_b == 0, "-h resp headers")
+    mt := r("-m\nexample.org")
+    // upstream quirk: non-tty hits `body || !is_terminal` first, so -m
+    // yields body-only (matches upstream Print::new chain order)
+    testing.expect(mt.intent.print_set.res_b == 1 && mt.intent.print_set.res_m == 0, "-m non-tty -> b")
+    xp := r("-v\n--print\nh\nexample.org")
+    testing.expect(xp.intent.print_set.res_h == 1 && xp.intent.print_set.req_h == 0 &&
+        xp.intent.print_set.res_b == 0, "explicit print beats -v")
+    hp := r("--print\nHb\nexample.org")
+    testing.expect(hp.intent.hist_set.req_h == 1 && hp.intent.hist_set.res_b == 1 &&
+        hp.intent.hist_set.req_b == 0 && hp.intent.hist_set.res_h == 0, "history defaults to print")
+    hp2 := r("--print\nHb\n--history-print\nm\nexample.org")
+    testing.expect(hp2.intent.hist_set.res_m == 1 && hp2.intent.hist_set.req_h == 0, "history explicit")
+}
+
+fn test_env_behaviors() {
+    testing.expect_streq(guess_pretty(0, ev("TERM=xterm")), "none", "non-tty -> none")
+    testing.expect_streq(guess_pretty(0, ev("")), "none", "non-tty no env -> none")
+    testing.expect_streq(guess_pretty(1, ev("TERM=xterm")), "all", "tty+TERM -> all")
+    testing.expect_streq(guess_pretty(1, ev("TERM=dumb")), "format", "TERM dumb")
+    testing.expect_streq(guess_pretty(1, ev("TERM=xterm\nNO_COLOR=1")), "format", "NO_COLOR")
+    testing.expect_streq(guess_pretty(1, ev("TERM=xterm\nNO_COLOR=")), "all", "NO_COLOR empty")
+    testing.expect_streq(guess_pretty(1, ev("")), "format", "TERM unset -> format")
+    o := re("example.org", "HTTP_PROXY=http://p:1\nALL_PROXY=socks5://a")
+    testing.expect_eq(len(o.intent.proxy_env), 2, "proxy env captured")
+    testing.expect_streq(o.intent.proxy_env[0], "HTTP_PROXY=http://p:1", "env order kept")
+    o2 := re("--proxy\nhttp://p:1\nexample.org", "HTTP_PROXY=http://e:1")
+    testing.expect_eq(len(o2.intent.proxy_env), 0, "--proxy disables env")
+    o3 := re("example.org", "NO_PROXY=localhost")
+    testing.expect_streq(o3.intent.no_proxy, "localhost", "no_proxy captured")
+}

@@ -1,13 +1,173 @@
 package main
 
-// oxttp — drop-in xh-compatible HTTP client CLI.
-// Surface contract: docs/corpus/corpus-xh.md. The flag/request-item
-// surface lands through ox-agent work items; this is the scaffold.
-import "github.com/oxidean/oxttp/core/model"
+// oxttp — drop-in xh-compatible HTTP client CLI (v0.1, HTTP only).
+// S4 scope: the full corpus argv surface — parse, positional
+// semantics, xh-shaped diagnostics. Request execution is deferred
+// (S5); a fully valid parse ends in an explicit deferral error.
+import "std/os"
 
-import "github.com/oxidean/oxttp/shared/version"
+import "github.com/oxidean/oxttp/shared/args"
+
+// envnames — the corpus §7 parse-level set plus every option-
+// declared env var (verify's CA bundle fallbacks live on the table
+// and are collected separately below).
+fn envnames() -> []str {
+    v := mkslice(str, 17)
+    v[0] = "XH_CONFIG_DIR"
+    v[1] = "XH_HTTPIE_COMPAT_MODE"
+    v[2] = "HOME"
+    v[3] = "NO_COLOR"
+    v[4] = "TERM"
+    v[5] = "HTTP_PROXY"
+    v[6] = "HTTPS_PROXY"
+    v[7] = "ALL_PROXY"
+    v[8] = "NO_PROXY"
+    v[9] = "http_proxy"
+    v[10] = "https_proxy"
+    v[11] = "all_proxy"
+    v[12] = "no_proxy"
+    v[13] = "NETRC"
+    v[14] = "RUST_LOG"
+    v[15] = "RUST_BACKTRACE"
+    v[16] = "SOURCE_DATE_EPOCH"
+    return v
+}
+
+// os_envpairs reads the named vars into "NAME=value" pairs.
+// os.getenv can't distinguish unset from empty — empty counts as
+// unset (the spec'd parse_os deviation, applied here too).
+fn os_envpairs(sp: ref args.Spec) -> []str {
+    pairs := mkslice(str, 0)
+    seen := mkslice(str, 0)
+    names := envnames()
+    i := 0
+    for i < len(names) {
+        seen = push(seen, names[i])
+        i = i + 1
+    }
+    i = 0
+    for i < len(sp.opts) {
+        o := sp.opts[i]
+        if len(o.env) > 0 {
+            names := split_csv(o.env)
+            j := 0
+            for j < len(names) {
+                if !has_str(seen, names[j]) {
+                    seen = push(seen, names[j])
+                }
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+    i = 0
+    for i < len(seen) {
+        v := os.getenv(seen[i])
+        if len(v) > 0 {
+            pairs = push(pairs, seen[i] + "=" + v)
+        }
+        i = i + 1
+    }
+    return pairs
+}
+
+fn has_str(v: []str, x: str) -> bool {
+    i := 0
+    for i < len(v) {
+        if v[i] == x {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// split_csv is a []str-flavored comma split for env name lists.
+fn split_csv(csv: str) -> []str {
+    out := mkslice(str, 0)
+    st := 0
+    i := 0
+    for i <= len(csv) {
+        if i == len(csv) || byteat(csv, i) == 44 {
+            out = push(out, substr(csv, st, i))
+            st = i + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// write_all emits s on the given File.
+fn write_all(f: os.File, s: str) {
+    b := mkslice(byte, len(s))
+    i := 0
+    for i < len(s) {
+        b[i] = byteat(s, i)
+        i = i + 1
+    }
+    [n, we] = f.write(b)
+    if we != nil || n < len(b) {
+        os.quit(1)
+    }
+}
 
 fn main() {
-    r := model.Req{method: "GET", url: "http://localhost", headers: nil, body: model.Body.Empty, timeout_ms: 0, follow: false, max_redirects: 0}
-    println("oxttp " + version.get() + " " + r.method + " " + r.url)
+    bname := "oxttp"
+    if os.nargs() > 0 {
+        bname = bin_name(os.args(0))
+    }
+    sp := spec(bname)
+    envpairs := os_envpairs(sp)
+
+    argv := mkslice(str, 0)
+    i := 1
+    for i < os.nargs() {
+        argv = push(argv, os.args(i))
+        i = i + 1
+    }
+
+    // config.json default_options prepend (cli.rs::default_cli_args)
+    [cd, cde] = config_dir(envpairs)
+    if cde == nil {
+        cfg := default_options_read(cd, bname)
+        if len(cfg.warn) > 0 {
+            write_all(os.stderr(), cfg.warn)
+        }
+        if len(cfg.opts) > 0 {
+            merged := mkslice(str, 0)
+            i = 0
+            for i < len(cfg.opts) {
+                merged = push(merged, cfg.opts[i])
+                i = i + 1
+            }
+            i = 0
+            for i < len(argv) {
+                merged = push(merged, argv[i])
+                i = i + 1
+            }
+            argv = merged
+        }
+    }
+
+    m := args.parse(sp, argv, envpairs)
+    if m.ok == 0 {
+        write_all(os.stderr(), m.diag)
+        os.quit(2)
+    }
+    if m.act == "help_short" {
+        write_all(os.stdout(), args.help(m.spec, 0) + "\nEach option can be reset with a --no-OPTION argument.\n\nRun \"" + bname + " help\" for more complete documentation.\n")
+        os.quit(0)
+    }
+    if m.act == "version" {
+        write_all(os.stdout(), args.version_string(m) + "\n-native-tls -rustls -http3 -http-message-signatures -network-interface\n")
+        os.quit(0)
+    }
+    o := resolve(m, envpairs)
+    if len(o.stdout) > 0 {
+        write_all(os.stdout(), o.stdout)
+    }
+    if len(o.stderr) > 0 {
+        write_all(os.stderr(), o.stderr)
+    }
+    os.quit(o.code)
 }
