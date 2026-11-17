@@ -1,7 +1,7 @@
 schema_version: 1
 project:
     name: oxttp
-    test_command: "oxl test ./cli ./tui ./core/... ./shared/..."
+    test_command: "oxl test $(git ls-files '*.oxl' | xargs -n1 dirname | sort -u)"
 workflow:
     default_profile: normal
     profiles:
