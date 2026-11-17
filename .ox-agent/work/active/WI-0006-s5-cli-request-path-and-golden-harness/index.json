@@ -2,9 +2,10 @@
   "schema_version": 1,
   "id": "WI-0006",
   "title": "S5 CLI request path and golden harness",
-  "state": "shipping",
+  "state": "blocked",
   "profile": "normal",
   "current_stage": "shipping",
+  "blocked_from": "shipping",
   "created_at": "2026-11-17T17:28:11Z",
-  "updated_at": "2026-11-17T21:02:53Z"
+  "updated_at": "2026-11-17T21:05:07Z"
 }
