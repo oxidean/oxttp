@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "id": "WI-0002",
+  "title": "S1: shared/args table-driven parser",
+  "state": "intake",
+  "profile": "normal",
+  "current_stage": "intake",
+  "created_at": "2026-11-17T14:57:08Z"
+}

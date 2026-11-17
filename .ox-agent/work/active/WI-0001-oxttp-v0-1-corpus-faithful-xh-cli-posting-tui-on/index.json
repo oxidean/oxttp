@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "id": "WI-0001",
+  "title": "oxttp v0.1: corpus-faithful xh CLI + Posting TUI on shared core",
+  "state": "implementing",
+  "profile": "normal",
+  "current_stage": "implementation",
+  "created_at": "2026-11-17T14:49:37Z",
+  "updated_at": "2026-11-17T14:56:05Z"
+}
