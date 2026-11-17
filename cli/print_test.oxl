@@ -1,0 +1,111 @@
+package main
+
+// Printer matrix — WI-0006 spec.md "cli/print_test.oxl": req/resp
+// head renders, titlecase, reason table incl. unknown fallback,
+// binary suppressor, meta fmt, HumanBytes.
+import "std/testing"
+
+import "github.com/oxidean/oxttp/core/model"
+
+fn test_req_head_render() {
+    p := pl("example.org/path\na=b\nX-Z:1", "")
+    out := req_head_for(p)
+    testing.expect(find(out, "POST /path HTTP/1.1\n") == 0, "status line: " + out)
+    testing.expect(find(out, "X-Z: 1\n") >= 0, "item header titlecase line")
+    testing.expect(find(out, "Content-Type: application/json\n") >= 0, "ct line")
+    testing.expect(find(out, "Accept: application/json, */*;q=0.5\n") >= 0, "json accept")
+}
+
+// req_head_for renders via the plan's request.
+fn req_head_for(p: ref ReqPlan) -> str {
+    i := new(Intent)
+    i.eff_method = p.req.method
+    i.http_version = ""
+    return req_head_render(i, p)
+}
+
+fn test_req_head_synth_tail() {
+    p := pl("example.org", "")
+    out := req_head_for(p)
+    // no body → no CL; synth Accept + Host at tail
+    testing.expect(find(out, "Accept: */*\n") >= 0, "synth accept")
+    testing.expect(find(out, "Host: example.org\n") >= 0, "host tail")
+    // Host is LAST header line before the blank
+    hi := find(out, "Host: example.org\n")
+    rest := substr(out, hi, len(out))
+    testing.expect(find(rest, "\n\n") >= 0, "host near end")
+    testing.expect(find(out, "Content-Length") < 0, "no CL on empty body")
+}
+
+fn test_req_head_cl_and_10() {
+    p := pl("--http-version\n1.0\nexample.org\na=b", "")
+    i := new(Intent)
+    i.eff_method = p.req.method
+    i.http_version = "1.0"
+    out := req_head_render(i, p)
+    testing.expect(find(out, "POST / HTTP/1.0\n") == 0, "1.0 status line")
+    testing.expect(find(out, "Content-Length: 9\n") >= 0, "CL rendered: " + out)
+    // Host after CL in display order
+    ci := find(out, "Content-Length: 9")
+    hi := find(out, "Host: example.org")
+    testing.expect(ci >= 0 && hi > ci, "CL before Host")
+}
+
+fn test_resp_head_render() {
+    let hs: []model.Header = nil
+    hs = push(hs, model.Header{name: "content-type", value: "text/plain"})
+    out := resp_head_render("1.1", 404, "", hs)
+    testing.expect(find(out, "HTTP/1.1 404 Not Found\n") == 0, "canonical reason: " + out)
+    testing.expect(find(out, "Content-Type: text/plain\n") >= 0, "titlecase")
+    out2 := resp_head_render("1.0", 418, "Short and stout", hs)
+    testing.expect(find(out2, "HTTP/1.0 418 Short and stout\n") == 0, "wire reason wins")
+    out3 := resp_head_render("1.1", 799, "", hs)
+    testing.expect(find(out3, "799 <unknown status code>") >= 0, "unknown fallback")
+}
+
+fn test_reason_table() {
+    testing.expect_streq(canonical_reason(200), "OK", "200")
+    testing.expect_streq(canonical_reason(301), "Moved Permanently", "301")
+    testing.expect_streq(canonical_reason(418), "I'm a teapot", "418")
+    testing.expect_streq(canonical_reason(451), "Unavailable For Legal Reasons", "451")
+    testing.expect_streq(canonical_reason(511), "Network Authentication Required", "511")
+    testing.expect_streq(canonical_reason(799), "", "unknown")
+    testing.expect_streq(reason_of(200, "Fine"), "Fine", "wire wins")
+    testing.expect_streq(reason_of(799, ""), "<unknown status code>", "fallback")
+}
+
+fn test_binary_suppressor() {
+    b := mkslice(byte, 3)
+    b[0] = 65
+    b[1] = 0
+    b[2] = 66
+    out := body_render(b)
+    testing.expect(find(out, "binary data not shown") >= 0, "suppressor note")
+    ok := body_render("plain" as []byte)
+    testing.expect_streq(ok, "plain", "verbatim")
+}
+
+fn test_meta_and_human_bytes() {
+    testing.expect_streq(fmt5(0.00123), "0.00123", "fmt5")
+    testing.expect_streq(fmt5(1.5), "1.50000", "fmt5 1.5")
+    testing.expect_streq(human_bytes(9), "9 B", "9 B")
+    testing.expect_streq(human_bytes(1023), "1023 B", "1023 B")
+    testing.expect_streq(human_bytes(2048), "2.00 KiB", "2KiB")
+    testing.expect_streq(human_bytes(5242880), "5.00 MiB", "5MiB")
+    testing.expect_streq(human_bytes(3221225472), "3.00 GiB", "3GiB")
+    resp := model.Resp{status: 200, reason: "OK", headers: nil, body: nil, elapsed_ms: 12.3, remote: "127.0.0.1:80", version: "1.1", req_head: "", hops: nil, trace: nil}
+    m := meta_render(resp)
+    testing.expect(find(m, "Elapsed time: 0.01230s") >= 0, "meta elapsed: " + m)
+    testing.expect(find(m, "Remote address: 127.0.0.1:80") >= 0, "meta remote")
+}
+
+fn test_titlecase() {
+    testing.expect_streq(titlecase("content-type"), "Content-Type", "ct")
+    testing.expect_streq(titlecase("x-cdn"), "X-Cdn", "x-cdn")
+    testing.expect_streq(titlecase("etag"), "Etag", "etag")
+    let hs: []model.Header = nil
+    hs = push(hs, model.Header{name: "a-b", value: "1"})
+    hs = push(hs, model.Header{name: "c-d", value: "2"})
+    out := htitle(hs)
+    testing.expect_streq(out, "A-B: 1\nC-D: 2\n", "htitle lines")
+}

@@ -1,0 +1,2 @@
+argv: --form -I {URL}/f a=1 b=two+words
+script: <ECHO>

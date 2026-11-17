@@ -1,0 +1,21 @@
+GET /h HTTP/1.1
+Accept-Encoding: gzip, deflate, br, zstd
+B: 
+Connection: keep-alive
+A: 1
+A: 2
+Accept: */*
+Host: 127.0.0.1:57992
+
+HTTP/1.1 200 OK
+Content-Length: 138
+
+GET /h HTTP/1.1
+Accept-Encoding: gzip, deflate, br, zstd
+B: 
+Connection: keep-alive
+A: 1
+A: 2
+Accept: */*
+Host: 127.0.0.1:57992
+

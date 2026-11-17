@@ -1,0 +1,208 @@
+package main
+
+// ReqPlan matrix — WI-0006 spec.md "cli/req_test.oxl": header
+// merge order + fixed slots, unset/replace/append semantics,
+// body kinds incl. @file and stdin mixes, query merge/escape,
+// auth precedence, version10, timeout, synth tail.
+import "std/testing"
+
+import "std/os"
+
+import "std/encoding/base64"
+
+import "github.com/oxidean/oxttp/core/model"
+
+// pl resolves argv+env then plans (interactive stdin, tty).
+fn pl(argv: str, env: str) -> own ReqPlan {
+    o := resolve(pe(argv, env), ev(env))
+    return plan(o.intent, ev(env), "", 1)
+}
+
+// pls plans with an explicit stdin payload.
+fn pls(argv: str, env: str, stdin: str) -> own ReqPlan {
+    o := resolve(pe(argv, env), ev(env))
+    return plan(o.intent, ev(env), stdin, 0)
+}
+
+fn hnames(hs: []model.Header) -> str {
+    out := ""
+    i := 0
+    for i < len(hs) {
+        out = out + hs[i].name + "|"
+        i = i + 1
+    }
+    return out
+}
+
+fn test_fixed_slots() {
+    p := pl("example.org", "")
+    testing.expect_streq(hget(p.req.headers, "accept-encoding"), "gzip, deflate", "AE default")
+    testing.expect(find(hget(p.req.headers, "user-agent"), "oxttp/") == 0, "UA oxttp/")
+    testing.expect_streq(hget(p.req.headers, "connection"), "close", "Connection close")
+    testing.expect(find(hnames(p.req.headers), "Accept-Encoding|User-Agent|Connection|") == 0, "fixed order")
+    p2 := pl("-d\nexample.org", "")
+    testing.expect_streq(hget(p2.req.headers, "accept-encoding"), "identity", "download AE identity")
+}
+
+fn test_json_body_headers() {
+    p := pl("example.org\na=b", "")
+    testing.expect_streq(hget(p.req.headers, "accept"), "application/json, */*;q=0.5", "json accept")
+    testing.expect_streq(hget(p.req.headers, "content-type"), "application/json", "json ct")
+    testing.expect_eq(p.req.body.kind(), 2, "json body kind")
+    p2 := pl("--json\nexample.org", "")
+    testing.expect_streq(hget(p2.req.headers, "content-type"), "application/json", "--json ct")
+    testing.expect_eq(p2.req.body.kind(), 0, "--json empty body")
+    p3 := pl("example.org", "")
+    testing.expect_streq(hget(p3.req.synth, "accept"), "*/*", "synth accept *")
+}
+
+fn test_form_and_promote() {
+    p := pl("--form\nexample.org\na=b\nc=d", "")
+    testing.expect_eq(p.req.body.kind(), 3, "form kind")
+    testing.expect_streq(hget(p.req.headers, "content-type"), "application/x-www-form-urlencoded", "form ct")
+    os.writefile_("/tmp/oxttp-req-f.bin", "FILEDATA")
+    p2 := pl("--form\nexample.org\na=b\nf@/tmp/oxttp-req-f.bin", "")
+    testing.expect_eq(p2.req.body.kind(), 4, "promoted multipart")
+    m := p2.req.body as model.Body.Multipart
+    testing.expect_eq(len(m.parts), 2, "2 parts")
+    testing.expect(m.parts[1].is_file, "second part is file")
+    os.remove("/tmp/oxttp-req-f.bin")
+}
+
+fn test_atfile_body() {
+    os.writefile_("/tmp/oxttp-req-body.json", "{\"k\":1}")
+    p := pl("example.org\n@/tmp/oxttp-req-body.json", "")
+    testing.expect_eq(len(p.err), 0, "no err: " + p.err)
+    testing.expect_eq(p.req.body.kind(), 1, "raw kind")
+    rb := p.req.body as model.Body.Raw
+    testing.expect_streq(rb.text, "{\"k\":1}", "file body text")
+    testing.expect_streq(hget(p.req.headers, "content-type"), "application/json", "mime guess json")
+    os.remove("/tmp/oxttp-req-body.json")
+    p2 := pl("example.org\n@/a\n@/b", "")
+    testing.expect_streq(p2.err, "Can't read request from multiple files", "two files err")
+    os.writefile_("/tmp/oxttp-req-body2", "x")
+    p3 := pl("example.org\n@/tmp/oxttp-req-body2\nk=v", "")
+    testing.expect(find(p3.err, "request data (key=value) cannot be mixed") >= 0, "file+data mix err")
+    os.remove("/tmp/oxttp-req-body2")
+}
+
+fn test_stdin_mixes() {
+    p := pls("example.org", "", "stdin-body")
+    testing.expect_eq(len(p.err), 0, "stdin ok: " + p.err)
+    testing.expect_eq(p.req.body.kind(), 1, "stdin raw body")
+    rb := p.req.body as model.Body.Raw
+    testing.expect_streq(rb.text, "stdin-body", "stdin text")
+    testing.expect_streq(p.req.method, "POST", "stdin implies POST")
+    testing.expect_streq(hget(p.req.headers, "content-type"), "application/json", "stdin ct")
+    p2 := pls("example.org\na=b", "", "x")
+    testing.expect(find(p2.err, "cannot be mixed") >= 0, "stdin+data err")
+    p3 := pls("--raw\nx\nexample.org", "", "y")
+    testing.expect(find(p3.err, "--raw cannot be mixed") >= 0, "stdin+raw err")
+    p4 := pls("--multipart\nexample.org", "", "z")
+    testing.expect(find(p4.err, "multipart request body from stdin") >= 0, "stdin+multipart err")
+    p5 := pls("--ignore-stdin\nexample.org", "", "z")
+    testing.expect_eq(len(p5.err), 0, "ignore-stdin ok")
+    testing.expect_eq(p5.req.body.kind(), 0, "ignore-stdin empty body")
+}
+
+fn test_header_merge() {
+    // item header replaces the fixed slot at its position
+    p := pl("example.org\nUser-Agent:custom/1", "")
+    testing.expect_streq(hget(p.req.headers, "user-agent"), "custom/1", "UA replaced")
+    testing.expect_eq(hfind(p.req.headers, "user-agent"), 1, "UA stays slot 1")
+    // repeat same-name: first replaces, second attaches right after
+    p2 := pl("example.org\nX-H:1\nX-H:2", "")
+    cnt := 0
+    last := -1
+    n := 0
+    for n < len(p2.req.headers) {
+        if elwr(p2.req.headers[n].name) == "x-h" {
+            cnt = cnt + 1
+            last = n
+        }
+        n = n + 1
+    }
+    testing.expect_eq(cnt, 2, "two X-H values")
+    testing.expect_streq(p2.req.headers[last].value, "2", "repeat appended after")
+    // `key:` (empty after colon) unsets
+    p3 := pl("example.org\nX-A:1\nX-A:", "")
+    testing.expect(!hhas(p3.req.headers, "x-a"), "unset removed")
+    // unset then set: set wins
+    p4 := pl("example.org\nX-B:\nX-B:2", "")
+    testing.expect_streq(hget(p4.req.headers, "x-b"), "2", "set after unset wins")
+    // `key;` is the empty-value header (corpus: deliberately not unset)
+    p5 := pl("example.org\nX-E;", "")
+    testing.expect(hhas(p5.req.headers, "x-e"), "empty header present")
+    testing.expect_streq(hget(p5.req.headers, "x-e"), "", "empty value")
+}
+
+fn test_query_merge() {
+    p := pl("example.org\na==1\nb==x y", "")
+    testing.expect(find(p.req.url, "?a=1&b=x%20y") >= 0 || find(p.req.url, "?a=1&b=x+y") >= 0, "query encoded: " + p.req.url)
+    p2 := pl("example.org?z=9\na==1", "")
+    testing.expect(find(p2.req.url, "?z=9&a=1") >= 0, "query appends: " + p2.req.url)
+}
+
+fn test_auth_precedence() {
+    // arg beats everything
+    p := pl("--auth\nu:p\nexample.org", "HOME=/nonexistent-oxttp")
+    testing.expect_streq(hget(p.req.headers, "authorization"), "Basic dTpw", "basic arg")
+    p2 := pl("--bearer\ntok\nexample.org", "HOME=/nonexistent-oxttp")
+    testing.expect_streq(hget(p2.req.headers, "authorization"), "Bearer tok", "bearer arg")
+    // netrc fallback when no arg/session
+    home := "/tmp/oxttp-nrc-home"
+    os.mkdir_all(home)
+    os.writefile_(home + "/.netrc", "machine example.org\n  login nl\n  password np\n")
+    p3 := pl("example.org", "HOME=" + home)
+    testing.expect_streq(hget(p3.req.headers, "authorization"), "Basic " + b64("nl:np"), "netrc fallback")
+    os.remove(home + "/.netrc")
+    os.remove_all(home)
+}
+
+fn test_flags_and_warns() {
+    p := pl("--http-version\n1.0\nexample.org", "")
+    testing.expect_streq(p.req.httpver, "HTTP/1.0", "version10")
+    p2 := pl("--http-version\n1.1\nexample.org", "")
+    testing.expect_streq(p2.req.httpver, "HTTP/1.1", "default 1.1")
+    p3 := pl("--timeout\n2.5\nexample.org", "")
+    testing.expect_eq(p3.req.timeout_ms, 2500, "timeout ms")
+    p4 := pl("--compress\nexample.org", "")
+    testing.expect_eq(len(p4.warn), 1, "compress warn")
+    testing.expect(find(p4.warn[0], "--compress is unsupported") >= 0, "compress warn text")
+    p5 := pl("--debug\nexample.org", "")
+    testing.expect(find(p5.warn[0], "--debug logging is unsupported") >= 0, "debug warn")
+    p6 := pl("-F\n--max-redirects=3\nexample.org", "")
+    testing.expect(p6.req.follow, "follow on")
+    testing.expect_eq(p6.req.max_redirects, 3, "max redirects")
+}
+
+fn test_session_merge() {
+    home := "/tmp/oxttp-sess-home"
+    sdir := home + "/sessions/example.org"
+    os.mkdir_all(sdir)
+    os.writefile_(sdir + "/s.json", "{\n    \"auth\": {\"type\": \"basic\", \"raw_auth\": \"su:sp\"},\n    \"cookies\": [{\"name\": \"c1\", \"value\": \"v1\"}],\n    \"headers\": [{\"name\": \"x-saved\", \"value\": \"sv\"}]\n}\n")
+    p := pl("--session\ns\nexample.org", "XH_CONFIG_DIR=" + home)
+    testing.expect_eq(len(p.err), 0, "sess err: " + p.err)
+    testing.expect_streq(hget(p.req.headers, "x-saved"), "sv", "session header merged")
+    testing.expect_streq(hget(p.req.headers, "authorization"), "Basic " + b64("su:sp"), "session auth")
+    testing.expect_streq(hget(p.req.synth, "cookie"), "c1=v1", "jar synth cookie")
+    testing.expect_eq(p.sess_write, 1, "sess_write on")
+    p2 := pl("--session-read-only\ns\nexample.org", "XH_CONFIG_DIR=" + home)
+    testing.expect_eq(p2.sess_write, 1, "ro + existing → write")
+    // item cookie extends the jar rather than header
+    p3 := pl("--session\ns\nexample.org\nCookie:c2=v2", "XH_CONFIG_DIR=" + home)
+    testing.expect(find(hget(p3.req.synth, "cookie"), "c1=v1; c2=v2") >= 0, "jar extends: " + hget(p3.req.synth, "cookie"))
+    // malformed session errors
+    os.writefile_(sdir + "/bad.json", "not json")
+    p4 := pl("--session\nbad\nexample.org", "XH_CONFIG_DIR=" + home)
+    testing.expect(find(p4.err, "couldn't load session") >= 0, "bad session err")
+    os.remove(sdir + "/s.json")
+    os.remove(sdir + "/bad.json")
+    os.remove_all(sdir)
+    os.remove_all(home + "/sessions")
+    os.remove_all(home)
+}
+
+fn b64(s: str) -> str {
+    return base64.encode(s as []byte)
+}

@@ -1,0 +1,3 @@
+# item headers: dup values, empty, unset of a fixed header.
+argv: -v -I {URL}/h A:1 A:2 B; User-Agent:
+script: <ECHO>

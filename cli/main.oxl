@@ -163,6 +163,37 @@ fn main() {
         os.quit(0)
     }
     o := resolve(m, envpairs)
+    if o.exec != 0 {
+        // S5: stdin feeds the body when it isn't a terminal (ADR 0022 —
+        // no isatty in oxl; /dev/stdin realpath is the heuristic).
+        tty := 1
+        rp := os.fullpath("/dev/stdin")
+        if len(rp) > 0 && find(rp, "pts") < 0 && find(rp, "tty") < 0 {
+            tty = 0
+        }
+        data := ""
+        if tty == 0 {
+            f := os.stdin()
+            buf := mkslice(byte, 65536)
+            for true {
+                [n, e] = f.read(buf)
+                if n > 0 {
+                    data = data + buf[0:n] as str
+                }
+                if e != nil || n <= 0 {
+                    break
+                }
+            }
+        }
+        r := execute(o.intent, envpairs, data, tty)
+        if len(r.stdout) > 0 {
+            write_all(os.stdout(), r.stdout)
+        }
+        if len(r.stderr) > 0 {
+            write_all(os.stderr(), r.stderr)
+        }
+        os.quit(r.code)
+    }
     if len(o.stdout) > 0 {
         write_all(os.stdout(), o.stdout)
     }

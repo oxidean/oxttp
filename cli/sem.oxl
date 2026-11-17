@@ -41,6 +41,7 @@ struct Intent {
     items: own []str,
     ikinds: own []int,
     body_type: int, // 0 json · 1 form · 2 multipart
+    json_flag: int, // explicit --json (empty-body header case)
     raw: str,
     has_raw: int,
     pretty: str,
@@ -110,6 +111,7 @@ struct Out {
     stdout: str,
     stderr: str,
     intent: own Intent,
+    exec: int, // S5: intent resolves to a request — main calls execute()
 }
 
 fn new_out() -> own Out {
@@ -1170,6 +1172,7 @@ fn resolve(m: own args.Matches, envpairs: []str) -> own Out {
     } else {
         o.intent.body_type = 0
     }
+    o.intent.json_flag = booli(args.get_flag(m, "json"))
     o.intent.has_raw = booli(args.present(m, "raw"))
     o.intent.raw = args.get_str(m, "raw")
     // is_body_empty: multipart or any body item (kinds 5..9)
@@ -1311,7 +1314,46 @@ fn resolve(m: own args.Matches, envpairs: []str) -> own Out {
         defer_out(o, prog, scheme + " URLs are unsupported in this build (only http:// is supported)")
         return o
     }
-    defer_out(o, prog, "request execution is unsupported in this build")
+    // S5 degrade routing (spec sem-G, ADR 0024): connection-affecting
+    // flags error out; display-only flags that upstream processes on
+    // pipes error too; --debug degrades to a warning inside execute.
+    if o.intent.curl != 0 || o.intent.curl_long != 0 {
+        defer_out(o, prog, "--curl is unsupported in this build")
+        return o
+    }
+    if o.intent.http_version == "2" || o.intent.http_version == "2-prior-knowledge" {
+        defer_out(o, prog, "HTTP/2 requests are unsupported in this build")
+        return o
+    }
+    if len(o.intent.proxies[:]) > 0 || len(o.intent.proxy_env[:]) > 0 {
+        defer_out(o, prog, "proxies are unsupported in this build")
+        return o
+    }
+    if len(o.intent.resolves[:]) > 0 {
+        defer_out(o, prog, "--resolve is unsupported in this build")
+        return o
+    }
+    if len(o.intent.interface) > 0 {
+        defer_out(o, prog, "--interface is unsupported in this build")
+        return o
+    }
+    if o.intent.ipv6 != 0 {
+        defer_out(o, prog, "IPv6 is unsupported in this build")
+        return o
+    }
+    if len(o.intent.unix_socket) > 0 {
+        defer_out(o, prog, "--unix-socket is unsupported in this build")
+        return o
+    }
+    if len(o.intent.pretty) > 0 && o.intent.pretty != "none" {
+        defer_out(o, prog, "--pretty is unsupported in this build")
+        return o
+    }
+    if len(o.intent.fmt_opts[:]) > 0 {
+        defer_out(o, prog, "--format-options is unsupported in this build")
+        return o
+    }
+    o.exec = 1
     return o
 }
 

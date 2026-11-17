@@ -1,0 +1,428 @@
+package main
+
+// Golden differential harness (WI-0006, ADR 0021): replays the
+// committed xh-captured fixtures in tests/golden/ against execute()
+// + an in-test scripted server. Normalizer masks the recorded
+// deviations (UA, Accept-Encoding set, Connection, timings,
+// addresses, boundary) — see tests/golden/README.md for the case
+// format and scripts/golden-gen.sh for regeneration.
+import "std/os"
+
+import "std/net"
+
+import "std/strconv"
+
+import "std/testing"
+
+import "github.com/oxidean/oxttp/shared/args"
+
+struct GCase {
+    name: str,
+    argv: []str,
+    stdin: str,
+    has_stdin: bool,
+    scripts: []str,
+    files: []str,
+}
+
+fn g_args(s: str) -> []str {
+    let out: []str = nil
+    i := 0
+    n := len(s)
+    for i < n {
+        c := byteat(s, i)
+        if c == 32 || c == 9 {
+            i = i + 1
+            continue
+        }
+        j := i
+        q := 0
+        cur := ""
+        for j < n {
+            c2 := byteat(s, j)
+            if q == 0 && (c2 == 32 || c2 == 9) {
+                break
+            }
+            if c2 == 34 || c2 == 39 {
+                if q == 0 {
+                    q = c2
+                    j = j + 1
+                    continue
+                }
+                if q == c2 {
+                    q = 0
+                    j = j + 1
+                    continue
+                }
+            }
+            cur = cur + substr(s, j, j + 1)
+            j = j + 1
+        }
+        out = push(out, cur)
+        i = j
+    }
+    return out
+}
+
+fn g_load(name: str) -> own GCase {
+    c := new(GCase)
+    c.name = name
+    c.has_stdin = false
+    raw := os.readfile_("tests/golden/cases/" + name + ".case")
+    i := 0
+    for i < len(raw) {
+        j := find(substr(raw, i, len(raw)), "\n")
+        line := raw
+        eol := len(raw)
+        if j >= 0 {
+            line = substr(raw, i, i + j)
+            eol = i + j + 1
+        }
+        i = eol
+        if len(line) == 0 || byteat(line, 0) == 35 {
+            continue
+        }
+        if find(line, "argv: ") == 0 {
+            c.argv = g_args(substr(line, 6, len(line)))
+        } else if find(line, "stdin: ") == 0 {
+            c.has_stdin = true
+            c.stdin = substr(line, 7, len(line))
+        } else if find(line, "stdin:") == 0 && len(line) == 6 {
+            c.has_stdin = true
+            c.stdin = ""
+        } else if find(line, "files: ") == 0 {
+            c.files = push(c.files, substr(line, 7, len(line)))
+        } else if find(line, "script: ") == 0 {
+            rest := substr(line, 8, len(line))
+            for len(rest) > 0 {
+                semi := find(rest, ";;")
+                if semi < 0 {
+                    c.scripts = push(c.scripts, rest)
+                    break
+                }
+                c.scripts = push(c.scripts, substr(rest, 0, semi))
+                rest = substr(rest, semi + 2, len(rest))
+                if len(rest) > 0 && byteat(rest, 0) == 32 {
+                    rest = substr(rest, 1, len(rest))
+                }
+            }
+        }
+    }
+    return c
+}
+
+// g_serve answers len(script) connections; each script is
+// `STATUS REASON\nHeader: v\n\nbody` (\n escapes) or <ECHO>.
+fn g_serve(l: net.Listener, scripts: own []str, hits: shared) {
+    set_rcvtimo(l.rawfd(), 5) // under-dialing cases (e.g. post-raw) can't hang the suite
+    i := 0
+    for i < len(scripts) {
+        [c, e] = l.accept()
+        if e != nil {
+            l.close()
+            return
+        }
+        defer_close := c
+        req := g_read_req(c)
+        s := scripts[i]
+        i = i + 1
+        resp := ""
+        if s == "<ECHO>" {
+            resp = "HTTP/1.1 200 OK\r\nContent-Length: " + itoa(len(req)) + "\r\n\r\n" + req
+        } else {
+            resp = "HTTP/1.1 " + g_unesc(s)
+        }
+        g_write_all(c, resp as []byte)
+        c.close()
+        sadd(hits, 1)
+    }
+    l.close()
+}
+
+fn g_read_req(c: net.Conn) -> str {
+    req := ""
+    b := mkslice(byte, 4096)
+    for find(req, "\r\n\r\n") < 0 {
+        [n, e] = c.read(b)
+        if n > 0 {
+            req = req + b[0:n] as str
+        }
+        if e != nil || n <= 0 {
+            return req
+        }
+    }
+    he := find(req, "\r\n\r\n")
+    cl := 0
+    low := g_lwr(substr(req, 0, he))
+    p := find(low, "\r\ncontent-length:")
+    if p >= 0 {
+        q := p + 17
+        for q < len(low) && byteat(low, q) == 32 {
+            q = q + 1
+        }
+        for q < len(low) && byteat(low, q) >= 48 && byteat(low, q) <= 57 {
+            cl = cl * 10 + (byteat(low, q) - 48)
+            q = q + 1
+        }
+    }
+    for len(req) - he - 4 < cl {
+        [n2, e2] = c.read(b)
+        if n2 > 0 {
+            req = req + b[0:n2] as str
+        }
+        if e2 != nil || n2 <= 0 {
+            break
+        }
+    }
+    return req
+}
+
+fn g_write_all(c: net.Conn, b: []byte) {
+    off := 0
+    for off < len(b) {
+        [n, e] = c.write(b[off:])
+        if e != nil {
+            return
+        }
+        off = off + n
+    }
+}
+
+fn g_lwr(s: str) -> str {
+    b := s as []byte
+    o := mkslice(byte, len(s))
+    i := 0
+    for i < len(s) {
+        ch := b[i]
+        if ch >= 65 && ch <= 90 {
+            ch = ch + 32
+        }
+        o[i] = ch
+        i = i + 1
+    }
+    return o as str
+}
+
+fn g_unesc(s: str) -> str {
+    out := ""
+    i := 0
+    for i < len(s) {
+        if byteat(s, i) == 92 && i + 1 < len(s) && byteat(s, i + 1) == 110 {
+            out = out + "\r\n"
+            i = i + 2
+        } else {
+            out = out + substr(s, i, i + 1)
+            i = i + 1
+        }
+    }
+    return out
+}
+
+// g_norm masks the recorded deviations so fixture diffs test
+// behavior, not product identity.
+fn g_norm(s: str) -> str {
+    s = g_norm_lineval(s, "User-Agent: ")
+    s = g_norm_lineval(s, "Host: 127.0.0.1:")
+    s = g_norm_lineval(s, "Content-Length: ")
+    s = g_norm_lineval(s, "Downloading")
+    s = g_repl(s, "Downloading <T>", "Downloading <T>")
+    s = g_repl(s, "Accept-Encoding: gzip, deflate, br, zstd", "Accept-Encoding: <AE>")
+    s = g_repl(s, "Accept-Encoding: gzip, deflate", "Accept-Encoding: <AE>")
+    s = g_repl(s, "Connection: keep-alive", "Connection: <CONN>")
+    s = g_repl(s, "Connection: close", "Connection: <CONN>")
+    s = g_repl(s, "xh: ", "<P>: ")
+    s = g_repl(s, "oxttp: ", "<P>: ")
+    s = g_norm_elapsed(s)
+    s = g_norm_addr(s)
+    s = g_norm_done(s)
+    return s
+}
+
+fn g_repl(s: str, a: str, b: str) -> str {
+    out := ""
+    i := 0
+    for i < len(s) {
+        if i + len(a) <= len(s) && substr(s, i, i + len(a)) == a {
+            out = out + b
+            i = i + len(a)
+        } else {
+            out = out + substr(s, i, i + 1)
+            i = i + 1
+        }
+    }
+    return out
+}
+
+// "Elapsed time: 0.00123s" → <EL>; "Remote address: 1.2.3.4:5" → <RA>
+fn g_norm_elapsed(s: str) -> str {
+    out := ""
+    i := 0
+    key := "Elapsed time: "
+    for i < len(s) {
+        if i + len(key) <= len(s) && substr(s, i, i + len(key)) == key {
+            j := i + len(key)
+            for j < len(s) && byteat(s, j) != 10 {
+                j = j + 1
+            }
+            out = out + "Elapsed time: <EL>"
+            i = j
+        } else {
+            out = out + substr(s, i, i + 1)
+            i = i + 1
+        }
+    }
+    return out
+}
+
+fn g_norm_addr(s: str) -> str {
+    out := ""
+    i := 0
+    key := "Remote address: "
+    for i < len(s) {
+        if i + len(key) <= len(s) && substr(s, i, i + len(key)) == key {
+            j := i + len(key)
+            for j < len(s) && byteat(s, j) != 10 {
+                j = j + 1
+            }
+            out = out + "Remote address: <RA>"
+            i = j
+        } else {
+            out = out + substr(s, i, i + 1)
+            i = i + 1
+        }
+    }
+    return out
+}
+
+// "<Key>: <value up to EOL>" → "<Key>: <V>" — for volatile values.
+fn g_norm_lineval(s: str, key: str) -> str {
+    out := ""
+    i := 0
+    for i < len(s) {
+        if i + len(key) <= len(s) && substr(s, i, i + len(key)) == key {
+            j := i + len(key)
+            for j < len(s) && byteat(s, j) != 10 && byteat(s, j) != 13 {
+                j = j + 1
+            }
+            out = out + key + "<V>"
+            i = j
+        } else {
+            out = out + substr(s, i, i + 1)
+            i = i + 1
+        }
+    }
+    return out
+}
+
+fn g_norm_done(s: str) -> str {
+    out := ""
+    i := 0
+    key := "Done. "
+    for i < len(s) {
+        if i + len(key) <= len(s) && substr(s, i, i + len(key)) == key {
+            j := i + len(key)
+            for j < len(s) && byteat(s, j) != 10 {
+                j = j + 1
+            }
+            out = out + "Done. <T>"
+            i = j
+        } else {
+            out = out + substr(s, i, i + 1)
+            i = i + 1
+        }
+    }
+    return out
+}
+
+// g_run drives one case end-to-end.
+fn g_run(name: str) {
+    c := g_load(name)
+    [l, e] = net.listen(0)
+    testing.expect(e == nil, name + " listen")
+    hits := mkshared(0)
+    spawnBlocking g_serve(l, new(c.scripts), hits)
+    u := "http://127.0.0.1:" + itoa(l.port())
+    // argv → Matches via the real spec+resolve path
+    argv := mkslice(str, 0)
+    i := 0
+    for i < len(c.argv) {
+        a := c.argv[i]
+        i = i + 1
+        if a == "{URL}" {
+            a = u
+        } else if find(a, "{URL}") >= 0 {
+            a = g_repl(a, "{URL}", u)
+        }
+        argv = push(argv, a)
+    }
+    sp := spec("oxttp")
+    envp := mkslice(str, 0)
+    envp = push(envp, "HOME=/nonexistent")
+    m := argsparse(sp, argv, envp)
+    if m.ok == 0 {
+        testing.expect(false, name + " parse: " + m.diag)
+        l.close()
+        return
+    }
+    o := resolve(m, envp)
+    if o.exec == 0 {
+        testing.expect(false, name + " no exec (code=" + itoa(o.code) + " err=" + o.stderr + ")")
+        l.close()
+        return
+    }
+    tty := 1
+    data := ""
+    if c.has_stdin {
+        tty = 0
+        data = c.stdin
+    } else {
+        // /dev/null-redirected stdin: empty + non-tty (fixtures were
+        // generated with `xh ... </dev/null`)
+        tty = 0
+        data = ""
+    }
+    r := execute(o.intent, envp, data, tty)
+    // files: post-state — `path<TAB><exists-check>` asserts the file
+    // was written, then removes it so the tree stays clean.
+    fi := 0
+    for fi < len(c.files) {
+        ent := c.files[fi]
+        fi = fi + 1
+        tab := find(ent, "\t")
+        fp := ent
+        if tab >= 0 {
+            fp = substr(ent, 0, tab)
+        }
+        testing.expect(os.exists(fp), name + " file exists: " + fp)
+        os.remove(fp)
+    }
+    want_out := os.readfile_("tests/golden/fixtures/" + name + ".stdout")
+    want_err := os.readfile_("tests/golden/fixtures/" + name + ".stderr")
+    want_code := 0
+    [wc, wce] = strconv.atoi(os.readfile_("tests/golden/fixtures/" + name + ".exit"))
+    if wce == nil {
+        want_code = wc
+    }
+    testing.expect_eq(r.code, want_code, name + " exit")
+    testing.expect_streq(g_norm(r.stdout), g_norm(want_out), name + " stdout")
+    testing.expect_streq(g_norm(r.stderr), g_norm(want_err), name + " stderr")
+    l.close()
+}
+
+fn argsparse(sp: own args.Spec, argv: []str, envp: []str) -> own args.Matches {
+    return args.parse(sp, argv, envp)
+}
+
+fn test_golden_get_echo() { g_run("get-echo") }
+fn test_golden_get_verbose() { g_run("get-verbose") }
+fn test_golden_post_json() { g_run("post-json") }
+fn test_golden_post_form() { g_run("post-form") }
+fn test_golden_headers() { g_run("headers") }
+fn test_golden_query() { g_run("query") }
+fn test_golden_auth_basic() { g_run("auth-basic") }
+fn test_golden_auth_bearer() { g_run("auth-bearer") }
+fn test_golden_redirect() { g_run("redirect") }
+fn test_golden_check_404() { g_run("check-404") }
+fn test_golden_stdin_empty() { g_run("stdin-empty") }
+fn test_golden_post_raw() { g_run("post-raw") }
+fn test_golden_download() { g_run("download") }
