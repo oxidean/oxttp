@@ -7,6 +7,9 @@ action:
     type: transition
     work_item_id: WI-0005
     target: shipped
-status: pending
+status: approved
+answer: approved
 created_by: ox-agent
+answered_by: Jesse
 created_at: "2026-11-17T17:00:34Z"
+answered_at: "2026-11-17T17:27:47Z"
