@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "id": "WI-0006",
+  "title": "S5 CLI request path and golden harness",
+  "state": "intake",
+  "profile": "normal",
+  "current_stage": "intake",
+  "created_at": "2026-11-17T17:28:11Z"
+}
