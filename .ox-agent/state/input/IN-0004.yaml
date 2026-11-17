@@ -1,0 +1,9 @@
+schema_version: 1
+request_id: IN-0004
+work_item_id: WI-0004
+run_id: run_1794935054971_0c308e
+kind: clarification
+question: Approve transition WI-0004 shipping -> shipped? Implementation, review, and verification are complete and green; the feat/wi-0004-h1-transport PR is the deliverable and is not to be merged by the agent.
+status: pending
+created_by: ox-agent
+created_at: "2026-11-17T17:05:06Z"
