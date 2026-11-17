@@ -1,0 +1,405 @@
+package args
+
+// Parse-matrix for the shared/args engine — the S1 gate.
+// Drives a fixture spec that exercises every engine feature
+// (a mini-xh core), never the cli. Matrix rows follow spec.md.
+import "std/strings"
+
+import "std/testing"
+
+// av builds argv (post-argv0) from a newline-joined literal.
+fn av(s: str) -> []str {
+    if len(s) == 0 {
+        return mkslice(str, 0)
+    }
+    parts := strings.split(s, "\n")
+    out := mkslice(str, 0)
+    cur := parts
+    for cur != nil {
+        out = push(out, cur.v)
+        cur = cur.next
+    }
+    return out
+}
+
+// ev builds envpairs ("K=V" list) likewise.
+fn ev(s: str) -> []str {
+    return av(s)
+}
+
+// fix builds the fixture spec — a mini-xh core exercising every
+// engine feature the 58-flag corpus surface needs.
+fn fix() -> own Spec {
+    s := newspec("xh", "0.0.0 (test mode)", "fixture spec")
+    flag(s, "json", "j", "JSON body")
+    overrides(s, "json", "form,multipart")
+    flag(s, "form", "f", "Form body")
+    overrides(s, "form", "json,multipart,xml")
+    flag(s, "xml", "", "XML body")
+    env(s, "xml", "XH_XML")
+    flag(s, "multipart", "", "Multipart body")
+    overrides(s, "multipart", "json,form")
+    conflicts(s, "multipart", "raw,compress")
+    str_(s, "raw", "", "RAW", "Raw body")
+    count(s, "compress", "x", "Compress body")
+    int_(s, "priority", "", "N", "Signed priority")
+    flag(s, "fixed", "", "No-negation flag")
+    nono(s, "fixed")
+    enum_(s, "pretty", "", "STYLE", "all,colors,format,none", "Pretty")
+    env(s, "pretty", "XH_PRETTY")
+    enum_(s, "style", "s", "THEME", "auto,solarized,monokai,fruity", "Theme")
+    enum_(s, "http-version", "", "VERSION", "1.0,1.1,2,2-prior-knowledge,3-prior-knowledge", "HTTP version")
+    alias(s, "http-version", "1", "1.0")
+    enum_(s, "generate", "", "KIND", "complete-bash,man", "Generate")
+    conflicts(s, "generate", "murl")
+    float_(s, "timeout", "", "SEC", "Timeout")
+    uint(s, "max-redirects", "", "NUM", "Max redirects")
+    def(s, "max-redirects", "10")
+    str_(s, "proxy", "", "PROTOCOL:URL", "Proxy")
+    repeat(s, "proxy")
+    str_(s, "verify", "", "VERIFY", "Verify")
+    env(s, "verify", "REQUESTS_CA_BUNDLE,CURL_CA_BUNDLE")
+    flag(s, "download", "d", "Download")
+    flag(s, "continue", "c", "Resume")
+    requires(s, "continue", "download,output")
+    str_(s, "output", "o", "FILE", "Output file")
+    str_(s, "session", "", "FILE", "Session")
+    str_(s, "session-read-only", "", "FILE", "Session read only")
+    conflicts(s, "session-read-only", "session")
+    count(s, "verbose", "v", "Verbose")
+    flag(s, "check-status", "", "Check status")
+    flag(s, "stream", "S", "Stream")
+    str_(s, "bearer", "", "TOKEN", "Bearer token")
+    hidden(s, "bearer")
+    flag(s, "help", "", "Print help")
+    action(s, "help", AHELP_SHORT)
+    flag(s, "version", "V", "Print version")
+    action(s, "version", AVERSION)
+    flag(s, "man", "", "Long help")
+    action(s, "man", AHELP_LONG)
+    help_extra(s, "Extra trailer line")
+    pos(s, "murl", "<[METHOD] URL>", 1, 0, "Method or URL")
+    pos(s, "url2", "<URL>", 0, 0, "")
+    pos_hidden(s, "url2")
+    pos(s, "items", "[REQUEST_ITEM]...", 0, 1, "Request items")
+    return s
+}
+
+// fix2 has a single required positional and no variadic tail, to
+// exercise the positional-overflow guard fix()'s items slot hides.
+fn fix2() -> own Spec {
+    s := newspec("t", "1", "tiny spec")
+    flag(s, "opt", "", "An option")
+    pos(s, "one", "<ONE>", 1, 0, "The only slot")
+    return s
+}
+
+fn test_defaults() {
+    m := parse(fix(), av("example.org"), ev(""))
+    testing.expect(m.ok == 1, "defaults ok")
+    testing.expect(!get_flag(m, "json"), "json default off")
+    testing.expect_streq(get_str(m, "pretty"), "", "pretty no default")
+    testing.expect_eq(get_int(m, "max-redirects"), 10, "redirects def")
+    testing.expect_eq(get_count(m, "verbose"), 0, "verbose 0")
+    testing.expect_streq(get_str(m, "verify"), "", "verify empty")
+    testing.expect_streq(pos_str(m, "murl"), "example.org", "murl value")
+    [_, e2] = pos_of(m, "url2")
+    testing.expect(e2 != nil, "url2 absent")
+    testing.expect_eq(npos(m), 1, "npos 1")
+    testing.expect_eq(state(m, "check-status"), 0, "tri unset")
+    testing.expect(!src_env(m, "verify"), "verify not env")
+}
+
+fn test_longs_and_values() {
+    m := parse(fix(), av("--json\nexample.org"), ev(""))
+    testing.expect(get_flag(m, "json"), "--json")
+    m2 := parse(fix(), av("--timeout=1.5\nexample.org"), ev(""))
+    testing.expect(get_float(m2, "timeout") == 1.5, "--t=1.5")
+    m3 := parse(fix(), av("--timeout\n2.5\nexample.org"), ev(""))
+    testing.expect(get_float(m3, "timeout") == 2.5, "--t 2.5")
+    m4 := parse(fix(), av("--raw=x\nexample.org"), ev(""))
+    testing.expect_streq(get_str(m4, "raw"), "x", "--raw=x")
+    m5 := parse(fix(), av("--timeout\nexample.org"), ev(""))
+    // next token not flag-shaped -> consumed as value, then invalid
+    testing.expect(m5.ok == 0, "--timeout consumed positional")
+    m6 := parse(fix(), av("--timeout\n--json\nexample.org"), ev(""))
+    testing.expect(m6.ok == 0, "missing value")
+    testing.expect(find(m6.diag, "a value is required for '--timeout <SEC>' but none was supplied") >= 0, "missing value msg")
+    m7 := parse(fix(), av("--json=yes\nexample.org"), ev(""))
+    testing.expect(m7.ok == 0, "flag=value bad")
+    testing.expect(find(m7.diag, "unexpected value 'yes' for '--json' found") >= 0, "flag value msg")
+    m9 := parse(fix(), av("--timeout"), ev(""))
+    testing.expect(m9.ok == 0, "value at argv end")
+    testing.expect(find(m9.diag, "a value is required for '--timeout <SEC>' but none was supplied") >= 0, "end-of-argv missing value")
+    m8 := parse(fix(), av("--bogus\nexample.org"), ev(""))
+    testing.expect(m8.ok == 0, "unknown long")
+    testing.expect(find(m8.diag, "unexpected argument '--bogus' found") >= 0, "unknown long msg")
+    testing.expect(find(m8.diag, "Usage: xh [OPTIONS] <[METHOD] URL>") >= 0, "diag usage line")
+    testing.expect(find(m8.diag, "For more information, try '--help'.") >= 0, "diag footer")
+}
+
+fn test_shorts() {
+    m := parse(fix(), av("-j\nexample.org"), ev(""))
+    testing.expect(get_flag(m, "json"), "-j")
+    m2 := parse(fix(), av("-jf\nexample.org"), ev(""))
+    testing.expect(get_flag(m2, "form") && get_flag(m2, "json") == false, "-jf cluster: form wins (f folds last)")
+    m3 := parse(fix(), av("-fj\nexample.org"), ev(""))
+    testing.expect(get_flag(m3, "json") && get_flag(m3, "form") == false, "-fj cluster: json last wins")
+    m4 := parse(fix(), av("-vv\nexample.org"), ev(""))
+    testing.expect_eq(get_count(m4, "verbose"), 2, "-vv count 2")
+    m5 := parse(fix(), av("-v\n-v\nexample.org"), ev(""))
+    testing.expect_eq(get_count(m5, "verbose"), 2, "-v -v count 2")
+    m6 := parse(fix(), av("-sauto\nexample.org"), ev(""))
+    testing.expect_streq(get_enum(m6, "style"), "auto", "-sauto")
+    m7 := parse(fix(), av("-s=fruity\nexample.org"), ev(""))
+    testing.expect_streq(get_enum(m7, "style"), "fruity", "-s=fruity")
+    m8 := parse(fix(), av("-s\nmonokai\nexample.org"), ev(""))
+    testing.expect_streq(get_enum(m8, "style"), "monokai", "-s monokai")
+    m9 := parse(fix(), av("-z\nexample.org"), ev(""))
+    testing.expect(m9.ok == 0, "unknown short")
+    testing.expect(find(m9.diag, "unexpected argument '-z' found") >= 0, "unknown short msg")
+    m10 := parse(fix(), av("-of.out\nexample.org"), ev(""))
+    testing.expect_streq(get_str(m10, "output"), "f.out", "-of.out")
+}
+
+fn test_enums() {
+    m := parse(fix(), av("--pretty\ncolors\nexample.org"), ev(""))
+    testing.expect_streq(get_enum(m, "pretty"), "colors", "enum val")
+    m2 := parse(fix(), av("--pretty=bogus\nexample.org"), ev(""))
+    testing.expect(m2.ok == 0, "enum invalid")
+    testing.expect(find(m2.diag, "invalid value 'bogus' for '--pretty <STYLE>'") >= 0, "enum err msg")
+    testing.expect(find(m2.diag, "[possible values: all, colors, format, none]") >= 0, "enum possible")
+    m3 := parse(fix(), av("--http-version=1\nexample.org"), ev(""))
+    testing.expect_streq(get_enum(m3, "http-version"), "1.0", "enum alias")
+    m4 := parse(fix(), av("--http-version\n1.1\nexample.org"), ev(""))
+    testing.expect_streq(get_enum(m4, "http-version"), "1.1", "enum next-arg")
+}
+
+fn test_numbers() {
+    m := parse(fix(), av("--max-redirects=20\nexample.org"), ev(""))
+    testing.expect_eq(get_int(m, "max-redirects"), 20, "uint 20")
+    m2 := parse(fix(), av("--max-redirects=-1\nexample.org"), ev(""))
+    testing.expect(m2.ok == 0, "uint negative")
+    testing.expect(find(m2.diag, "invalid value '-1' for '--max-redirects <NUM>': invalid digit found in string") >= 0, "uint err")
+    m3 := parse(fix(), av("--max-redirects=abc\nexample.org"), ev(""))
+    testing.expect(m3.ok == 0, "uint garbage")
+    m4 := parse(fix(), av("--timeout=abc\nexample.org"), ev(""))
+    testing.expect(m4.ok == 0, "float garbage")
+    testing.expect(find(m4.diag, "not a valid number") >= 0, "float err")
+}
+
+fn test_negations() {
+    m := parse(fix(), av("--json\n--no-json\nexample.org"), ev(""))
+    testing.expect(!get_flag(m, "json"), "set then no- unset")
+    m2 := parse(fix(), av("--no-json\n--json\nexample.org"), ev(""))
+    testing.expect(get_flag(m2, "json"), "no- then set")
+    testing.expect_eq(state(m, "json"), -1, "json negated state")
+    testing.expect_eq(state(m2, "json"), 1, "json set state")
+    m3 := parse(fix(), av("--check-status\nexample.org"), ev(""))
+    testing.expect_eq(state(m3, "check-status"), 1, "tri set")
+    m4 := parse(fix(), av("--no-check-status\nexample.org"), ev(""))
+    testing.expect_eq(state(m4, "check-status"), -1, "tri unset")
+    m5 := parse(fix(), av("--stream\n--no-stream\nexample.org"), ev(""))
+    testing.expect_eq(state(m5, "stream"), -1, "stream negated")
+    m6 := parse(fix(), av("-vv\n--no-verbose\nexample.org"), ev(""))
+    testing.expect_eq(get_count(m6, "verbose"), 0, "no- resets count")
+    m7 := parse(fix(), av("-vv\n--no-verbose\n-v\nexample.org"), ev(""))
+    testing.expect_eq(get_count(m7, "verbose"), 1, "count after reset")
+    m8 := parse(fix(), av("--proxy\na\n--proxy\nb\n--no-proxy\nexample.org"), ev(""))
+    testing.expect_eq(len(get_list(m8, "proxy")), 0, "no-proxy clears")
+    m9 := parse(fix(), av("--proxy\na\n--no-proxy\n--proxy\nb\nexample.org"), ev(""))
+    l := get_list(m9, "proxy")
+    testing.expect_eq(len(l), 1, "proxy re-add")
+    testing.expect_streq(l[0], "b", "proxy re-add val")
+    m10 := parse(fix(), av("--raw\nx\n--no-raw\nexample.org"), ev(""))
+    testing.expect_streq(get_str(m10, "raw"), "", "no-raw clears value")
+    m11 := parse(fix(), av("--no-help\nexample.org"), ev(""))
+    testing.expect(m11.ok == 1, "no-help parses")
+    testing.expect_streq(m11.act, "", "no-help no action")
+    m12 := parse(fix(), av("--no-json=v\nexample.org"), ev(""))
+    testing.expect(m12.ok == 0, "no-x value bad")
+}
+
+fn test_overrides() {
+    m := parse(fix(), av("--form\n--json\nexample.org"), ev(""))
+    testing.expect(get_flag(m, "json") && !get_flag(m, "form"), "json wins")
+    m2 := parse(fix(), av("--json\n--form\nexample.org"), ev(""))
+    testing.expect(get_flag(m2, "form") && !get_flag(m2, "json"), "form wins")
+    m3 := parse(fix(), av("--form\n--json\n--multipart\nexample.org"), ev(""))
+    testing.expect(get_flag(m3, "multipart") && !get_flag(m3, "json") && !get_flag(m3, "form"), "multipart wins trio")
+    m4 := parse(fix(), av("--json\n--form\n--json\nexample.org"), ev(""))
+    testing.expect(get_flag(m4, "json") && !get_flag(m4, "form"), "j-f-j")
+}
+
+fn test_conflicts() {
+    m := parse(fix(), av("--multipart\n--raw\nx\nexample.org"), ev(""))
+    testing.expect(m.ok == 0, "conflict errors")
+    testing.expect(find(m.diag, "the argument '--raw' cannot be used with '--multipart'") >= 0, "later arg blamed")
+    m2 := parse(fix(), av("--raw\nx\n--multipart\nexample.org"), ev(""))
+    testing.expect(find(m2.diag, "the argument '--multipart' cannot be used with '--raw'") >= 0, "multipart blamed when later")
+    m3 := parse(fix(), av("--session\ns\n--session-read-only\nr\nexample.org"), ev(""))
+    testing.expect(find(m3.diag, "the argument '--session-read-only' cannot be used with '--session'") >= 0, "session pair conflict")
+    m4 := parse(fix(), av("--multipart\n--raw\nx\n--no-multipart\nexample.org"), ev(""))
+    testing.expect(m4.ok == 1, "negated conflict free")
+    m5 := parse(fix(), av("--generate\nman\nexample.org"), ev(""))
+    testing.expect(m5.ok == 0, "generate conflicts positional")
+    testing.expect(find(m5.diag, "the argument '<[METHOD] URL>' cannot be used with '--generate'") >= 0, "positional blamed")
+    m6 := parse(fix(), av("--generate\nman"), ev(""))
+    testing.expect(m6.ok == 1, "generate alone ok")
+    testing.expect_streq(get_enum(m6, "generate"), "man", "generate val")
+}
+
+fn test_requires() {
+    m := parse(fix(), av("--continue\nexample.org"), ev(""))
+    testing.expect(m.ok == 0, "requires fails")
+    testing.expect(find(m.diag, "the following required arguments were not provided:") >= 0, "req msg")
+    testing.expect(find(m.diag, "--download") >= 0, "req download")
+    testing.expect(find(m.diag, "--output") >= 0, "req output")
+    m2 := parse(fix(), av("--continue\n--download\nexample.org"), ev(""))
+    testing.expect(find(m2.diag, "--output") >= 0, "req output only")
+    testing.expect(find(m2.diag, "--download\n") < 0, "download satisfied")
+    m3 := parse(fix(), av("-c\n-d\n-o\nf\nexample.org"), ev(""))
+    testing.expect(m3.ok == 1, "requires satisfied")
+    m4 := parse(fix(), av("--continue\n--download\n--no-download\nexample.org"), ev(""))
+    testing.expect(m4.ok == 0, "negated req still missing")
+    testing.expect(find(m4.diag, "--download") >= 0, "req download negated")
+}
+
+fn test_positionals() {
+    m := parse(fix(), av("get\nexample.org\na=1\nb=2"), ev(""))
+    testing.expect_eq(npos(m), 4, "npos 4")
+    testing.expect_streq(pos_str(m, "murl"), "get", "murl get")
+    testing.expect_streq(pos_str(m, "url2"), "example.org", "url2")
+    it := pos_all(m, "items")
+    testing.expect_eq(len(it), 2, "items 2")
+    testing.expect_streq(it[0], "a=1", "item0")
+    testing.expect_streq(it[1], "b=2", "item1")
+    testing.expect_streq(pos_at(m, 2), "a=1", "pos_at 2")
+    m2 := parse(fix(), av("-j\nget\nexample.org\n--form"), ev(""))
+    testing.expect(get_flag(m2, "form"), "interspersed opt")
+    testing.expect_streq(pos_str(m2, "murl"), "get", "interspersed pos")
+    testing.expect(get_flag(m2, "json") == false, "form overrode json")
+    m3 := parse(fix(), av(""), ev(""))
+    testing.expect(m3.ok == 0, "empty argv errors")
+    testing.expect(find(m3.diag, "the following required arguments were not provided:") >= 0, "req pos")
+    testing.expect(find(m3.diag, "<[METHOD] URL>") >= 0, "req pos meta")
+    m4 := parse(fix(), av("--json\n--\n--form\nx"), ev(""))
+    testing.expect(get_flag(m4, "json"), "-- keeps prior opt")
+    testing.expect(!get_flag(m4, "form"), "--form is positional")
+    testing.expect_streq(pos_at(m4, 0), "--form", "pos --form")
+    testing.expect_streq(pos_at(m4, 1), "x", "pos x")
+    m5 := parse(fix(), av("-\nexample.org"), ev(""))
+    testing.expect_streq(pos_at(m5, 0), "-", "lone dash positional")
+}
+
+fn test_env() {
+    m := parse(fix(), av("example.org"), ev("REQUESTS_CA_BUNDLE=/ca.pem"))
+    testing.expect_streq(get_str(m, "verify"), "/ca.pem", "env fallback")
+    testing.expect(src_env(m, "verify"), "verify src env")
+    testing.expect(present(m, "verify"), "env counts present")
+    m2 := parse(fix(), av("--verify\nno\nexample.org"), ev("REQUESTS_CA_BUNDLE=/ca.pem"))
+    testing.expect_streq(get_str(m2, "verify"), "no", "argv beats env")
+    testing.expect(!src_env(m2, "verify"), "argv not env")
+    m3 := parse(fix(), av("example.org"), ev("CURL_CA_BUNDLE=/curl.pem\nREQUESTS_CA_BUNDLE=/req.pem"))
+    testing.expect_streq(get_str(m3, "verify"), "/req.pem", "env order")
+    m4 := parse(fix(), av("example.org"), ev("CURL_CA_BUNDLE=/curl.pem"))
+    testing.expect_streq(get_str(m4, "verify"), "/curl.pem", "curl fallback")
+    m5 := parse(fix(), av("example.org"), ev("XH_PRETTY=colors"))
+    testing.expect_streq(get_enum(m5, "pretty"), "colors", "env enum")
+    m6 := parse(fix(), av("example.org"), ev("XH_PRETTY=bogus"))
+    testing.expect(m6.ok == 0, "env enum invalid errors")
+    testing.expect(find(m6.diag, "invalid value 'bogus'") >= 0, "env err msg")
+    m7 := parse(fix(), av("example.org"), ev("XH_PRETTY="))
+    // pair present but empty value -> empty string applied (spec'd)
+    testing.expect_streq(get_str(m7, "pretty"), "", "empty env empty val")
+    mx := parse(fix(), av("--form\nexample.org"), ev("XH_XML=1"))
+    testing.expect(!present(mx, "xml"), "override cancels env")
+    mx2 := parse(fix(), av("example.org"), ev("XH_XML=1"))
+    testing.expect(get_flag(mx2, "xml"), "env sets flag")
+    m8 := parse(fix(), av("--no-verify\nexample.org"), ev("REQUESTS_CA_BUNDLE=/ca.pem"))
+    testing.expect(!present(m8, "verify"), "negation blocks env")
+    testing.expect_eq(state(m8, "verify"), -1, "verify negated")
+    m9 := parse(fix(), av("--proxy=a\n--proxy=b\nexample.org"), ev(""))
+    pl := get_list(m9, "proxy")
+    testing.expect_eq(len(pl), 2, "repeat = form")
+    testing.expect_streq(pl[0], "a", "repeat a")
+    testing.expect_streq(pl[1], "b", "repeat b")
+}
+
+fn test_actions() {
+    m := parse(fix(), av("--help"), ev(""))
+    testing.expect(m.ok == 1, "help ok")
+    testing.expect_streq(m.act, "help_short", "help act")
+    m2 := parse(fix(), av("--bogus\n--help"), ev(""))
+    testing.expect(m2.ok == 0, "error before help")
+    m3 := parse(fix(), av("--help\n--bogus"), ev(""))
+    testing.expect(m3.ok == 1, "help stops parse")
+    testing.expect_streq(m3.act, "help_short", "help short-circuits")
+    m4 := parse(fix(), av("--version"), ev(""))
+    testing.expect_streq(m4.act, "version", "version act")
+    m5 := parse(fix(), av("-V"), ev(""))
+    testing.expect_streq(m5.act, "version", "-V version")
+    m6 := parse(fix(), av("--help\nexample.org"), ev(""))
+    testing.expect_streq(m6.act, "help_short", "help skips required check")
+}
+
+fn test_render() {
+    s := fix()
+    u := usage_line(s)
+    testing.expect_streq(u, "Usage: xh [OPTIONS] <[METHOD] URL> [REQUEST_ITEM]...", "usage line")
+    h := help(s, 0)
+    testing.expect(find(h, "--json") >= 0, "help lists json")
+    testing.expect(find(h, "-j") >= 0, "help lists -j")
+    testing.expect(find(h, "--pretty <STYLE>") >= 0, "help metavar")
+    testing.expect(find(h, "Arguments:") >= 0, "help arguments section")
+    testing.expect(find(h, "<[METHOD] URL>") >= 0, "help murl")
+    testing.expect(find(h, "Options:") >= 0, "help options section")
+    testing.expect(find(h, "bearer") < 0, "hidden bearer absent")
+    testing.expect(find(h, "--no-json") < 0, "no- forms absent")
+    testing.expect(find(h, "possible values: all, colors, format, none") < 0, "short help no possible-values")
+    hl := help(s, 1)
+    testing.expect(find(hl, "possible values: all, colors, format, none") >= 0, "long help possible values")
+    testing.expect(find(hl, "[default: 10]") >= 0, "long help default")
+    testing.expect(find(hl, "[env: REQUESTS_CA_BUNDLE") >= 0, "long help env")
+    testing.expect(find(hl, "aliases: 1") >= 0, "long help aliases")
+    m := parse(fix(), av("--bogus"), ev(""))
+    testing.expect_streq(diag_of(m), m.diag, "diag_of")
+    testing.expect_streq(version_string(m), "xh 0.0.0 (test mode)", "version")
+}
+
+fn test_tip() {
+    m := parse(fix(), av("--verbos\nexample.org"), ev(""))
+    testing.expect(m.ok == 0, "near miss errors")
+    testing.expect(find(m.diag, "tip: a similar argument exists: '--verbose'") >= 0, "tip verbose")
+    m2 := parse(fix(), av("--jsonn\nexample.org"), ev(""))
+    testing.expect(find(m2.diag, "tip: a similar argument exists: '--json'") >= 0, "tip json")
+    m3 := parse(fix(), av("--xyzzy\nexample.org"), ev(""))
+    testing.expect(find(m3.diag, "tip:") < 0, "far miss no tip")
+}
+
+fn test_edges() {
+    // KINT accepts negatives; KUINT rejects them (test_numbers)
+    m := parse(fix(), av("--priority=-3\nexample.org"), ev(""))
+    testing.expect_eq(get_int(m, "priority"), -3, "kint negative ok")
+    m2 := parse(fix(), av("--priority=abc\nexample.org"), ev(""))
+    testing.expect(m2.ok == 0, "kint garbage")
+    testing.expect(find(m2.diag, "invalid digit found in string") >= 0, "kint err")
+    // nono opts out of --no-* synthesis -> unknown-argument error
+    m3 := parse(fix(), av("--no-fixed\nexample.org"), ev(""))
+    testing.expect(m3.ok == 0, "nono negation rejected")
+    testing.expect(find(m3.diag, "unexpected argument '--no-fixed' found") >= 0, "nono msg")
+    m4 := parse(fix(), av("--fixed\nexample.org"), ev(""))
+    testing.expect(get_flag(m4, "fixed"), "fixed flag still works")
+    // long-help action + trailer
+    m5 := parse(fix(), av("--man"), ev(""))
+    testing.expect_streq(m5.act, "help_long", "help_long act")
+    hl := help(fix(), 1)
+    testing.expect(find(hl, "Extra trailer line") >= 0, "help_extra")
+    // positional overflow without a variadic tail
+    m6 := parse(fix2(), av("a\nb"), ev(""))
+    testing.expect(m6.ok == 0, "positional overflow")
+    testing.expect(find(m6.diag, "unexpected argument 'b' found") >= 0, "overflow msg")
+    m7 := parse(fix2(), av("--opt\na"), ev(""))
+    testing.expect(m7.ok == 1, "fix2 ok")
+    testing.expect_streq(pos_str(m7, "one"), "a", "fix2 positional")
+}
