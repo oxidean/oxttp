@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "id": "WI-0005",
+  "title": "S4 CLI flag surface",
+  "state": "archived",
+  "profile": "normal",
+  "current_stage": "shipping",
+  "created_at": "2026-11-17T16:04:05Z",
+  "updated_at": "2026-11-17T17:27:53Z"
+}
