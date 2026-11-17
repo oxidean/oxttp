@@ -1,0 +1,95 @@
+package main
+
+// Session matrix — WI-0006 spec.md "cli/sess_test.oxl": path
+// resolution, load absent/malformed/valid, save+persist shape,
+// save_headers exclusions, RO skip, couldn't-load error.
+import "std/testing"
+
+import "std/os"
+
+import "github.com/oxidean/oxttp/core/model"
+
+fn sess_intent(session: str, u: str, ro: int) -> own Intent {
+    i := new(Intent)
+    i.session = session
+    i.session_ro = ro
+    i.url = u
+    return i
+}
+
+fn test_session_path() {
+    // literal path when it contains /
+    [p1, e1] = session_path(sess_intent("dir/s.json", "http://h/", 0), ev(""))
+    testing.expect(e1 == nil, "literal ok")
+    testing.expect_streq(p1, "dir/s.json", "literal path")
+    // named → <cfg>/sessions/<host>/<name>.json
+    [p2, e2] = session_path(sess_intent("s", "http://example.org/", 0), ev("XH_CONFIG_DIR=/tmp/oxcfg"))
+    testing.expect(e2 == nil, "named ok")
+    testing.expect_streq(p2, "/tmp/oxcfg/sessions/example.org/s.json", "cfg session path")
+    // port → host_port dir
+    [p3, e3] = session_path(sess_intent("s", "http://example.org:8080/", 0), ev("XH_CONFIG_DIR=/tmp/oxcfg"))
+    testing.expect(find(p3, "sessions/example.org_8080/s.json") >= 0, "port dir: " + p3)
+}
+
+fn test_session_load() {
+    s := session_load("/tmp/oxttp-nonexistent-session.json")
+    testing.expect_eq(s.ok, 0, "absent ok=0")
+    os.writefile_("/tmp/oxttp-sess-bad.json", "garbage{")
+    s2 := session_load("/tmp/oxttp-sess-bad.json")
+    testing.expect_eq(s2.ok, -1, "malformed ok=-1")
+    os.remove("/tmp/oxttp-sess-bad.json")
+    os.writefile_("/tmp/oxttp-sess-good.json", "{\n    \"__meta__\": {\"about\": \"xh session file\", \"xh\": \"0.26.3\"},\n    \"auth\": {\"type\": \"basic\", \"raw_auth\": \"u:p\"},\n    \"cookies\": [{\"name\": \"c\", \"value\": \"v\"}],\n    \"headers\": [{\"name\": \"x-a\", \"value\": \"1\"}]\n}\n")
+    s3 := session_load("/tmp/oxttp-sess-good.json")
+    testing.expect_eq(s3.ok, 1, "good ok=1")
+    testing.expect_streq(s3.auth_type, "basic", "auth type")
+    testing.expect_streq(s3.auth_raw, "u:p", "auth raw")
+    testing.expect_eq(len(s3.cookies), 1, "1 cookie")
+    testing.expect_streq(s3.cookies[0], "c=v", "cookie row")
+    testing.expect_eq(len(s3.headers), 1, "1 header")
+    testing.expect_streq(s3.headers[0].name, "x-a", "header name")
+    os.remove("/tmp/oxttp-sess-good.json")
+}
+
+fn test_session_save_roundtrip() {
+    path := "/tmp/oxttp-sess-rt/sub/s.json"
+    cookies := mkslice(str, 1)
+    cookies[0] = "c1=v1"
+    let hs: []model.Header = nil
+    hs = push(hs, model.Header{name: "X-Saved", value: "sv"})
+    hs = push(hs, model.Header{name: "Cookie", value: "skip=me"})
+    hs = push(hs, model.Header{name: "Content-Type", value: "skip"})
+    hs = push(hs, model.Header{name: "If-None-Match", value: "skip"})
+    e := session_save(path, "basic", "u:p", cookies[:], hs)
+    testing.expect(e == nil, "save ok")
+    // persisted shape: meta + auth + cookies + headers, exclusions applied
+    raw := os.readfile_(path)
+    testing.expect(find(raw, "\"__meta__\"") >= 0, "meta block")
+    testing.expect(find(raw, "\"oxttp session file\"") >= 0, "oxttp about")
+    testing.expect(find(raw, "\"type\": \"basic\"") >= 0, "auth type")
+    testing.expect(find(raw, "\"name\": \"c1\"") >= 0, "cookie saved")
+    testing.expect(find(raw, "\"name\": \"x-saved\"") >= 0, "header saved lowercase")
+    testing.expect(find(raw, "content-type") < 0, "content-* excluded")
+    testing.expect(find(raw, "if-none-match") < 0, "if-* excluded")
+    testing.expect(find(raw, "skip=me") < 0, "cookie excluded")
+    // roundtrip loads back
+    s := session_load(path)
+    testing.expect_eq(s.ok, 1, "roundtrip loads")
+    testing.expect_streq(s.cookies[0], "c1=v1", "cookie back")
+    testing.expect_eq(len(s.headers), 1, "1 header back")
+    os.remove_all("/tmp/oxttp-sess-rt")
+}
+
+fn test_session_plan_integration() {
+    home := "/tmp/oxttp-sess-t"
+    os.mkdir_all(home + "/sessions/example.org")
+    os.writefile_(home + "/sessions/example.org/s.json", "{\"cookies\":[{\"name\":\"jc\",\"value\":\"jv\"}]}")
+    env := "XH_CONFIG_DIR=" + home
+    p := pl("--session\ns\nexample.org", env)
+    testing.expect_eq(len(p.err), 0, "plan ok")
+    testing.expect_eq(p.sess_write, 1, "writes when file exists + rw")
+    p2 := pl("--session\nmissing\nexample.org", env)
+    testing.expect_eq(p2.sess_write, 1, "new session writes")
+    p3 := pl("--session-read-only\nmissing\nexample.org", env)
+    testing.expect_eq(p3.sess_write, 0, "ro + missing → no write")
+    os.remove_all(home)
+}

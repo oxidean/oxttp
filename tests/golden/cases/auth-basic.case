@@ -1,0 +1,2 @@
+argv: -v {URL}/a -a user:pass
+script: <ECHO>

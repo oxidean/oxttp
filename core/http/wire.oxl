@@ -39,7 +39,7 @@ let MP_BOUNDARY = "oxttp-multipart-7f3a9c51b2d4"
 struct RenderedBody { ctype: str, data: []byte }
 
 // Head is a parsed response head: status line + ordered headers.
-struct Head { status: int, reason: str, headers: []model.Header }
+struct Head { status: int, reason: str, headers: []model.Header, version: str }
 
 // ChunkedBody is a decoded transfer-encoding: chunked payload plus
 // the trailer fields that followed the 0-chunk.
@@ -50,10 +50,12 @@ struct ChunkedBody { data: []byte, trailers: []model.Header }
 struct OutHead {
     method: str,
     uri: str,
+    ver: str,
     host: str,
     hdrs: []model.Header,
     body_len: int,
     has_body: bool,
+    synth: []model.Header,
 }
 
 // lwr ASCII-folds s for case-insensitive header/compare work.
@@ -130,7 +132,7 @@ fn hdr_has(hs: []model.Header, name: str) -> bool {
 // Raw verbatim; Json via tojson; Form query-escaped k=v&; Multipart
 // boundary assembly; FileBody read from disk. Disabled rows/parts
 // are skipped (KV/Part.enabled is save-not-send).
-fn render_body(b: model.Body) -> [RenderedBody, err] {
+fn RenderBody(b: model.Body) -> [RenderedBody, err] {
     bad := RenderedBody{ctype: "", data: nil}
     k := b.kind()
     if k == 0 {
@@ -253,16 +255,20 @@ fn push_str(b: []byte, s: str) -> []byte {
     return b
 }
 
-// serialize_head builds the request head: request line, Host first,
-// caller headers in order (Host among them wins and is not
-// duplicated), then synthesized defaults for absent
-// Accept-Encoding/Connection/Content-Length.
+// serialize_head builds the request head: request line, caller
+// headers in order (a caller Host wins and is not duplicated), then
+// synthesized defaults for absent Accept-Encoding/Connection/
+// Content-Length, then the synth tail, with Host last (corpus §9).
 fn serialize_head(h: OutHead) -> str {
     host := h.host
     if hdr_has(h.hdrs, "host") {
         host = hdr_get(h.hdrs, "host")
     }
-    out := h.method + " " + h.uri + " HTTP/1.1\r\nHost: " + host + "\r\n"
+    ver := h.ver
+    if len(ver) == 0 {
+        ver = "HTTP/1.1"
+    }
+    out := h.method + " " + h.uri + " " + ver + "\r\n"
     i := 0
     for i < len(h.hdrs) {
         hd := h.hdrs[i]
@@ -281,7 +287,14 @@ fn serialize_head(h: OutHead) -> str {
     if h.has_body && !hdr_has(h.hdrs, "content-length") {
         out = out + "Content-Length: " + itoa(h.body_len) + "\r\n"
     }
-    return out + "\r\n"
+    // synthesized tail lands between CL and Host — upstream's wire
+    // order puts the default Accept after Content-Length (corpus §9).
+    i = 0
+    for i < len(h.synth) {
+        out = out + h.synth[i].name + ": " + h.synth[i].value + "\r\n"
+        i = i + 1
+    }
+    return out + "Host: " + host + "\r\n\r\n"
 }
 
 // read_head consumes status line + header block through the blank
@@ -311,7 +324,7 @@ fn read_head(r: mut bufio.Reader) -> [str, err] {
 // Bare-LF lines are tolerated alongside CRLF (Go's parser does the
 // same); header names may not be empty or carry whitespace.
 fn parse_head(head: str) -> [Head, err] {
-    bad := Head{status: 0, reason: "", headers: nil}
+    bad := Head{status: 0, reason: "", headers: nil, version: ""}
     eol := find(head, "\n")
     if eol < 0 {
         return bad, errors.new("http: malformed status line")
@@ -324,6 +337,7 @@ fn parse_head(head: str) -> [Head, err] {
     if sp < 0 {
         return bad, errors.new("http: malformed status line: " + line)
     }
+    ver := substr(line, 5, sp)
     rest := substr(line, sp + 1, len(line))
     sp2 := find(rest, " ")
     codetok := rest
@@ -359,7 +373,7 @@ fn parse_head(head: str) -> [Head, err] {
         }
         hs = push(hs, model.Header{name: name, value: trim_ows(substr(hline, c + 1, len(hline)))})
     }
-    return Head{status: code, reason: reason, headers: hs}, nil
+    return Head{status: code, reason: reason, headers: hs, version: ver}, nil
 }
 
 // content_length returns the response Content-Length: -1 absent,

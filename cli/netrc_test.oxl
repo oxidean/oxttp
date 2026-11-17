@@ -1,0 +1,77 @@
+package main
+
+// Netrc matrix — WI-0006 spec.md "cli/netrc_test.oxl": machine /
+// default / suppress, login/password/account, comments, NETRC env,
+// ~/.netrc + ~/_netrc precedence, incomplete entries.
+import "std/testing"
+
+import "std/os"
+
+fn nrc(argv: str, env: str) -> str {
+    o := resolve(pe(argv, env), ev(env))
+    return netrc_auth(o.intent, ev(env))
+}
+
+fn test_netrc_machine() {
+    home := "/tmp/oxttp-nrc1"
+    os.mkdir_all(home)
+    os.writefile_(home + "/.netrc", "machine example.org\n  login l1\n  password p1\n")
+    out := nrc("example.org", "HOME=" + home)
+    testing.expect_streq(out, "B" + charat(1) + "l1" + charat(1) + "p1", "machine match")
+    // non-matching host → empty
+    out2 := nrc("other.org", "HOME=" + home)
+    testing.expect_streq(out2, "", "no match")
+    os.remove_all(home)
+}
+
+fn test_netrc_default_and_suppress() {
+    home := "/tmp/oxttp-nrc2"
+    os.mkdir_all(home)
+    os.writefile_(home + "/.netrc", "machine other.org\n  login lo\n  password po\ndefault\n  login dl\n  password dp\n")
+    out := nrc("example.org", "HOME=" + home)
+    testing.expect_streq(out, "B" + charat(1) + "dl" + charat(1) + "dp", "default fallback")
+    // matching machine beats default
+    out2 := nrc("other.org", "HOME=" + home)
+    testing.expect_streq(out2, "B" + charat(1) + "lo" + charat(1) + "po", "machine beats default")
+    os.remove_all(home)
+}
+
+fn test_netrc_incomplete_and_comments() {
+    home := "/tmp/oxttp-nrc3"
+    os.mkdir_all(home)
+    // login without password → incomplete → empty
+    os.writefile_(home + "/.netrc", "# comment\nmachine example.org\n  login l1\n")
+    out := nrc("example.org", "HOME=" + home)
+    testing.expect_streq(out, "", "incomplete login-only")
+    // password without login → falls back to account
+    os.writefile_(home + "/.netrc", "machine example.org\n  account acc1\n  password p1\n")
+    out2 := nrc("example.org", "HOME=" + home)
+    testing.expect_streq(out2, "B" + charat(1) + "acc1" + charat(1) + "p1", "account as login")
+    os.remove_all(home)
+}
+
+fn test_netrc_env_and_underscore() {
+    home := "/tmp/oxttp-nrc4"
+    os.mkdir_all(home)
+    // NETRC env points anywhere
+    os.writefile_("/tmp/oxttp-custom-nrc", "machine example.org\n  login el\n  password ep\n")
+    out := nrc("example.org", "HOME=" + home + "\nNETRC=/tmp/oxttp-custom-nrc")
+    testing.expect_streq(out, "B" + charat(1) + "el" + charat(1) + "ep", "NETRC env path")
+    os.remove("/tmp/oxttp-custom-nrc")
+    // _netrc fallback when .netrc absent
+    os.writefile_(home + "/_netrc", "machine example.org\n  login ul\n  password up\n")
+    out2 := nrc("example.org", "HOME=" + home)
+    testing.expect_streq(out2, "B" + charat(1) + "ul" + charat(1) + "up", "_netrc fallback")
+    os.remove_all(home)
+}
+
+fn test_netrc_ignore_and_missing() {
+    home := "/tmp/oxttp-nrc5"
+    os.mkdir_all(home)
+    os.writefile_(home + "/.netrc", "machine example.org\n  login l\n  password p\n")
+    out := nrc("--ignore-netrc\nexample.org", "HOME=" + home)
+    testing.expect_streq(out, "", "--ignore-netrc")
+    out2 := nrc("example.org", "HOME=/nonexistent-oxttp-nrc")
+    testing.expect_streq(out2, "", "missing home")
+    os.remove_all(home)
+}

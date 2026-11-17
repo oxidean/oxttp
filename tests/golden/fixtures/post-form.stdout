@@ -1,0 +1,10 @@
+POST /f HTTP/1.1
+Accept-Encoding: gzip, deflate, br, zstd
+User-Agent: xh/0.26.3
+Connection: keep-alive
+Content-Type: application/x-www-form-urlencoded
+Content-Length: 17
+Accept: */*
+Host: 127.0.0.1:57302
+
+a=1&b=two%2Bwords

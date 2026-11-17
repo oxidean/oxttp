@@ -13,7 +13,7 @@ import "std/encoding/base64"
 import "github.com/oxidean/oxttp/core/model"
 
 fn rq(method: str, u: str) -> own model.Req {
-    return new(model.Req{method: method, url: u, headers: nil, body: model.Body.Empty, timeout_ms: 0, follow: false, max_redirects: 10})
+    return new(model.Req{method: method, url: u, headers: nil, body: model.Body.Empty, timeout_ms: 0, follow: false, max_redirects: 10, httpver: "", synth: nil})
 }
 
 fn hs1(n: str, v: str) -> []model.Header {
@@ -112,7 +112,7 @@ fn test_userinfo_basic_auth() {
     }
     b := resp.body as str
     // base64("user:pass") = dXNlcjpwYXNz
-    exp := "Authorization: Basic " + base64.encode("user:pass" as []byte)
+    exp := "Authorization: " + "Basic " + base64.encode("user:pass" as []byte)
     testing.expect(find(b, exp) >= 0, "userinfo->basic")
 }
 
@@ -433,4 +433,70 @@ fn test_conn_refused() {
     r := rq("GET", "http://127.0.0.1:1/")
     [_resp, e] = request(r)
     testing.expect(e != nil, "refused errors")
+}
+
+// S5 spec additions: hop recording, version exposure, jar-lite
+// cookie carry across redirects, Host-last wire ordering.
+fn test_redirect_hops_recorded() {
+    sc := mkslice(str, 2)
+    sc[0] = "HTTP/1.1 301 Moved Permanently\r\nLocation: /b\r\nContent-Length: 0\r\n\r\n"
+    sc[1] = "<ECHO>"
+    f := fx_start(sc)
+    defer f.stop()
+    r := rq("GET", f.url() + "/a")
+    r.follow = true
+    [resp, e] = request(r)
+    testing.expect(e == nil, "send")
+    if e != nil {
+        return
+    }
+    testing.expect_eq(len(resp.hops), 1, "one hop recorded")
+    testing.expect_eq(resp.hops[0].status, 301, "hop status")
+    testing.expect_eq(find(resp.hops[0].req_head, "GET /a HTTP/1.1"), 0, "hop req head")
+    testing.expect_eq(find(resp.req_head, "GET /b HTTP/1.1"), 0, "final req head recorded")
+}
+
+fn test_version_exposed() {
+    sc := mkslice(str, 1)
+    sc[0] = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+    f := fx_start(sc)
+    defer f.stop()
+    [resp, e] = request(rq("GET", f.url() + "/x"))
+    testing.expect(e == nil, "send")
+    if e != nil {
+        return
+    }
+    testing.expect_streq(resp.version, "1.1", "wire version token")
+}
+
+fn test_cookie_carry_across_redirect() {
+    sc := mkslice(str, 2)
+    sc[0] = "HTTP/1.1 302 Found\r\nLocation: /b\r\nSet-Cookie: s=1; Path=/\r\nContent-Length: 0\r\n\r\n"
+    sc[1] = "<ECHO>"
+    f := fx_start(sc)
+    defer f.stop()
+    r := rq("GET", f.url() + "/a")
+    r.follow = true
+    [resp, e] = request(r)
+    testing.expect(e == nil, "send")
+    if e != nil {
+        return
+    }
+    b := resp.body as str
+    testing.expect(find(b, "Cookie: s=1") >= 0, "set-cookie carried to hop 2: " + b)
+}
+
+fn test_host_last() {
+    sc := mkslice(str, 1)
+    sc[0] = "<ECHO>"
+    f := fx_start(sc)
+    defer f.stop()
+    [resp, e] = request(rq("GET", f.url() + "/x"))
+    testing.expect(e == nil, "send")
+    if e != nil {
+        return
+    }
+    b := resp.body as str
+    tail := "Host: 127.0.0.1:" + itoa(f.port) + "\r\n\r\n"
+    testing.expect(len(b) >= len(tail) && substr(b, len(b) - len(tail), len(b)) == tail, "host is last header: " + b)
 }

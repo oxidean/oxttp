@@ -1,0 +1,15 @@
+POST /hello HTTP/1.1
+Accept-Encoding: gzip, deflate, br, zstd
+User-Agent: xh/0.26.3
+Connection: keep-alive
+Accept: application/json, */*;q=0.5
+Content-Type: application/json
+Content-Length: 0
+Host: 127.0.0.1:57026
+
+
+
+HTTP/1.1 200 OK
+Content-Type: text/plain
+
+hi

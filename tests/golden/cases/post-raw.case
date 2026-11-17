@@ -1,0 +1,2 @@
+argv: --raw rawtext {URL}/r
+script: <ECHO>

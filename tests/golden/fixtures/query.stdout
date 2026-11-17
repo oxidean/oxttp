@@ -1,0 +1,7 @@
+GET /p?q=0&x=1&y=a%2Bb HTTP/1.1
+Accept-Encoding: gzip, deflate, br, zstd
+User-Agent: xh/0.26.3
+Connection: keep-alive
+Accept: */*
+Host: 127.0.0.1:58926
+

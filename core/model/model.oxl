@@ -50,6 +50,26 @@ struct Req {
     timeout_ms: int,
     follow: bool,
     max_redirects: int,
+    httpver: str, // "" or "HTTP/1.1" default; "HTTP/1.0" for --http-version=1.0
+    synth: []Header, // synthesized tail (Accept*/Cookie) — wire emits after Content-Length, before Host
+}
+
+// ReqHead is what the wire emitted for one request — kept verbatim
+// (CRLF line ends) so the CLI can render --all history exactly.
+struct ReqHead { head: str }
+
+// Hop is one redirect-chain exchange before the final response:
+// the sent head plus the response that followed it (ADR 0020 —
+// xh --all/--history-print print each hop interleaved).
+struct Hop {
+    req_head: str,
+    status: int,
+    reason: str,
+    version: str,
+    headers: []Header,
+    body: []byte,
+    elapsed_ms: float,
+    remote: str,
 }
 
 // Trace is the per-stage timing posting shows in its Trace tab
@@ -74,6 +94,9 @@ struct Resp {
     body: []byte,
     elapsed_ms: float,
     remote: str,
+    version: str, // wire version token, e.g. "1.1" from "HTTP/1.1"
+    req_head: str, // wire request head that produced this response (CRLF text)
+    hops: own []Hop, // redirect-chain exchanges before this response
     trace: own Trace,
 }
 

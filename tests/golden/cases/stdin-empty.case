@@ -1,0 +1,4 @@
+# redirected empty stdin → POST, CL 0, json accept/content-type.
+argv: {URL}/e
+stdin: {"from":"pipe"}
+script: <ECHO>

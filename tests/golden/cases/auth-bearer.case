@@ -1,0 +1,2 @@
+argv: -v {URL}/a --bearer tok123
+script: <ECHO>
