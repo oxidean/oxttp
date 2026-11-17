@@ -38,7 +38,9 @@ oxl run  ./cli          # oxttp
 oxl run  ./tui          # oxttp-tui
 oxl build ./cli  -o oxttp
 oxl build ./tui  -o oxttp-tui
-oxl test ./...
+
+# `oxl test` honors only its first package-dir arg — run per dir, as CI does:
+for d in $(git ls-files '*.oxl' | xargs -n1 dirname | sort -u); do oxl test "$d"; done
 ```
 
 ## Development
