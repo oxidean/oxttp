@@ -1,0 +1,732 @@
+package args
+
+// parse.oxl — the fold engine: tokenize argv, fold each occurrence
+// into per-option state, then env/requires/conflicts post-loop.
+// Semantics per WI-0002 spec.md; decisions 0012 (folded state),
+// 0013 (pinned diagnostic templates).
+//
+// oxl notes: `ref`/`mut` free-fn params bind only own/ref args, so
+// value-typed helpers (Opt/State/Pos) are methods (auto-ref); slice
+// elements lend neither — mutate via copy-out/write-back; `push`
+// takes only plain []T, so own slices grow via new(push(x[:], e)).
+import "std/strings"
+
+import "std/strconv"
+
+import "std/errors"
+
+import "std/os"
+
+/// State is the folded runtime state of one option.
+/// gen bumps on every reset (negation/override) so logged values from
+/// a dead streak stop matching — that's what makes --no-* last-wins
+/// cheap: stale SVal rows carry an old gen.
+struct State {
+    seen: int, // net positive occurrences (count for KCOUNT)
+    neg: int, // 1 when the streak ended negated
+    active_pos: int, // argv index of first occurrence in the streak
+    last_pos: int, // argv index of latest occurrence
+    env: int, // value came from envpairs
+    gen: int,
+}
+
+/// SVal is one recorded option value (raw; canonicalized for KENUM).
+struct SVal { opt: int, gen: int, v: str }
+
+/// Matches is the parse result — owns its Spec so every post-parse
+/// read hangs off the one object.
+struct Matches {
+    spec: own Spec,
+    states: own []State,
+    svals: own []SVal,
+    pos: own []str, // flat captured positionals
+    diag: str, // full diagnostic block when ok == 0
+    act: str, // "", "help_short", "help_long", "version"
+    ok: int,
+}
+
+/// VCheck is check_val's result: msg "" + canon means valid.
+struct VCheck { msg: str, canon: str }
+
+// flag_shaped reports whether tok parses as an option token rather
+// than a value/positional (lone "-" is a positional, "--" the
+// separator).
+fn flag_shaped(tok: str) -> bool {
+    return len(tok) > 1 && byteat(tok, 0) == 45
+}
+
+// fail assembles a clap-4 diagnostic block: error line, optional tip,
+// usage line, help footer. Sets ok=0.
+fn (m mut Matches) fail(msg: str, tip: str) {
+    m.ok = 0
+    m.diag = "error: " + msg
+    if len(tip) > 0 {
+        m.diag = m.diag + "\n\n  tip: a similar argument exists: '" + tip + "'"
+    }
+    m.diag = m.diag + "\n\n" + usage_line(m.spec) + "\n\nFor more information, try '--help'.\n"
+}
+
+// lev is plain Levenshtein over bytes (names are ASCII).
+fn lev(a: str, b: str) -> int {
+    prev := mkslice(int, len(b) + 1)
+    cur := mkslice(int, len(b) + 1)
+    j := 0
+    for j <= len(b) {
+        prev[j] = j
+        j = j + 1
+    }
+    i := 1
+    for i <= len(a) {
+        cur[0] = i
+        j = 1
+        for j <= len(b) {
+            c := prev[j - 1] + 1
+            if prev[j] + 1 < c {
+                c = prev[j] + 1
+            }
+            if cur[j - 1] + 1 < c {
+                c = cur[j - 1] + 1
+            }
+            if byteat(a, i - 1) == byteat(b, j - 1) {
+                if prev[j - 1] < c {
+                    c = prev[j - 1]
+                }
+            }
+            cur[j] = c
+            j = j + 1
+        }
+        t := prev
+        prev = cur
+        cur = t
+        i = i + 1
+    }
+    return prev[len(b)]
+}
+
+// suggest finds the closest declared long or --no-* form within
+// Levenshtein 3; "" when nothing is near (tips cover longs only).
+fn (s ref Spec) suggest(name: str) -> str {
+    best := ""
+    bd := 4
+    i := 0
+    for i < len(s.opts) {
+        c := s.opts[i].name
+        d := lev(name, c)
+        if d < bd {
+            bd = d
+            best = "--" + c
+        }
+        if s.opts[i].nono != 0 {
+            cn := "no-" + c
+            d = lev(name, cn)
+            if d < bd {
+                bd = d
+                best = "--" + cn
+            }
+        }
+        i = i + 1
+    }
+    if bd <= 3 {
+        return best
+    }
+    return ""
+}
+
+// env_get scans "K=V" envpairs for name; [value, nil] when present
+// (empty value counts), err when absent.
+fn env_get(pairs: []str, name: str) -> [str, err] {
+    i := 0
+    for i < len(pairs) {
+        eq := find(pairs[i], "=")
+        if eq > 0 && substr(pairs[i], 0, eq) == name {
+            return substr(pairs[i], eq + 1, len(pairs[i])), nil
+        }
+        i = i + 1
+    }
+    return "", errors.new("unset")
+}
+
+// short_index resolves a short character to an option index.
+fn (s ref Spec) short_index(ch: int) -> int {
+    i := 0
+    for i < len(s.opts) {
+        if len(s.opts[i].short) == 1 && byteat(s.opts[i].short, 0) == ch {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// canon canonicalizes a KENUM value through vals/aliases; "" invalid.
+fn (o ref Opt) canon(v: str) -> str {
+    if csv_has(o.vals, v) {
+        return v
+    }
+    if len(o.aliases) > 0 {
+        parts := strings.split(o.aliases, ",")
+        cur := parts
+        for cur != nil {
+            eq := find(cur.v, "=")
+            if eq > 0 && substr(cur.v, 0, eq) == v {
+                return substr(cur.v, eq + 1, len(cur.v))
+            }
+            cur = cur.next
+        }
+    }
+    return ""
+}
+
+// possibles renders "a, b, c" for the invalid-value diagnostic.
+fn (o ref Opt) possibles() -> str {
+    out := ""
+    parts := strings.split(o.vals, ",")
+    cur := parts
+    first := true
+    for cur != nil {
+        if !first {
+            out = out + ", "
+        }
+        out = out + cur.v
+        first = false
+        cur = cur.next
+    }
+    return out
+}
+
+// check validates v against the option kind; msg "" means valid and
+// canon carries the value to store (canonicalized for KENUM).
+fn (o ref Opt) check(v: str) -> VCheck {
+    disp := "--" + o.name
+    if len(o.metavar) > 0 {
+        disp = disp + " <" + o.metavar + ">"
+    }
+    if o.kind == KINT {
+        [_, e] = strconv.atoi(v)
+        if e != nil {
+            return VCheck{msg: "invalid value '" + v + "' for '" + disp + "': invalid digit found in string", canon: v}
+        }
+        return VCheck{msg: "", canon: v}
+    }
+    if o.kind == KUINT {
+        bad := false
+        [x, e] = strconv.atoi(v)
+        if e != nil {
+            bad = true
+        }
+        if !bad && (x < 0 || byteat(v, 0) == 43 || byteat(v, 0) == 45) {
+            bad = true
+        }
+        if bad {
+            return VCheck{msg: "invalid value '" + v + "' for '" + disp + "': invalid digit found in string", canon: v}
+        }
+        return VCheck{msg: "", canon: v}
+    }
+    if o.kind == KFLOAT {
+        [_, e2] = strconv.parsefloat(v)
+        if e2 != nil {
+            return VCheck{msg: "invalid value '" + v + "' for '" + disp + "': not a valid number", canon: v}
+        }
+        return VCheck{msg: "", canon: v}
+    }
+    if o.kind == KENUM {
+        c := o.canon(v)
+        if len(c) == 0 {
+            return VCheck{msg: "invalid value '" + v + "' for '" + disp + "'\n  [possible values: " + o.possibles() + "]", canon: v}
+        }
+        return VCheck{msg: "", canon: c}
+    }
+    return VCheck{msg: "", canon: v}
+}
+
+// reset clears a streak — gen++ invalidates its logged values.
+fn (st mut State) reset() {
+    st.seen = 0
+    st.neg = 0
+    st.active_pos = -1
+    st.last_pos = -1
+    st.env = 0
+    st.gen = st.gen + 1
+}
+
+// fold_pos folds one positive occurrence of opt oi at argv position
+// p; val is the already-validated/canonicalized value ("" for
+// value-less kinds).
+fn (m mut Matches) fold_pos(oi: int, p: int, val: str) {
+    st := m.states[oi]
+    if st.active_pos < 0 {
+        st.active_pos = p
+    }
+    st.neg = 0
+    st.seen = st.seen + 1
+    st.last_pos = p
+    o := m.spec.opts[oi]
+    if o.kind != KFLAG && o.kind != KCOUNT {
+        m.svals = new(push(m.svals[:], SVal{opt: oi, gen: st.gen, v: val}))
+        if o.repeat == 0 && st.seen > 1 {
+            // non-repeat last-wins: bump gen so only the newest reads
+            st.gen = st.gen + 1
+            sv := m.svals[len(m.svals) - 1]
+            sv.gen = st.gen
+            m.svals[len(m.svals) - 1] = sv
+        }
+    }
+    m.states[oi] = st
+    if len(o.overrides) > 0 {
+        parts := strings.split(o.overrides, ",")
+        cur := parts
+        for cur != nil {
+            j := opt_index(m.spec, cur.v)
+            if j >= 0 {
+                st2 := m.states[j]
+                st2.reset()
+                m.states[j] = st2
+            }
+            cur = cur.next
+        }
+    }
+}
+
+// fold_neg folds a --no-x occurrence: the streak dies negated.
+fn (m mut Matches) fold_neg(oi: int) {
+    st := m.states[oi]
+    st.reset()
+    st.neg = 1
+    m.states[oi] = st
+}
+
+// act_name maps an action constant to its Matches.act string.
+fn act_name(a: int) -> str {
+    if a == AHELP_SHORT {
+        return "help_short"
+    }
+    if a == AHELP_LONG {
+        return "help_long"
+    }
+    if a == AVERSION {
+        return "version"
+    }
+    return ""
+}
+
+/// parse folds argv (post-argv0 tokens) plus envpairs ("K=V" list)
+/// against spec, consuming the spec into the returned Matches. Never
+/// fails to return: ok==0 carries the full diagnostic in diag; ok==1
+/// with act set asks the app to render help/version and exit 0.
+fn parse(spec: own Spec, argv: []str, envpairs: []str) -> own Matches {
+    m := new(Matches)
+    m.spec = spec
+    m.states = new(mkslice(State, len(m.spec.opts)))
+    m.svals = new(mkslice(SVal, 0))
+    m.pos = new(mkslice(str, 0))
+    m.diag = ""
+    m.act = ""
+    m.ok = 1
+    i := 0
+    for i < len(m.states) {
+        st := m.states[i]
+        st.active_pos = -1
+        st.last_pos = -1
+        m.states[i] = st
+        i = i + 1
+    }
+    after_dd := false
+    i = 0
+    for i < len(argv) && m.ok == 1 && len(m.act) == 0 {
+        tok := argv[i]
+        if after_dd {
+            m.push_pos(tok)
+            i = i + 1
+            continue
+        }
+        if tok == "--" {
+            after_dd = true
+            i = i + 1
+            continue
+        }
+        if len(tok) > 2 && byteat(tok, 0) == 45 && byteat(tok, 1) == 45 {
+            i = m.parse_long(argv, i)
+            continue
+        }
+        if len(tok) >= 2 && byteat(tok, 0) == 45 {
+            i = m.parse_shorts(argv, i)
+            continue
+        }
+        m.push_pos(tok)
+        i = i + 1
+    }
+    if m.ok == 1 && len(m.act) == 0 {
+        m.env_pass(envpairs)
+    }
+    if m.ok == 1 && len(m.act) == 0 {
+        m.check_conflicts()
+    }
+    if m.ok == 1 && len(m.act) == 0 {
+        m.check_required()
+    }
+    return m
+}
+
+// push_pos captures a flat positional, erroring past the declared
+// tail when the last slot isn't variadic.
+fn (m mut Matches) push_pos(tok: str) {
+    n := len(m.spec.poss)
+    last_var := n > 0 && m.spec.poss[n - 1].variadic != 0
+    if !last_var && len(m.pos) >= n {
+        m.fail("unexpected argument '" + tok + "' found", "")
+        return
+    }
+    m.pos = new(push(m.pos[:], tok))
+}
+
+// parse_long handles one "--name[=v]" token; returns next argv index.
+fn (m mut Matches) parse_long(argv: []str, i: int) -> int {
+    tok := argv[i]
+    body := substr(tok, 2, len(tok))
+    eq := find(body, "=")
+    name := body
+    val := ""
+    has_val := false
+    if eq >= 0 {
+        name = substr(body, 0, eq)
+        val = substr(body, eq + 1, len(body))
+        has_val = true
+    }
+    oi := opt_index(m.spec, name)
+    negating := false
+    if oi < 0 && strings.startswith(name, "no-") {
+        cand := opt_index(m.spec, substr(name, 3, len(name)))
+        if cand >= 0 && m.spec.opts[cand].nono != 0 {
+            oi = cand
+            negating = true
+        }
+    }
+    if oi < 0 {
+        m.fail("unexpected argument '--" + name + "' found", m.spec.suggest(name))
+        return i + 1
+    }
+    o := m.spec.opts[oi]
+    if negating {
+        if has_val {
+            m.fail("unexpected value '" + val + "' for '--no-" + o.name + "' found; no more expected", "")
+            return i + 1
+        }
+        m.fold_neg(oi)
+        return i + 1
+    }
+    if o.kind == KFLAG || o.kind == KCOUNT {
+        if has_val {
+            m.fail("unexpected value '" + val + "' for '--" + o.name + "' found; no more expected", "")
+            return i + 1
+        }
+        m.fold_pos(oi, i, "")
+        if o.action != ANONE {
+            m.act = act_name(o.action)
+        }
+        return i + 1
+    }
+    // value kind: =val or next non-flag-shaped token
+    if !has_val {
+        if i + 1 < len(argv) && !flag_shaped(argv[i + 1]) {
+            val = argv[i + 1]
+            has_val = true
+            i = i + 1
+        }
+    }
+    if !has_val {
+        m.fail("a value is required for '--" + o.name + " <" + o.metavar + ">' but none was supplied", "")
+        return i + 1
+    }
+    r := o.check(val)
+    if len(r.msg) > 0 {
+        m.fail(r.msg, "")
+        return i + 1
+    }
+    m.fold_pos(oi, i, r.canon)
+    return i + 1
+}
+
+// parse_shorts handles a "-abc" cluster token; returns next index.
+fn (m mut Matches) parse_shorts(argv: []str, i: int) -> int {
+    tok := argv[i]
+    j := 1
+    for j < len(tok) && m.ok == 1 && len(m.act) == 0 {
+        ch := byteat(tok, j)
+        si := m.spec.short_index(ch)
+        if si < 0 {
+            m.fail("unexpected argument '-" + substr(tok, j, j + 1) + "' found", "")
+            return i + 1
+        }
+        o := m.spec.opts[si]
+        if o.kind == KFLAG || o.kind == KCOUNT {
+            if j + 1 < len(tok) && byteat(tok, j + 1) == 61 {
+                m.fail("unexpected value '" + substr(tok, j + 2, len(tok)) + "' for '--" + o.name + "' found; no more expected", "")
+                return i + 1
+            }
+            m.fold_pos(si, i, "")
+            if o.action != ANONE {
+                m.act = act_name(o.action)
+            }
+            j = j + 1
+            continue
+        }
+        // value-kind short: rest of cluster (strip leading '=') or
+        // the next non-flag-shaped argv token
+        rest := substr(tok, j + 1, len(tok))
+        val := ""
+        has := false
+        if len(rest) > 0 {
+            if byteat(rest, 0) == 61 {
+                rest = substr(rest, 1, len(rest))
+            }
+            val = rest
+            has = true
+        } else if i + 1 < len(argv) && !flag_shaped(argv[i + 1]) {
+            val = argv[i + 1]
+            has = true
+            i = i + 1
+        }
+        if !has {
+            m.fail("a value is required for '--" + o.name + " <" + o.metavar + ">' but none was supplied", "")
+            return i + 1
+        }
+        r := o.check(val)
+        if len(r.msg) > 0 {
+            m.fail(r.msg, "")
+            return i + 1
+        }
+        m.fold_pos(si, i, r.canon)
+        j = len(tok)
+    }
+    return i + 1
+}
+
+// env_overridden reports whether a present option's override group
+// covers oi — an argv override must also cancel an env fallback
+// (clap's overrides_with resets env-sourced occurrences too).
+fn (m ref Matches) env_overridden(oi: int) -> bool {
+    name := m.spec.opts[oi].name
+    j := 0
+    for j < len(m.spec.opts) {
+        if j != oi && m.states[j].seen > 0 && csv_has(m.spec.opts[j].overrides, name) {
+            return true
+        }
+        j = j + 1
+    }
+    return false
+}
+
+// env_pass applies declared env fallbacks to never-seen options in
+// table order; env values validate like argv values. Options whose
+// overrider is present are skipped (the override already won).
+fn (m mut Matches) env_pass(envpairs: []str) {
+    i := 0
+    for i < len(m.spec.opts) && m.ok == 1 {
+        o := m.spec.opts[i]
+        st := m.states[i]
+        if st.seen == 0 && st.neg == 0 && len(o.env) > 0 && !m.env_overridden(i) {
+            parts := strings.split(o.env, ",")
+            cur := parts
+            for cur != nil && st.seen == 0 {
+                [v, e] = env_get(envpairs, cur.v)
+                if e == nil {
+                    r := o.check(v)
+                    if len(r.msg) > 0 {
+                        m.fail(r.msg, "")
+                        m.states[i] = st
+                        return
+                    }
+                    st.seen = 1
+                    st.env = 1
+                    st.active_pos = -2
+                    st.last_pos = -2
+                    if o.kind != KFLAG && o.kind != KCOUNT {
+                        m.svals = new(push(m.svals[:], SVal{opt: i, gen: st.gen, v: r.canon}))
+                    }
+                }
+                cur = cur.next
+            }
+            m.states[i] = st
+        }
+        i = i + 1
+    }
+}
+
+// slot_present reports whether positional slot k captured a value.
+fn (m ref Matches) slot_present(k: int) -> bool {
+    return len(m.pos) > k
+}
+
+// arg_present resolves a conflicts/requires name — option or
+// positional slot — and reports net presence.
+fn (m ref Matches) arg_present(name: str) -> bool {
+    oi := opt_index(m.spec, name)
+    if oi >= 0 {
+        return m.states[oi].seen > 0
+    }
+    pi := pos_index(m.spec, name)
+    if pi >= 0 {
+        return m.slot_present(pi)
+    }
+    return false
+}
+
+// arg_disp renders a conflicts/requires name for diagnostics.
+fn (m ref Matches) arg_disp(name: str) -> str {
+    oi := opt_index(m.spec, name)
+    if oi >= 0 {
+        return "--" + m.spec.opts[oi].name
+    }
+    pi := pos_index(m.spec, name)
+    if pi >= 0 {
+        return m.spec.poss[pi].metavar
+    }
+    return "--" + name
+}
+
+// arg_pos gives a blame position: options keep their streak's
+// active_pos; positional slots are always "later" (clap faults the
+// later-seen arg).
+fn (m ref Matches) arg_pos(name: str) -> int {
+    oi := opt_index(m.spec, name)
+    if oi >= 0 {
+        return m.states[oi].active_pos
+    }
+    return len(m.pos) + len(m.spec.opts) + 1000000
+}
+
+// check_conflicts scans declared conflicts on net-present options;
+// the arg with the later active position is blamed.
+fn (m mut Matches) check_conflicts() {
+    i := 0
+    for i < len(m.spec.opts) && m.ok == 1 {
+        if m.states[i].seen == 0 {
+            i = i + 1
+            continue
+        }
+        o := m.spec.opts[i]
+        if len(o.conflicts) > 0 {
+            parts := strings.split(o.conflicts, ",")
+            cur := parts
+            for cur != nil {
+                cname := cur.v
+                if m.arg_present(cname) {
+                    p_self := m.arg_pos(o.name)
+                    p_other := m.arg_pos(cname)
+                    if p_other > p_self {
+                        m.fail("the argument '" + m.arg_disp(cname) + "' cannot be used with '" + m.arg_disp(o.name) + "'", "")
+                    } else {
+                        m.fail("the argument '" + m.arg_disp(o.name) + "' cannot be used with '" + m.arg_disp(cname) + "'", "")
+                    }
+                    return
+                }
+                cur = cur.next
+            }
+        }
+        i = i + 1
+    }
+}
+
+// excused reports whether a missing required arg is excused by a
+// conflict: clap drops required-ness when a PRESENT arg conflicts
+// with the required one (that's how xh's --generate satisfies the
+// required METHOD/URL positional — conflict declared, L424).
+fn (m ref Matches) excused(name: str) -> bool {
+    i := 0
+    for i < len(m.spec.opts) {
+        if m.states[i].seen > 0 && csv_has(m.spec.opts[i].conflicts, name) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// check_required collects missing requires (present options only)
+// then missing required positional slots, into one clap-shaped list.
+// Missing args excused by a present conflict are skipped.
+fn (m mut Matches) check_required() {
+    missing := mkslice(str, 0)
+    i := 0
+    for i < len(m.spec.opts) {
+        if m.states[i].seen == 0 {
+            i = i + 1
+            continue
+        }
+        o := m.spec.opts[i]
+        if len(o.requires) > 0 {
+            parts := strings.split(o.requires, ",")
+            cur := parts
+            for cur != nil {
+                if !m.arg_present(cur.v) && !m.excused(cur.v) {
+                    d := m.arg_disp(cur.v)
+                    if !str_in(missing, d) {
+                        missing = push(missing, d)
+                    }
+                }
+                cur = cur.next
+            }
+        }
+        i = i + 1
+    }
+    k := 0
+    for k < len(m.spec.poss) {
+        if m.spec.poss[k].required != 0 && !m.slot_present(k) && !m.excused(m.spec.poss[k].name) {
+            missing = push(missing, m.spec.poss[k].metavar)
+        }
+        k = k + 1
+    }
+    if len(missing) > 0 {
+        msg := "the following required arguments were not provided:"
+        q := 0
+        for q < len(missing) {
+            msg = msg + "\n  " + missing[q]
+            q = q + 1
+        }
+        m.fail(msg, "")
+    }
+}
+
+// str_in reports whether the slice contains x.
+fn str_in(v: []str, x: str) -> bool {
+    i := 0
+    for i < len(v) {
+        if v[i] == x {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+/// parse_os wraps parse for real binaries: argv = os.args[1:],
+/// envpairs collected from each option's declared env names via
+/// os.getenv. os.getenv cannot distinguish an empty-set var from
+/// unset, so empty env values are treated as unset here (spec'd
+/// deviation — inject pairs through parse() when it matters).
+fn parse_os(spec: own Spec) -> own Matches {
+    argv := mkslice(str, 0)
+    i := 1
+    for i < os.nargs() {
+        argv = push(argv, os.args(i))
+        i = i + 1
+    }
+    envpairs := mkslice(str, 0)
+    i = 0
+    for i < len(spec.opts) {
+        o := spec.opts[i]
+        if len(o.env) > 0 {
+            parts := strings.split(o.env, ",")
+            cur := parts
+            for cur != nil {
+                v := os.getenv(cur.v)
+                if len(v) > 0 {
+                    envpairs = push(envpairs, cur.v + "=" + v)
+                }
+                cur = cur.next
+            }
+        }
+        i = i + 1
+    }
+    return parse(spec, argv, envpairs)
+}

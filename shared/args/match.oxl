@@ -1,0 +1,194 @@
+package args
+
+// match.oxl — the read side: typed getters over the folded state,
+// positional slot accessors, and env provenance.
+//
+// Getters take `m: ref Matches` — the caller's `own Matches` lends a
+// ref freely. Missing/invalid names trap (they're table-author bugs,
+// not runtime conditions). Values come back last-wins/canonicalized.
+import "std/strconv"
+
+import "std/errors"
+
+// opt_of resolves a name to its option row; traps on typo.
+fn (m ref Matches) opt_of(name: str) -> Opt {
+    i := opt_index(m.spec, name)
+    assert(i >= 0) // table bug: getter on undeclared option
+    return m.spec.opts[i]
+}
+
+/// present reports a net positive occurrence (or env-applied) — clap's
+/// `matches.contains` for the tri-state flags.
+fn present(m: ref Matches, name: str) -> bool {
+    i := opt_index(m.spec, name)
+    assert(i >= 0)
+    return m.states[i].seen > 0
+}
+
+/// negated reports that the current streak ended in --no-<name>.
+fn negated(m: ref Matches, name: str) -> bool {
+    i := opt_index(m.spec, name)
+    assert(i >= 0)
+    st := m.states[i]
+    return st.neg != 0 && st.seen == 0
+}
+
+/// state gives the tri-state: 1 set / -1 negated / 0 absent —
+/// xh's Option<bool> for --check-status/--stream.
+fn state(m: ref Matches, name: str) -> int {
+    i := opt_index(m.spec, name)
+    assert(i >= 0)
+    st := m.states[i]
+    if st.seen > 0 {
+        return 1
+    }
+    if st.neg != 0 {
+        return -1
+    }
+    return 0
+}
+
+/// src_env reports whether the option's current value came from env.
+fn src_env(m: ref Matches, name: str) -> bool {
+    i := opt_index(m.spec, name)
+    assert(i >= 0)
+    return m.states[i].env != 0
+}
+
+/// get_flag reads a bool option (any kind: net presence).
+fn get_flag(m: ref Matches, name: str) -> bool {
+    return present(m, name)
+}
+
+/// get_count reads an occurrence-count option.
+fn get_count(m: ref Matches, name: str) -> int {
+    i := opt_index(m.spec, name)
+    assert(i >= 0)
+    return m.states[i].seen
+}
+
+// last_val returns the newest live sval for the option, else "".
+fn (m ref Matches) last_val(oi: int) -> str {
+    st := m.states[oi]
+    out := ""
+    i := 0
+    for i < len(m.svals) {
+        if m.svals[i].opt == oi && m.svals[i].gen == st.gen {
+            out = m.svals[i].v
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// get_str reads a value option: newest value, else declared default.
+fn get_str(m: ref Matches, name: str) -> str {
+    i := opt_index(m.spec, name)
+    assert(i >= 0)
+    st := m.states[i]
+    if st.seen > 0 {
+        return m.last_val(i)
+    }
+    return m.spec.opts[i].def
+}
+
+/// get_int reads an int-kind option (KINT/KUINT).
+fn get_int(m: ref Matches, name: str) -> int {
+    v := get_str(m, name)
+    if len(v) == 0 {
+        return 0
+    }
+    [x, e] = strconv.atoi(v)
+    if e != nil {
+        return 0
+    }
+    return x
+}
+
+/// get_float reads a KFLOAT option.
+fn get_float(m: ref Matches, name: str) -> float {
+    v := get_str(m, name)
+    if len(v) == 0 {
+        return 0.0
+    }
+    [f, e] = strconv.parsefloat(v)
+    if e != nil {
+        return 0.0
+    }
+    return f
+}
+
+/// get_enum reads a KENUM option's canonical value (or default).
+fn get_enum(m: ref Matches, name: str) -> str {
+    return get_str(m, name)
+}
+
+/// get_list returns every live value of a repeat option in order
+/// (at most one for non-repeat kinds).
+fn get_list(m: ref Matches, name: str) -> own []str {
+    i := opt_index(m.spec, name)
+    assert(i >= 0)
+    st := m.states[i]
+    out := mkslice(str, 0)
+    j := 0
+    for j < len(m.svals) {
+        if m.svals[j].opt == i && m.svals[j].gen == st.gen {
+            out = push(out, m.svals[j].v)
+        }
+        j = j + 1
+    }
+    return new(out)
+}
+
+// pos_idx resolves a positional slot name; traps on typo.
+fn (m ref Matches) pos_idx(name: str) -> int {
+    i := pos_index(m.spec, name)
+    assert(i >= 0) // table bug: getter on undeclared slot
+    return i
+}
+
+/// pos_of returns [value, nil] when the slot captured, ["", err]
+/// when absent. Non-variadic slots map to their flat index.
+fn pos_of(m: ref Matches, name: str) -> [str, err] {
+    i := m.pos_idx(name)
+    if len(m.pos) > i {
+        return m.pos[i], nil
+    }
+    return "", errors.new("absent")
+}
+
+/// pos_str is pos_of for callers that don't care about presence.
+fn pos_str(m: ref Matches, name: str) -> str {
+    [v, e] = pos_of(m, name)
+    if e != nil {
+        return ""
+    }
+    return v
+}
+
+/// pos_all returns the variadic slot's captured tail (empty when
+/// none). For non-variadic slots it returns the single value or none.
+fn pos_all(m: ref Matches, name: str) -> own []str {
+    i := m.pos_idx(name)
+    out := mkslice(str, 0)
+    if m.spec.poss[i].variadic != 0 {
+        j := i
+        for j < len(m.pos) {
+            out = push(out, m.pos[j])
+            j = j + 1
+        }
+    } else if len(m.pos) > i {
+        out = push(out, m.pos[i])
+    }
+    return new(out)
+}
+
+/// npos counts flat captured positionals.
+fn npos(m: ref Matches) -> int {
+    return len(m.pos)
+}
+
+/// pos_at returns the flat positional at index i (traps out of range).
+fn pos_at(m: ref Matches, i: int) -> str {
+    return m.pos[i]
+}

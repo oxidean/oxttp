@@ -1,0 +1,178 @@
+package args
+
+// usage.oxl — clap-shaped rendering: usage line, help text, and the
+// diagnostic accessors apps use to print what parse decided.
+// Shapes per WI-0002 spec.md (decision 0013 pins the templates).
+import "std/strings"
+
+/// usage_line renders `Usage: <prog> [OPTIONS] <pos-metas...>`.
+/// [OPTIONS] appears when any non-hidden option exists; only
+/// non-hidden positional metas are listed, in declaration order.
+fn usage_line(s: ref Spec) -> str {
+    u := "Usage: " + s.prog
+    i := 0
+    any_opt := false
+    for i < len(s.opts) {
+        if s.opts[i].hidden == 0 {
+            any_opt = true
+        }
+        i = i + 1
+    }
+    if any_opt {
+        u = u + " [OPTIONS]"
+    }
+    i = 0
+    for i < len(s.poss) {
+        if s.poss[i].hidden == 0 {
+            u = u + " " + s.poss[i].metavar
+        }
+        i = i + 1
+    }
+    return u
+}
+
+// opt_left renders an option's left help column:
+// "  -j, --json" / "      --raw <RAW>" (6-wide short field).
+fn (o ref Opt) left() -> str {
+    left := "  "
+    if len(o.short) == 1 {
+        left = left + "-" + o.short + ", --" + o.name
+    } else {
+        left = left + "    --" + o.name
+    }
+    if o.kind != KFLAG && o.kind != KCOUNT && len(o.metavar) > 0 {
+        left = left + " <" + o.metavar + ">"
+    }
+    return left
+}
+
+// opt_suffix renders the long-help suffixes for one option.
+fn (o ref Opt) suffix() -> str {
+    suf := ""
+    if o.kind == KENUM {
+        suf = suf + " [possible values: " + o.possibles() + "]"
+        if len(o.aliases) > 0 {
+            al := ""
+            parts := strings.split(o.aliases, ",")
+            cur := parts
+            first := true
+            for cur != nil {
+                eq := find(cur.v, "=")
+                if !first {
+                    al = al + ", "
+                }
+                if eq > 0 {
+                    al = al + substr(cur.v, 0, eq)
+                }
+                first = false
+                cur = cur.next
+            }
+            suf = suf + " [aliases: " + al + "]"
+        }
+    }
+    if len(o.def) > 0 {
+        suf = suf + " [default: " + o.def + "]"
+    }
+    if len(o.env) > 0 {
+        suf = suf + " [env: " + o.env + "]"
+    }
+    return suf
+}
+
+/// help renders clap-shaped help: about, usage, Arguments (visible
+/// positionals), Options (visible options). long != 0 adds the
+/// possible-values/aliases/default/env suffixes clap shows in
+/// `help`-subcommand output; short help omits them.
+fn help(s: ref Spec, long: int) -> str {
+    h := s.about + "\n\n" + usage_line(s) + "\n"
+    // collect rows first so the help column aligns (clap pads to
+    // the widest left part + 2)
+    rows := mkslice(str, 0)
+    texts := mkslice(str, 0)
+    i := 0
+    for i < len(s.poss) {
+        if s.poss[i].hidden == 0 {
+            rows = push(rows, "  " + s.poss[i].metavar)
+            texts = push(texts, s.poss[i].help)
+        }
+        i = i + 1
+    }
+    narg := len(rows)
+    i = 0
+    for i < len(s.opts) {
+        if s.opts[i].hidden == 0 {
+            o := s.opts[i]
+            rows = push(rows, o.left())
+            t := o.help
+            if long != 0 {
+                t = t + o.suffix()
+            }
+            texts = push(texts, t)
+        }
+        i = i + 1
+    }
+    col := 0
+    i = 0
+    for i < len(rows) {
+        if len(rows[i]) > col {
+            col = len(rows[i])
+        }
+        i = i + 1
+    }
+    col = col + 2
+    if narg > 0 {
+        h = h + "\nArguments:\n"
+        i = 0
+        for i < narg {
+            h = h + help_row(rows[i], texts[i], col)
+            i = i + 1
+        }
+    }
+    if len(rows) > narg {
+        h = h + "\nOptions:\n"
+        i = narg
+        for i < len(rows) {
+            h = h + help_row(rows[i], texts[i], col)
+            i = i + 1
+        }
+    }
+    if len(s.extra) > 0 {
+        h = h + "\n" + s.extra + "\n"
+    }
+    return h
+}
+
+// help_row renders "  <left>  <help>" padded to the shared column;
+// overlong lefts push help onto the next line (clap's behavior).
+fn help_row(left: str, text: str, col: int) -> str {
+    if len(text) == 0 {
+        return left + "\n"
+    }
+    if len(left) + 2 <= col {
+        pad := col - len(left)
+        out := left
+        i := 0
+        for i < pad {
+            out = out + " "
+            i = i + 1
+        }
+        return out + text + "\n"
+    }
+    out := left + "\n"
+    i := 0
+    for i < col {
+        out = out + " "
+        i = i + 1
+    }
+    return out + text + "\n"
+}
+
+/// diag_of returns the assembled diagnostic block ("" when ok==1).
+fn diag_of(m: ref Matches) -> str {
+    return m.diag
+}
+
+/// version_string renders "<prog> <version>" for --version output.
+fn version_string(m: ref Matches) -> str {
+    return m.spec.prog + " " + m.spec.version
+}

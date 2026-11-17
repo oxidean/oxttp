@@ -1,0 +1,289 @@
+package args
+
+// shared/args — table-driven argv parser for the xh/posting surfaces.
+// spec.oxl: the option-table model and its builders (WI-0002 spec.md).
+//
+// A Spec is pure data: apps declare options and positional slots with
+// builder calls, then hand the spec to parse() once. Multi-name
+// attributes (env fallbacks, conflicts, requires, overrides, enum
+// values, aliases) are comma-joined strings — oxl has no slice
+// literals, and keeping every field scalar keeps `own []Opt` copies
+// shallow-safe.
+import "std/strings"
+
+// Option kinds.
+let KFLAG = 0 // bool set-true (--json)
+
+let KCOUNT = 1 // occurrence count (-v, -vv)
+
+let KSTR = 2 // string value (--raw)
+
+let KINT = 3 // signed int
+
+let KUINT = 4 // non-negative int (--max-redirects)
+
+let KFLOAT = 5 // float (--timeout)
+
+let KENUM = 6 // enum value w/ aliases (--pretty, --http-version)
+
+// Occurrence actions — fired at the argv position they appear.
+let ANONE = 0
+
+let AHELP_SHORT = 1 // clap ArgAction::HelpShort  (xh --help)
+
+let AHELP_LONG = 2 // clap ArgAction::HelpLong   (xh `help` is app-side)
+
+let AVERSION = 3 // clap version action        (xh -V/--version)
+
+/// Opt is one declared option (row of the table).
+struct Opt {
+    name: str, // long name without dashes ("json")
+    short: str, // "" or one character ("j")
+    kind: int, // KFLAG..KENUM
+    action: int, // ANONE..AVERSION
+    metavar: str, // value placeholder ("RAW"); "" for flags
+    help: str, // short help line
+    def: str, // default, parsed through the kind at read time
+    env: str, // csv of env fallback names, first present wins
+    conflicts: str, // csv of option names or positional-slot names
+    requires: str, // csv likewise
+    overrides: str, // csv — a positive occurrence resets these
+    vals: str, // KENUM: csv of canonical values
+    aliases: str, // KENUM: csv of "alias=canonical"
+    repeat: int, // values accumulate (--proxy, --resolve)
+    hidden: int, // parses but absent from help (--bearer)
+    nono: int, // synthesize --no-<name> (default 1, nono() clears)
+}
+
+/// Pos is one declared positional slot.
+struct Pos {
+    name: str, // id for getters/conflicts/requires ("murl")
+    metavar: str, // display form ("<[METHOD] URL>")
+    help: str,
+    required: int,
+    variadic: int, // consumes the remaining flat positionals
+    hidden: int, // captured but absent from usage/help (xh raw_url)
+}
+
+/// Spec is the whole declared surface of one program.
+struct Spec {
+    prog: str,
+    version: str,
+    about: str,
+    extra: str, // trailing help lines, "" when none
+    opts: own []Opt,
+    poss: own []Pos,
+}
+
+/// newspec starts a table for `prog`.
+fn newspec(prog: str, version: str, about: str) -> own Spec {
+    s := new(Spec)
+    s.prog = prog
+    s.version = version
+    s.about = about
+    s.extra = ""
+    s.opts = new(mkslice(Opt, 0))
+    s.poss = new(mkslice(Pos, 0))
+    return s
+}
+
+// opt_index resolves a long name to its table index, -1 when absent.
+fn opt_index(s: ref Spec, name: str) -> int {
+    i := 0
+    for i < len(s.opts) {
+        if s.opts[i].name == name {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// pos_index resolves a positional slot name likewise.
+fn pos_index(s: ref Spec, name: str) -> int {
+    i := 0
+    for i < len(s.poss) {
+        if s.poss[i].name == name {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// add registers a fresh option row with the shared defaults.
+fn add(s: mut Spec, name: str, short: str, kind: int, metavar: str, help: str) -> int {
+    s.opts = new(push(s.opts[:], Opt{name: name, short: short, kind: kind, action: ANONE, metavar: metavar, help: help, def: "", env: "", conflicts: "", requires: "", overrides: "", vals: "", aliases: "", repeat: 0, hidden: 0, nono: 1}))
+    return len(s.opts) - 1
+}
+
+/// flag declares a bool option (-j/--json).
+fn flag(s: mut Spec, name: str, short: str, help: str) {
+    add(s, name, short, KFLAG, "", help)
+}
+
+/// count declares an occurrence-count option (-v, -vv, -q).
+fn count(s: mut Spec, name: str, short: str, help: str) {
+    add(s, name, short, KCOUNT, "", help)
+}
+
+/// str_ declares a string-value option (--raw <RAW>).
+fn str_(s: mut Spec, name: str, short: str, metavar: str, help: str) {
+    add(s, name, short, KSTR, metavar, help)
+}
+
+/// int_ declares a signed-int option.
+fn int_(s: mut Spec, name: str, short: str, metavar: str, help: str) {
+    add(s, name, short, KINT, metavar, help)
+}
+
+/// uint declares a non-negative-int option (--max-redirects).
+fn uint(s: mut Spec, name: str, short: str, metavar: str, help: str) {
+    add(s, name, short, KUINT, metavar, help)
+}
+
+/// float_ declares a float option (--timeout).
+fn float_(s: mut Spec, name: str, short: str, metavar: str, help: str) {
+    add(s, name, short, KFLOAT, metavar, help)
+}
+
+/// enum_ declares an enum option; vals_csv lists canonical values.
+fn enum_(s: mut Spec, name: str, short: str, metavar: str, vals_csv: str, help: str) {
+    i := add(s, name, short, KENUM, metavar, help)
+    o := s.opts[i]
+    o.vals = vals_csv
+    s.opts[i] = o
+}
+
+/// pos declares a positional slot in capture order; at most the last
+/// slot may be variadic.
+fn pos(s: mut Spec, name: str, metavar: str, required: int, variadic: int, help: str) {
+    s.poss = new(push(s.poss[:], Pos{name: name, metavar: metavar, help: help, required: required, variadic: variadic, hidden: 0}))
+}
+
+// --- row attributes (all resolve name -> last-declared row) -------
+fn must(s: ref Spec, name: str) -> int {
+    i := opt_index(s, name)
+    if i < 0 {
+        assert(false) // table bug: attribute on undeclared option
+    }
+    return i
+}
+
+/// env sets ordered env fallbacks ("A,B" — first present wins).
+fn env(s: mut Spec, name: str, csv: str) {
+    i := must(s, name)
+    o := s.opts[i]
+    o.env = csv
+    s.opts[i] = o
+}
+
+/// conflicts declares mutual exclusions vs options or positional ids.
+fn conflicts(s: mut Spec, name: str, csv: str) {
+    i := must(s, name)
+    o := s.opts[i]
+    o.conflicts = csv
+    s.opts[i] = o
+}
+
+/// requires declares args that must accompany this option.
+fn requires(s: mut Spec, name: str, csv: str) {
+    i := must(s, name)
+    o := s.opts[i]
+    o.requires = csv
+    s.opts[i] = o
+}
+
+/// overrides declares the radio group this option resets (json/form/
+/// multipart style — declare on each member like clap).
+fn overrides(s: mut Spec, name: str, csv: str) {
+    i := must(s, name)
+    o := s.opts[i]
+    o.overrides = csv
+    s.opts[i] = o
+}
+
+/// alias maps an enum alias onto its canonical value.
+fn alias(s: mut Spec, name: str, a: str, canonical: str) {
+    i := must(s, name)
+    o := s.opts[i]
+    if len(o.aliases) > 0 {
+        o.aliases = o.aliases + ","
+    }
+    o.aliases = o.aliases + a + "=" + canonical
+    s.opts[i] = o
+}
+
+/// repeat marks a value option as accumulating.
+fn repeat(s: mut Spec, name: str) {
+    i := must(s, name)
+    o := s.opts[i]
+    o.repeat = 1
+    s.opts[i] = o
+}
+
+/// hidden keeps an option out of usage/help (--bearer).
+fn hidden(s: mut Spec, name: str) {
+    i := must(s, name)
+    o := s.opts[i]
+    o.hidden = 1
+    s.opts[i] = o
+}
+
+/// nono opts an option OUT of --no-<name> synthesis.
+fn nono(s: mut Spec, name: str) {
+    i := must(s, name)
+    o := s.opts[i]
+    o.nono = 0
+    s.opts[i] = o
+}
+
+/// action sets the option's fire-at-occurrence action.
+fn action(s: mut Spec, name: str, act: int) {
+    i := must(s, name)
+    o := s.opts[i]
+    o.action = act
+    s.opts[i] = o
+}
+
+/// def sets the option's default, parsed through its kind at read.
+fn def(s: mut Spec, name: str, d: str) {
+    i := must(s, name)
+    o := s.opts[i]
+    o.def = d
+    s.opts[i] = o
+}
+
+/// pos_hidden keeps a positional slot out of usage/help (xh's raw_url
+/// is captured but the usage line shows only two positional forms).
+fn pos_hidden(s: mut Spec, name: str) {
+    i := pos_index(s, name)
+    assert(i >= 0) // table bug: pos_hidden on undeclared slot
+    p := s.poss[i]
+    p.hidden = 1
+    s.poss[i] = p
+}
+
+/// help_extra appends a trailer line to long help output.
+fn help_extra(s: mut Spec, line: str) {
+    if len(s.extra) > 0 {
+        s.extra = s.extra + "\n"
+    }
+    s.extra = s.extra + line
+}
+
+// csv_has reports whether comma-joined list `csv` contains `x`.
+fn csv_has(csv: str, x: str) -> bool {
+    if len(csv) == 0 {
+        return false
+    }
+    parts := strings.split(csv, ",")
+    cur := parts
+    for cur != nil {
+        if cur.v == x {
+            return true
+        }
+        cur = cur.next
+    }
+    return false
+}
