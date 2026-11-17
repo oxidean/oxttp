@@ -41,8 +41,14 @@ jobs:
           /tmp/oxttp
           /tmp/oxttp-tui
 
+      # `oxl test` honors only its first package-dir arg and silently
+      # ignores the rest (oxidean/oxl#131) — invoke once per leaf dir.
       - name: test
-        run: oxl test ./cli ./tui ./core/... ./shared/...
+        run: |
+          for d in $(git ls-files '*.oxl' | xargs -n1 dirname | sort -u); do
+            echo "--- $d"
+            oxl test "$d"
+          done
 
   # Commit-message gate (see scripts/commit-check.sh): SemVer-prefix
   # grammar on subjects + no-AI-attribution scan, on the PR's commit
