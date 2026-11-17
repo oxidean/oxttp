@@ -1,0 +1,74 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    # edited re-fires the gate on title/body changes — otherwise a
+    # post-green metadata edit could land attribution unchecked.
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: oxl-build
+    if: github.event.action != 'edited'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false # PR code runs here; don't leave a token in git config
+
+      - name: install oxl toolchain
+        run: |
+          OXL_VERSION=$(cat .oxl-version)
+          curl -fsSL -o /tmp/oxl.tar.gz \
+            "https://github.com/oxidean/oxl/releases/download/v${OXL_VERSION}/oxl-toolchain-linux-x86_64.tar.gz"
+          mkdir -p /tmp/oxl-toolchain
+          tar -xzf /tmp/oxl.tar.gz -C /tmp/oxl-toolchain --strip-components=1
+          echo "/tmp/oxl-toolchain" >> "$GITHUB_PATH"
+          /tmp/oxl-toolchain/oxl version
+
+      # oxl build emits binaries only for `package main` dirs; building
+      # the two apps transitively compiles shared/ and core/.
+      - name: build apps
+        run: |
+          oxl build ./cli -o /tmp/oxttp
+          oxl build ./tui -o /tmp/oxttp-tui
+          /tmp/oxttp
+          /tmp/oxttp-tui
+
+      - name: test
+        run: oxl test ./cli ./tui ./core/... ./shared/...
+
+  # Commit-message gate (see scripts/commit-check.sh): SemVer-prefix
+  # grammar on subjects + no-AI-attribution scan, on the PR's commit
+  # range, its title, and its body.
+  commit-lint:
+    name: commit-lint
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: lint commit range (PR)
+        env:
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: scripts/commit-check.sh --range "$PR_BASE..$PR_HEAD"
+
+      - name: lint PR title
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: scripts/commit-check.sh --pr-title "$PR_TITLE"
+
+      - name: scan PR body (attribution only)
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: printf '%s' "$PR_BODY" | scripts/commit-check.sh --scan-file /dev/stdin

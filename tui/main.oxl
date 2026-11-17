@@ -1,0 +1,10 @@
+package main
+
+// oxttp-tui — drop-in Posting-compatible terminal HTTP client.
+// Surface contract: docs/corpus/corpus-posting.md (Posting 3, Go
+// rewrite lineage). Screens/keybindings land via ox-agent work items.
+import "github.com/oxidean/oxttp/shared/version"
+
+fn main() {
+    println("oxttp-tui " + version.get())
+}

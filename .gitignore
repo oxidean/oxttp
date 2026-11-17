@@ -1,0 +1,10 @@
+# build outputs
+a.out
+out.c
+*.o
+/oxttp
+/oxttp-tui
+target/
+
+# ox-agent generated context index — rebuild via `ox-agent context index`
+.ox-agent/context/index.yaml

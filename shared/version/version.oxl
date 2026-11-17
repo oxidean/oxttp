@@ -1,0 +1,6 @@
+package version
+
+// Single source for the oxttp version string — both apps report it.
+fn get() -> str {
+    return "0.1.0-dev"
+}
