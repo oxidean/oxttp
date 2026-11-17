@@ -1,0 +1,82 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+language: en
+reviews:
+  path_filters:
+    # ox-agent managed assets materialize from the Ox-Agent distribution on
+    # `init --repair --sync` and are hash-tracked by assets.lock — findings
+    # on them get fixed upstream (oxidean/Ox-Agent), not in place.
+    - "!.ox-agent/assets.lock"
+    - "!.ox-agent/framework.yaml"
+    - "!.ox-agent/context/index.yaml"
+    - "!.ox-agent/integrations/**"
+    - "!.ox-agent/lifecycle/**"
+    - "!.ox-agent/pipelines/**"
+    - "!.ox-agent/schemas/**"
+    - "!.ox-agent/workflows/**"
+    - "!.ox-agent/skills/adr/**"
+    - "!.ox-agent/skills/brainstorm/**"
+    - "!.ox-agent/skills/clean-user-facing-text/**"
+    - "!.ox-agent/skills/code-review/**"
+    - "!.ox-agent/skills/discover-context/**"
+    - "!.ox-agent/skills/discussion/**"
+    - "!.ox-agent/skills/implementation/**"
+    - "!.ox-agent/skills/multi-stage-plan/**"
+    - "!.ox-agent/skills/progress/**"
+    - "!.ox-agent/skills/remove-ai-marks/**"
+    - "!.ox-agent/skills/retrospective/**"
+    - "!.ox-agent/skills/shipping/**"
+    - "!.ox-agent/skills/specify/**"
+    - "!.ox-agent/skills/tdd/**"
+    - "!.ox-agent/skills/verify/**"
+    - "!.ox-agent/skills/README.md"
+    # Lifecycle journal — event log, snapshots, input requests, and run
+    # packets are append-only runtime records, not authored content.
+    # Work-item artifacts under .ox-agent/work/ (brainstorm, spec, plan)
+    # stay in the review surface, same as oxidean-app.
+    - "!.ox-agent/state/**"
+    - "!.ox-agent/runtime/**"
+  profile: chill
+  tools:
+    shellcheck:
+      enabled: true
+    markdownlint:
+      enabled: false
+    gitleaks:
+      enabled: true
+    actionlint:
+      enabled: true
+    github-checks:
+      enabled: false
+  high_level_summary: true
+  review_status: true
+  commit_status: true
+  collapse_walkthrough: true
+  changed_files_summary: true
+  sequence_diagrams: false
+  assess_linked_issues: true
+  related_issues: true
+  related_prs: true
+  suggested_labels: true
+  suggested_reviewers: true
+  poem: false
+  labeling_instructions: []
+  path_instructions: []
+  auto_approvals:
+    # Approve automatically once a review is clean and all threads are
+    # resolved; CodeRabbit requests changes on blocking findings instead.
+    enabled: true
+  auto_review:
+    # Reviews run on demand only (@coderabbitai review / dashboard), not
+    # automatically on open or push — per-push auto-reviews burn the
+    # fair-usage quota during fix-commit rounds (same org-wide policy as
+    # oxidean-app, Ox-Agent, oxl, oxidean.dev).
+    enabled: false
+    auto_incremental_review: false
+    ignore_title_keywords: []
+    drafts: false
+    base_branches: []
+  pre_merge_checks:
+    docstrings:
+      # Bootstrap-stage repo — doc comments welcome but unmeasured (same
+      # policy as oxidean/oxl).
+      mode: off
