@@ -1,0 +1,339 @@
+package item
+
+// REQUEST_ITEM unit matrix — corpus docs/corpus/corpus-xh.md section 3
+// + source-verified quirks (context/references/xh-request-item-grammar.md).
+// Kind tags follow declaration order:
+//   0 HttpHeader 1 HttpHeaderFromFile 2 HttpHeaderToUnset
+//   3 UrlParam 4 UrlParamFromFile 5 DataField 6 DataFieldFromFile
+//   7 JsonField 8 JsonFieldFromFile 9 FormFile
+import "std/testing"
+
+import "std/errors"
+
+fn must(s: str) -> Item {
+    [it, e] = parse(s)
+    testing.expect(e == nil, "parse(" + s + ") err=" + errors.msg(e))
+    return it
+}
+
+fn bad(s: str) -> err {
+    [it, e] = parse(s)
+    testing.expect(e != nil, "parse(" + s + ") should fail")
+    return e
+}
+
+// --- the 12 syntax forms ---
+fn test_syntax_forms() {
+    it := must("k==v")
+    testing.expect(it.kind() == 3, "k==v kind")
+    p := it as Item.UrlParam
+    testing.expect_streq(p.key, "k", "urlparam key")
+    testing.expect_streq(p.value, "v", "urlparam value")
+
+    it = must("k==@f")
+    testing.expect(it.kind() == 4, "k==@f kind")
+    pf := it as Item.UrlParamFromFile
+    testing.expect_streq(pf.key, "k", "upf key")
+    testing.expect_streq(pf.value, "f", "upf value")
+
+    it = must("k=v")
+    testing.expect(it.kind() == 5, "k=v kind")
+    d := it as Item.DataField
+    testing.expect_streq(d.key, "k", "df key")
+    testing.expect_streq(d.raw_key, "k", "df raw_key")
+    testing.expect_streq(d.value, "v", "df value")
+
+    it = must("k=@f")
+    testing.expect(it.kind() == 6, "k=@f kind")
+    df := it as Item.DataFieldFromFile
+    testing.expect_streq(df.key, "k", "dff key")
+    testing.expect_streq(df.raw_key, "k", "dff raw")
+    testing.expect_streq(df.value, "f", "dff value")
+
+    it = must("k:=true")
+    testing.expect(it.kind() == 7, "k:= kind")
+    j := it as Item.JsonField
+    testing.expect_streq(j.raw_key, "k", "jf raw_key")
+    testing.expect_streq(j.raw_value, "true", "jf raw_value")
+    testing.expect(j.value != nil, "jf parsed")
+    testing.expect(j.value.kind == 1, "jf parsed bool")
+
+    it = must("k:=@f")
+    testing.expect(it.kind() == 8, "k:=@f kind")
+    jf := it as Item.JsonFieldFromFile
+    testing.expect_streq(jf.raw_key, "k", "jff raw")
+    testing.expect_streq(jf.value, "f", "jff value")
+
+    it = must("k:v")
+    testing.expect(it.kind() == 0, "k:v kind")
+    h := it as Item.HttpHeader
+    testing.expect_streq(h.key, "k", "hdr key")
+    testing.expect_streq(h.value, "v", "hdr value")
+
+    it = must("k:")
+    testing.expect(it.kind() == 2, "k: kind")
+    hu := it as Item.HttpHeaderToUnset
+    testing.expect_streq(hu.key, "k", "unset key")
+
+    it = must("k:@f")
+    testing.expect(it.kind() == 1, "k:@f kind")
+    hf := it as Item.HttpHeaderFromFile
+    testing.expect_streq(hf.key, "k", "hff key")
+    testing.expect_streq(hf.value, "f", "hff value")
+
+    it = must("k@f")
+    testing.expect(it.kind() == 9, "k@f kind")
+    ff := it as Item.FormFile
+    testing.expect_streq(ff.key, "k", "ff key")
+    testing.expect_streq(ff.file_name, "f", "ff name")
+    testing.expect(!ff.has_type, "ff no type")
+    testing.expect(!ff.has_fname, "ff no fname")
+
+    it = must("@f")
+    testing.expect(it.kind() == 9, "@f kind")
+    ef := it as Item.FormFile
+    testing.expect_streq(ef.key, "", "@f empty key")
+    testing.expect_streq(ef.file_name, "f", "@f name")
+
+    it = must("k;")
+    testing.expect(it.kind() == 0, "k; kind")
+    se := it as Item.HttpHeader
+    testing.expect_streq(se.key, "k", "k; key")
+    testing.expect_streq(se.value, "", "k; empty value")
+}
+
+// --- longest-match ordering: first position, then SEPS order ---
+fn test_longest_match() {
+    it := must("a:=@f")
+    testing.expect(it.kind() == 8, "a:=@f is JsonFieldFromFile")
+
+    it = must("a=@f")
+    testing.expect(it.kind() == 6, "a=@f is DataFieldFromFile")
+
+    it = must("a==@f")
+    testing.expect(it.kind() == 4, "a==@f is UrlParamFromFile")
+
+    it = must("a==v")
+    testing.expect(it.kind() == 3, "a==v is UrlParam not DataField")
+
+    it = must("a:=true")
+    testing.expect(it.kind() == 7, "a:=true is JsonField not header")
+    // `a:=v` proves := won over : — and errors since v is not JSON
+    bad("a:=v")
+
+    it = must("a:b@c")
+    testing.expect(it.kind() == 0, "a:b@c is header (earlier pos)")
+    h := it as Item.HttpHeader
+    testing.expect_streq(h.value, "b@c", "a:b@c value")
+
+    it = must("a@b:c")
+    testing.expect(it.kind() == 9, "a@b:c is FormFile (earlier pos)")
+    f := it as Item.FormFile
+    testing.expect_streq(f.file_name, "b:c", "a@b:c file")
+
+    it = must("a=b:c")
+    testing.expect(it.kind() == 5, "a=b:c is DataField")
+    d := it as Item.DataField
+    testing.expect_streq(d.value, "b:c", "a=b:c value")
+
+    it = must("a:b=c")
+    testing.expect(it.kind() == 0, "a:b=c is header")
+    h2 := it as Item.HttpHeader
+    testing.expect_streq(h2.value, "b=c", "a:b=c value")
+}
+
+// --- escaping ---
+fn test_escapes() {
+    it := must("foo\\==bar")
+    testing.expect(it.kind() == 5, "foo\\==bar DataField")
+    d := it as Item.DataField
+    testing.expect_streq(d.key, "foo=", "escaped sep in key")
+    testing.expect_streq(d.raw_key, "foo\\=", "raw keeps backslash")
+    testing.expect_streq(d.value, "bar", "escaped value")
+
+    it = must("weird\\:key=value")
+    d2 := it as Item.DataField
+    testing.expect_streq(d2.key, "weird:key", "escaped colon key")
+    testing.expect_streq(d2.value, "value", "escaped colon value")
+
+    it = must("f\\o\\o=\\ba\\r")
+    d3 := it as Item.DataField
+    testing.expect_streq(d3.key, "f\\o\\o", "backslash kept pre-normal")
+    testing.expect_streq(d3.value, "\\ba\\r", "backslash kept in value")
+
+    it = must("foo=bar\\")
+    d4 := it as Item.DataField
+    testing.expect_streq(d4.value, "bar\\", "trailing backslash literal")
+
+    // backslash consumes ANY next char during the scan, not just seps
+    it = must("a\\xb=c")
+    d5 := it as Item.DataField
+    testing.expect_streq(d5.key, "a\\xb", "backslash-normal kept")
+    testing.expect_streq(d5.value, "c", "backslash-normal value")
+
+    // escaped = inside a VALUE stays literal text
+    it = must("a=b\\=c")
+    d6 := it as Item.DataField
+    testing.expect_streq(d6.value, "b=c", "escaped sep in value")
+}
+
+// --- the key; quirk pair (both upstream-faithful) ---
+fn test_semicolon_quirks() {
+    // escaped \; still triggers the empty-header branch...
+    it := must("foo\\;")
+    testing.expect(it.kind() == 0, "foo\\; is empty header")
+    h := it as Item.HttpHeader
+    // ...and the key is NOT unescaped on this path
+    testing.expect_streq(h.key, "foo\\", "key; keeps backslash")
+    testing.expect_streq(h.value, "", "key; empty")
+
+    // ; rule fires only after sep scan fails
+    it = must("a=b;")
+    testing.expect(it.kind() == 5, "a=b; is DataField")
+    d := it as Item.DataField
+    testing.expect_streq(d.value, "b;", "a=b; value keeps ;")
+
+    // bare ; and \; give the empty-name header
+    it = must(";")
+    h2 := it as Item.HttpHeader
+    testing.expect_streq(h2.key, "", "; empty name")
+
+    it = must("\\;")
+    h3 := it as Item.HttpHeader
+    testing.expect_streq(h3.key, "\\", "\\; empty name keeps backslash")
+
+    // strip_suffix removes ONE trailing ;; name keeps the inner one
+    it = must("a;;")
+    h4 := it as Item.HttpHeader
+    testing.expect_streq(h4.key, "a;", "a;; keeps inner ;")
+}
+
+// --- empty keys / empty values ---
+fn test_empty_sides() {
+    it := must("=v")
+    d := it as Item.DataField
+    testing.expect_streq(d.key, "", "=v empty key")
+
+    it = must("==v")
+    testing.expect(it.kind() == 3, "==v UrlParam")
+    u := it as Item.UrlParam
+    testing.expect_streq(u.key, "", "==v empty key")
+
+    it = must(":@f")
+    hf := it as Item.HttpHeaderFromFile
+    testing.expect_streq(hf.key, "", ":@f empty key")
+
+    it = must("a==")
+    u2 := it as Item.UrlParam
+    testing.expect_streq(u2.value, "", "a== empty value")
+
+    it = must("a=")
+    d2 := it as Item.DataField
+    testing.expect_streq(d2.value, "", "a= empty value")
+
+    it = must("k:=@")
+    jf := it as Item.JsonFieldFromFile
+    testing.expect_streq(jf.value, "", "k:=@ empty file")
+
+    it = must("k@")
+    ff := it as Item.FormFile
+    testing.expect_streq(ff.file_name, "", "k@ empty file")
+}
+
+// --- := JSON validation (eager, corpus: parse error at parse time) ---
+fn test_json_validation() {
+    jk := must("x:=[1,2,3]")
+    testing.expect(jk.kind() == 7, "arr ok")
+    jk = must("x:={\"a\":1}")
+    testing.expect(jk.kind() == 7, "obj ok")
+    jk = must("x:=\"s\"")
+    testing.expect(jk.kind() == 7, "str ok")
+    jk = must("x:=12.5")
+    testing.expect(jk.kind() == 7, "float ok")
+    jk = must("x:=-3")
+    testing.expect(jk.kind() == 7, "neg ok")
+    jk = must("x:=null")
+    testing.expect(jk.kind() == 7, "null ok")
+    jk = must("x:=false")
+    testing.expect(jk.kind() == 7, "false ok")
+    j := must("x:={\"a\":[1,{\"b\":null}]}") as Item.JsonField
+    testing.expect(j.value.kind == 4, "nested parsed obj")
+
+    bad("x:=notjson")
+    bad("x:={bad}")
+    bad("x:=[1,]")
+    bad("x:=")
+    bad("x:=tru")
+    bad("x:=01")
+    bad("x:={\"a\":}")
+}
+
+// --- file-upload params: right-scan, each consumed once ---
+fn test_part_params() {
+    pp := parse_part_params("x;type=text/plain")
+    testing.expect_streq(pp.value, "x", "type splits")
+    testing.expect(pp.has_type, "type present")
+    testing.expect_streq(pp.file_type, "text/plain", "type value")
+    testing.expect(!pp.has_fname, "no filename")
+
+    pp = parse_part_params("x;type=a;type=b")
+    testing.expect_streq(pp.value, "x;type=a", "leftover type stays")
+    testing.expect_streq(pp.file_type, "b", "rightmost type wins")
+
+    pp = parse_part_params("x;filename=n")
+    testing.expect_streq(pp.value, "x", "filename splits")
+    testing.expect_streq(pp.file_name_header, "n", "filename value")
+
+    pp = parse_part_params("x;type=a;filename=n")
+    testing.expect_streq(pp.value, "x", "both split")
+    testing.expect_streq(pp.file_type, "a", "type a")
+    testing.expect_streq(pp.file_name_header, "n", "fname n")
+
+    pp = parse_part_params("x;filename=n;type=a")
+    testing.expect_streq(pp.value, "x", "order-independent")
+    testing.expect_streq(pp.file_type, "a", "type a2")
+    testing.expect_streq(pp.file_name_header, "n", "fname n2")
+
+    pp = parse_part_params("x;filename=a;filename=b")
+    testing.expect_streq(pp.value, "x;filename=a", "leftover fname")
+    testing.expect_streq(pp.file_name_header, "b", "rightmost fname")
+
+    pp = parse_part_params("x;type=")
+    testing.expect(pp.has_type, "empty type present")
+    testing.expect_streq(pp.file_type, "", "empty type")
+
+    pp = parse_part_params("x;other=y;type=t")
+    testing.expect_streq(pp.value, "x;other=y", "unknown param stays")
+    testing.expect_streq(pp.file_type, "t", "type still found")
+
+    pp = parse_part_params("x.txt")
+    testing.expect_streq(pp.value, "x.txt", "plain name")
+    testing.expect(!pp.has_type, "plain no type")
+
+    // integrated through parse
+    it := must("f@x;type=a;type=b")
+    ff := it as Item.FormFile
+    testing.expect_streq(ff.file_name, "x;type=a", "ff leftover")
+    testing.expect_streq(ff.file_type, "b", "ff type")
+    testing.expect(!ff.has_fname, "ff no fname")
+}
+
+// --- errors ---
+fn test_errors() {
+    e := bad("plainword")
+    testing.expect_streq(errors.msg(e), "Invalid value for '[REQUEST_ITEM]...': \"plainword\"", "no-sep error")
+    bad("")
+    bad("\\")
+}
+
+// --- unescape direct ---
+fn test_unescape() {
+    testing.expect_streq(unescape("a\\=b", "=@:;\\"), "a=b", "esc =")
+    testing.expect_streq(unescape("\\@x", "=@:;\\"), "@x", "esc @")
+    testing.expect_streq(unescape("\\;", "=@:;\\"), ";", "esc ;")
+    testing.expect_streq(unescape("\\\\", "=@:;\\"), "\\", "esc backslash")
+    testing.expect_streq(unescape("f\\o", "=@:;\\"), "f\\o", "kept pre-normal")
+    testing.expect_streq(unescape("x\\", "=@:;\\"), "x\\", "trailing kept")
+    testing.expect_streq(unescape("a\\[b", "=@:;[]\\"), "a[b", "nested set")
+    testing.expect_streq(unescape("a\\[b", "=@:;\\"), "a\\[b", "[ not in base set")
+}

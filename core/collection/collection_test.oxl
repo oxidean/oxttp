@@ -1,0 +1,23 @@
+package collection
+
+// .posting.yaml schema surface — all 17 corpus keys present, optionals
+// nil-able, presence markers distinguishable.
+import "std/testing"
+
+fn test_schema_surface() {
+    r := PRequest{name: "req", description: "d", kind: "", method: "GET", url: "http://x", headers: nil, params: nil, path_params: nil, body: nil, graphql: nil, grpc: nil, websocket: nil, auth: nil, scripts: nil, options: nil, captures: nil, variable_scope: nil}
+    testing.expect_streq(r.method, "GET", "method field")
+    testing.expect(r.body == nil, "body optional")
+    testing.expect(r.auth == nil, "auth optional")
+
+    b := PBody{content: "raw", has_content: true, form_data: nil, has_form_data: false, multipart: nil, has_multipart: false, file: "", has_file: false, content_type: "text/plain"}
+    testing.expect(b.has_content && !b.has_file, "exactly-one markers")
+
+    a := PAuth{type: "oauth2", basic: nil, digest: nil, bearer_token: nil, oauth2: nil}
+    testing.expect_streq(a.type, "oauth2", "auth type")
+    pp := PathParam{name: "id", value: "7"}
+    testing.expect_streq(pp.name, "id", "path param")
+
+    o := POptions{follow_redirects: true, verify_ssl: true, attach_cookies: true, substitute_body_variables: true, proxy_url: "", timeout: 5.0}
+    testing.expect(o.follow_redirects, "options flags")
+}

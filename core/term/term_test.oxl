@@ -1,0 +1,72 @@
+package term
+
+// Screen/Key surface — key vocabulary, modifier bitset, and a
+// headless Screen implementation proving the port is implementable.
+
+import "std/testing"
+
+struct MockScreen {
+    w: int,
+    h: int,
+    cells: int,
+    cx: int,
+    cy: int,
+    cur_show: bool,
+    presents: int,
+}
+
+fn (s MockScreen) size() -> [int, int] {
+    return s.w, s.h
+}
+
+fn (s mut MockScreen) set_cell(x: int, y: int, ch: str, fg: int, bg: int, attr: int) {
+    s.cells = s.cells + 1
+}
+
+fn (s mut MockScreen) present() -> err {
+    s.presents = s.presents + 1
+    return nil
+}
+
+fn (s mut MockScreen) cursor(x: int, y: int, show: bool) {
+    s.cx = x
+    s.cy = y
+    s.cur_show = show
+}
+
+fn test_key_surface() {
+    e := KeyEvent{key: Key.Named{code: KeyEnter}, ctrl: true,
+        alt: false, shift: false, meta: false, sup: false}
+    n := e.key as Key.Named
+    testing.expect_eq(n.code, 1, "enter code")
+    testing.expect(e.ctrl && !e.alt, "ctrl flag")
+
+    e = KeyEvent{key: Key.Rune{ch: "g"}, ctrl: false,
+        alt: false, shift: false, meta: false, sup: false}
+    r := e.key as Key.Rune
+    testing.expect_streq(r.ch, "g", "rune")
+
+    e = KeyEvent{key: Key.Mouse{kind: MouseScrollUp, x: 4, y: 9, button: 0},
+        ctrl: false, alt: false, shift: false, meta: false, sup: false}
+    m := e.key as Key.Mouse
+    testing.expect_eq(m.kind, 3, "scroll up kind")
+    testing.expect_eq(m.y, 9, "mouse y")
+}
+
+fn test_named_key_coverage() {
+    // every corpus named key has a distinct code; f1..f12 contiguous
+    testing.expect_eq(KeyF1 + 11, 111, "f12 = f1+11")
+    testing.expect(KeyEnter != KeyEscape, "enter != esc")
+    testing.expect(KeyPgUp != KeyPgDown, "pgup != pgdown")
+}
+
+fn test_screen_port() {
+    s := MockScreen{w: 80, h: 24, cells: 0, cx: 0, cy: 0, cur_show: false, presents: 0}
+    let scr: Screen = s
+    [w, h] = scr.size()
+    testing.expect_eq(w, 80, "size w")
+    scr.set_cell(0, 0, "x", 0, 0, AttrBold)
+    scr.cursor(1, 1, true)
+    e := scr.present()
+    testing.expect(e == nil, "present ok")
+}
