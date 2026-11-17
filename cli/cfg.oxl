@@ -1,0 +1,119 @@
+package main
+
+// cfg.oxl — env/config lookups for the parse-level env set
+// (corpus §7): bin_name detection, XH_CONFIG_DIR/HOME, and the
+// config.json default_options mechanism (cli.rs::default_cli_args +
+// utils.rs::config_dir). File IO is confined to
+// default_options_read; everything else is pure over envpairs.
+import "std/errors"
+
+import "std/os"
+
+import "std/encoding/json"
+
+/// lookup finds "NAME=value" in envpairs → [value, nil] or
+/// ["", err]; an empty value still counts as present (upstream's
+/// env::var_os().is_some()).
+fn lookup(pairs: []str, name: str) -> [str, err] {
+    return env_lookup(pairs, name)
+}
+
+/// bin_name is argv0 → the program name upstream uses for https/
+/// compat detection: basename, then extension stripped at the FIRST
+/// '.' (`xhs.exe`→`xhs`); empty → "oxttp".
+fn bin_name(argv0: str) -> str {
+    s := -1
+    i := 0
+    for i < len(argv0) {
+        c := byteat(argv0, i)
+        if c == 47 || c == 92 {
+            s = i
+        }
+        i = i + 1
+    }
+    base := argv0
+    if s >= 0 {
+        base = substr(argv0, s + 1, len(argv0))
+    }
+    dot := find(base, ".")
+    if dot >= 0 {
+        base = substr(base, 0, dot)
+    }
+    if len(base) == 0 {
+        return "oxttp"
+    }
+    return base
+}
+
+/// config_dir → utils::config_dir: XH_CONFIG_DIR wins; else
+/// $HOME/.config/xh. HOME unset/empty → err (caller skips config).
+fn config_dir(envpairs: []str) -> [str, err] {
+    [d, e] = env_lookup(envpairs, "XH_CONFIG_DIR")
+    if e == nil {
+        return d, nil
+    }
+    [h, he] = env_lookup(envpairs, "HOME")
+    if he != nil || len(h) == 0 {
+        return "", errors.new("no home dir")
+    }
+    return h + "/.config/xh", nil
+}
+
+/// CfgParse is the default_cli_args result: tokens to prepend after
+/// argv0, plus a warning line ("" when clean).
+struct CfgParse {
+    opts: own []str,
+    warn: str,
+}
+
+fn new_cfgparse() -> own CfgParse {
+    c := new(CfgParse)
+    c.opts = new(mkslice(str, 0))
+    c.warn = ""
+    return c
+}
+
+/// default_options_parse validates config.json content the way
+/// serde_json::from_str::<Config> does: top-level must be an object
+/// carrying a `default_options` array of strings; anything else →
+/// the corpus's "Unable to parse config file" warning.
+fn default_options_parse(content: str, prog: str) -> own CfgParse {
+    c := new_cfgparse()
+    j := json.jparse(content)
+    bad := j.kind != 4
+    arr := json.jnull()
+    if !bad {
+        arr = json.jget(j, "default_options")
+        bad = arr == nil || arr.kind != 5
+    }
+    if !bad {
+        m := arr.child
+        for m != nil {
+            if m.kind != 3 {
+                bad = true
+                break
+            }
+            c.opts = new(push(c.opts[:], m.s))
+            m = m.next
+        }
+    }
+    if bad {
+        c.opts = new(mkslice(str, 0))
+        c.warn = "\n" + prog + ": warning: Unable to parse config file: malformed input\n"
+    }
+    return c
+}
+
+/// default_options_read is the IO half of default_cli_args: reads
+/// `<dir>/config.json`; absent file → no options, no warning;
+/// present file → default_options_parse. (readfile_ conflates
+/// unreadable with empty — both end at the parse warning, which is
+/// what upstream produces for an unreadable file's content anyway.)
+fn default_options_read(dir: str, prog: str) -> own CfgParse {
+    path := dir + "/config.json"
+    if !os.exists(path) {
+        return new_cfgparse()
+    }
+    content := os.readfile_(path)
+    return default_options_parse(content, prog)
+}

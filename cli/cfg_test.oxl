@@ -1,0 +1,57 @@
+package main
+
+// cfg_test.oxl — bin_name, config_dir, default_options_parse.
+import "std/testing"
+
+fn test_bin_name() {
+    testing.expect_streq(bin_name("xh"), "xh", "plain")
+    testing.expect_streq(bin_name("/usr/bin/xhs"), "xhs", "basename")
+    testing.expect_streq(bin_name("C:\\tools\\xhs.exe"), "xhs", "win ext")
+    testing.expect_streq(bin_name("xh.exe"), "xh", "ext strip")
+    testing.expect_streq(bin_name("xhttps"), "xhttps", "xhttps")
+    testing.expect_streq(bin_name("https"), "https", "https")
+    testing.expect_streq(bin_name(""), "oxttp", "empty->oxttp")
+    testing.expect_streq(bin_name("/x/y/z"), "z", "deep path")
+    testing.expect_streq(bin_name("a.b.c"), "a", "first dot")
+}
+
+fn test_config_dir() {
+    [d, e] = config_dir(ev("XH_CONFIG_DIR=/x"))
+    testing.expect(e == nil && d == "/x", "XH_CONFIG_DIR wins")
+    [d2, e2] = config_dir(ev("HOME=/h"))
+    testing.expect(e2 == nil && d2 == "/h/.config/xh", "HOME fallback")
+    [d3, e3] = config_dir(ev("XH_CONFIG_DIR=/x\nHOME=/h"))
+    testing.expect(e3 == nil && d3 == "/x", "explicit over HOME")
+    [d4, e4] = config_dir(ev(""))
+    testing.expect(e4 != nil, "no home -> err")
+    [d5, e5] = config_dir(ev("HOME="))
+    testing.expect(e5 != nil, "empty home -> err")
+    testing.expect_streq(d5, "", "empty home dir")
+}
+
+fn test_default_options_parse() {
+    c := default_options_parse("{\"default_options\":[\"--form\",\"-v\"]}", "oxttp")
+    testing.expect_streq(c.warn, "", "no warn")
+    testing.expect_eq(len(c.opts), 2, "2 opts")
+    testing.expect_streq(c.opts[0], "--form", "opt0")
+    testing.expect_streq(c.opts[1], "-v", "opt1")
+    // empty object / missing key
+    c2 := default_options_parse("{}", "oxttp")
+    testing.expect(find(c2.warn, "Unable to parse config file") >= 0, "obj no key warns")
+    // non-object
+    c3 := default_options_parse("[1,2]", "oxttp")
+    testing.expect(find(c3.warn, "Unable to parse config file") >= 0, "non-obj warns")
+    // non-array value
+    c4 := default_options_parse("{\"default_options\":\"x\"}", "oxttp")
+    testing.expect(find(c4.warn, "Unable to parse config file") >= 0, "non-arr warns")
+    // non-string element
+    c5 := default_options_parse("{\"default_options\":[1]}", "oxttp")
+    testing.expect(find(c5.warn, "Unable to parse config file") >= 0, "non-str warns")
+    // malformed json
+    c6 := default_options_parse("{bad", "oxttp")
+    testing.expect(find(c6.warn, "Unable to parse config file") >= 0, "malformed warns")
+    // empty array ok
+    c7 := default_options_parse("{\"default_options\":[]}", "oxttp")
+    testing.expect_streq(c7.warn, "", "empty arr no warn")
+    testing.expect_eq(len(c7.opts), 0, "empty arr 0 opts")
+}

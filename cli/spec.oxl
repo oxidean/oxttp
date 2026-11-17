@@ -1,0 +1,117 @@
+package main
+
+// spec.oxl — the complete xh argv surface as an args.Spec table.
+// 58 options in upstream `Cli` struct order (corpus §4, cli.rs @
+// 8b21cc0) + the two positional slots. --no-* forms are engine-
+// synthesized per row (nono() opts out — none do).
+import "github.com/oxidean/oxttp/shared/args"
+
+import "github.com/oxidean/oxttp/shared/version"
+
+/// spec declares the corpus's full option table for `prog`.
+/// Declaration order mirrors upstream's struct order so help output
+/// reads like `xh --help`.
+fn spec(prog: str) -> own args.Spec {
+    s := args.newspec(prog, version.get(), "oxttp is a friendly and fast tool for sending HTTP requests.")
+
+    // 1. request content type / body (corpus §4.1)
+    args.flag(s, "json", "j", "(default) Serialize data items from the command line as a JSON object.")
+    args.overrides(s, "json", "form,multipart")
+    args.flag(s, "form", "f", "Serialize data items from the command line as form fields.")
+    args.overrides(s, "form", "json,multipart")
+    args.flag(s, "multipart", "", "Like --form, but force a multipart/form-data request even without files.")
+    args.overrides(s, "multipart", "json,form")
+    args.conflicts(s, "multipart", "raw,compress")
+    args.str_(s, "raw", "", "RAW", "Pass raw request data without extra processing.")
+
+    // 2. output formatting / printing (corpus §4.2)
+    args.enum_(s, "pretty", "", "STYLE", "all,colors,format,none", "Controls output processing.")
+    args.str_(s, "format-options", "", "FORMAT_OPTIONS", "Set output formatting options.")
+    args.repeat(s, "format-options")
+    args.enum_(s, "style", "s", "THEME", "auto,solarized,monokai,fruity", "Output coloring style.")
+    args.str_(s, "response-charset", "", "ENCODING", "Override the response encoding for terminal display purposes.")
+    args.str_(s, "response-mime", "", "MIME_TYPE", "Override the response mime type for coloring and formatting for the terminal.")
+    args.str_(s, "print", "p", "FORMAT", "String specifying what the output should contain")
+    args.flag(s, "headers", "h", "Print only the response headers. Shortcut for --print=h.")
+    args.flag(s, "body", "b", "Print only the response body. Shortcut for --print=b.")
+    args.flag(s, "meta", "m", "Print only the response metadata. Shortcut for --print=m.")
+    args.count(s, "verbose", "v", "Print the whole request as well as the response.")
+    args.flag(s, "debug", "", "Print full error stack traces and debug log messages.")
+    args.flag(s, "all", "", "Show any intermediary requests/responses while following redirects with --follow.")
+    args.str_(s, "history-print", "P", "FORMAT", "The same as --print but applies only to intermediary requests/responses.")
+    args.count(s, "quiet", "q", "Do not print to stdout or stderr.")
+    args.flag(s, "stream", "S", "Always stream the response body.")
+    args.count(s, "compress", "x", "Content compressed (encoded) with Deflate algorithm.")
+
+    // 3. download / output files (corpus §4.3)
+    args.str_(s, "output", "o", "FILE", "Save output to FILE instead of stdout.")
+    args.flag(s, "download", "d", "Download the body to a file instead of printing it.")
+    args.flag(s, "continue", "c", "Resume an interrupted download. Requires --download and --output.")
+    args.requires(s, "continue", "download,output")
+
+    // 4. sessions (corpus §4.4)
+    args.str_(s, "session", "", "FILE", "Create, or reuse and update a session.")
+    args.str_(s, "session-read-only", "", "FILE", "Create or read a session without updating it from the request/response exchange.")
+    args.conflicts(s, "session-read-only", "session")
+
+    // 5. auth / TLS / proxy (corpus §4.5)
+    args.enum_(s, "auth-type", "A", "AUTH_TYPE", "basic,bearer,digest", "Specify the auth mechanism.")
+    args.str_(s, "auth", "a", "USER[:PASS] | TOKEN", "Authenticate as USER with PASS (-A basic|digest) or with TOKEN (-A bearer).")
+    args.str_(s, "bearer", "", "TOKEN", "Authenticate with a bearer token.")
+    args.hidden(s, "bearer")
+    args.flag(s, "ignore-netrc", "", "Do not use credentials from .netrc")
+    args.str_(s, "unstable-m-sig-id", "", "KEY_ID", "Message signature key identifier (RFC 9421).")
+    args.requires(s, "unstable-m-sig-id", "unstable-m-sig-key")
+    args.hidden(s, "unstable-m-sig-id")
+    args.str_(s, "unstable-m-sig-key", "", "KEY", "Message signature key material (RFC 9421).")
+    args.requires(s, "unstable-m-sig-key", "unstable-m-sig-id")
+    args.hidden(s, "unstable-m-sig-key")
+    args.enum_(s, "unstable-m-sig-alg", "", "ALG", "hmac-sha256,ed25519,ecdsa-p256-sha256,ecdsa-p384-sha384,rsa-v1_5-sha256,rsa-pss-sha512", "Message signature algorithm (RFC 9421).")
+    args.requires(s, "unstable-m-sig-alg", "unstable-m-sig-key")
+    args.hidden(s, "unstable-m-sig-alg")
+    args.str_(s, "unstable-m-sig-comp", "", "COMPONENTS", "Comma-separated list of message signature components (RFC 9421).")
+    args.repeat(s, "unstable-m-sig-comp")
+    args.hidden(s, "unstable-m-sig-comp")
+
+    // 6. execution / connection (corpus §4.6-4.7)
+    args.flag(s, "offline", "", "Construct HTTP requests without sending them anywhere.")
+    args.flag(s, "check-status", "", "(default) Exit with an error status code if the server replies with an error.")
+    args.flag(s, "follow", "F", "Do follow redirects.")
+    args.uint(s, "max-redirects", "", "NUM", "Number of redirects to follow. Only respected if --follow is used.")
+    args.str_(s, "timeout", "", "SEC", "Connection timeout of the request.")
+    args.str_(s, "proxy", "", "PROTOCOL:URL", "Use a proxy for a protocol. For example: --proxy https:http://proxy.host:8080.")
+    args.repeat(s, "proxy")
+    args.str_(s, "verify", "", "VERIFY", "If \"no\", skip SSL verification. If a file path, use it as a CA bundle.")
+    args.env(s, "verify", "REQUESTS_CA_BUNDLE,CURL_CA_BUNDLE")
+    args.str_(s, "cert", "", "FILE", "Use a client side certificate for SSL.")
+    args.str_(s, "cert-key", "", "FILE", "A private key file to use with --cert.")
+    args.enum_(s, "ssl", "", "VERSION", "auto,tls1,tls1.1,tls1.2,tls1.3", "Force a particular TLS version.")
+    args.alias(s, "ssl", "ssl2.3", "auto")
+    args.flag(s, "native-tls", "", "Use the system TLS library instead of rustls (if enabled at compile time).")
+    args.hidden(s, "native-tls")
+    args.str_(s, "default-scheme", "", "SCHEME", "The default scheme to use if not specified in the URL.")
+    args.hidden(s, "default-scheme")
+    args.flag(s, "https", "", "Make HTTPS requests if not specified in the URL.")
+    args.enum_(s, "http-version", "", "VERSION", "1.0,1.1,2,2-prior-knowledge,3-prior-knowledge", "HTTP version to use")
+    args.alias(s, "http-version", "1", "1.0")
+    args.str_(s, "resolve", "", "HOST:ADDRESS", "Override DNS resolution for specific domain to a custom IP.")
+    args.repeat(s, "resolve")
+    args.str_(s, "interface", "", "NAME", "Bind to a network interface or local IP address.")
+    args.flag(s, "ipv4", "4", "Resolve hostname to ipv4 addresses only.")
+    args.flag(s, "ipv6", "6", "Resolve hostname to ipv6 addresses only.")
+    args.str_(s, "unix-socket", "", "FILE", "Connect using a Unix domain socket.")
+    args.flag(s, "ignore-stdin", "I", "Do not attempt to read stdin.")
+    args.flag(s, "curl", "", "Print a translation to a curl command.")
+    args.flag(s, "curl-long", "", "Use the long versions of curl's flags.")
+    args.enum_(s, "generate", "", "KIND", "complete-bash,complete-elvish,complete-fish,complete-nushell,complete-powershell,complete-zsh,man,man-markdown", "Generate shell completions or man pages.")
+    args.conflicts(s, "generate", "murl")
+    args.flag(s, "help", "", "Print help.")
+    args.action(s, "help", args.AHELP_SHORT)
+    args.flag(s, "version", "V", "Print version.")
+    args.action(s, "version", args.AVERSION)
+
+    // positional slots — upstream's exact two
+    args.pos(s, "murl", "<[METHOD] URL>", 1, 0, "The request URL, preceded by an optional HTTP method.")
+    args.pos(s, "rest", "[REQUEST_ITEM]...", 0, 1, "Optional key-value pairs to be included in the request.")
+    return s
+}
