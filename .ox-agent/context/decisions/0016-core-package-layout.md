@@ -1,4 +1,4 @@
-# 0012 — core/ package layout and domain representations
+# 0016 — core/ package layout and domain representations
 
 Status: accepted (2026-11-17, WI-0003 specification)
 

@@ -1,0 +1,587 @@
+package http
+
+// Pure wire helpers for the h1 transport — request serialization,
+// response head/chunked/body decoding, header lookup, body-variant
+// rendering, redirect-header rules. Everything here is socket-free:
+// readers come in as mut bufio.Reader so tests run on bytes.Buffer.
+import "std/bufio"
+
+import "std/errors"
+
+import "std/os"
+
+import "std/strconv"
+
+import "std/encoding/json"
+
+import "std/compress/gzip"
+
+import "std/compress/zlib"
+
+import "std/compress/flate"
+
+import "std/net/url"
+
+import "github.com/oxidean/oxttp/core/model"
+
+// HEAD_MAX caps the response head (status line + header block) — a
+// peer streaming headers forever must not grow memory unboundedly.
+let HEAD_MAX = 65536
+
+// MP_BOUNDARY is the fixed multipart boundary — xh/reqwest use a
+// random one, but a deterministic token keeps renders testable and
+// is equally conformant (RFC 2046 only requires it not appear in
+// the parts).
+let MP_BOUNDARY = "oxttp-multipart-7f3a9c51b2d4"
+
+// RenderedBody is a model.Body flattened to wire bytes plus the
+// content-type the variant implies ("" when it fixes none).
+struct RenderedBody { ctype: str, data: []byte }
+
+// Head is a parsed response head: status line + ordered headers.
+struct Head { status: int, reason: str, headers: []model.Header }
+
+// ChunkedBody is a decoded transfer-encoding: chunked payload plus
+// the trailer fields that followed the 0-chunk.
+struct ChunkedBody { data: []byte, trailers: []model.Header }
+
+// OutHead carries everything serialize_head needs for the request
+// head: resolved host line, caller headers, and body facts.
+struct OutHead {
+    method: str,
+    uri: str,
+    host: str,
+    hdrs: []model.Header,
+    body_len: int,
+    has_body: bool,
+}
+
+// lwr ASCII-folds s for case-insensitive header/compare work.
+fn lwr(s: str) -> str {
+    b := s as []byte
+    out := mkslice(byte, len(s))
+    i := 0
+    for i < len(s) {
+        c := b[i]
+        if c >= 65 && c <= 90 {
+            c = c + 32
+        }
+        out[i] = c
+        i = i + 1
+    }
+    return out as str
+}
+
+// trim_ows strips leading/trailing spaces and tabs — the optional
+// whitespace RFC 7230 allows around field values and chunk sizes.
+fn trim_ows(s: str) -> str {
+    lo := 0
+    for lo < len(s) && (byteat(s, lo) == 32 || byteat(s, lo) == 9) {
+        lo = lo + 1
+    }
+    hi := len(s)
+    for hi > lo && (byteat(s, hi - 1) == 32 || byteat(s, hi - 1) == 9) {
+        hi = hi - 1
+    }
+    return substr(s, lo, hi)
+}
+
+// chomp strips one trailing "\n" then one trailing "\r" — the CRLF
+// (or bare LF) line ending readline leaves behind.
+fn chomp(s: str) -> str {
+    t := s
+    if len(t) > 0 && byteat(t, len(t) - 1) == 10 {
+        t = substr(t, 0, len(t) - 1)
+    }
+    if len(t) > 0 && byteat(t, len(t) - 1) == 13 {
+        t = substr(t, 0, len(t) - 1)
+    }
+    return t
+}
+
+// hdr_get returns the first value for name (case-insensitive), ""
+// when absent.
+fn hdr_get(hs: []model.Header, name: str) -> str {
+    ln := lwr(name)
+    i := 0
+    for i < len(hs) {
+        if lwr(hs[i].name) == ln {
+            return hs[i].value
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// hdr_has reports whether name appears in hs (case-insensitive).
+fn hdr_has(hs: []model.Header, name: str) -> bool {
+    ln := lwr(name)
+    i := 0
+    for i < len(hs) {
+        if lwr(hs[i].name) == ln {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// render_body flattens a Body variant to (ctype, bytes) per the spec:
+// Raw verbatim; Json via tojson; Form query-escaped k=v&; Multipart
+// boundary assembly; FileBody read from disk. Disabled rows/parts
+// are skipped (KV/Part.enabled is save-not-send).
+fn render_body(b: model.Body) -> [RenderedBody, err] {
+    bad := RenderedBody{ctype: "", data: nil}
+    k := b.kind()
+    if k == 0 {
+        return bad, nil
+    }
+    if k == 1 {
+        v := b as model.Body.Raw
+        return RenderedBody{ctype: v.ctype, data: v.text as []byte}, nil
+    }
+    if k == 2 {
+        v := b as model.Body.Json
+        return RenderedBody{ctype: "application/json", data: json.tojson(v.j) as []byte}, nil
+    }
+    if k == 3 {
+        v := b as model.Body.Form
+        return render_form(v.fields)
+    }
+    if k == 4 {
+        v := b as model.Body.Multipart
+        return render_multipart(v.parts)
+    }
+    v := b as model.Body.FileBody
+    return render_file(v)
+}
+
+// render_form joins enabled fields as k=v& — queryescape is the
+// application/x-www-form-urlencoded encoding (space -> '+', like
+// reqwest's form_urlencoded serializer).
+fn render_form(fs: ref []model.KV) -> [RenderedBody, err] {
+    out := ""
+    first := true
+    i := 0
+    for i < len(fs) {
+        kv := fs[i]
+        i = i + 1
+        if !kv.enabled {
+            continue
+        }
+        if !first {
+            out = out + "&"
+        }
+        out = out + url.queryescape(kv.name) + "=" + url.queryescape(kv.value)
+        first = false
+    }
+    return RenderedBody{ctype: "application/x-www-form-urlencoded", data: out as []byte}, nil
+}
+
+// render_multipart assembles an RFC 2046 multipart/form-data body:
+// each enabled part gets a Content-Disposition line (filename when
+// the part carries one — explicit filename wins over the file
+// path's basename), an optional Content-Type, then the value text
+// or file bytes.
+fn render_multipart(ps: ref []model.Part) -> [RenderedBody, err] {
+    out := "" as []byte
+    i := 0
+    for i < len(ps) {
+        p := ps[i]
+        i = i + 1
+        if !p.enabled {
+            continue
+        }
+        out = push_str(out, "--" + MP_BOUNDARY + "\r\n")
+        disp := "Content-Disposition: form-data; name=\"" + p.name + "\""
+        fnm := p.filename
+        if p.is_file && len(fnm) == 0 {
+            fnm = basename(p.file)
+        }
+        if len(fnm) > 0 {
+            disp = disp + "; filename=\"" + fnm + "\""
+        }
+        out = push_str(out, disp + "\r\n")
+        if len(p.content_type) > 0 {
+            out = push_str(out, "Content-Type: " + p.content_type + "\r\n")
+        }
+        out = push_str(out, "\r\n")
+        if p.is_file {
+            if !os.exists(p.file) {
+                return RenderedBody{ctype: "", data: nil}, errors.new("http: cannot read file part: " + p.file)
+            }
+            out = push_str(out, os.readfile_(p.file))
+        } else {
+            out = push_str(out, p.value)
+        }
+        out = push_str(out, "\r\n")
+    }
+    out = push_str(out, "--" + MP_BOUNDARY + "--\r\n")
+    return RenderedBody{ctype: "multipart/form-data; boundary=" + MP_BOUNDARY, data: out}, nil
+}
+
+// basename returns the final path segment — multipart filenames
+// default to the file's base name when none is given.
+fn basename(p: str) -> str {
+    i := len(p)
+    for i > 0 {
+        if byteat(p, i - 1) == 47 || byteat(p, i - 1) == 92 {
+            return substr(p, i, len(p))
+        }
+        i = i - 1
+    }
+    return p
+}
+
+// render_file reads a whole-file body from disk.
+fn render_file(v: model.Body.FileBody) -> [RenderedBody, err] {
+    if !os.exists(v.path) {
+        return RenderedBody{ctype: "", data: nil}, errors.new("http: cannot read file body: " + v.path)
+    }
+    return RenderedBody{ctype: v.ctype, data: os.readfile_(v.path) as []byte}, nil
+}
+
+// push_str appends a str to a byte slice — the byte-level body
+// assembler (file bytes are opaque, so str concat can't carry them).
+fn push_str(b: []byte, s: str) -> []byte {
+    sb := s as []byte
+    i := 0
+    for i < len(sb) {
+        b = push(b, sb[i])
+        i = i + 1
+    }
+    return b
+}
+
+// serialize_head builds the request head: request line, Host first,
+// caller headers in order (Host among them wins and is not
+// duplicated), then synthesized defaults for absent
+// Accept-Encoding/Connection/Content-Length.
+fn serialize_head(h: OutHead) -> str {
+    host := h.host
+    if hdr_has(h.hdrs, "host") {
+        host = hdr_get(h.hdrs, "host")
+    }
+    out := h.method + " " + h.uri + " HTTP/1.1\r\nHost: " + host + "\r\n"
+    i := 0
+    for i < len(h.hdrs) {
+        hd := h.hdrs[i]
+        i = i + 1
+        if lwr(hd.name) == "host" {
+            continue
+        }
+        out = out + hd.name + ": " + hd.value + "\r\n"
+    }
+    if !hdr_has(h.hdrs, "accept-encoding") {
+        out = out + "Accept-Encoding: gzip, deflate\r\n"
+    }
+    if !hdr_has(h.hdrs, "connection") {
+        out = out + "Connection: close\r\n"
+    }
+    if h.has_body && !hdr_has(h.hdrs, "content-length") {
+        out = out + "Content-Length: " + itoa(h.body_len) + "\r\n"
+    }
+    return out + "\r\n"
+}
+
+// read_head consumes status line + header block through the blank
+// line and returns the raw head text.
+fn read_head(r: mut bufio.Reader) -> [str, err] {
+    head := ""
+    for true {
+        [line, e] = r.readline()
+        head = head + line
+        if len(head) > HEAD_MAX {
+            return "", errors.new("http: response head exceeds 64KiB")
+        }
+        if e != nil {
+            if e == io.eof() {
+                return "", errors.new("http: response never completed headers")
+            }
+            return "", e
+        }
+        if len(chomp(line)) == 0 {
+            return head, nil
+        }
+    }
+    return "", nil
+}
+
+// parse_head parses a raw head into status/reason/ordered headers.
+// Bare-LF lines are tolerated alongside CRLF (Go's parser does the
+// same); header names may not be empty or carry whitespace.
+fn parse_head(head: str) -> [Head, err] {
+    bad := Head{status: 0, reason: "", headers: nil}
+    eol := find(head, "\n")
+    if eol < 0 {
+        return bad, errors.new("http: malformed status line")
+    }
+    line := chomp(substr(head, 0, eol + 1))
+    if len(line) < 5 || substr(line, 0, 5) != "HTTP/" {
+        return bad, errors.new("http: malformed status line: " + line)
+    }
+    sp := find(line, " ")
+    if sp < 0 {
+        return bad, errors.new("http: malformed status line: " + line)
+    }
+    rest := substr(line, sp + 1, len(line))
+    sp2 := find(rest, " ")
+    codetok := rest
+    reason := ""
+    if sp2 >= 0 {
+        codetok = substr(rest, 0, sp2)
+        reason = substr(rest, sp2 + 1, len(rest))
+    }
+    [code, ce] = strconv.atoi(codetok)
+    if ce != nil || code < 100 || code > 999 {
+        return bad, errors.new("http: malformed status line: " + line)
+    }
+    let hs: []model.Header = nil
+    pos := eol + 1
+    for pos < len(head) {
+        le := find(substr(head, pos, len(head)), "\n")
+        if le < 0 {
+            // unterminated tail — clamp instead of slicing past the end
+            le = len(head) - pos - 1
+        }
+        hline := chomp(substr(head, pos, pos + le + 1))
+        pos = pos + le + 1
+        if len(hline) == 0 {
+            break
+        }
+        c := find(hline, ":")
+        if c <= 0 {
+            return bad, errors.new("http: malformed response header: " + hline)
+        }
+        name := substr(hline, 0, c)
+        if find(name, " ") >= 0 || find(name, "\t") >= 0 {
+            return bad, errors.new("http: malformed response header: " + hline)
+        }
+        hs = push(hs, model.Header{name: name, value: trim_ows(substr(hline, c + 1, len(hline)))})
+    }
+    return Head{status: code, reason: reason, headers: hs}, nil
+}
+
+// content_length returns the response Content-Length: -1 absent,
+// >=0 the length; conflicting or malformed values are errors
+// (smuggling guard, same rule the std server applies).
+fn content_length(hs: []model.Header) -> [int, err] {
+    v := -1
+    i := 0
+    for i < len(hs) {
+        if lwr(hs[i].name) != "content-length" {
+            i = i + 1
+            continue
+        }
+        t := trim_ows(hs[i].value)
+        if len(t) == 0 {
+            return -1, errors.new("http: empty content-length")
+        }
+        [n, e] = strconv.atoi(t)
+        if e != nil || n < 0 {
+            return -1, errors.new("http: bad content-length " + t)
+        }
+        if v >= 0 && n != v {
+            return -1, errors.new("http: conflicting content-length")
+        }
+        v = n
+        i = i + 1
+    }
+    return v, nil
+}
+
+// read_exact reads exactly n bytes or fails (short read = truncation).
+fn read_exact(r: mut bufio.Reader, n: int) -> [[]byte, err] {
+    out := mkslice(byte, n)
+    got := 0
+    for got < n {
+        [m, e] = r.read(out[got:n])
+        if m > 0 {
+            got = got + m
+        }
+        if e == io.eof() {
+            return nil, errors.new("http: response truncated: content-length " + itoa(n) + ", got " + itoa(got))
+        }
+        if e != nil {
+            return nil, e
+        }
+    }
+    return out, nil
+}
+
+// read_eof drains the reader until io.eof() — the HTTP/1.0 and
+// connection-close body framing.
+fn read_eof(r: mut bufio.Reader) -> [[]byte, err] {
+    out := mkslice(byte, 0)
+    scratch := mkslice(byte, 8192)
+    dry := 0
+    for true {
+        [n, e] = r.read(scratch)
+        if n > 0 {
+            i := 0
+            for i < n {
+                out = push(out, scratch[i])
+                i = i + 1
+            }
+        }
+        if e == io.eof() {
+            return out, nil
+        }
+        if e != nil {
+            return nil, e
+        }
+        if n <= 0 {
+            dry = dry + 1
+            if dry >= 100 {
+                return nil, errors.new("http: no progress reading body")
+            }
+        }
+    }
+    return out, nil
+}
+
+// read_chunked decodes a chunked body, returning data + trailer
+// fields in wire order. Chunk extensions are ignored; a missing
+// CRLF or truncated stream is a hard error.
+fn read_chunked(r: mut bufio.Reader) -> [ChunkedBody, err] {
+    cb := ChunkedBody{data: mkslice(byte, 0), trailers: nil}
+    for true {
+        [line, e] = r.readline()
+        if e != nil {
+            return cb, errors.new("http: truncated chunk size")
+        }
+        szs := chomp(line)
+        semi := find(szs, ";")
+        if semi >= 0 {
+            szs = substr(szs, 0, semi)
+        }
+        szs = trim_ows(szs)
+        if len(szs) == 0 || len(szs) > 16 {
+            return cb, errors.new("http: bad chunk size " + szs)
+        }
+        [sz, se] = strconv.parseint(szs, 16)
+        if se != nil || sz < 0 {
+            return cb, errors.new("http: bad chunk size " + szs)
+        }
+        if sz == 0 {
+            for true {
+                [tl, te] = r.readline()
+                if te != nil {
+                    return cb, errors.new("http: truncated trailer")
+                }
+                t := chomp(tl)
+                if len(t) == 0 {
+                    return cb, nil
+                }
+                c := find(t, ":")
+                if c <= 0 {
+                    return cb, errors.new("http: malformed trailer line")
+                }
+                cb.trailers = push(cb.trailers, model.Header{name: substr(t, 0, c), value: trim_ows(substr(t, c + 1, len(t)))})
+            }
+        }
+        [d, de] = read_exact(r, sz)
+        if de != nil {
+            return cb, errors.new("http: truncated chunk data")
+        }
+        i := 0
+        for i < len(d) {
+            cb.data = push(cb.data, d[i])
+            i = i + 1
+        }
+        [nl, ne] = read_exact(r, 2)
+        if ne != nil || byteat(nl as str, 0) != 13 || byteat(nl as str, 1) != 10 {
+            return cb, errors.new("http: missing CRLF after chunk")
+        }
+    }
+    return cb, nil
+}
+
+// decode_body applies content-encoding: identity/""/gzip/x-gzip/
+// deflate (zlib then raw flate)/x-compress; anything else is an
+// explicit unsupported-encoding error. An empty body skips decode
+// entirely — a HEAD reply may advertise an encoding it never sent.
+fn decode_body(raw: []byte, ce: str) -> [own []byte, err] {
+    if len(raw) == 0 {
+        return new(mkslice(byte, 0)), nil
+    }
+    enc := lwr(trim_ows(ce))
+    if enc == "" || enc == "identity" {
+        return new(raw), nil
+    }
+    if enc == "gzip" || enc == "x-gzip" {
+        return gzip.decompress(raw)
+    }
+    if enc == "deflate" || enc == "x-compress" {
+        [d, e] = zlib.decompress(raw)
+        if e == nil {
+            return d, nil
+        }
+        return flate.inflate(raw)
+    }
+    return nil, errors.new("http: unsupported content-encoding \"" + enc + "\"")
+}
+
+// is_redirect reports whether status is one of the five codes the
+// follow loop chases (301/302/303/307/308).
+fn is_redirect(status: int) -> bool {
+    return status == 301 || status == 302 || status == 303 || status == 307 || status == 308
+}
+
+// redirect_headers returns a fresh header list with the redirect
+// strips applied: signature pair always; the five auth-ish headers
+// on cross-origin hops; content-* when the method rewrite dropped
+// the body.
+fn redirect_headers(hs: []model.Header, cross: bool, drop_body: bool) -> []model.Header {
+    let out: []model.Header = nil
+    i := 0
+    for i < len(hs) {
+        n := lwr(hs[i].name)
+        keep := true
+        if n == "signature" || n == "signature-input" {
+            keep = false
+        }
+        if keep && cross {
+            if n == "authorization" || n == "cookie" || n == "cookie2" || n == "proxy-authorization" || n == "www-authenticate" {
+                keep = false
+            }
+        }
+        if keep && drop_body && len(n) >= 8 && substr(n, 0, 8) == "content-" {
+            keep = false
+        }
+        if keep {
+            out = push(out, hs[i])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// resolve_location resolves a Location value against base; invalid
+// targets surface the corpus-shaped "Redirect to invalid URL".
+fn resolve_location(base: ref url.URL, loc: str) -> [own url.URL, err] {
+    [r, e] = url.parse(loc)
+    if e != nil {
+        return nil, errors.new("http: Redirect to invalid URL: " + loc)
+    }
+    return url.resolve_reference(base, r), nil
+}
+
+// eff_port is the port a URL implies — explicit or the scheme's
+// default (80/443) for origin comparison.
+fn eff_port(u: ref url.URL) -> int {
+    p := u.port()
+    if len(p) > 0 {
+        [n, _e] = strconv.atoi(p)
+        return n
+    }
+    if lwr(u.scheme) == "https" {
+        return 443
+    }
+    return 80
+}
+
+// same_origin compares scheme + hostname + effective port.
+fn same_origin(a: ref url.URL, b: ref url.URL) -> bool {
+    return lwr(a.scheme) == lwr(b.scheme) && lwr(a.hostname()) == lwr(b.hostname()) && eff_port(a) == eff_port(b)
+}

@@ -1,0 +1,161 @@
+package http
+
+// Scripted fixture server for the live-transport matrix. A plain
+// net.Listener accepts connections serially; each connection's raw
+// request (head + Content-Length body) is captured, then the i-th
+// script entry is written back. Script tokens: "<ECHO>" synthesizes
+// a 200 response whose body IS the captured request (correct
+// Content-Length computed here) — request-side assertions read the
+// echo; "<SLEEP:n>" prefix delays the reply n ms (timeout coverage).
+// std/net/http serve() can't emit chunked, trailer, or redirect
+// responses, hence the hand-rolled socket loop
+// (context/references/std-net-transport-surface.md).
+import "std/net"
+
+import "std/strconv"
+
+import "std/testing"
+
+// Fx is a running fixture: the listener, its port, and a hit counter.
+struct Fx {
+    l: net.Listener,
+    port: int,
+    hits: shared,
+}
+
+// fx_start binds an ephemeral port and serves len(script)
+// connections serially, then closes the listener. The loop runs
+// detached; tests call fx_stop (accept also self-limits to 30s).
+fn fx_start(script: []str) -> own Fx {
+    [l, e] = net.listen(0)
+    testing.expect(e == nil, "fx listen")
+    f := new(Fx)
+    f.l = l
+    f.port = l.port()
+    f.hits = mkshared(0)
+    spawnBlocking fx_serve(l, new(script), f.hits)
+    return f
+}
+
+fn (f ref Fx) url() -> str {
+    return "http://127.0.0.1:" + itoa(f.port)
+}
+
+fn (f mut Fx) stop() {
+    f.l.close()
+}
+
+fn fx_serve(l: net.Listener, script: own []str, hits: shared) {
+    set_rcvtimo(l.rawfd(), 30) // a dead client can't hang the test
+    i := 0
+    for i < len(script) {
+        [c, e] = l.accept()
+        if e != nil {
+            l.close()
+            return
+        }
+        fx_conn(c, script[i], hits)
+        i = i + 1
+    }
+    l.close()
+}
+
+// fx_conn captures the request, then writes the scripted response.
+fn fx_conn(c: net.Conn, resp: str, hits: shared) {
+    defer c.close()
+    set_rcvtimo(c.rawfd(), 20)
+    req := fx_read_req(c)
+    sadd(hits, 1)
+    delay := 0
+    if len(resp) >= 7 && substr(resp, 0, 7) == "<SLEEP:" {
+        end := find(resp, ">")
+        [ms, _e] = strconv.atoi(substr(resp, 7, end))
+        delay = ms
+        resp = substr(resp, end + 1, len(resp))
+    }
+    if resp == "<ECHO>" {
+        resp = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: " + itoa(len(req)) + "\r\nConnection: close\r\n\r\n" + req
+    }
+    if delay > 0 {
+        msleep(delay)
+    }
+    fx_write_all(c, resp as []byte)
+}
+
+// fx_read_req accumulates a request head through \r\n\r\n, then
+// drains the Content-Length body, returning head+body verbatim.
+fn fx_read_req(c: net.Conn) -> str {
+    req := ""
+    scratch := mkslice(byte, 4096)
+    for find(req, "\r\n\r\n") < 0 {
+        [n, e] = c.read(scratch)
+        if n > 0 {
+            req = req + scratch[0:n] as str
+        }
+        if e != nil || n <= 0 {
+            return req
+        }
+        if len(req) > 65536 {
+            return req
+        }
+    }
+    he := find(req, "\r\n\r\n")
+    cl := fx_req_len(req, he)
+    have := len(req) - (he + 4)
+    for have < cl {
+        [n, e] = c.read(scratch)
+        if n > 0 {
+            req = req + scratch[0:n] as str
+            have = have + n
+        }
+        if e != nil || n <= 0 {
+            return req
+        }
+    }
+    return req
+}
+
+// fx_req_len extracts Content-Length from a request head (0 absent).
+fn fx_req_len(req: str, he: int) -> int {
+    low := fx_lwr(substr(req, 0, he))
+    i := find(low, "\r\ncontent-length:")
+    if i < 0 {
+        return 0
+    }
+    j := i + 17
+    for j < len(low) && (byteat(low, j) == 32 || byteat(low, j) == 9) {
+        j = j + 1
+    }
+    n := 0
+    for j < len(low) && byteat(low, j) >= 48 && byteat(low, j) <= 57 {
+        n = n * 10 + (byteat(low, j) - 48)
+        j = j + 1
+    }
+    return n
+}
+
+fn fx_lwr(s: str) -> str {
+    b := s as []byte
+    out := mkslice(byte, len(s))
+    i := 0
+    for i < len(s) {
+        c := b[i]
+        if c >= 65 && c <= 90 {
+            c = c + 32
+        }
+        out[i] = c
+        i = i + 1
+    }
+    return out as str
+}
+
+fn fx_write_all(c: net.Conn, b: []byte) {
+    off := 0
+    for off < len(b) {
+        [n, e] = c.write(b[off:])
+        if e != nil || n <= 0 {
+            return
+        }
+        off = off + n
+    }
+}

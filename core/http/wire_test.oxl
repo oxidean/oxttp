@@ -1,0 +1,352 @@
+package http
+
+// Wire-helper unit matrix — pure functions on bufio-over-Buffer
+// readers; no sockets. Covers spec AC3: serialization, head parse,
+// content-length rules, chunk decode, body readers, content-encoding.
+import "std/bufio"
+
+import "std/bytes"
+
+import "std/os"
+
+import "std/errors"
+
+import "std/testing"
+
+import "std/encoding/json"
+
+import "github.com/oxidean/oxttp/core/model"
+
+// reader over a string — the no-socket io.Reader every case uses.
+fn sreader(s: str) -> own bufio.Reader {
+    // the Buffer must outlive the returned reader — asreader boxes a
+    // borrow, so a value local would dangle after return
+    b := new(bytes.newbuffer())
+    [_w, _e] = b.write(s as []byte)
+    return new(bufio.newreadersize(b.asreader(), 8192))
+}
+
+fn test_lwr() {
+    testing.expect_streq(lwr("AbC-XyZ"), "abc-xyz", "lwr folds")
+    testing.expect_streq(lwr("already"), "already", "lwr identity")
+    testing.expect_streq(lwr("A1!"), "a1!", "lwr non-alpha")
+}
+
+fn test_hdr_get_has() {
+    let hs: []model.Header = nil
+    hs = push(hs, model.Header{name: "Content-Type", value: "text/plain"})
+    hs = push(hs, model.Header{name: "x-a", value: "1"})
+    hs = push(hs, model.Header{name: "X-A", value: "2"})
+    testing.expect_streq(hdr_get(hs, "content-type"), "text/plain", "case-insensitive hit")
+    testing.expect_streq(hdr_get(hs, "X-A"), "1", "first of duplicates")
+    testing.expect_streq(hdr_get(hs, "missing"), "", "absent empty")
+    testing.expect(hdr_has(hs, "x-a"), "hdr_has hit")
+    testing.expect(!hdr_has(hs, "x-b"), "hdr_has miss")
+}
+
+fn test_render_body_raw_json() {
+    [rb, e] = render_body(model.Body.Raw{ctype: "text/plain", text: "hi"})
+    testing.expect(e == nil, "raw render")
+    testing.expect_streq(rb.ctype, "text/plain", "raw ctype")
+    testing.expect_streq(rb.data as str, "hi", "raw bytes")
+
+    [rj, ej] = render_body(model.Body.Json{j: json.jparse("{\"a\":1}")})
+    testing.expect(ej == nil, "json render")
+    testing.expect_streq(rj.ctype, "application/json", "json ctype")
+    testing.expect_streq(rj.data as str, "{\"a\":1}", "json bytes")
+
+    [re, ee] = render_body(model.Body.Empty)
+    testing.expect(ee == nil, "empty render")
+    testing.expect_eq(len(re.data), 0, "empty bytes")
+}
+
+fn test_render_body_form_multipart() {
+    let fsv: []model.KV = nil
+    fsv = push(fsv, model.KV{name: "a b", value: "x&y", enabled: true})
+    fsv = push(fsv, model.KV{name: "off", value: "no", enabled: false})
+    fsv = push(fsv, model.KV{name: "c", value: "3", enabled: true})
+    fs := new(fsv)
+    [rf, e] = render_body(model.Body.Form{fields: fs})
+    testing.expect(e == nil, "form render")
+    testing.expect_streq(rf.ctype, "application/x-www-form-urlencoded", "form ctype")
+    testing.expect_streq(rf.data as str, "a+b=x%26y&c=3", "form escaped, disabled skipped")
+
+    let psv: []model.Part = nil
+    psv = push(psv, model.Part{name: "f1", value: "v1", file: "", filename: "", content_type: "", enabled: true, is_file: false})
+    psv = push(psv, model.Part{name: "skip", value: "x", file: "", filename: "", content_type: "", enabled: false, is_file: false})
+    ps := new(psv)
+    [rm, em] = render_body(model.Body.Multipart{parts: ps})
+    testing.expect(em == nil, "multipart render")
+    testing.expect(strings_has(rm.ctype, "multipart/form-data; boundary="), "multipart ctype")
+    body := rm.data as str
+    // boundary consistent between ctype and body
+    bnd := rm.ctype
+    bi := find(bnd, "boundary=")
+    bnd = substr(bnd, bi + 9, len(bnd))
+    testing.expect(len(bnd) > 8, "boundary nonempty")
+    testing.expect(find(body, "--" + bnd) >= 0, "boundary in body")
+    testing.expect(find(body, "Content-Disposition: form-data; name=\"f1\"") >= 0, "part disposition")
+    testing.expect(find(body, "\r\n\r\nv1\r\n") >= 0, "part value")
+    testing.expect(find(body, "skip") < 0, "disabled part skipped")
+    testing.expect(strings_ends(body, "--" + bnd + "--\r\n"), "closing boundary")
+}
+
+fn test_render_body_file() {
+    p := os.temp_dir() + "/oxttp-wire-body.txt"
+    we := os.writefile_(p, "file-body-bytes")
+    testing.expect_eq(we, 0, "fixture write")
+    [rf, e] = render_body(model.Body.FileBody{path: p, ctype: "text/plain", filename: "x.txt"})
+    testing.expect(e == nil, "filebody render")
+    testing.expect_streq(rf.ctype, "text/plain", "filebody ctype")
+    testing.expect_streq(rf.data as str, "file-body-bytes", "filebody bytes")
+    [_r, e2] = render_body(model.Body.FileBody{path: p + ".missing", ctype: "text/plain", filename: "x"})
+    testing.expect(e2 != nil, "missing file errors")
+    de := os.remove(p)
+    testing.expect(de == nil, "fixture cleanup")
+}
+
+fn test_serialize_head() {
+    let hs: []model.Header = nil
+    hs = push(hs, model.Header{name: "X-Custom", value: "v"})
+    hs = push(hs, model.Header{name: "Accept", value: "*/*"})
+    h := OutHead{method: "GET", uri: "/p?q=1", host: "ex.com", hdrs: hs, body_len: 0, has_body: false}
+    out := serialize_head(h)
+    exp := "GET /p?q=1 HTTP/1.1\r\nHost: ex.com\r\nX-Custom: v\r\nAccept: */*\r\nAccept-Encoding: gzip, deflate\r\nConnection: close\r\n\r\n"
+    testing.expect_streq(out, exp, "GET head exact")
+
+    hb := OutHead{method: "POST", uri: "/", host: "h:8080", hdrs: nil, body_len: 4, has_body: true}
+    ob := serialize_head(hb)
+    testing.expect(find(ob, "Content-Length: 4\r\n") >= 0, "CL synthesized")
+    testing.expect(strings_ends(ob, "\r\n\r\n"), "head terminated")
+
+    // caller-supplied defaults win and are not duplicated
+    let hc: []model.Header = nil
+    hc = push(hc, model.Header{name: "Accept-Encoding", value: "identity"})
+    hc = push(hc, model.Header{name: "Connection", value: "keep-alive"})
+    hc = push(hc, model.Header{name: "Content-Length", value: "9"})
+    hc = push(hc, model.Header{name: "Host", value: "override.example"})
+    o2 := serialize_head(OutHead{method: "POST", uri: "/x", host: "h", hdrs: hc, body_len: 9, has_body: true})
+    testing.expect(find(o2, "Host: override.example\r\n") >= 0, "caller host wins")
+    testing.expect_eq(count_str(o2, "Host:"), 1, "host not duplicated")
+    testing.expect_eq(count_str(o2, "Accept-Encoding:"), 1, "ae not duplicated")
+    testing.expect(find(o2, "Accept-Encoding: identity\r\n") >= 0, "caller ae wins")
+    testing.expect(find(o2, "Connection: keep-alive\r\n") >= 0, "caller conn wins")
+    testing.expect_eq(count_str(o2, "Content-Length:"), 1, "cl not duplicated")
+}
+
+fn test_read_parse_head() {
+    r := sreader("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nX-A: 1\r\nX-A: 2\r\n\r\nbody")
+    [raw, e] = read_head(r)
+    testing.expect(e == nil, "read_head clean")
+    [h, pe] = parse_head(raw)
+    testing.expect(pe == nil, "parse_head clean")
+    testing.expect_eq(h.status, 200, "status")
+    testing.expect_streq(h.reason, "OK", "reason")
+    testing.expect_eq(len(h.headers), 3, "3 headers")
+    testing.expect_streq(h.headers[1].name, "X-A", "dup order kept")
+    testing.expect_streq(h.headers[2].value, "2", "dup value")
+
+    // trailing body byte stays in the reader for the body phase
+    rest := mkslice(byte, 4)
+    [n, re] = r.read(rest)
+    testing.expect(re == nil && n == 4, "body untouched")
+    testing.expect_streq(rest as str, "body", "unconsumed body")
+}
+
+fn test_parse_head_variants() {
+    [h1, e1] = parse_head("HTTP/1.0 404 Not Found\r\n\r\n")
+    testing.expect(e1 == nil && h1.status == 404, "http/1.0")
+    testing.expect_streq(h1.reason, "Not Found", "two-word reason")
+
+    [h2, e2] = parse_head("HTTP/1.1 204\r\n\r\n")
+    testing.expect(e2 == nil && h2.status == 204, "no reason")
+    testing.expect_streq(h2.reason, "", "empty reason")
+
+    [h3, e3] = parse_head("HTTP/1.1 200 OK\nX-A: 1\n\n")
+    testing.expect(e3 == nil && h3.status == 200, "LF-only tolerated")
+    testing.expect_eq(len(h3.headers), 1, "lf headers")
+
+    [_b1, be1] = parse_head("garbage\r\n\r\n")
+    testing.expect(be1 != nil, "bad status line errors")
+    [_b2, be2] = parse_head("HTTP/1.1 200 OK\r\nNoColon\r\n\r\n")
+    testing.expect(be2 != nil, "colonless header errors")
+}
+
+fn test_content_length() {
+    let hs: []model.Header = nil
+    hs = push(hs, model.Header{name: "Content-Length", value: "42"})
+    [n, e] = content_length(hs)
+    testing.expect(e == nil && n == 42, "simple cl")
+
+    [n2, e2] = content_length(nil)
+    testing.expect(e2 == nil && n2 == -1, "absent -1")
+
+    let hs2: []model.Header = nil
+    hs2 = push(hs2, model.Header{name: "content-length", value: "5"})
+    hs2 = push(hs2, model.Header{name: "Content-Length", value: " 5 "})
+    [n3, e3] = content_length(hs2)
+    testing.expect(e3 == nil && n3 == 5, "agreeing dupes ok")
+
+    let hs3: []model.Header = nil
+    hs3 = push(hs3, model.Header{name: "Content-Length", value: "5"})
+    hs3 = push(hs3, model.Header{name: "Content-Length", value: "6"})
+    [_n4, e4] = content_length(hs3)
+    testing.expect(e4 != nil, "conflict errors")
+
+    let hs4: []model.Header = nil
+    hs4 = push(hs4, model.Header{name: "Content-Length", value: "12x"})
+    [_n5, e5] = content_length(hs4)
+    testing.expect(e5 != nil, "malformed errors")
+}
+
+fn test_read_exact_eof() {
+    r := sreader("0123456789")
+    [b1, e1] = read_exact(r, 4)
+    testing.expect(e1 == nil && len(b1) == 4, "exact read")
+    testing.expect_streq(b1 as str, "0123", "exact bytes")
+
+    [_b2, e2] = read_exact(r, 100)
+    testing.expect(e2 != nil, "short read errors")
+
+    r2 := sreader("all of it")
+    [b3, e3] = read_eof(r2)
+    testing.expect(e3 == nil, "eof read clean")
+    testing.expect_streq(b3 as str, "all of it", "eof bytes")
+}
+
+fn test_read_chunked() {
+    wire := "4\r\nWiki\r\n6;ext=1\r\npedia \r\n4\r\n\r\nin\r\n0\r\nX-T1: a\r\nX-T2: b\r\n\r\n"
+    r := sreader(wire)
+    [cb, e] = read_chunked(r)
+    testing.expect(e == nil, "chunk decode clean")
+    testing.expect_streq(cb.data as str, "Wikipedia \r\nin", "chunk data incl ;ext skip")
+    testing.expect_eq(len(cb.trailers), 2, "two trailers")
+    testing.expect_streq(cb.trailers[0].name, "X-T1", "trailer order")
+
+    // empty trailer section
+    r2 := sreader("1\r\nx\r\n0\r\n\r\n")
+    [cb2, e2] = read_chunked(r2)
+    testing.expect(e2 == nil && cb2.data as str == "x", "no trailers")
+    testing.expect_eq(len(cb2.trailers), 0, "empty trailer list")
+
+    [_c1, be1] = read_chunked(sreader("zz\r\nx\r\n0\r\n\r\n"))
+    testing.expect(be1 != nil, "bad chunk size errors")
+    [_c2, be2] = read_chunked(sreader("4\r\nWi"))
+    testing.expect(be2 != nil, "truncated chunk errors")
+    [_c3, be3] = read_chunked(sreader("1\r\nxXX0\r\n\r\n"))
+    testing.expect(be3 != nil, "missing chunk CRLF errors")
+    [_c4, be4] = read_chunked(sreader("0\r\nTrailer: no-end"))
+    testing.expect(be4 != nil, "truncated trailer errors")
+}
+
+fn test_decode_body() {
+    // python: gzip.compress(b"hello oxttp", mtime=0)
+    gz := "1f8b08000000000002ffcb48cdc9c957c8af28292900007692580c0b000000"
+    [d1, e1] = decode_body(hx_b(gz) as []byte, "gzip")
+    testing.expect(e1 == nil, "gzip decodes")
+    testing.expect_streq(d1 as str, "hello oxttp", "gzip bytes")
+    [d1b, e1b] = decode_body(hx_b(gz) as []byte, "x-gzip")
+    testing.expect(e1b == nil && d1b as str == "hello oxttp", "x-gzip alias")
+
+    // python: zlib.compress(b"deflate me") and raw-flate equivalent
+    zl := "789c4b494dcb492c4955c84d0500156003c8"
+    [d2, e2] = decode_body(hx_b(zl) as []byte, "deflate")
+    testing.expect(e2 == nil, "zlib-wrapped deflate")
+    testing.expect_streq(d2 as str, "deflate me", "deflate bytes")
+    fl := "4b494dcb492c4955c84d0500"
+    [d3, e3] = decode_body(hx_b(fl) as []byte, "deflate")
+    testing.expect(e3 == nil && d3 as str == "deflate me", "raw flate fallback")
+    [d4, e4] = decode_body(hx_b(fl) as []byte, "x-compress")
+    testing.expect(e4 == nil && d4 as str == "deflate me", "x-compress alias")
+
+    [d5, e5] = decode_body("plain" as []byte, "identity")
+    testing.expect(e5 == nil && d5 as str == "plain", "identity passthrough")
+    [d6, e6] = decode_body("plain" as []byte, "")
+    testing.expect(e6 == nil && d6 as str == "plain", "absent passthrough")
+
+    [_d7, e7] = decode_body("whatever" as []byte, "br")
+    testing.expect(e7 != nil, "br unsupported errors")
+    testing.expect(find(errors.msg(e7), "br") >= 0, "error names encoding")
+
+    // empty body with encoding tolerated (HEAD)
+    [d8, e8] = decode_body(mkslice(byte, 0), "gzip")
+    testing.expect(e8 == nil && len(d8) == 0, "empty tolerated")
+}
+
+fn test_redirect_helpers() {
+    testing.expect(is_redirect(301) && is_redirect(302) && is_redirect(303), "301-303")
+    testing.expect(is_redirect(307) && is_redirect(308), "307-308")
+    testing.expect(!is_redirect(300) && !is_redirect(304) && !is_redirect(200), "non-followed")
+
+    let hs: []model.Header = nil
+    hs = push(hs, model.Header{name: "Authorization", value: "Basic x"})
+    hs = push(hs, model.Header{name: "Cookie", value: "c"})
+    hs = push(hs, model.Header{name: "Content-Length", value: "5"})
+    hs = push(hs, model.Header{name: "Signature", value: "s"})
+    hs = push(hs, model.Header{name: "X-Keep", value: "k"})
+    hs = push(hs, model.Header{name: "Content-Type", value: "t"})
+
+    same := redirect_headers(hs, false, false)
+    testing.expect_eq(len(same), 5, "same-origin strips signature only")
+    testing.expect(!hdr_has(same, "signature"), "signature gone")
+    testing.expect(hdr_has(same, "authorization"), "auth kept same-origin")
+
+    cross := redirect_headers(hs, true, true)
+    testing.expect_eq(len(cross), 1, "cross+body-drop strips to X-Keep")
+    testing.expect_streq(cross[0].name, "X-Keep", "only X-Keep survives")
+}
+
+// count_str counts needle occurrences in s.
+fn count_str(s: str, needle: str) -> int {
+    n := 0
+    pos := 0
+    for pos + len(needle) <= len(s) {
+        i := find(substr(s, pos, len(s)), needle)
+        if i < 0 {
+            return n
+        }
+        n = n + 1
+        pos = pos + i + 1
+    }
+    return n
+}
+
+fn strings_has(s: str, sub: str) -> bool {
+    return find(s, sub) >= 0
+}
+
+fn strings_ends(s: str, suf: str) -> bool {
+    if len(suf) > len(s) {
+        return false
+    }
+    return substr(s, len(s) - len(suf), len(s)) == suf
+}
+
+// hx decodes a hex string to bytes (fixture helper — std/encoding/hex
+// returns own []byte; tests want str for sreader).
+fn hx(s: str) -> str {
+    out := mkslice(byte, len(s) / 2)
+    i := 0
+    for i < len(out) {
+        out[i] = hexv(byteat(s, i * 2)) * 16 + hexv(byteat(s, i * 2 + 1))
+        i = i + 1
+    }
+    return out as str
+}
+
+fn hx_b(s: str) -> str {
+    return hx(s)
+}
+
+fn hexv(c: int) -> int {
+    if c >= 48 && c <= 57 {
+        return c - 48
+    }
+    if c >= 97 && c <= 102 {
+        return c - 87
+    }
+    if c >= 65 && c <= 70 {
+        return c - 55
+    }
+    return -1
+}

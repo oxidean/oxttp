@@ -1,6 +1,6 @@
 # WI-0003 spec - S2: core domain model + request-item grammar
 
-Upstream: plan.md S2, WI-0001 spec, ADRs 0002/0003/0005/0010/0012.
+Upstream: plan.md S2, WI-0001 spec, ADRs 0002/0003/0005/0010/0016.
 Corpus: `docs/corpus/corpus-xh.md` §2-4 + §4.4, `docs/corpus/corpus-posting.md`
 §5.2 + §3-4; source-verified algorithm in
 `context/references/xh-request-item-grammar.md`.
@@ -13,7 +13,7 @@ OUT: any IO (no file/socket/terminal), request-item→body assembly (S6),
 nested-JSON key paths (S6), method/URL positional handling (S4/S5),
 h1 transport implementation (S3 - port only), posting.yaml load/save (S10).
 
-## Packages (ADR-0012)
+## Packages (ADR-0016)
 
 ### `core/model` - transport-agnostic domain
 
