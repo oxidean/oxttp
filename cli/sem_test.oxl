@@ -93,7 +93,7 @@ fn test_relations() {
     testing.expect_streq(o3.intent.auth_type, "bearer", "bearer sets type")
     testing.expect_streq(o3.intent.auth, "tok", "bearer sets auth")
     o4 := r("--https\nexample.org")
-    deferr(o4, "https URLs are unsupported in this build (TLS is not available)")
+    testing.expect_eq(o4.code, 0, "https intent ready")
     testing.expect(o4.intent.https == 1, "https flag")
     testing.expect_streq(o4.intent.url, "https://example.org/", "https url")
     o5 := r("-d\nexample.org")
@@ -266,7 +266,7 @@ fn test_construct_url() {
     o4 := r("http://h:99999/")
     diag(o4, "Invalid <URL>: invalid port number")
     o5 := r("https://example.org")
-    deferr(o5, "https URLs are unsupported in this build (TLS is not available)")
+    testing.expect_eq(o5.code, 0, "https url ready")
 }
 
 fn test_deferrals() {

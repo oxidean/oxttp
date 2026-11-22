@@ -17,8 +17,8 @@ Updated: 2026-11-22 · pin oxl 0.23.2
 | §4.3 Download/output | `next` | S7 |
 | §4.4 Sessions | `next` | S7 (types exist) |
 | §4.5 Auth basic/bearer/digest | `next` | S7 |
-| §4.5 `https://` / `--https` / `--verify=yes\|pem` | `next` | HTTPS WI (IN-0005=B) |
-| §4.5 `--verify=no` | `next` | Accept-all Verifier (IN-0005=B) |
+| §4.5 `https://` / `--https` / `--verify=yes\|pem` | `next` | H1+tls.client landed; PEM/env polish S7 |
+| §4.5 `--verify=no` | `done` | AcceptAll Verifier (IN-0005=B) |
 | §4.5 `--cert` / `--cert-key` | `oxl-blocked` | [#221](https://github.com/oxidean/oxl/issues/221) |
 | §4.5 `--ssl` <1.3 / `--native-tls` | `oxl-blocked` | [#224](https://github.com/oxidean/oxl/issues/224) |
 | §4.5 HTTPS + `--proxy` CONNECT | `oxl-blocked` | [#222](https://github.com/oxidean/oxl/issues/222) |

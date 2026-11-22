@@ -1310,9 +1310,16 @@ fn resolve(m: own args.Matches, envpairs: []str) -> own Out {
         return o
     }
     scheme := url_scheme(o.intent.url)
-    if scheme != "http" {
-        // ADR-0015 pins the TLS deferral text for every non-http scheme.
+    if scheme != "http" && scheme != "https" {
+        // ADR-0015 TLS deferral retained for non-http(s); https execs via
+        // std/net/tls (ADR-0021).
         defer_out(o, prog, scheme + " URLs are unsupported in this build (TLS is not available)")
+        return o
+    }
+    // --native-tls is inert on cleartext (ADR-0024); on https it would
+    // select a different stack, so degrade rather than silent oxl TLS.
+    if o.intent.native_tls != 0 && scheme == "https" {
+        defer_out(o, prog, "--native-tls is unsupported in this build (oxidean/oxl#221)")
         return o
     }
     // S5 degrade routing (spec sem-G, ADR 0024): connection-affecting

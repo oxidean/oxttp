@@ -1,23 +1,31 @@
 package http
 
-// H1 is the S2 Transport port's HTTP/1.1 implementation on std/net
+// H1 is the Transport port's HTTP/1.1 implementation on std/net
 // sockets (decisions 0003/0014/0015/0016). Stateless: a zero value
 // is a complete client; v0.1 opens one connection per request and
-// closes it (Connection: close on the wire). TLS is out of scope —
-// https URLs are rejected with an explicit error rather than
-// silently downgraded (oxidean/oxl#128).
+// closes it (Connection: close on the wire). HTTPS dials TCP via the
+// non-suspending path then wraps with std/net/tls.client (oxidean/oxl
+// #128 shipped; mTLS/CONNECT/TLS1.2 still parked — #221/#222/#224).
 //
 // Concurrency note: Transport.send dispatches through a vtable —
 // "vtable calls carry no task frame", so send can never suspend.
 // std's dial path suspends (lookup_ipv4 parks on msleep), hence the
 // socket/DNS work below runs on the raw rt_* externs with usleep
 // backoff — blocking the calling thread, which is exactly right for
-// a sequential request/response exchange.
+// a sequential request/response exchange. TLS handshake uses the
+// already-connected socket (tls.client) so it does not call
+// net.dial_timeout.
 import "std/bufio"
 
 import "std/io"
 
 import "std/net"
+
+import "std/net/tls"
+
+import "std/crypto/x509"
+
+import "std/os"
 
 import "std/errors"
 
@@ -50,9 +58,7 @@ let lkp_pending = 4294967296
 // H1 implements Transport — one std/net socket per request.
 struct H1 { }
 
-// TmoReader wraps a Conn with a whole-request deadline: every read
-// re-arms SO_RCVTIMEO to the remaining budget, and an expired
-// deadline surfaces as a request timeout rather than a socket error.
+// TmoReader wraps a plain Conn with a whole-request deadline.
 struct TmoReader {
     c: net.Conn,
     deadline: int,
@@ -78,11 +84,37 @@ fn (t mut TmoReader) asreader() -> io.Reader {
     return t
 }
 
+// TmoTlsReader is TmoReader for a TLS conn (rawfd still works).
+struct TmoTlsReader {
+    c: tls.Conn,
+    deadline: int,
+    tmo: int,
+}
+
+fn (t mut TmoTlsReader) read(b: []byte) -> [int, err] {
+    if t.deadline > 0 {
+        rem := t.deadline - now_ms()
+        if rem <= 0 {
+            return 0, errors.new("http: request timed out after " + itoa(t.tmo) + "ms")
+        }
+        set_rcvtimo_ms(t.c.rawfd(), rem)
+    }
+    [n, e] = t.c.read(b)
+    if e != nil && e != io.eof() && t.deadline > 0 && now_ms() >= t.deadline {
+        return 0, errors.new("http: request timed out after " + itoa(t.tmo) + "ms")
+    }
+    return n, e
+}
+
+fn (t mut TmoTlsReader) asreader() -> io.Reader {
+    return t
+}
+
 // send satisfies Transport: one request (plus redirect hops when
 // req.follow) through roundtrip; the final Resp is returned.
 fn (t H1) send(req: ref model.Req) -> [model.Resp, err] {
     rt_sigpipe_ignore()
-    cur := new(model.Req{method: req.method, url: req.url, headers: req.headers, body: req.body, timeout_ms: req.timeout_ms, follow: req.follow, max_redirects: req.max_redirects, httpver: req.httpver, synth: req.synth})
+    cur := new(model.Req{method: req.method, url: req.url, headers: req.headers, body: req.body, timeout_ms: req.timeout_ms, follow: req.follow, max_redirects: req.max_redirects, httpver: req.httpver, synth: req.synth, verify: req.verify})
     hops := 0
     jar := "" // jar-lite: "n=v; n=v" accumulated across hops (ADR 0023)
     let hs: []model.Hop = nil
@@ -141,8 +173,9 @@ fn (t H1) send(req: ref model.Req) -> [model.Resp, err] {
         if ne != nil {
             return resp, ne
         }
-        if lwr(nu.scheme) != "http" {
-            return resp, errors.new("http: unsupported scheme \"" + nu.scheme + "\" (TLS is not supported in this build)")
+        sch := lwr(nu.scheme)
+        if sch != "http" && sch != "https" {
+            return resp, errors.new("http: unsupported scheme \"" + nu.scheme + "\"")
         }
         cross := !same_origin(bu, nu)
         drop := false
@@ -252,7 +285,11 @@ fn (t H1) roundtrip(req: ref model.Req, cap: mut model.Hop) -> [model.Resp, err]
     if find(host, ":") >= 0 {
         return bad, errors.new("http: IPv6 addresses not supported")
     }
+    https := lwr(u.scheme) == "https"
     port := 80
+    if https {
+        port = 443
+    }
     ps := u.port()
     if len(ps) > 0 {
         [p, pe] = strconv.atoi(ps)
@@ -293,37 +330,83 @@ fn (t H1) roundtrip(req: ref model.Req, cap: mut model.Hop) -> [model.Resp, err]
     if dtmo <= 0 {
         dtmo = 30000
     }
-    [conn, de] = dial_h1(host, port, dtmo)
+    [raw, de] = dial_h1(host, port, dtmo)
     if de != nil {
         return bad, de
     }
-    defer conn.close()
     tr.connect_ms = itof(now_ms() - c0)
-    // the send phase bounds itself: a peer that accepts but never
-    // reads can't hold the write open past the request budget.
-    if req.timeout_ms > 0 {
-        set_sndtimo(conn.rawfd(), (req.timeout_ms + 999) / 1000)
-    }
-    we := write_all(conn, head as []byte)
-    if we != nil {
-        return bad, we
-    }
-    tr.send_headers_ms = itof(now_ms() - c0)
-    if len(rb.data) > 0 {
-        we = write_all(conn, rb.data)
-        if we != nil {
-            return bad, we
-        }
-    }
-    tr.send_body_ms = itof(now_ms() - c0)
-    // response — every read re-arms the remaining budget through
-    // TmoReader so a silent peer can't stretch the deadline.
     deadline := 0
     if req.timeout_ms > 0 {
         deadline = t0 + req.timeout_ms
     }
-    trr := TmoReader{c: conn, deadline: deadline, tmo: req.timeout_ms}
+    // HTTPS: tls.client takes ownership of the TCP socket. Plain: keep
+    // raw for the whole exchange.
+    if https {
+        t0tls := now_ms()
+        // Remaining budget after TCP dial — tls.client_tmo bounds the
+        // handshake; plain tls.client hard-codes 30s and ignores us.
+        htmo := dtmo
+        if deadline > 0 {
+            htmo = deadline - now_ms()
+            if htmo <= 0 {
+                htmo = 1
+            }
+        }
+        [tc, te] = tls_wrap(raw, host, req.verify, htmo)
+        if te != nil {
+            return bad, te
+        }
+        tr.tls_ms = itof(now_ms() - t0tls)
+        if req.timeout_ms > 0 {
+            set_sndtimo(tc.rawfd(), (req.timeout_ms + 999) / 1000)
+        }
+        we := write_all_tls(tc, head as []byte)
+        if we != nil {
+            tc.close()
+            return bad, we
+        }
+        tr.send_headers_ms = itof(now_ms() - c0)
+        if len(rb.data) > 0 {
+            we = write_all_tls(tc, rb.data)
+            if we != nil {
+                tc.close()
+                return bad, we
+            }
+        }
+        tr.send_body_ms = itof(now_ms() - c0)
+        trr := TmoTlsReader{c: tc, deadline: deadline, tmo: req.timeout_ms}
+        br := new(bufio.newreadersize(trr.asreader(), 16384))
+        [resp, re] = finish_roundtrip(req, br, cap, host, port, t0, c0, tr, bad)
+        tc.close()
+        return resp, re
+    }
+    if req.timeout_ms > 0 {
+        set_sndtimo(raw.rawfd(), (req.timeout_ms + 999) / 1000)
+    }
+    we := write_all(raw, head as []byte)
+    if we != nil {
+        raw.close()
+        return bad, we
+    }
+    tr.send_headers_ms = itof(now_ms() - c0)
+    if len(rb.data) > 0 {
+        we = write_all(raw, rb.data)
+        if we != nil {
+            raw.close()
+            return bad, we
+        }
+    }
+    tr.send_body_ms = itof(now_ms() - c0)
+    trr := TmoReader{c: raw, deadline: deadline, tmo: req.timeout_ms}
     br := new(bufio.newreadersize(trr.asreader(), 16384))
+    [resp, re] = finish_roundtrip(req, br, cap, host, port, t0, c0, tr, bad)
+    raw.close()
+    return resp, re
+}
+
+// finish_roundtrip reads the HTTP response from br, fills hop cap, and
+// builds Resp (shared by cleartext and TLS paths).
+fn finish_roundtrip(req: ref model.Req, br: own bufio.Reader, cap: mut model.Hop, host: str, port: int, t0: int, c0: int, tr: own model.Trace, bad: model.Resp) -> [model.Resp, err] {
     h := Head{status: 0, reason: "", headers: nil, version: ""}
     for true {
         [raw, rhe] = read_head(br)
@@ -394,15 +477,13 @@ fn (t H1) roundtrip(req: ref model.Req, cap: mut model.Hop) -> [model.Resp, err]
     if dbe != nil {
         return bad, dbe
     }
-    conn.close()
     tr.closed_ms = itof(now_ms() - c0)
     let bodyb: []byte = db
     return model.Resp{status: h.status, reason: h.reason, headers: h.headers, body: bodyb, elapsed_ms: itof(now_ms() - t0), remote: host + ":" + itoa(port), version: h.version, hops: nil, req_head: "", trace: tr}, nil
 }
 
-// check_url gates the scheme surface: http only. https errors name
-// the scheme (TLS is parked on oxidean/oxl#128); anything else —
-// schemeless, empty host — is an explicit error too.
+// check_url gates the scheme surface: http and https. Other schemes
+// (and empty) are explicit errors.
 fn check_url(raw: str) -> [own url.URL, err] {
     [u, e] = url.parse(raw)
     if e != nil {
@@ -412,10 +493,44 @@ fn check_url(raw: str) -> [own url.URL, err] {
     if len(s) == 0 {
         return nil, errors.new("http: unsupported scheme \"\" in " + raw)
     }
-    if s != "http" {
-        return nil, errors.new("http: unsupported scheme \"" + s + "\" (TLS is not supported in this build)")
+    if s != "http" && s != "https" {
+        return nil, errors.new("http: unsupported scheme \"" + s + "\"")
     }
     return u, nil
+}
+
+// tls_wrap handshakes over an already-connected TCP socket. verify:
+// ""/"yes" → system roots; "no" → AcceptAll; else PEM path.
+fn tls_wrap(c: net.Conn, host: str, verify: str, tmo_ms: int) -> [tls.Conn, err] {
+    if tmo_ms < 0 {
+        tmo_ms = 0
+    }
+    cfg := tls.default_cfg()
+    cfg.server_name = host
+    v := lwr(verify)
+    if v == "no" {
+        let a: tls.Verifier = AcceptAll{}
+        cfg.verify = a
+    } else if len(v) > 0 && v != "yes" {
+        if !os.exists(verify) {
+            c.close()
+            let z: tls.Conn
+            return z, errors.new("http: verify CA file not found: " + verify)
+        }
+        text := os.readfile_(verify)
+        roots := x509.Roots{cas: new(mkslice(x509.Cert, 0))}
+        [_, le] = roots.load_pem(text)
+        if le != nil {
+            c.close()
+            let z: tls.Conn
+            return z, le
+        }
+        cfg.roots = roots
+    }
+    if tmo_ms <= 0 {
+        tmo_ms = 30000
+    }
+    return tls.client_tmo(c, cfg, tmo_ms)
 }
 
 // bodyless reports whether the method/status combination forbids a
@@ -430,9 +545,24 @@ fn bodyless(method: str, status: int) -> bool {
     return status == 204 || status == 304
 }
 
-// write_all loops Conn.write until the buffer is flushed — a socket
-// may write short; partial failure surfaces as the write error.
+// write_all loops Conn.write until the buffer is flushed.
 fn write_all(c: net.Conn, b: []byte) -> err {
+    off := 0
+    for off < len(b) {
+        [n, e] = c.write(b[off:])
+        if e != nil {
+            return e
+        }
+        if n <= 0 {
+            return errors.new("http: connection closed during write")
+        }
+        off = off + n
+    }
+    return nil
+}
+
+// write_all_tls is write_all for a TLS conn (record writes may short).
+fn write_all_tls(c: tls.Conn, b: []byte) -> err {
     off := 0
     for off < len(b) {
         [n, e] = c.write(b[off:])

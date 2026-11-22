@@ -15,6 +15,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `core/http`: HTTP/1.1 transport on `std/net` sockets (WI-0004)
 - `cli`: complete 58-flag xh argv surface with parse-time semantics
   (WI-0005)
+- `cli`: S5 HTTP request path — Intent → H1 Transport → print /
+  check-status; `tests/golden/run.sh` diffs basic rows vs xh 0.26.3
+  (WI-0006)
+- `core/http` + `cli`: HTTPS via `std/net/tls` behind H1; `--verify=no`
+  accept-all Verifier (WI-0009 / ADR-0021)
 
 ### Changed
 
