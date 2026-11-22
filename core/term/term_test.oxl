@@ -15,8 +15,8 @@ struct MockScreen {
     presents: int,
 }
 
-fn (s MockScreen) size() -> [int, int] {
-    return s.w, s.h
+fn (s MockScreen) size() -> Size {
+    return Size{cols: s.w, rows: s.h}
 }
 
 fn (s mut MockScreen) set_cell(x: int, y: int, ch: str, fg: int, bg: int, attr: int) {
@@ -63,8 +63,9 @@ fn test_named_key_coverage() {
 fn test_screen_port() {
     s := MockScreen{w: 80, h: 24, cells: 0, cx: 0, cy: 0, cur_show: false, presents: 0}
     let scr: Screen = s
-    [w, h] = scr.size()
-    testing.expect_eq(w, 80, "size w")
+    sz := scr.size()
+    testing.expect_eq(sz.cols, 80, "size w")
+    testing.expect_eq(sz.rows, 24, "size h")
     scr.set_cell(0, 0, "x", 0, 0, AttrBold)
     scr.cursor(1, 1, true)
     e := scr.present()

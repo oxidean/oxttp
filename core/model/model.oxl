@@ -52,6 +52,9 @@ struct Req {
     max_redirects: int,
     httpver: str, // "" or "HTTP/1.1" default; "HTTP/1.0" for --http-version=1.0
     synth: []Header, // synthesized tail (Accept*/Cookie) — wire emits after Content-Length, before Host
+    // verify: "" or "yes" → system roots; "no" → accept-all Verifier
+    // (IN-0005=B); otherwise a PEM path loaded into x509.Roots.
+    verify: str,
 }
 
 // ReqHead is what the wire emitted for one request — kept verbatim

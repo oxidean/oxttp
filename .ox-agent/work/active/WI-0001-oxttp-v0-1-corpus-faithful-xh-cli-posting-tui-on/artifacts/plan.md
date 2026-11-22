@@ -96,11 +96,17 @@ transcript suite green.
 
 - `stty`/ANSI TUI is the least-proven surface (S8–S11); mitigate by
   keeping the driver thin behind `Screen`/`Key` and building the
-  transcript harness early in S9.
+  transcript harness early in S9. **Update (2026-11-22):** oxl
+  ≥0.23.2 ships `std/os/term` + `std/os/signal` — prefer that driver
+  before S8 (see WI-0007 / decision 0020); do not invest in `stty`.
 - `std/net` socket API depth unverified for the full h1 feature set —
   S3 spikes first; blockers become upstream oxl issues, not workarounds.
+  **S3 shipped** on own h1; TLS join is now available via `std/net/tls`
+  (oxidean/oxl#128 closed) — tracked as follow-on WI-0009 in WI-0007.
 - xh differential harness needs `xh` installed in CI — single static
   binary, download in workflow.
-- Upstream gaps tracked: oxidean/oxl#125 (termios/isatty), #126
-  (signals), #127 (richer http client), #128 (TLS); none block v0.1
-  scope. Ox-Agent docs drift: oxidean/Ox-Agent#78.
+- Upstream gaps **closed** on oxl ≥0.23.2: #125 termios, #126 signals,
+  #127 richer http client, #128 TLS/HTTPS, #131 multi-arg test.
+  Remaining parks (mTLS, TLS≤1.2, HTTPS CONNECT) are documented in
+  oxl `docs/tls.md`. Post-bump sequencing: WI-0007. Ox-Agent docs
+  drift: oxidean/Ox-Agent#78.

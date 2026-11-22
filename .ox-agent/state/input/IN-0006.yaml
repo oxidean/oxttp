@@ -1,0 +1,17 @@
+schema_version: 1
+request_id: IN-0006
+work_item_id: WI-0008
+run_id: run_1795374468496_f710e6
+kind: decision
+question: Confirm the definition of full corpus parity and whether protocol long-tail (h2/h3/gRPC/WS) stays in the program as blocked rows or is carved out.
+options:
+    - 'A: Honest oxl-capable parity + tracked degradations; keep M5 rows as oxl-blocked until upstream (recommended)'
+    - 'B: Same as A, but carve gRPC/WS out of oxttp permanently (HTTP(+TLS) apps only)'
+    - 'C: Literal every corpus line including gRPC/WS/h2/h3 as near-term commitments (accept large oxl dependency)'
+    - 'D: other — free text'
+status: answered
+answer: 'A: Honest oxl-capable parity + tracked degradations; keep M5 rows as oxl-blocked until upstream (recommended)'
+created_by: ox-agent
+answered_by: Jesse
+created_at: "2026-11-22T19:09:18Z"
+answered_at: "2026-11-22T19:12:07Z"

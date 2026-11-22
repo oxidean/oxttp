@@ -337,7 +337,8 @@ fn session_save(path: str, auth_type: str, auth_raw: str, cookies: []str, hs: []
         out = out + "\n        {\n            \"name\": \"" + ln + "\",\n            \"value\": \"" + h.value + "\"\n        }"
     }
     out = out + "\n    ]\n}\n"
-    if os.writefile_(path, out) != 0 {
+    // oxl ≥0.23: writefile_ returns bytes written on success; <0 errno.
+    if os.writefile_(path, out) < 0 {
         return errors.new("couldn't write session file " + path)
     }
     return nil
@@ -1169,6 +1170,7 @@ fn plan(i: ref Intent, env: []str, stdin: str, stdin_tty: int) -> own ReqPlan {
     }
     p.req.follow = (i.follow != 0)
     p.req.max_redirects = i.eff_redirects
+    p.req.verify = i.verify
     if i.http_version == "1.0" {
         p.req.httpver = "HTTP/1.0"
     } else {
@@ -1600,7 +1602,7 @@ fn execute(i: ref Intent, envpairs: []str, stdin: str, stdin_tty: int) -> own Ru
             }
             if len(i.output) > 0 {
                 we := os.writefile_(dest, resp.body as str)
-                if we != 0 {
+                if we < 0 {
                     r.code = 1
                     r.stderr = warn + prog + ": error: couldn't write to " + dest + "\n"
                     return r
@@ -1638,7 +1640,7 @@ fn execute(i: ref Intent, envpairs: []str, stdin: str, stdin_tty: int) -> own Ru
     session_maybe_save(i, envpairs, p, p.req.headers)
     if len(i.output) > 0 {
         we := os.writefile_(i.output, out)
-        if we != 0 {
+        if we < 0 {
             r.code = 1
             r.stderr = warn + prog + ": error: couldn't write to " + i.output + "\n"
             return r

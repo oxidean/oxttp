@@ -1,0 +1,17 @@
+schema_version: 1
+request_id: IN-0007
+work_item_id: WI-0006-s5-cli-request-path-and-golden-harness
+kind: clarification
+question: |-
+    CodeRabbit auto-reviews are off and @coderabbitai full review comments posted by cursor[bot] have not produced a real review on https://github.com/oxidean/oxttp/pull/8 or https://github.com/oxidean/oxttp/pull/9 (status stays "skipping"). Please post a human comment that is exactly:
+
+    @coderabbitai full review
+
+    on BOTH PRs #8 and #9 (one comment each, command alone on its line). Reply here with "posted" when done, or "blocked" with reason if CodeRabbit still will not run.
+status: answered
+answer: 'waived: ship without CodeRabbit; subagents already approved and CodeRabbit stays skipping/rate-limited'
+created_by: cli
+answered_by: JesseKoldewijn
+created_at: "2026-11-22T20:52:37Z"
+answered_at: "2026-11-22T21:00:24Z"
+expires_at: "2026-11-24T20:52:37Z"

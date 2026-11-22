@@ -1,0 +1,12 @@
+package http
+
+// Accept-all Verifier for --verify=no (IN-0005 = B). Replaces both
+// chain and hostname checks — see std/net/tls.Config.verify.
+import "std/crypto/x509"
+
+// AcceptAll implements tls.Verifier — every leaf is trusted.
+struct AcceptAll { }
+
+fn (a AcceptAll) check(leaf: x509.Cert, untrusted: []x509.Cert) -> err {
+    return nil
+}

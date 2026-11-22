@@ -1,7 +1,7 @@
 schema_version: 1
 project:
     name: oxttp
-    # `oxl test` honors only its first package-dir arg (oxidean/oxl#131) — loop per leaf dir.
+    # Loop per leaf dir — safer than multi-arg `oxl test` (oxidean/oxl#131 history).
     test_command: "for d in $(git ls-files '*.oxl' | xargs -n1 dirname | sort -u); do oxl test $d || exit 1; done"
 workflow:
     default_profile: normal

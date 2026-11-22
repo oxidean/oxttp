@@ -13,7 +13,7 @@ import "std/encoding/base64"
 import "github.com/oxidean/oxttp/core/model"
 
 fn rq(method: str, u: str) -> own model.Req {
-    return new(model.Req{method: method, url: u, headers: nil, body: model.Body.Empty, timeout_ms: 0, follow: false, max_redirects: 10, httpver: "", synth: nil})
+    return new(model.Req{method: method, url: u, headers: nil, body: model.Body.Empty, timeout_ms: 0, follow: false, max_redirects: 10, httpver: "", synth: nil, verify: ""})
 }
 
 fn hs1(n: str, v: str) -> []model.Header {
@@ -392,14 +392,14 @@ fn test_redirect_bad_location() {
 }
 
 fn test_redirect_https_target() {
-    f := fx_start(one("HTTP/1.1 302 Found\r\nLocation: https://example.com/x\r\nContent-Length: 0\r\n\r\n"))
+    f := fx_start(one("HTTP/1.1 302 Found\r\nLocation: https://example.com/\r\nContent-Length: 0\r\n\r\n"))
     defer f.stop()
     r := rq("GET", f.url() + "/")
     r.follow = true
-    [_resp, e] = request(r)
-    testing.expect(e != nil, "https target errors")
-    if e != nil {
-        testing.expect(find(errors.msg(e), "https") >= 0, "scheme named in error")
+    [resp, e] = request(r)
+    testing.expect(e == nil, "https redirect follow")
+    if e == nil {
+        testing.expect_eq(resp.status, 200, "example.com 200")
     }
 }
 
@@ -416,10 +416,19 @@ fn test_timeout() {
 
 fn test_bad_and_https_urls() {
     r := rq("GET", "https://example.com/")
-    [_resp, e] = request(r)
-    testing.expect(e != nil, "https url errors")
-    if e != nil {
-        testing.expect(find(errors.msg(e), "https") >= 0, "https named")
+    [resp, e] = request(r)
+    testing.expect(e == nil, "https example.com")
+    if e == nil {
+        testing.expect_eq(resp.status, 200, "https 200")
+        testing.expect(len(resp.body) > 0, "https body")
+    }
+    // --verify=no still connects (accept-all Verifier)
+    r0 := rq("GET", "https://example.com/")
+    r0.verify = "no"
+    [resp0, e0] = request(r0)
+    testing.expect(e0 == nil, "verify=no")
+    if e0 == nil {
+        testing.expect_eq(resp0.status, 200, "verify=no 200")
     }
     r2 := rq("GET", "http://")
     [_r2, e2] = request(r2)
@@ -427,6 +436,9 @@ fn test_bad_and_https_urls() {
     r3 := rq("GET", "notaurl")
     [_r3, e3] = request(r3)
     testing.expect(e3 != nil, "schemeless errors")
+    r4 := rq("GET", "ftp://example.com/")
+    [_r4, e4] = request(r4)
+    testing.expect(e4 != nil, "ftp rejected")
 }
 
 fn test_conn_refused() {
