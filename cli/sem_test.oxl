@@ -93,7 +93,7 @@ fn test_relations() {
     testing.expect_streq(o3.intent.auth_type, "bearer", "bearer sets type")
     testing.expect_streq(o3.intent.auth, "tok", "bearer sets auth")
     o4 := r("--https\nexample.org")
-    deferr(o4, "https URLs are unsupported in this build (only http:// is supported)")
+    deferr(o4, "https URLs are unsupported in this build (TLS is not available)")
     testing.expect(o4.intent.https == 1, "https flag")
     testing.expect_streq(o4.intent.url, "https://example.org/", "https url")
     o5 := r("-d\nexample.org")
@@ -258,7 +258,7 @@ fn test_construct_url() {
     testing.expect_streq(r("get\nexample.org\na==b").intent.url, "http://example.org/", "params not in url yet")
     o := r("--default-scheme\nftp\nexample.org")
     testing.expect_streq(o.intent.url, "ftp://example.org/", "default scheme")
-    deferr(o, "ftp URLs are unsupported in this build (only http:// is supported)")
+    deferr(o, "ftp URLs are unsupported in this build (TLS is not available)")
     o2 := r("http://")
     diag(o2, "Invalid <URL>: empty host")
     o3 := r("http://h:abc/")
@@ -266,7 +266,7 @@ fn test_construct_url() {
     o4 := r("http://h:99999/")
     diag(o4, "Invalid <URL>: invalid port number")
     o5 := r("https://example.org")
-    deferr(o5, "https URLs are unsupported in this build (only http:// is supported)")
+    deferr(o5, "https URLs are unsupported in this build (TLS is not available)")
 }
 
 fn test_deferrals() {
@@ -281,6 +281,8 @@ fn test_deferrals() {
     testing.expect_eq(o2.intent.offline, 1, "offline flag")
     o3 := r("--curl\nexample.org")
     deferr(o3, "--curl is unsupported in this build")
+    o4 := r("--download\n--continue\n--output\nout.bin\nexample.org")
+    deferr(o4, "--continue is unsupported in this build")
 }
 
 fn test_effective_getters() {

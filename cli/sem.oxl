@@ -1311,12 +1311,17 @@ fn resolve(m: own args.Matches, envpairs: []str) -> own Out {
     }
     scheme := url_scheme(o.intent.url)
     if scheme != "http" {
-        defer_out(o, prog, scheme + " URLs are unsupported in this build (only http:// is supported)")
+        // ADR-0015 pins the TLS deferral text for every non-http scheme.
+        defer_out(o, prog, scheme + " URLs are unsupported in this build (TLS is not available)")
         return o
     }
     // S5 degrade routing (spec sem-G, ADR 0024): connection-affecting
     // flags error out; display-only flags that upstream processes on
     // pipes error too; --debug degrades to a warning inside execute.
+    if o.intent.resume != 0 {
+        defer_out(o, prog, "--continue is unsupported in this build")
+        return o
+    }
     if o.intent.curl != 0 || o.intent.curl_long != 0 {
         defer_out(o, prog, "--curl is unsupported in this build")
         return o

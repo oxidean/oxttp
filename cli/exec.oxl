@@ -1577,8 +1577,10 @@ fn execute(i: ref Intent, envpairs: []str, stdin: str, stdin_tty: int) -> own Ru
             code = 5
         }
     }
-    // warning when stdout redirected and headers not printed
-    if code != 0 && (ps.res_h == 0 || len(i.output) == 0 || i.download == 0) {
+    // warning when headers are not printed, or neither -o nor -d
+    // (xh: !res_h || (no -o && !download)). Do not warn solely because
+    // download==0 when -o already redirected the response.
+    if code != 0 && (ps.res_h == 0 || (len(i.output) == 0 && i.download == 0)) {
         if i.quiet < 1 {
             warn = warn + prog + ": warning: HTTP " + itoa(resp.status) + " " + reason_of(resp.status, resp.reason) + "\n"
         }
