@@ -851,7 +851,7 @@ fn parse_rust_url(raw: str) -> [str, err] {
 // construct_url → upstream construct_url: default-scheme prepend,
 // "://" paste shorthand, ":" localhost shorthand.
 // [url, err].
-fn construct_url(raw_url: str, default_scheme: str) -> [str, str] {
+fn construct_url(raw_url: str, default_scheme: str) -> [str, err] {
     ds := default_scheme
     if len(ds) == 0 {
         ds = "http://"

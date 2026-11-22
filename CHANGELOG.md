@@ -15,3 +15,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `core/http`: HTTP/1.1 transport on `std/net` sockets (WI-0004)
 - `cli`: complete 58-flag xh argv surface with parse-time semantics
   (WI-0005)
+
+### Changed
+
+- Toolchain pin `.oxl-version` **0.15.0 → 0.23.2** (unlocks `std/net/tls`,
+  `std/os/term`, `std/os/signal`). Compat: `[T, err]` multi-returns,
+  `Screen.Size`, `os.writefile_` byte-count success.

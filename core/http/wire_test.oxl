@@ -94,7 +94,8 @@ fn test_render_body_form_multipart() {
 fn test_render_body_file() {
     p := os.temp_dir() + "/oxttp-wire-body.txt"
     we := os.writefile_(p, "file-body-bytes")
-    testing.expect_eq(we, 0, "fixture write")
+    // oxl ≥0.23: writefile_ returns bytes written on success (was 0).
+    testing.expect(we >= 0, "fixture write")
     [rf, e] = RenderBody(model.Body.FileBody{path: p, ctype: "text/plain", filename: "x.txt"})
     testing.expect(e == nil, "filebody render")
     testing.expect_streq(rf.ctype, "text/plain", "filebody ctype")
