@@ -38,7 +38,8 @@ fn deferr(o: ref Out, msg: str) {
 
 fn test_method_url() {
     o := r("example.org")
-    deferr(o, "request execution is unsupported in this build")
+    testing.expect_eq(o.code, 0, "plain url routes to exec")
+    testing.expect_eq(o.exec, 1, "plain url execs")
     testing.expect_streq(o.intent.method, "", "no method")
     testing.expect_streq(o.intent.url, "http://example.org/", "default url")
     o2 := r("get\nexample.org")
@@ -92,7 +93,7 @@ fn test_relations() {
     testing.expect_streq(o3.intent.auth_type, "bearer", "bearer sets type")
     testing.expect_streq(o3.intent.auth, "tok", "bearer sets auth")
     o4 := r("--https\nexample.org")
-    deferr(o4, "https URLs are unsupported in this build (only http:// is supported)")
+    deferr(o4, "https URLs are unsupported in this build (TLS is not available)")
     testing.expect(o4.intent.https == 1, "https flag")
     testing.expect_streq(o4.intent.url, "https://example.org/", "https url")
     o5 := r("-d\nexample.org")
@@ -113,11 +114,11 @@ fn test_relations() {
     rc := r("--raw\nx\nexample.org\na=b")
     diag(rc, "Request body (from --raw) and request data (key=value) cannot be mixed.")
     rc2 := r("--raw\nx\nexample.org\nh:v")
-    testing.expect_eq(rc2.code, 1, "raw+header ok (deferral)")
+    testing.expect_eq(rc2.exec, 1, "raw+header execs")
     rc3 := r("--raw\nx\nexample.org\nk:=1")
     diag(rc3, "Request body (from --raw)")
     rc4 := r("--raw\nx\nexample.org")
-    testing.expect_eq(rc4.code, 1, "raw alone ok")
+    testing.expect_eq(rc4.exec, 1, "raw alone execs")
 }
 
 fn test_check_status() {
@@ -152,7 +153,7 @@ fn test_value_timeout() {
     o4 := r("--timeout=nan\nexample.org")
     diag(o4, "invalid value 'nan' for '--timeout <SEC>': Connection timeout is not a valid number")
     o5 := r("--timeout\n1.5\nexample.org")
-    testing.expect_eq(o5.code, 1, "good timeout parses")
+    testing.expect_eq(o5.exec, 1, "good timeout parses")
     testing.expect(o5.intent.has_timeout == 1, "has_timeout")
     testing.expect(o5.intent.timeout > 1.4 && o5.intent.timeout < 1.6, "timeout 1.5")
     // dead occurrence still validates (upstream token-time check)
@@ -164,10 +165,10 @@ fn test_value_print() {
     o := r("--print\nHx\nexample.org")
     diag(o, "invalid value 'Hx' for '--print <FORMAT>': 'x' is not a valid value")
     o2 := r("--history-print\nmb\nexample.org")
-    testing.expect_eq(o2.code, 1, "history-print ok")
+    testing.expect_eq(o2.exec, 1, "history-print execs")
     testing.expect_streq(o2.intent.history_print, "mb", "hist raw")
     o3 := r("--print\nHBhbm\nexample.org")
-    testing.expect_eq(o3.code, 1, "all chars ok")
+    testing.expect_eq(o3.exec, 1, "all chars exec")
 }
 
 fn test_value_format_options() {
@@ -182,7 +183,7 @@ fn test_value_format_options() {
     o5 := r("--format-options\njson.format:maybe\nexample.org")
     diag(o5, "invalid value 'json.format:maybe' for '--format-options <FORMAT_OPTIONS>': Invalid value 'maybe' in 'json.format:maybe'")
     o6 := r("--format-options\nJSON.INDENT:2\n--format-options\nheaders.sort:true,json.indent:4\nexample.org")
-    testing.expect_eq(o6.code, 1, "merged ok")
+    testing.expect_eq(o6.code, 1, "merged parses (then defers)")
     fo := o6.intent.fmt_opts
     testing.expect_eq(len(fo), 2, "2 merged keys")
     testing.expect_streq(fo[0], "json.indent=4", "json.indent last wins")
@@ -199,7 +200,7 @@ fn test_value_proxy() {
     o3 := r("--proxy\nhttp:proxy.host:8080\nexample.org")
     diag(o3, "invalid value 'http:proxy.host:8080' for '--proxy <PROTOCOL:URL>': Invalid proxy URL 'proxy.host:8080' for protocol 'http': relative URL without a base")
     o4 := r("--proxy\nhttp:http://h:1\n--proxy\nall:socks5://u:p@h\nexample.org")
-    testing.expect_eq(o4.code, 1, "good proxies")
+    testing.expect_eq(o4.code, 1, "proxies parse (then defer)")
     testing.expect_eq(len(o4.intent.proxies), 2, "2 proxies")
 }
 
@@ -211,13 +212,13 @@ fn test_value_resolve() {
     o3 := r("--resolve\nh:zzz\nexample.org")
     diag(o3, "invalid value 'h:zzz' for '--resolve <HOST:ADDRESS>': Invalid address 'zzz'")
     o4 := r("--resolve\nh:1.2.3.4\n--resolve\nx:[::1]\n--resolve\ny:::1\nexample.org")
-    testing.expect_eq(o4.code, 1, "good resolves")
+    testing.expect_eq(o4.code, 1, "resolves parse (then defer)")
     testing.expect_eq(len(o4.intent.resolves), 3, "3 resolves")
 }
 
 fn test_value_charset() {
     o := r("--response-charset\nutf8\nexample.org")
-    testing.expect_eq(o.code, 1, "utf8 ok")
+    testing.expect_eq(o.exec, 1, "utf8 execs")
     testing.expect_streq(o.intent.response_charset, "UTF-8", "utf8 canonical")
     o2 := r("--response-charset\nlatin1\nexample.org")
     testing.expect_streq(o2.intent.response_charset, "windows-1252", "latin1 canonical")
@@ -257,7 +258,7 @@ fn test_construct_url() {
     testing.expect_streq(r("get\nexample.org\na==b").intent.url, "http://example.org/", "params not in url yet")
     o := r("--default-scheme\nftp\nexample.org")
     testing.expect_streq(o.intent.url, "ftp://example.org/", "default scheme")
-    deferr(o, "ftp URLs are unsupported in this build (only http:// is supported)")
+    deferr(o, "ftp URLs are unsupported in this build (TLS is not available)")
     o2 := r("http://")
     diag(o2, "Invalid <URL>: empty host")
     o3 := r("http://h:abc/")
@@ -265,7 +266,7 @@ fn test_construct_url() {
     o4 := r("http://h:99999/")
     diag(o4, "Invalid <URL>: invalid port number")
     o5 := r("https://example.org")
-    deferr(o5, "https URLs are unsupported in this build (only http:// is supported)")
+    deferr(o5, "https URLs are unsupported in this build (TLS is not available)")
 }
 
 fn test_deferrals() {
@@ -273,11 +274,15 @@ fn test_deferrals() {
     deferr(r("--unstable-m-sig-id\ni\n--unstable-m-sig-key\nk\nexample.org"), "This binary was built without message signature support. Enable the `http-message-signatures` feature.")
     deferr(r("--http-version\n3-prior-knowledge\nexample.org"), "This binary was built without support for HTTP/3. Enable the `http3` feature.")
     o := r("--http-version\n2-prior-knowledge\nexample.org")
-    deferr(o, "request execution is unsupported in this build")
+    deferr(o, "HTTP/2 requests are unsupported in this build")
     o2 := r("--offline\nexample.org")
-    deferr(o2, "request execution is unsupported in this build")
+    testing.expect_eq(o2.code, 0, "offline routes to exec")
+    testing.expect_eq(o2.exec, 1, "offline execs")
+    testing.expect_eq(o2.intent.offline, 1, "offline flag")
     o3 := r("--curl\nexample.org")
-    deferr(o3, "request execution is unsupported in this build")
+    deferr(o3, "--curl is unsupported in this build")
+    o4 := r("--download\n--continue\n--output\nout.bin\nexample.org")
+    deferr(o4, "--continue is unsupported in this build")
 }
 
 fn test_effective_getters() {

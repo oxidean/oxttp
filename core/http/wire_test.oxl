@@ -45,17 +45,17 @@ fn test_hdr_get_has() {
 }
 
 fn test_render_body_raw_json() {
-    [rb, e] = render_body(model.Body.Raw{ctype: "text/plain", text: "hi"})
+    [rb, e] = RenderBody(model.Body.Raw{ctype: "text/plain", text: "hi"})
     testing.expect(e == nil, "raw render")
     testing.expect_streq(rb.ctype, "text/plain", "raw ctype")
     testing.expect_streq(rb.data as str, "hi", "raw bytes")
 
-    [rj, ej] = render_body(model.Body.Json{j: json.jparse("{\"a\":1}")})
+    [rj, ej] = RenderBody(model.Body.Json{j: json.jparse("{\"a\":1}")})
     testing.expect(ej == nil, "json render")
     testing.expect_streq(rj.ctype, "application/json", "json ctype")
     testing.expect_streq(rj.data as str, "{\"a\":1}", "json bytes")
 
-    [re, ee] = render_body(model.Body.Empty)
+    [re, ee] = RenderBody(model.Body.Empty)
     testing.expect(ee == nil, "empty render")
     testing.expect_eq(len(re.data), 0, "empty bytes")
 }
@@ -66,7 +66,7 @@ fn test_render_body_form_multipart() {
     fsv = push(fsv, model.KV{name: "off", value: "no", enabled: false})
     fsv = push(fsv, model.KV{name: "c", value: "3", enabled: true})
     fs := new(fsv)
-    [rf, e] = render_body(model.Body.Form{fields: fs})
+    [rf, e] = RenderBody(model.Body.Form{fields: fs})
     testing.expect(e == nil, "form render")
     testing.expect_streq(rf.ctype, "application/x-www-form-urlencoded", "form ctype")
     testing.expect_streq(rf.data as str, "a+b=x%26y&c=3", "form escaped, disabled skipped")
@@ -75,7 +75,7 @@ fn test_render_body_form_multipart() {
     psv = push(psv, model.Part{name: "f1", value: "v1", file: "", filename: "", content_type: "", enabled: true, is_file: false})
     psv = push(psv, model.Part{name: "skip", value: "x", file: "", filename: "", content_type: "", enabled: false, is_file: false})
     ps := new(psv)
-    [rm, em] = render_body(model.Body.Multipart{parts: ps})
+    [rm, em] = RenderBody(model.Body.Multipart{parts: ps})
     testing.expect(em == nil, "multipart render")
     testing.expect(strings_has(rm.ctype, "multipart/form-data; boundary="), "multipart ctype")
     body := rm.data as str
@@ -95,11 +95,11 @@ fn test_render_body_file() {
     p := os.temp_dir() + "/oxttp-wire-body.txt"
     we := os.writefile_(p, "file-body-bytes")
     testing.expect_eq(we, 0, "fixture write")
-    [rf, e] = render_body(model.Body.FileBody{path: p, ctype: "text/plain", filename: "x.txt"})
+    [rf, e] = RenderBody(model.Body.FileBody{path: p, ctype: "text/plain", filename: "x.txt"})
     testing.expect(e == nil, "filebody render")
     testing.expect_streq(rf.ctype, "text/plain", "filebody ctype")
     testing.expect_streq(rf.data as str, "file-body-bytes", "filebody bytes")
-    [_r, e2] = render_body(model.Body.FileBody{path: p + ".missing", ctype: "text/plain", filename: "x"})
+    [_r, e2] = RenderBody(model.Body.FileBody{path: p + ".missing", ctype: "text/plain", filename: "x"})
     testing.expect(e2 != nil, "missing file errors")
     de := os.remove(p)
     testing.expect(de == nil, "fixture cleanup")
@@ -109,12 +109,12 @@ fn test_serialize_head() {
     let hs: []model.Header = nil
     hs = push(hs, model.Header{name: "X-Custom", value: "v"})
     hs = push(hs, model.Header{name: "Accept", value: "*/*"})
-    h := OutHead{method: "GET", uri: "/p?q=1", host: "ex.com", hdrs: hs, body_len: 0, has_body: false}
+    h := OutHead{method: "GET", uri: "/p?q=1", ver: "", synth: nil, host: "ex.com", hdrs: hs, body_len: 0, has_body: false}
     out := serialize_head(h)
-    exp := "GET /p?q=1 HTTP/1.1\r\nHost: ex.com\r\nX-Custom: v\r\nAccept: */*\r\nAccept-Encoding: gzip, deflate\r\nConnection: close\r\n\r\n"
+    exp := "GET /p?q=1 HTTP/1.1\r\nX-Custom: v\r\nAccept: */*\r\nAccept-Encoding: gzip, deflate\r\nConnection: close\r\nHost: ex.com\r\n\r\n"
     testing.expect_streq(out, exp, "GET head exact")
 
-    hb := OutHead{method: "POST", uri: "/", host: "h:8080", hdrs: nil, body_len: 4, has_body: true}
+    hb := OutHead{method: "POST", uri: "/", ver: "", synth: nil, host: "h:8080", hdrs: nil, body_len: 4, has_body: true}
     ob := serialize_head(hb)
     testing.expect(find(ob, "Content-Length: 4\r\n") >= 0, "CL synthesized")
     testing.expect(strings_ends(ob, "\r\n\r\n"), "head terminated")
@@ -125,7 +125,7 @@ fn test_serialize_head() {
     hc = push(hc, model.Header{name: "Connection", value: "keep-alive"})
     hc = push(hc, model.Header{name: "Content-Length", value: "9"})
     hc = push(hc, model.Header{name: "Host", value: "override.example"})
-    o2 := serialize_head(OutHead{method: "POST", uri: "/x", host: "h", hdrs: hc, body_len: 9, has_body: true})
+    o2 := serialize_head(OutHead{method: "POST", uri: "/x", ver: "", synth: nil, host: "h", hdrs: hc, body_len: 9, has_body: true})
     testing.expect(find(o2, "Host: override.example\r\n") >= 0, "caller host wins")
     testing.expect_eq(count_str(o2, "Host:"), 1, "host not duplicated")
     testing.expect_eq(count_str(o2, "Accept-Encoding:"), 1, "ae not duplicated")

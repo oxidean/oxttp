@@ -21,17 +21,17 @@ fn test_req_resp_surface() {
     h := mkslice(Header, 1)
     h[0].name = "accept"
     h[0].value = "application/json"
-    r := Req{method: "POST", url: "http://localhost:8080/x", headers: h, body: Body.Raw{ctype: "application/json", text: "{}"}, timeout_ms: 0, follow: false, max_redirects: 10}
+    r := Req{method: "POST", url: "http://localhost:8080/x", headers: h, body: Body.Raw{ctype: "application/json", text: "{}"}, timeout_ms: 0, follow: false, max_redirects: 10, httpver: "", synth: nil}
     testing.expect_streq(r.method, "POST", "req method")
     testing.expect_streq(r.headers[0].name, "accept", "hdr order")
     b := r.body as Body.Raw
     testing.expect_streq(b.ctype, "application/json", "raw ctype")
 
-    rp := Resp{status: 200, reason: "OK", headers: h, body: nil, elapsed_ms: 1.5, remote: "127.0.0.1:8080", trace: nil}
+    rp := Resp{status: 200, reason: "OK", headers: h, body: nil, elapsed_ms: 1.5, remote: "127.0.0.1:8080", version: "", hops: nil, req_head: "", trace: nil}
     testing.expect_eq(rp.status, 200, "resp status")
     testing.expect(rp.trace == nil, "trace optional")
 
-    jr := Req{method: "POST", url: "u", headers: nil, body: Body.Json{j: json.jparse("{\"a\":1}")}, timeout_ms: 0, follow: false, max_redirects: 0}
+    jr := Req{method: "POST", url: "u", headers: nil, body: Body.Json{j: json.jparse("{\"a\":1}")}, timeout_ms: 0, follow: false, max_redirects: 0, httpver: "", synth: nil}
     jb := jr.body as Body.Json
     testing.expect(jb.j.kind == 4, "json body kind")
 }

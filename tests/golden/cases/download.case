@@ -1,0 +1,3 @@
+argv: -d -o out.txt {URL}/d
+files: out.txt	<exists-check>
+script: 200 OK\nContent-Type: text/plain\n\nfile-body

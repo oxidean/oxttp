@@ -1,0 +1,3 @@
+# GET with default output: response body only on stdout.
+argv: -b {URL}/hello
+script: 200 OK\nContent-Type: application/json\n\n{"ok": true, "path": "/hello"}

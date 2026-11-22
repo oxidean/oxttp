@@ -1,0 +1,3 @@
+# json body kind from = and := items → POST + application/json.
+argv: -v -I {URL}/j a=1 n:=2
+script: <ECHO>

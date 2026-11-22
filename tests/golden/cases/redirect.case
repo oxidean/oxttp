@@ -1,0 +1,3 @@
+# --all shows the 302 hop + rewritten GET; final 200.
+argv: -v --follow --all {URL}/a
+script: 302 Found\nLocation: /b\nContent-Length: 0\n\n;;200 OK\nContent-Type: text/plain\n\nlanded

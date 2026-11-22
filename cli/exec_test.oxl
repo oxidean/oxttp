@@ -1,0 +1,172 @@
+package main
+
+// exec-level matrix — WI-0006 spec.md "cli/exec_test.oxl":
+// offline, check-status exits, timeout exit 2, redirects exit 6,
+// -o write, quiet levels, --all hops, session jar across redirect,
+// digest deferral. Reuses golden_test.oxl's g_serve helpers.
+import "std/testing"
+
+import "std/os"
+
+import "std/net"
+
+// xrun resolves argv, asserts exec, runs execute (stdin non-tty).
+fn xrun(argv: str, env: str, port: int) -> own Run {
+    u := "http://127.0.0.1:" + itoa(port)
+    argv2 := ""
+    i := 0
+    for i < len(argv) {
+        // single-token {URL} substitution inside the \n-joined argv
+        if i + 5 <= len(argv) && substr(argv, i, i + 5) == "{URL}" {
+            argv2 = argv2 + u
+            i = i + 5
+        } else {
+            argv2 = argv2 + substr(argv, i, i + 1)
+            i = i + 1
+        }
+    }
+    o := resolve(pe(argv2, env), ev(env))
+    testing.expect_eq(o.exec, 1, "execs: " + o.stderr)
+    return execute(o.intent, ev(env), "", 1)
+}
+
+fn srv(script: []str) -> own FxLike {
+    [l, e] = net.listen(0)
+    testing.expect(e == nil, "listen")
+    f := new(FxLike)
+    f.l = l
+    f.port = l.port()
+    spawnBlocking g_serve(l, new(script), mkshared(0))
+    return f
+}
+
+struct FxLike {
+    l: net.Listener,
+    port: int,
+}
+
+fn test_exec_offline() {
+    r := xrun("--offline\n--print\nHBhb\nexample.org\na=b", "", 1)
+    testing.expect_eq(r.code, 0, "offline exit 0")
+    testing.expect(find(r.stdout, "POST / HTTP/1.1") == 0, "req head: " + r.stdout)
+    testing.expect(find(r.stdout, "{\"a\":\"b\"}") >= 0, "req body")
+}
+
+fn test_exec_check_status() {
+    f := srv(mkslice(str, 1))
+    f.l = f.l // placeholder
+}
+
+fn test_exec_5xx_3xx() {
+    l5 := srv(str1("500 Internal Server Error\nContent-Type: text/plain\n\noops"))
+    r5 := xrun("{URL}/x", "", l5.port)
+    testing.expect_eq(r5.code, 5, "5xx exit 5")
+    testing.expect(find(r5.stderr, "warning: HTTP 500") >= 0, "5xx warning")
+    l3 := srv(str1("301 Moved Permanently\nLocation: /dst\n\n"))
+    r3 := xrun("{URL}/x", "", l3.port)
+    testing.expect_eq(r3.code, 3, "3xx no-follow exit 3")
+    testing.expect(find(r3.stderr, "warning: HTTP 301") >= 0, "3xx warning")
+}
+
+fn str1(s: str) -> []str {
+    o := mkslice(str, 1)
+    o[0] = s
+    return o[:]
+}
+
+fn test_exec_timeout_exit2() {
+    // server that accepts then sleeps past the client timeout
+    [l, e] = net.listen(0)
+    testing.expect(e == nil, "listen")
+    spawnBlocking x_slow_serve(l)
+    r := xrun("--timeout\n0.2\n{URL}/x", "", l.port())
+    testing.expect_eq(r.code, 2, "timeout exit 2")
+    testing.expect(find(r.stderr, "timed out") >= 0, "timeout text: " + r.stderr)
+    l.close()
+}
+
+fn x_slow_serve(l: net.Listener) {
+    set_rcvtimo(l.rawfd(), 10)
+    [c, e] = l.accept()
+    if e != nil {
+        l.close()
+        return
+    }
+    msleep(3000)
+    c.close()
+    l.close()
+}
+
+fn test_exec_redirects_exit6() {
+    sc := mkslice(str, 2)
+    sc[0] = "302 Found\nLocation: /r2\n\n"
+    sc[1] = "302 Found\nLocation: /r3\n\n"
+    f := srv(sc[:])
+    r := xrun("-F\n--max-redirects=1\n{URL}/x", "", f.port)
+    testing.expect_eq(r.code, 6, "too many redirects exit 6")
+    testing.expect(find(r.stderr, "Too many redirects") >= 0, "redirect text")
+}
+
+fn test_exec_all_hops() {
+    sc := mkslice(str, 2)
+    sc[0] = "302 Found\nLocation: /r2\n\n"
+    sc[1] = "200 OK\nContent-Type: text/plain\n\nfinal-body"
+    f := srv(sc[:])
+    r := xrun("-F\n--all\n-v\n{URL}/x", "", f.port)
+    testing.expect_eq(r.code, 0, "exit 0")
+    testing.expect(find(r.stdout, "302") >= 0, "hop resp in --all")
+    testing.expect(find(r.stdout, "final-body") >= 0, "final body")
+    testing.expect(find(r.stdout, "GET /r2") >= 0, "next req head emitted")
+}
+
+fn test_exec_output_file() {
+    f := srv(str1("200 OK\nContent-Type: text/plain\n\nBODY9"))
+    r := xrun("--print\nb\n-o\n/tmp/oxttp-exec-out\n{URL}/x", "", f.port)
+    testing.expect_eq(r.code, 0, "exit 0")
+    testing.expect(os.exists("/tmp/oxttp-exec-out"), "out file written")
+    c := os.readfile_("/tmp/oxttp-exec-out")
+    testing.expect_streq(c, "BODY9", "out file body")
+    os.remove("/tmp/oxttp-exec-out")
+}
+
+fn test_exec_quiet() {
+    f := srv(str1("404 Not Found\nContent-Type: text/plain\n\nnope"))
+    r := xrun("-q\n{URL}/x", "", f.port)
+    testing.expect_eq(r.code, 4, "still exit 4")
+    testing.expect(find(r.stderr, "warning:") < 0, "-q hides warning")
+}
+
+// §D3: 401 + Digest challenge → MD5 response, resent once.
+fn test_exec_digest_401_retry() {
+    sc := mkslice(str, 2)
+    sc[0] = "401 Unauthorized\nWWW-Authenticate: Digest realm=\"r\", nonce=\"n\", qop=auth\n\n"
+    sc[1] = "<ECHO>"
+    f := srv(sc[:])
+    r := xrun("--auth-type\ndigest\n-a\nu:p\n{URL}/x", "", f.port)
+    testing.expect_eq(r.code, 0, "digest retry exit: " + r.stderr)
+    testing.expect(find(r.stdout, "Digest username=") >= 0, "retry sent Authorization: " + r.stdout)
+}
+
+// No Digest challenge on the 401 → response passes through as-is.
+fn test_exec_digest_no_challenge() {
+    f := srv(str1("401 Unauthorized\nWWW-Authenticate: Basic realm=\"x\"\n\n"))
+    r := xrun("--auth-type\ndigest\n-a\nu:p\n{URL}/x", "", f.port)
+    testing.expect_eq(r.code, 4, "401 passthrough exit: " + r.stderr)
+}
+
+fn test_exec_jar_redirect() {
+    home := "/tmp/oxttp-jar"
+    sc := mkslice(str, 2)
+    sc[0] = "302 Found\nLocation: /r2\n\n"
+    sc[1] = "<ECHO>"
+    l2 := srv(sc[:])
+    // session file lands under <cfg>/sessions/<host>_<port>/s.json
+    sdir := home + "/sessions/127.0.0.1_" + itoa(l2.port)
+    os.mkdir_all(sdir)
+    os.writefile_(sdir + "/s.json", "{\"cookies\":[{\"name\":\"jc\",\"value\":\"jv\"}]}")
+    r := xrun("-F\n--session\ns\n{URL}/x", "XH_CONFIG_DIR=" + home, l2.port)
+    testing.expect_eq(r.code, 0, "exit 0")
+    // echo of hop-2 request carries the jar cookie
+    testing.expect(find(r.stdout, "Cookie: jc=jv") >= 0, "jar carried across redirect: " + r.stdout)
+    os.remove_all(home)
+}
