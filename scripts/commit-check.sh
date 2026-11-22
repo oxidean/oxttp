@@ -97,7 +97,10 @@ check_attribution() {
     fi
     # vendor-stamped HTML comments smuggled into the message —
     # line grep misses a marker on a different line than '<!--',
-    # so extract comment bodies (multiline-aware) and scan joined
+    # so extract comment bodies (multiline-aware) and scan joined.
+    # Platform wrappers are exempt: Cursor wraps the agent-owned PR
+    # description in CURSOR_AGENT_PR_BODY_{BEGIN,END} markers (the
+    # forge tool injects them; they are not human/AI signatures).
     _comments=$(printf '%s\n' "$_msg" | awk '
         { l = $0
           while (length(l)) {
@@ -106,7 +109,7 @@ check_attribution() {
               else { printf "%s ", l; l = "" }
             } else if (match(l, /<!--/)) { l = substr(l,RSTART+4); in_c = 1 }
             else l = ""
-          } }')
+          } }' | grep -ivE '^[[:space:]]*CURSOR_AGENT_PR_BODY_(BEGIN|END)[[:space:]]*$' || :)
     if printf '%s' "$_comments" | grep -iqE '('"$_VENDOR"'|generated|made|created|authored|written|produced|built|powered|co-?authored|attributed|🤖)'; then
         err "attribution HTML comment"
     fi
