@@ -1,0 +1,54 @@
+# Corpus parity matrix (living)
+
+Definition: IN-0006 option A. Status values: `done` | `next` |
+`post` | `oxl-blocked` (cite issue).
+
+Updated: 2026-11-22 · pin oxl 0.23.2
+
+## xh (`docs/corpus/corpus-xh.md`)
+
+| Section | Status | Notes |
+|---|---|---|
+| §1 Invocation / bin names / config.json | `next` | Parse done (S4); config default_options S7 |
+| §2 METHOD/URL positionals | `next` | S5 wires construct_url → request |
+| §3 REQUEST_ITEM grammar | `done` | WI-0003 |
+| §4.1 Body modes json/form/multipart/raw/stdin | `next` | S6 |
+| §4.2 Print/pretty/style/meta/verbose | `next` | S7 (+ isatty via std/os/term) |
+| §4.3 Download/output | `next` | S7 |
+| §4.4 Sessions | `next` | S7 (types exist) |
+| §4.5 Auth basic/bearer/digest | `next` | S7 |
+| §4.5 `https://` / `--https` / `--verify=yes\|pem` | `next` | HTTPS WI (IN-0005=B) |
+| §4.5 `--verify=no` | `next` | Accept-all Verifier (IN-0005=B) |
+| §4.5 `--cert` / `--cert-key` | `oxl-blocked` | [#221](https://github.com/oxidean/oxl/issues/221) |
+| §4.5 `--ssl` <1.3 / `--native-tls` | `oxl-blocked` | [#224](https://github.com/oxidean/oxl/issues/224) |
+| §4.5 HTTPS + `--proxy` CONNECT | `oxl-blocked` | [#222](https://github.com/oxidean/oxl/issues/222) |
+| §4.6 `--http-version` 1.0/1.1 | `next` | S7 / H1 |
+| §4.6 `--http-version` 2* | `oxl-blocked` | [#218](https://github.com/oxidean/oxl/issues/218) |
+| §4.6 `--http-version` 3* | `oxl-blocked` | [#219](https://github.com/oxidean/oxl/issues/219) |
+| §4.7 offline/curl/generate/check-status | `next`/`post` | curl+check-status S7; generate `post` |
+| §5 `--curl` map | `next` | S7 |
+| §6 Completions/man | `post` | |
+| §7 Env vars | `next` | Partial; finish S5–S7 |
+| §8 Exit codes / warnings | `next` | S5/S7 |
+| §10 Feature gates | `done`/`oxl-blocked` | Deferrals already match |
+
+## Posting (`docs/corpus/corpus-posting.md`)
+
+| Section | Status | Notes |
+|---|---|---|
+| §1 CLI flags / locate/version | `next` | S11 |
+| §1 import / run / remote | `post` | M4 |
+| §2 Config 40 keys | `next` | S11 |
+| §3 Keymap ~114 | `next` | S9 (degrade unimplemented) |
+| §4 Screens / panels | `next` | S9–S10 |
+| §5 `.posting.yaml` collections | `next` | S10 (types in WI-0003) |
+| §6 Environments / captures | `next`/`post` | Env S10/S11; captures M4 |
+| §7.1 HTTP(+TLS) send | `next` | S10 + HTTPS WI |
+| §7.1 client certs | `oxl-blocked` | [#221](https://github.com/oxidean/oxl/issues/221) |
+| §7.2 GraphQL | `post` | M4 |
+| §7.3 gRPC | `oxl-blocked` | [#223](https://github.com/oxidean/oxl/issues/223) (needs [#218](https://github.com/oxidean/oxl/issues/218)) |
+| §7.4 WebSocket | `oxl-blocked` | [#220](https://github.com/oxidean/oxl/issues/220) |
+| §7.5 SSE | `post` | M4 |
+| §7.6 OAuth2 | `post` | M4 |
+| §8 Themes / import / remote / tools | `post` | M4 |
+| S8 terminal driver | `next` | `std/os/term`+`signal` (not stty) |

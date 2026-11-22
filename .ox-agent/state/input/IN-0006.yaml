@@ -9,6 +9,9 @@ options:
     - 'B: Same as A, but carve gRPC/WS out of oxttp permanently (HTTP(+TLS) apps only)'
     - 'C: Literal every corpus line including gRPC/WS/h2/h3 as near-term commitments (accept large oxl dependency)'
     - 'D: other — free text'
-status: pending
+status: answered
+answer: 'A: Honest oxl-capable parity + tracked degradations; keep M5 rows as oxl-blocked until upstream (recommended)'
 created_by: ox-agent
+answered_by: Jesse
 created_at: "2026-11-22T19:09:18Z"
+answered_at: "2026-11-22T19:12:07Z"

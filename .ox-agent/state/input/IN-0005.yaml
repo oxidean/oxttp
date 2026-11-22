@@ -9,6 +9,9 @@ options:
     - 'B: bump → S5/S6 HTTP → HTTPS WI; --verify=no via local accept-all Verifier'
     - 'C: fold HTTPS into S5–S7 before calling CLI tranche done; decide --verify=no later'
     - 'D: other — answer in free text'
-status: pending
+status: answered
+answer: 'B: bump → S5/S6 HTTP → HTTPS WI; --verify=no via local accept-all Verifier'
 created_by: ox-agent
+answered_by: Jesse
 created_at: "2026-11-22T19:05:41Z"
+answered_at: "2026-11-22T19:12:07Z"

@@ -2,8 +2,9 @@
   "schema_version": 1,
   "id": "WI-0007",
   "title": "Post-oxl-0.23 unlock plan (TLS, term, signal)",
-  "state": "intake",
+  "state": "planning",
   "profile": "normal",
-  "current_stage": "intake",
-  "created_at": "2026-11-22T19:04:49Z"
+  "current_stage": "planning",
+  "created_at": "2026-11-22T19:04:49Z",
+  "updated_at": "2026-11-22T19:20:20Z"
 }
