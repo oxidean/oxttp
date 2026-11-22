@@ -1312,7 +1312,7 @@ fn resolve(m: own args.Matches, envpairs: []str) -> own Out {
     scheme := url_scheme(o.intent.url)
     if scheme != "http" && scheme != "https" {
         // ADR-0015 TLS deferral retained for non-http(s); https execs via
-        // std/net/tls (ADR-0021).
+        // std/net/tls (ADR-0026).
         defer_out(o, prog, scheme + " URLs are unsupported in this build (TLS is not available)")
         return o
     }

@@ -1,4 +1,4 @@
-# ADR-0021 — HTTPS via std/net/tls behind H1
+# ADR-0026 — HTTPS via std/net/tls behind H1
 
 - Status: accepted
 - Date: 2026-11-22

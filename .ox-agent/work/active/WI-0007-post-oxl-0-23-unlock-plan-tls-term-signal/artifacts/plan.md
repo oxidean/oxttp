@@ -1,7 +1,7 @@
 # WI-0007 plan — follow-on work after oxl ≥ 0.23.2
 
 Brainstorm: `artifacts/brainstorm.md`. Spec: `artifacts/spec.md`.
-Sequencing: `context/decisions/0020-post-oxl-023-unlock-sequencing.md`
+Sequencing: `context/decisions/0025-post-oxl-023-unlock-sequencing.md`
 (IN-0005 = B).
 
 ## M0 — Toolchain bump (this PR)

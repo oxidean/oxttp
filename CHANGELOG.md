@@ -19,7 +19,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   check-status; `tests/golden/run.sh` diffs basic rows vs xh 0.26.3
   (WI-0006)
 - `core/http` + `cli`: HTTPS via `std/net/tls` behind H1; `--verify=no`
-  accept-all Verifier (WI-0009 / ADR-0021)
+  accept-all Verifier (WI-0009 / ADR-0026)
 
 ### Changed
 

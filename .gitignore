@@ -8,3 +8,4 @@ target/
 
 # ox-agent generated context index — rebuild via `ox-agent context index`
 .ox-agent/context/index.yaml
+.tools/
