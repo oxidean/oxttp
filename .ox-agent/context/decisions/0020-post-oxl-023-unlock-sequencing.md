@@ -1,6 +1,6 @@
 # 0020 — Post-oxl-0.23 unlock sequencing
 
-Status: proposed (2026-11-22, WI-0007 brainstorm — confirm at
+Status: proposed (2026-11-22, WI-0007 (ox-agent) brainstorm — confirm at
 specification / when opening follow-on WIs)
 
 oxl v0.23.2 closed the upstream blockers that shaped oxttp v0.1

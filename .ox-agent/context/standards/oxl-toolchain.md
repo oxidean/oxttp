@@ -4,11 +4,11 @@ Pinned toolchain: `.oxl-version` → v0.15.0. `oxl` on PATH resolves the pin;
 bump pin and CI together. CI installs `oxl-toolchain-linux-x86_64.tar.gz`
 from oxidean/oxl releases.
 
-**Pending bump:** latest oxl is v0.23.2. WI-0007 plans the post-bump
-unlock sequence; WI-0008 (not yet opened) is the chore PR that moves
-the pin. Capability notes below still describe the **pinned** 0.15.0
-surface; a “≥0.23.2” subsection records what the bump unlocks so
-docs are not silently stale.
+**Pending bump:** latest oxl is v0.23.2. WI-0007 (ox-agent work item)
+plans the post-bump unlock sequence via the `plan` pipeline; WI-0008
+(not yet opened) is the chore PR that moves the pin. Capability notes
+below still describe the **pinned** 0.15.0 surface; a “≥0.23.2”
+subsection records what the bump unlocks so docs are not silently stale.
 
 ## Build / test
 
