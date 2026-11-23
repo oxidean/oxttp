@@ -920,10 +920,9 @@ fn print_of_chars(v: str) -> own Print {
     return p
 }
 
-// print_new → Print::new. is_terminal is still treated as false for
-// the print-set chain (stdout pretty/colors use guess_pretty separately;
-// matching upstream's non-TTY `body || !is_terminal` default for pipes).
-fn print_new(verbose: int, headers: int, body: int, meta: int, quiet: int, offline: int) -> own Print {
+// print_new → Print::new. is_tty mirrors stdout isatty: on a TTY the
+// default is `hb`; on a pipe `body || !is_terminal` yields `b`.
+fn print_new(verbose: int, headers: int, body: int, meta: int, quiet: int, offline: int, is_tty: int) -> own Print {
     p := new(Print)
     if verbose > 0 {
         p.req_h = 1
@@ -947,8 +946,7 @@ fn print_new(verbose: int, headers: int, body: int, meta: int, quiet: int, offli
         p.res_h = 1
         return p
     }
-    if body != 0 || 1 == 1 {
-        // `body || !is_terminal` — print-set still assumes non-TTY
+    if body != 0 || is_tty == 0 {
         p.res_b = 1
         return p
     }
@@ -1285,7 +1283,11 @@ fn resolve(m: own args.Matches, envpairs: []str) -> own Out {
     if args.present(m, "print") {
         o.intent.print_set = print_of_chars(o.intent.print)
     } else {
-        o.intent.print_set = print_new(o.intent.verbose, o.intent.headers, o.intent.body, o.intent.meta, o.intent.quiet, o.intent.offline)
+        out_tty := 0
+        if term.isatty(term.stdout_fd()) {
+            out_tty = 1
+        }
+        o.intent.print_set = print_new(o.intent.verbose, o.intent.headers, o.intent.body, o.intent.meta, o.intent.quiet, o.intent.offline, out_tty)
     }
     if args.present(m, "history-print") {
         o.intent.hist_set = print_of_chars(o.intent.history_print)
@@ -1330,6 +1332,12 @@ fn resolve(m: own args.Matches, envpairs: []str) -> own Out {
     // select a different stack, so degrade rather than silent oxl TLS.
     if o.intent.native_tls != 0 && scheme == "https" {
         defer_out(o, prog, "--native-tls is unsupported in this build (oxidean/oxl#221)")
+        return o
+    }
+    // --curl never sends: skip connection-affecting degrades so the
+    // emit path can warn about ignored flags instead of exit 1.
+    if o.intent.curl != 0 {
+        o.exec = 1
         return o
     }
     // Degrade routing (ADR 0024): connection-affecting flags error

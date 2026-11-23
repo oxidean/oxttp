@@ -6,6 +6,8 @@ package main
 // land in S9+.
 import "std/os"
 
+import "std/time"
+
 import "github.com/oxidean/oxttp/core/term"
 
 import "github.com/oxidean/oxttp/shared/version"
@@ -68,6 +70,9 @@ fn main() {
         }
         if re != nil && n <= 0 {
             break
+        }
+        if n <= 0 {
+            time.sleep_ms(50)
         }
     }
 }

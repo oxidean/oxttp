@@ -26,7 +26,7 @@ Updated: 2026-11-22 · pin oxl 0.23.2
 | §4.6 `--http-version` 2* | `oxl-blocked` | [#218](https://github.com/oxidean/oxl/issues/218) |
 | §4.6 `--http-version` 3* | `oxl-blocked` | [#219](https://github.com/oxidean/oxl/issues/219) |
 | §4.7 offline/curl/generate/check-status | `next`/`post` | check-status+curl done; generate `post` |
-| §5 `--curl` map | `done` | emit after plan(); long flags |
+| §5 `--curl` map | `next` | emit + Ignored warnings; map incomplete vs corpus |
 | §6 Completions/man | `post` | |
 | §7 Env vars | `next` | proxy/netrc/CA partial; finish S7 |
 | §8 Exit codes / warnings | `done` | 0–6 paths covered in S5 |

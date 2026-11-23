@@ -1537,19 +1537,51 @@ fn shquote(s: str) -> str {
     return out + "'"
 }
 
+// curl_ignored appends xh-shaped "Warning: Ignored …" lines for
+// flags that affect oxttp output/session but not the curl argv map.
+fn curl_ignored(i: ref Intent) -> str {
+    out := ""
+    if i.offline != 0 {
+        out = out + "Warning: Ignored --offline\n"
+    }
+    if len(i.session) > 0 {
+        out = out + "Warning: Ignored --session\n"
+    }
+    if len(i.print) > 0 {
+        out = out + "Warning: Ignored --print\n"
+    }
+    if len(i.pretty) > 0 && i.pretty != "none" {
+        out = out + "Warning: Ignored --pretty\n"
+    }
+    if i.download != 0 {
+        out = out + "Warning: Ignored --download\n"
+    }
+    if len(i.proxies[:]) > 0 || len(i.proxy_env[:]) > 0 {
+        out = out + "Warning: Ignored --proxy\n"
+    }
+    if len(i.resolves[:]) > 0 {
+        out = out + "Warning: Ignored --resolve\n"
+    }
+    return out
+}
+
 // curl_emit translates the planned request into a curl command line
-// (corpus §5 subset: follow, method, headers, body, http1.0, URL).
+// (corpus §5 subset: follow, method, headers, body, http1.0, -C, -o, URL).
 fn curl_emit(i: ref Intent, p: ref ReqPlan) -> str {
     long := i.curl_long
     fl_loc := "-L"
     fl_x := "-X"
     fl_h := "-H"
     fl_d := "-d"
+    fl_c := "-C"
+    fl_o := "-o"
     if long != 0 {
         fl_loc = "--location"
         fl_x = "--request"
         fl_h = "--header"
         fl_d = "--data"
+        fl_c = "--continue-at"
+        fl_o = "--output"
     }
     cmd := "curl"
     if i.follow != 0 {
@@ -1557,6 +1589,12 @@ fn curl_emit(i: ref Intent, p: ref ReqPlan) -> str {
     }
     if i.http_version == "1.0" {
         cmd = cmd + " --http1.0"
+    }
+    if p.resume_off > 0 {
+        cmd = cmd + " " + fl_c + " -"
+    }
+    if len(i.output) > 0 {
+        cmd = cmd + " " + fl_o + " " + shquote(i.output)
     }
     meth := p.req.method
     if len(meth) == 0 {
@@ -1666,8 +1704,12 @@ fn execute(i: ref Intent, envpairs: []str, stdin: str, stdin_tty: int) -> own Ru
     if i.curl != 0 {
         r.code = 0
         r.stdout = curl_emit(i, p) + "\n"
-        r.stderr = warn
+        r.stderr = warn + curl_ignored(i)
         return r
+    }
+    // colors/all: format-only until style lands (ADR-0006: say so).
+    if (i.pretty == "all" || i.pretty == "colors") && i.quiet < 2 {
+        warn = warn + prog + ": warning: --pretty " + i.pretty + " colors/style unsupported in this build; formatting only\n"
     }
     ps := i.print_set
     hs := i.hist_set
@@ -1768,10 +1810,13 @@ fn execute(i: ref Intent, envpairs: []str, stdin: str, stdin_tty: int) -> own Ru
         }
     }
     code := 0
+    // Only oxttp-injected Range (resume_off>0) enables 416-as-success.
+    // Manual Range: + --continue disables resume (warn above) and must
+    // not treat 416 as complete.
+    resumable := p.resume_off > 0
     if i.check_eff != 0 {
         s := resp.status
-        // 416 during --continue is success (file already complete)
-        if s == 416 && i.resume != 0 {
+        if s == 416 && resumable {
             code = 0
         } else if s >= 300 && s <= 399 && i.follow == 0 {
             code = 3
@@ -1791,8 +1836,8 @@ fn execute(i: ref Intent, envpairs: []str, stdin: str, stdin_tty: int) -> own Ru
     }
     if i.download != 0 {
         dest := i.output
-        // 416 + --continue: already complete — no rewrite
-        if resp.status == 416 && i.resume != 0 {
+        // 416 + oxttp-injected Range: already complete — no rewrite
+        if resp.status == 416 && resumable {
             if len(dest) == 0 {
                 dest = "<stdout>"
             }

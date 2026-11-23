@@ -1,6 +1,6 @@
 # 0005 — Pure-oxl terminal layer via stty + ANSI
 
-Status: proposed (2026-11-17, WI-0001 brainstorm — confirm at specification)
+Status: superseded (2026-11-23 by ADR-0027 — `std/os/term` + `std/os/signal`)
 
 `tui/` drives the terminal in pure oxl: `std/os/exec` runs
 `stty raw -echo` to enter raw mode (restore on exit); input is the stdin

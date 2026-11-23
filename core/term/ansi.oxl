@@ -162,13 +162,18 @@ fn open_session() -> [own Session, err] {
         rows = sz.rows
     }
     ae1 := signal.arm("SIGINT")
-    ae2 := signal.arm("SIGWINCH")
     if ae1 != nil {
         raw.restore()
         return nil, ae1
     }
+    ae2 := signal.arm("SIGWINCH")
     if ae2 != nil {
+        // Don't leave SIGINT armed after a half-open session.
+        de := signal.disarm("SIGINT")
         raw.restore()
+        if de != nil {
+            return nil, de
+        }
         return nil, ae2
     }
     s := new(Session)
@@ -179,30 +184,30 @@ fn open_session() -> [own Session, err] {
 }
 
 fn (s mut Session) close() -> err {
+    // Always leave the alternate screen first so a disarm/restore
+    // failure cannot trap the parent shell on the hidden buffer.
+    f := os.stdout()
+    [nw, we] = f.write("\x1b[?1049l\x1b[?25h\x1b[0m" as []byte)
+    first := we
+    if nw < 0 && first == nil {
+        // ignore short write on teardown
+    }
     if s.armed != 0 {
         de1 := signal.disarm("SIGINT")
         de2 := signal.disarm("SIGWINCH")
         s.armed = 0
-        if de1 != nil {
-            s.raw.restore()
-            return de1
+        if first == nil {
+            first = de1
         }
-        if de2 != nil {
-            s.raw.restore()
-            return de2
+        if first == nil {
+            first = de2
         }
     }
-    // Leave alternate screen + show cursor before restoring cooked.
-    f := os.stdout()
-    [nw, we] = f.write("\x1b[?1049l\x1b[?25h\x1b[0m" as []byte)
-    if we != nil {
-        s.raw.restore()
-        return we
+    re := s.raw.restore()
+    if first != nil {
+        return first
     }
-    if nw < 0 {
-        // ignore short write on teardown
-    }
-    return s.raw.restore()
+    return re
 }
 
 fn (s mut Session) interrupted() -> bool {

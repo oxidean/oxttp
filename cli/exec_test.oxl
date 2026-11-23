@@ -211,4 +211,27 @@ fn test_exec_pretty_json() {
     r := xrun("--pretty\nformat\n--print\nb\n{URL}/x", "", f.port)
     testing.expect_eq(r.code, 0, "pretty exit 0")
     testing.expect(find(r.stdout, "{\n  \"a\": 1,\n  \"b\": true\n}") >= 0, "pretty body: " + r.stdout)
+    r2 := xrun("--pretty\ncolors\n--print\nb\n--offline\nexample.org", "", 1)
+    testing.expect(find(r2.stderr, "colors/style unsupported") >= 0, "colors warn: " + r2.stderr)
+}
+
+fn test_exec_continue_range_conflict() {
+    // Manual Range: disables --continue; 416 is a normal 4xx.
+    dest := "/tmp/oxttp-exec-resume-conflict.bin"
+    os.writefile_(dest, "AAAA")
+    f := srv(str1("416 Range Not Satisfiable\nContent-Type: text/plain\n\n"))
+    r := xrun("-d\n-c\n-o\n" + dest + "\n--check-status\n{URL}/x\nRange:bytes=0-", "", f.port)
+    testing.expect_eq(r.code, 4, "416 exit 4 when continue disabled: " + r.stderr)
+    testing.expect(find(r.stderr, "--continue will be disabled") >= 0, "disable warn: " + r.stderr)
+    testing.expect(find(r.stderr, "already complete") < 0, "no complete msg")
+    testing.expect_streq(os.readfile_(dest), "AAAA", "no rewrite")
+    os.remove(dest)
+}
+
+fn test_exec_curl_ignored_warn() {
+    r := xrun("--curl\n--offline\n--pretty\nformat\n--print\nHbh\nexample.org", "", 1)
+    testing.expect_eq(r.code, 0, "curl exit")
+    testing.expect(find(r.stderr, "Warning: Ignored --offline") >= 0, "ignored offline: " + r.stderr)
+    testing.expect(find(r.stderr, "Warning: Ignored --pretty") >= 0, "ignored pretty: " + r.stderr)
+    testing.expect(find(r.stderr, "Warning: Ignored --print") >= 0, "ignored print: " + r.stderr)
 }
