@@ -9,12 +9,12 @@ Updated: 2026-11-22 · pin oxl 0.23.2
 
 | Section | Status | Notes |
 |---|---|---|
-| §1 Invocation / bin names / config.json | `next` | Parse done (S4); config default_options S7 |
+| §1 Invocation / bin names / config.json | `done` | config.json default_options wired |
 | §2 METHOD/URL positionals | `done` | S5 construct_url → H1 (+ https) |
 | §3 REQUEST_ITEM grammar | `done` | WI-0003 |
 | §4.1 Body modes json/form/multipart/raw/stdin | `done` | WI-0006 S5 |
-| §4.2 Print/pretty/style/meta/verbose | `next` | meta/print done; pretty≠none degrades; style/isatty S7 |
-| §4.3 Download/output | `next` | `-d`/`-o` done; `--continue` degrades until Range |
+| §4.2 Print/pretty/style/meta/verbose | `next` | pretty+isatty+JSON indent done; style/colors polish later |
+| §4.3 Download/output | `done` | `-d`/`-o` + `--continue` Range/206/416 |
 | §4.4 Sessions | `done` | jar-lite + load/save (ADR-0023) |
 | §4.5 Auth basic/bearer/digest | `done` | digest §D3 retry landed |
 | §4.5 `https://` / `--https` / `--verify=yes\|pem` | `done` | ADR-0026; PEM path + system roots |
@@ -25,8 +25,8 @@ Updated: 2026-11-22 · pin oxl 0.23.2
 | §4.6 `--http-version` 1.0/1.1 | `done` | H1 emits 1.0/1.1 |
 | §4.6 `--http-version` 2* | `oxl-blocked` | [#218](https://github.com/oxidean/oxl/issues/218) |
 | §4.6 `--http-version` 3* | `oxl-blocked` | [#219](https://github.com/oxidean/oxl/issues/219) |
-| §4.7 offline/curl/generate/check-status | `next`/`post` | check-status done; curl degrade; generate `post` |
-| §5 `--curl` map | `next` | still degraded |
+| §4.7 offline/curl/generate/check-status | `next`/`post` | check-status+curl done; generate `post` |
+| §5 `--curl` map | `done` | emit after plan(); long flags |
 | §6 Completions/man | `post` | |
 | §7 Env vars | `next` | proxy/netrc/CA partial; finish S7 |
 | §8 Exit codes / warnings | `done` | 0–6 paths covered in S5 |
@@ -51,4 +51,4 @@ Updated: 2026-11-22 · pin oxl 0.23.2
 | §7.5 SSE | `post` | M4 |
 | §7.6 OAuth2 | `post` | M4 |
 | §8 Themes / import / remote / tools | `post` | M4 |
-| S8 terminal driver | `next` | `std/os/term`+`signal` (not stty) |
+| S8 terminal driver | `done` | ADR-0027 AnsiScreen Session |
