@@ -79,10 +79,12 @@ fn test_binary_suppressor() {
     b[0] = 65
     b[1] = 0
     b[2] = 66
-    out := body_render(b)
+    out := body_render(b, "none")
     testing.expect(find(out, "binary data not shown") >= 0, "suppressor note")
-    ok := body_render("plain" as []byte)
+    ok := body_render("plain" as []byte, "none")
     testing.expect_streq(ok, "plain", "verbatim")
+    pretty := body_render("{\"a\":1,\"b\":[2,3]}" as []byte, "format")
+    testing.expect(find(pretty, "{\n  \"a\": 1,\n  \"b\": [\n    2,\n    3\n  ]\n}") >= 0, "json pretty: " + pretty)
 }
 
 fn test_meta_and_human_bytes() {

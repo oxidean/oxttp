@@ -20,6 +20,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (WI-0006)
 - `core/http` + `cli`: HTTPS via `std/net/tls` behind H1; `--verify=no`
   accept-all Verifier (WI-0009 / ADR-0026)
+- `cli` S7: `--continue` Range resume (206/416), `--curl` emit, `--pretty`
+  + `std/os/term` isatty + JSON indent (WI-0010)
+- `core/term` + `tui` S8: AnsiScreen Session on `std/os/term` +
+  `std/os/signal` (ADR-0027 supersedes ADR-0005)
 
 ### Changed
 

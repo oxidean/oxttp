@@ -1,0 +1,236 @@
+package term
+
+// AnsiScreen + Session — S8 driver on std/os/term + std/os/signal
+// (ADR-0027, supersedes ADR-0005's stty path).
+import "std/os"
+
+import "std/os/term" as osterm
+
+import "std/os/signal"
+
+import "std/errors"
+
+// AnsiScreen is an in-memory cell grid flushed with ANSI CSI.
+struct AnsiScreen {
+    cols: int,
+    rows: int,
+    chs: []str,
+    fgs: []int,
+    bgs: []int,
+    attrs: []int,
+    cx: int,
+    cy: int,
+    show_cur: bool,
+}
+
+fn new_ansi(cols: int, rows: int) -> own AnsiScreen {
+    if cols < 1 {
+        cols = 80
+    }
+    if rows < 1 {
+        rows = 24
+    }
+    n := cols * rows
+    s := new(AnsiScreen)
+    s.cols = cols
+    s.rows = rows
+    s.chs = mkslice(str, n)
+    s.fgs = mkslice(int, n)
+    s.bgs = mkslice(int, n)
+    s.attrs = mkslice(int, n)
+    i := 0
+    for i < n {
+        s.chs[i] = " "
+        s.fgs[i] = -1
+        s.bgs[i] = -1
+        s.attrs[i] = 0
+        i = i + 1
+    }
+    s.cx = 0
+    s.cy = 0
+    s.show_cur = true
+    return s
+}
+
+fn (s AnsiScreen) size() -> CellSize {
+    return CellSize{cols: s.cols, rows: s.rows}
+}
+
+fn (s mut AnsiScreen) set_cell(x: int, y: int, ch: str, fg: int, bg: int, attr: int) {
+    if x < 0 || y < 0 || x >= s.cols || y >= s.rows {
+        return
+    }
+    i := y * s.cols + x
+    if len(ch) == 0 {
+        ch = " "
+    }
+    s.chs[i] = substr(ch, 0, 1)
+    s.fgs[i] = fg
+    s.bgs[i] = bg
+    s.attrs[i] = attr
+}
+
+fn (s mut AnsiScreen) cursor(x: int, y: int, show: bool) {
+    s.cx = x
+    s.cy = y
+    s.show_cur = show
+}
+
+fn sgr_attr(attr: int) -> str {
+    // No bitwise-& in oxl — peel flag bits high→low.
+    out := "0"
+    a := attr
+    if a >= AttrReverse {
+        a = a - AttrReverse
+        out = out + ";7"
+    }
+    if a >= AttrUnderline {
+        a = a - AttrUnderline
+        out = out + ";4"
+    }
+    if a >= AttrItalic {
+        a = a - AttrItalic
+        out = out + ";3"
+    }
+    if a >= AttrDim {
+        a = a - AttrDim
+        out = out + ";2"
+    }
+    if a >= AttrBold {
+        out = out + ";1"
+    }
+    return out
+}
+
+fn (s mut AnsiScreen) present() -> err {
+    // Alternate-screen home + clear once per flush is expensive but
+    // correct for the S8 bootstrap (S9 adds dirty-rect).
+    buf := "\x1b[?1049h\x1b[H\x1b[2J\x1b[0m"
+    y := 0
+    for y < s.rows {
+        x := 0
+        buf = buf + "\x1b[" + itoa(y + 1) + ";1H"
+        for x < s.cols {
+            i := y * s.cols + x
+            buf = buf + "\x1b[" + sgr_attr(s.attrs[i]) + "m"
+            fg := s.fgs[i]
+            if fg >= 0 && fg < 8 {
+                buf = buf + "\x1b[" + itoa(30 + fg) + "m"
+            }
+            bg := s.bgs[i]
+            if bg >= 0 && bg < 8 {
+                buf = buf + "\x1b[" + itoa(40 + bg) + "m"
+            }
+            buf = buf + s.chs[i]
+            x = x + 1
+        }
+        y = y + 1
+    }
+    if s.show_cur {
+        buf = buf + "\x1b[?25h\x1b[" + itoa(s.cy + 1) + ";" + itoa(s.cx + 1) + "H"
+    } else {
+        buf = buf + "\x1b[?25l"
+    }
+    f := os.stdout()
+    [_, we] = f.write(buf as []byte)
+    return we
+}
+
+// Session owns raw mode + signal arming for a TUI process.
+struct Session {
+    raw: osterm.Raw,
+    scr: own AnsiScreen,
+    armed: int,
+}
+
+// open_session enters raw mode on stdin, arms SIGINT/SIGWINCH, and
+// builds an AnsiScreen sized to the tty. Non-tty → err (caller falls
+// back to plain stdout).
+fn open_session() -> [own Session, err] {
+    if !osterm.isatty(osterm.stdin_fd()) {
+        return nil, errors.new("stdin is not a tty")
+    }
+    [raw, re] = osterm.raw(osterm.stdin_fd())
+    if re != nil {
+        return nil, re
+    }
+    cols := 80
+    rows := 24
+    [sz, se] = osterm.size(osterm.stdout_fd())
+    if se == nil {
+        cols = sz.cols
+        rows = sz.rows
+    }
+    ae1 := signal.arm("SIGINT")
+    if ae1 != nil {
+        raw.restore()
+        return nil, ae1
+    }
+    ae2 := signal.arm("SIGWINCH")
+    if ae2 != nil {
+        // Don't leave SIGINT armed after a half-open session.
+        de := signal.disarm("SIGINT")
+        raw.restore()
+        if de != nil {
+            return nil, de
+        }
+        return nil, ae2
+    }
+    s := new(Session)
+    s.raw = raw
+    s.scr = new_ansi(cols, rows)
+    s.armed = 1
+    return s, nil
+}
+
+fn (s mut Session) close() -> err {
+    // Always leave the alternate screen first so a disarm/restore
+    // failure cannot trap the parent shell on the hidden buffer.
+    f := os.stdout()
+    [nw, we] = f.write("\x1b[?1049l\x1b[?25h\x1b[0m" as []byte)
+    first := we
+    if nw < 0 && first == nil {
+        // ignore short write on teardown
+    }
+    if s.armed != 0 {
+        de1 := signal.disarm("SIGINT")
+        de2 := signal.disarm("SIGWINCH")
+        s.armed = 0
+        if first == nil {
+            first = de1
+        }
+        if first == nil {
+            first = de2
+        }
+    }
+    re := s.raw.restore()
+    if first != nil {
+        return first
+    }
+    return re
+}
+
+fn (s mut Session) interrupted() -> bool {
+    [hit, e] = signal.take("SIGINT")
+    if e != nil {
+        return false
+    }
+    return hit
+}
+
+fn (s mut Session) resized() -> bool {
+    [hit, e] = signal.take("SIGWINCH")
+    if e != nil || !hit {
+        return false
+    }
+    [sz, se] = osterm.size(osterm.stdout_fd())
+    if se != nil {
+        return true
+    }
+    s.scr = new_ansi(sz.cols, sz.rows)
+    return true
+}
+
+fn (s mut Session) screen() -> Screen {
+    return s.scr
+}

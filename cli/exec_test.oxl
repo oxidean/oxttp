@@ -170,3 +170,68 @@ fn test_exec_jar_redirect() {
     testing.expect(find(r.stdout, "Cookie: jc=jv") >= 0, "jar carried across redirect: " + r.stdout)
     os.remove_all(home)
 }
+
+fn test_exec_curl_emit() {
+    r := xrun("--curl\n--offline\nexample.org/path", "", 1)
+    testing.expect_eq(r.code, 0, "curl exit 0")
+    testing.expect(find(r.stdout, "curl") == 0, "starts with curl: " + r.stdout)
+    testing.expect(find(r.stdout, "http://example.org/path") >= 0, "url in curl: " + r.stdout)
+    r2 := xrun("--curl-long\n-F\n--http-version\n1.0\nPOST\nexample.org\na=b", "", 1)
+    testing.expect_eq(r2.code, 0, "curl-long exit 0")
+    testing.expect(find(r2.stdout, "--location") >= 0, "long location: " + r2.stdout)
+    testing.expect(find(r2.stdout, "--header") >= 0, "long header: " + r2.stdout)
+    testing.expect(find(r2.stdout, "--data") >= 0, "long data: " + r2.stdout)
+    testing.expect(find(r2.stdout, "--http1.0") >= 0, "http1.0: " + r2.stdout)
+    // curl short-circuits offline — still no network; offline alone
+    // would print the request, curl alone prints curl.
+    testing.expect(find(r2.stdout, "POST / HTTP") < 0, "no req head with curl")
+}
+
+fn test_exec_continue_206_416() {
+    dest := "/tmp/oxttp-exec-resume.bin"
+    os.writefile_(dest, "AAAA")
+    // 206 → append body onto existing file
+    f206 := srv(str1("206 Partial Content\nContent-Type: application/octet-stream\n\nBBBB"))
+    r206 := xrun("-d\n-c\n-o\n" + dest + "\n{URL}/x", "", f206.port)
+    testing.expect_eq(r206.code, 0, "206 exit 0: " + r206.stderr)
+    testing.expect_streq(os.readfile_(dest), "AAAABBBB", "206 append")
+    testing.expect(find(r206.stderr, "Done.") >= 0, "206 Done msg")
+    // 416 → already complete, no rewrite
+    os.writefile_(dest, "FULLFILE")
+    f416 := srv(str1("416 Range Not Satisfiable\nContent-Type: text/plain\n\n"))
+    r416 := xrun("-d\n-c\n-o\n" + dest + "\n--check-status\n{URL}/x", "", f416.port)
+    testing.expect_eq(r416.code, 0, "416 exit 0 under check-status: " + r416.stderr)
+    testing.expect_streq(os.readfile_(dest), "FULLFILE", "416 no rewrite")
+    testing.expect(find(r416.stderr, "already complete") >= 0, "416 complete msg: " + r416.stderr)
+    os.remove(dest)
+}
+
+fn test_exec_pretty_json() {
+    f := srv(str1("200 OK\nContent-Type: application/json\n\n{\"a\":1,\"b\":true}"))
+    r := xrun("--pretty\nformat\n--print\nb\n{URL}/x", "", f.port)
+    testing.expect_eq(r.code, 0, "pretty exit 0")
+    testing.expect(find(r.stdout, "{\n  \"a\": 1,\n  \"b\": true\n}") >= 0, "pretty body: " + r.stdout)
+    r2 := xrun("--pretty\ncolors\n--print\nb\n--offline\nexample.org", "", 1)
+    testing.expect(find(r2.stderr, "colors/style unsupported") >= 0, "colors warn: " + r2.stderr)
+}
+
+fn test_exec_continue_range_conflict() {
+    // Manual Range: disables --continue; 416 is a normal 4xx.
+    dest := "/tmp/oxttp-exec-resume-conflict.bin"
+    os.writefile_(dest, "AAAA")
+    f := srv(str1("416 Range Not Satisfiable\nContent-Type: text/plain\n\n"))
+    r := xrun("-d\n-c\n-o\n" + dest + "\n--check-status\n{URL}/x\nRange:bytes=0-", "", f.port)
+    testing.expect_eq(r.code, 4, "416 exit 4 when continue disabled: " + r.stderr)
+    testing.expect(find(r.stderr, "--continue will be disabled") >= 0, "disable warn: " + r.stderr)
+    testing.expect(find(r.stderr, "already complete") < 0, "no complete msg")
+    testing.expect_streq(os.readfile_(dest), "AAAA", "no rewrite")
+    os.remove(dest)
+}
+
+fn test_exec_curl_ignored_warn() {
+    r := xrun("--curl\n--offline\n--pretty\nformat\n--print\nHbh\nexample.org", "", 1)
+    testing.expect_eq(r.code, 0, "curl exit")
+    testing.expect(find(r.stderr, "Warning: Ignored --offline") >= 0, "ignored offline: " + r.stderr)
+    testing.expect(find(r.stderr, "Warning: Ignored --pretty") >= 0, "ignored pretty: " + r.stderr)
+    testing.expect(find(r.stderr, "Warning: Ignored --print") >= 0, "ignored print: " + r.stderr)
+}

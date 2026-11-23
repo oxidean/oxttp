@@ -15,8 +15,8 @@ struct MockScreen {
     presents: int,
 }
 
-fn (s MockScreen) size() -> Size {
-    return Size{cols: s.w, rows: s.h}
+fn (s MockScreen) size() -> CellSize {
+    return CellSize{cols: s.w, rows: s.h}
 }
 
 fn (s mut MockScreen) set_cell(x: int, y: int, ch: str, fg: int, bg: int, attr: int) {
@@ -70,4 +70,21 @@ fn test_screen_port() {
     scr.cursor(1, 1, true)
     e := scr.present()
     testing.expect(e == nil, "present ok")
+}
+
+fn test_ansi_grid() {
+    a := new_ansi(4, 2)
+    testing.expect_eq(a.cols, 4, "cols")
+    testing.expect_eq(a.rows, 2, "rows")
+    a.set_cell(1, 0, "Z", 1, 2, AttrBold)
+    testing.expect_streq(a.chs[1], "Z", "cell ch")
+    testing.expect_eq(a.fgs[1], 1, "fg")
+    testing.expect_streq(sgr_attr(AttrBold + AttrUnderline), "0;4;1", "sgr bits")
+    let scr: Screen = a
+    sz := scr.size()
+    testing.expect_eq(sz.cols, 4, "iface size")
+}
+
+fn test_sgr_attr_plain() {
+    testing.expect_streq(sgr_attr(0), "0", "plain")
 }

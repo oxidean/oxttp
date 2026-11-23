@@ -1,9 +1,9 @@
 package term
 
-// Screen/Key abstractions — the TUI's port (decision 0005: the stty
-// raw-mode + ANSI driver lives behind these so a future termios
-// driver or a headless test driver swaps in). Types only; input
-// decode + render land in S8.
+// Screen/Key abstractions — the TUI's port. S8 ships an AnsiScreen
+// driver on std/os/term + std/os/signal (ADR-0027, supersedes the
+// ADR-0005 stty plan). Headless MockScreen stays for tests; full
+// key decode lands with S9.
 // Key vocabulary: docs/corpus/corpus-posting.md section 3
 // (ctrl/alt/shift/meta/super modifiers, named keys enter..f12) and
 // section 4 (SGR mouse: clicks + scroll).
@@ -66,16 +66,16 @@ let AttrItalic = 4
 let AttrUnderline = 8
 let AttrReverse = 16
 
-// Size is a terminal's cell dimensions — returned by Screen.size
-// (oxl ≥0.23 requires multi-return signatures to be `[T, err]`, so
-// width/height ride a struct instead of `[int, int]`).
-struct Size { cols: int, rows: int }
+// CellSize is a terminal's cell dimensions — returned by Screen.size.
+// Named apart from std/os/term.Size so the C backend does not collide
+// when both packages are linked into oxttp-tui.
+struct CellSize { cols: int, rows: int }
 
 // Screen is the cell-buffer port the TUI renders into: size in
 // cells, set_cell writes one cell (fg/bg are palette ids — S8 maps
 // them to SGR), present flushes, cursor positions + hides.
 interface Screen {
-    size() -> Size
+    size() -> CellSize
     set_cell(x: int, y: int, ch: str, fg: int, bg: int, attr: int)
     present() -> err
     cursor(x: int, y: int, show: bool)

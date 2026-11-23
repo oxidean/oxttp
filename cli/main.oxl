@@ -6,6 +6,8 @@ package main
 // (S5); a fully valid parse ends in an explicit deferral error.
 import "std/os"
 
+import "std/os/term"
+
 import "github.com/oxidean/oxttp/shared/args"
 
 // envnames — the corpus §7 parse-level set plus every option-
@@ -164,12 +166,11 @@ fn main() {
     }
     o := resolve(m, envpairs)
     if o.exec != 0 {
-        // S5: stdin feeds the body when it isn't a terminal (ADR 0022 —
-        // no isatty in oxl; /dev/stdin realpath is the heuristic).
-        tty := 1
-        rp := os.fullpath("/dev/stdin")
-        if len(rp) > 0 && find(rp, "pts") < 0 && find(rp, "tty") < 0 {
-            tty = 0
+        // Stdin feeds the body when it isn't a terminal (std/os/term
+        // isatty; ADR 0022's /dev/stdin realpath heuristic is retired).
+        tty := 0
+        if term.isatty(term.stdin_fd()) {
+            tty = 1
         }
         data := ""
         if tty == 0 {

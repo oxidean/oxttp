@@ -14,6 +14,8 @@ import "std/strconv"
 
 import "std/errors"
 
+import "std/os/term"
+
 import "github.com/oxidean/oxttp/shared/args"
 
 import "github.com/oxidean/oxttp/core/item"
@@ -875,8 +877,8 @@ fn construct_url(raw_url: str, default_scheme: str) -> [str, err] {
 // --- pretty / print resolution -----------------------------------
 
 // guess_pretty → buffer.rs::guess_pretty under a caller-supplied
-// is_terminal (v0.1 has no isatty — main passes 0, yielding "none";
-// the tty arm stays for S5).
+// is_terminal (from std/os/term.isatty on stdout when --pretty is
+// absent).
 fn guess_pretty(is_tty: int, envpairs: []str) -> str {
     if is_tty == 0 {
         return "none"
@@ -918,9 +920,9 @@ fn print_of_chars(v: str) -> own Print {
     return p
 }
 
-// print_new → Print::new with is_terminal=false (no isatty; the
-// `body || !is_terminal` branch therefore always fires once reached).
-fn print_new(verbose: int, headers: int, body: int, meta: int, quiet: int, offline: int) -> own Print {
+// print_new → Print::new. is_tty mirrors stdout isatty: on a TTY the
+// default is `hb`; on a pipe `body || !is_terminal` yields `b`.
+fn print_new(verbose: int, headers: int, body: int, meta: int, quiet: int, offline: int, is_tty: int) -> own Print {
     p := new(Print)
     if verbose > 0 {
         p.req_h = 1
@@ -944,8 +946,7 @@ fn print_new(verbose: int, headers: int, body: int, meta: int, quiet: int, offli
         p.res_h = 1
         return p
     }
-    if body != 0 || 1 == 1 {
-        // `body || !is_terminal` — is_terminal is always 0 here
+    if body != 0 || is_tty == 0 {
         p.res_b = 1
         return p
     }
@@ -1213,6 +1214,13 @@ fn resolve(m: own args.Matches, envpairs: []str) -> own Out {
         o.intent.timeout = args.get_float(m, "timeout")
     }
     o.intent.pretty = args.get_enum(m, "pretty")
+    if args.present(m, "pretty") == false {
+        is_tty := 0
+        if term.isatty(term.stdout_fd()) {
+            is_tty = 1
+        }
+        o.intent.pretty = guess_pretty(is_tty, envpairs)
+    }
     o.intent.style = args.get_enum(m, "style")
     [rc, rce] = chk_charset(args.get_str(m, "response-charset"))
     if args.present(m, "response-charset") && rce == nil {
@@ -1275,7 +1283,11 @@ fn resolve(m: own args.Matches, envpairs: []str) -> own Out {
     if args.present(m, "print") {
         o.intent.print_set = print_of_chars(o.intent.print)
     } else {
-        o.intent.print_set = print_new(o.intent.verbose, o.intent.headers, o.intent.body, o.intent.meta, o.intent.quiet, o.intent.offline)
+        out_tty := 0
+        if term.isatty(term.stdout_fd()) {
+            out_tty = 1
+        }
+        o.intent.print_set = print_new(o.intent.verbose, o.intent.headers, o.intent.body, o.intent.meta, o.intent.quiet, o.intent.offline, out_tty)
     }
     if args.present(m, "history-print") {
         o.intent.hist_set = print_of_chars(o.intent.history_print)
@@ -1322,17 +1334,15 @@ fn resolve(m: own args.Matches, envpairs: []str) -> own Out {
         defer_out(o, prog, "--native-tls is unsupported in this build (oxidean/oxl#221)")
         return o
     }
-    // S5 degrade routing (spec sem-G, ADR 0024): connection-affecting
-    // flags error out; display-only flags that upstream processes on
-    // pipes error too; --debug degrades to a warning inside execute.
-    if o.intent.resume != 0 {
-        defer_out(o, prog, "--continue is unsupported in this build")
+    // --curl never sends: skip connection-affecting degrades so the
+    // emit path can warn about ignored flags instead of exit 1.
+    if o.intent.curl != 0 {
+        o.exec = 1
         return o
     }
-    if o.intent.curl != 0 || o.intent.curl_long != 0 {
-        defer_out(o, prog, "--curl is unsupported in this build")
-        return o
-    }
+    // Degrade routing (ADR 0024): connection-affecting flags error
+    // out; --debug degrades to a warning inside execute. S7 landed
+    // --continue / --curl / --pretty (format-options still deferred).
     if o.intent.http_version == "2" || o.intent.http_version == "2-prior-knowledge" {
         defer_out(o, prog, "HTTP/2 requests are unsupported in this build")
         return o
@@ -1355,10 +1365,6 @@ fn resolve(m: own args.Matches, envpairs: []str) -> own Out {
     }
     if len(o.intent.unix_socket) > 0 {
         defer_out(o, prog, "--unix-socket is unsupported in this build")
-        return o
-    }
-    if len(o.intent.pretty) > 0 && o.intent.pretty != "none" {
-        defer_out(o, prog, "--pretty is unsupported in this build")
         return o
     }
     if len(o.intent.fmt_opts[:]) > 0 {
