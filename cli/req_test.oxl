@@ -203,6 +203,20 @@ fn test_session_merge() {
     os.remove_all(home)
 }
 
+fn test_continue_range_plan() {
+    dest := "/tmp/oxttp-req-resume.bin"
+    os.writefile_(dest, "ABCD")
+    p := pl("-d\n-c\n-o\n" + dest + "\nexample.org", "")
+    testing.expect_eq(len(p.err), 0, "no err: " + p.err)
+    testing.expect_eq(p.resume_off, 4, "resume_off = existing size")
+    testing.expect_streq(hget(p.req.headers, "range"), "bytes=4-", "Range header set")
+    os.remove(dest)
+    // missing/empty -o → no Range
+    p2 := pl("-d\n-c\n-o\n/tmp/oxttp-req-resume-missing.bin\nexample.org", "")
+    testing.expect_eq(p2.resume_off, 0, "missing file resume_off 0")
+    testing.expect(hhas(p2.req.headers, "range") == false, "no Range when missing")
+}
+
 fn b64(s: str) -> str {
     return base64.encode(s as []byte)
 }

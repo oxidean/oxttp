@@ -280,9 +280,17 @@ fn test_deferrals() {
     testing.expect_eq(o2.exec, 1, "offline execs")
     testing.expect_eq(o2.intent.offline, 1, "offline flag")
     o3 := r("--curl\nexample.org")
-    deferr(o3, "--curl is unsupported in this build")
+    testing.expect_eq(o3.code, 0, "curl routes to exec")
+    testing.expect_eq(o3.exec, 1, "curl execs")
+    testing.expect_eq(o3.intent.curl, 1, "curl flag")
     o4 := r("--download\n--continue\n--output\nout.bin\nexample.org")
-    deferr(o4, "--continue is unsupported in this build")
+    testing.expect_eq(o4.code, 0, "continue routes to exec")
+    testing.expect_eq(o4.exec, 1, "continue execs")
+    testing.expect_eq(o4.intent.resume, 1, "continue flag")
+    o5 := r("--pretty\nformat\nexample.org")
+    testing.expect_eq(o5.code, 0, "pretty routes to exec")
+    testing.expect_eq(o5.exec, 1, "pretty execs")
+    testing.expect_streq(o5.intent.pretty, "format", "pretty format")
 }
 
 fn test_effective_getters() {
