@@ -19,8 +19,9 @@ Updated: 2026-11-25 · pin oxl 0.26.0
 | §4.5 Auth basic/bearer/digest | `done` | digest §D3 retry landed |
 | §4.5 `https://` / `--https` / `--verify=yes\|pem` | `done` | ADR-0026; PEM path + system roots |
 | §4.5 `--verify=no` | `done` | AcceptAll Verifier (IN-0005=B) |
-| §4.5 `--cert` / `--cert-key` | `next` | oxl 0.26.0 `tls.Config.client_cert` → WI-0013 |
-| §4.5 `--ssl` <1.3 / `--native-tls` | `next` | oxl 0.26.0 `Config.min_ver/max_ver` (V12) → WI-0013 |
+| §4.5 `--cert` / `--cert-key` | `next` | oxl 0.26.0 `tls.Config.client_cert` → WI-0013; cert is TLS 1.3-only — a negotiated 1.2 session sends empty certificate_list |
+| §4.5 `--ssl tls1.2` / `--native-tls` | `next` | oxl 0.26.0 `Config.min_ver/max_ver` (V12) → WI-0013 |
+| §4.5 `--ssl tls1` / `tls1.1` | `oxl-blocked` | oxl rejects <V12 (deprecated versions); degrade = warn + auto-fallback per corpus §4.5 |
 | §4.5 HTTPS + `--proxy` CONNECT | `next` | oxl 0.26.0 `Request.proxy`/`connect_proxy` → WI-0013 |
 | §4.6 `--http-version` 1.0/1.1 | `done` | H1 emits 1.0/1.1 |
 | §4.6 `--http-version` 2* | `next` | oxl 0.26.0 `http_version` "2"/"2-prior-knowledge" → WI-0013 |
@@ -44,7 +45,7 @@ Updated: 2026-11-25 · pin oxl 0.26.0
 | §5 `.posting.yaml` collections | `next` | S10 (types in WI-0003) |
 | §6 Environments / captures | `next`/`post` | Env S10/S11; captures M4 |
 | §7.1 HTTP(+TLS) send | `next` | S10 + HTTPS WI |
-| §7.1 client certs | `next` | oxl 0.26.0 `client_cert` → WI-0013 cli + M4 tui |
+| §7.1 client certs | `next` | oxl 0.26.0 `client_cert` → WI-0013 cli + M4 tui; TLS 1.3-only — negotiated 1.2 sends empty cert list |
 | §7.2 GraphQL | `post` | M4 |
 | §7.3 gRPC | `post` | oxl 0.26.0 `net/grpc` shipped → M4 |
 | §7.4 WebSocket | `post` | oxl 0.26.0 `net/websocket` shipped → M4 |
