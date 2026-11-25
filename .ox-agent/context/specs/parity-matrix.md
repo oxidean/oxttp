@@ -3,7 +3,7 @@
 Definition: IN-0006 option A. Status values: `done` | `next` |
 `post` | `oxl-blocked` (cite issue).
 
-Updated: 2026-11-22 · pin oxl 0.23.2
+Updated: 2026-11-25 · pin oxl 0.26.0
 
 ## xh (`docs/corpus/corpus-xh.md`)
 
@@ -19,12 +19,12 @@ Updated: 2026-11-22 · pin oxl 0.23.2
 | §4.5 Auth basic/bearer/digest | `done` | digest §D3 retry landed |
 | §4.5 `https://` / `--https` / `--verify=yes\|pem` | `done` | ADR-0026; PEM path + system roots |
 | §4.5 `--verify=no` | `done` | AcceptAll Verifier (IN-0005=B) |
-| §4.5 `--cert` / `--cert-key` | `oxl-blocked` | [#221](https://github.com/oxidean/oxl/issues/221) |
-| §4.5 `--ssl` <1.3 / `--native-tls` | `oxl-blocked` | [#224](https://github.com/oxidean/oxl/issues/224) |
-| §4.5 HTTPS + `--proxy` CONNECT | `oxl-blocked` | [#222](https://github.com/oxidean/oxl/issues/222) |
+| §4.5 `--cert` / `--cert-key` | `next` | oxl 0.26.0 `tls.Config.client_cert` → WI-0013 |
+| §4.5 `--ssl` <1.3 / `--native-tls` | `next` | oxl 0.26.0 `Config.min_ver/max_ver` (V12) → WI-0013 |
+| §4.5 HTTPS + `--proxy` CONNECT | `next` | oxl 0.26.0 `Request.proxy`/`connect_proxy` → WI-0013 |
 | §4.6 `--http-version` 1.0/1.1 | `done` | H1 emits 1.0/1.1 |
-| §4.6 `--http-version` 2* | `oxl-blocked` | [#218](https://github.com/oxidean/oxl/issues/218) |
-| §4.6 `--http-version` 3* | `oxl-blocked` | [#219](https://github.com/oxidean/oxl/issues/219) |
+| §4.6 `--http-version` 2* | `next` | oxl 0.26.0 `http_version` "2"/"2-prior-knowledge" → WI-0013 |
+| §4.6 `--http-version` 3* | `oxl-blocked` | [#219](https://github.com/oxidean/oxl/issues/219) closed w/o consumable pkg — ADR-0029 |
 | §4.7 offline/curl/generate/check-status | `next`/`post` | check-status+curl done; generate `post` |
 | §5 `--curl` map | `next` | emit + Ignored warnings; map incomplete vs corpus |
 | §6 Completions/man | `post` | |
@@ -44,10 +44,10 @@ Updated: 2026-11-22 · pin oxl 0.23.2
 | §5 `.posting.yaml` collections | `next` | S10 (types in WI-0003) |
 | §6 Environments / captures | `next`/`post` | Env S10/S11; captures M4 |
 | §7.1 HTTP(+TLS) send | `next` | S10 + HTTPS WI |
-| §7.1 client certs | `oxl-blocked` | [#221](https://github.com/oxidean/oxl/issues/221) |
+| §7.1 client certs | `next` | oxl 0.26.0 `client_cert` → WI-0013 cli + M4 tui |
 | §7.2 GraphQL | `post` | M4 |
-| §7.3 gRPC | `oxl-blocked` | [#223](https://github.com/oxidean/oxl/issues/223) (needs [#218](https://github.com/oxidean/oxl/issues/218)) |
-| §7.4 WebSocket | `oxl-blocked` | [#220](https://github.com/oxidean/oxl/issues/220) |
+| §7.3 gRPC | `post` | oxl 0.26.0 `net/grpc` shipped → M4 |
+| §7.4 WebSocket | `post` | oxl 0.26.0 `net/websocket` shipped → M4 |
 | §7.5 SSE | `post` | M4 |
 | §7.6 OAuth2 | `post` | M4 |
 | §8 Themes / import / remote / tools | `post` | M4 |
