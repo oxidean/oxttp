@@ -143,6 +143,20 @@ struct Session {
     armed: int,
 }
 
+// open_seq enables the input modes S9 needs on top of S8's raw mode:
+// SGR mouse (button-event tracking 1002 + SGR coords 1006) and the
+// kitty keyboard disambiguate flag (`>1u`) so ctrl+shift+{s,v,z} and
+// alt-modified keys arrive as distinguishable CSI-u (corpus §9 notes
+// the kitty dependency). Returned by open_seq() for tests.
+fn open_seq() -> str {
+    return "\x1b[?1002h\x1b[?1006h\x1b[>1u"
+}
+
+// close_seq reverses open_seq before leaving the alternate screen.
+fn close_seq() -> str {
+    return "\x1b[?1002l\x1b[?1006l\x1b[<u"
+}
+
 // open_session enters raw mode on stdin, arms SIGINT/SIGWINCH, and
 // builds an AnsiScreen sized to the tty. Non-tty → err (caller falls
 // back to plain stdout).
@@ -180,6 +194,11 @@ fn open_session() -> [own Session, err] {
     s.raw = raw
     s.scr = new_ansi(cols, rows)
     s.armed = 1
+    // Enable SGR mouse + kitty disambiguate for the S9 shell
+    // (ADR-0028); failure is non-fatal — keys still decode without
+    // them, degrade paths cover the rest.
+    f := os.stdout()
+    [_, _we] = f.write(open_seq() as []byte)
     return s, nil
 }
 
@@ -187,7 +206,7 @@ fn (s mut Session) close() -> err {
     // Always leave the alternate screen first so a disarm/restore
     // failure cannot trap the parent shell on the hidden buffer.
     f := os.stdout()
-    [nw, we] = f.write("\x1b[?1049l\x1b[?25h\x1b[0m" as []byte)
+    [nw, we] = f.write((close_seq() + "\x1b[?1049l\x1b[?25h\x1b[0m") as []byte)
     first := we
     if nw < 0 && first == nil {
         // ignore short write on teardown
