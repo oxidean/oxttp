@@ -303,10 +303,30 @@ fn csi_final(fb: int, pos: int, i: int, priv: int, p0: int, p1: int, p2: int) ->
     if priv != 0 {
         return res(used, nil_ev(), false, false)
     }
-    // kitty CSI-u: final 'u', p0 = codepoint, p1 = mods
+    // kitty CSI-u: final 'u', p0 = codepoint, p1 = mods. With
+    // disambiguation on, esc/enter/tab/backspace arrive as CSI-u —
+    // map them to Named keys so the keymap's "escape"/"enter"/"tab"/
+    // "backspace" bindings fire (modal close, cell commit). Other
+    // codepoints stay Runes (printable combos like ctrl+shift+v);
+    // modifiers apply to either result.
     if fb == 117 {
         if p0 < 0 {
             return res(used, nil_ev(), false, false)
+        }
+        code := -1
+        if p0 == 27 {
+            code = KeyEscape
+        } else if p0 == 13 {
+            code = KeyEnter
+        } else if p0 == 9 {
+            code = KeyTab
+        } else if p0 == 127 {
+            code = KeyBackspace
+        }
+        if code >= 0 {
+            e := named_ev(code)
+            e = apply_mods(e, p1)
+            return res(used, e, true, false)
         }
         e := KeyEvent{key: Key.Rune{ch: utf8_of(p0)}, ctrl: false, alt: false, shift: false, meta: false, sup: false}
         e = apply_mods(e, p1)

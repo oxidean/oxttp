@@ -313,8 +313,66 @@ fn test_decode_shift_tab_csi() {
     testing.expect(evs[2].shift && evs[2].alt && evs[2].ctrl, "mod8 = shift+alt+ctrl+left")
 }
 
+fn test_decode_kitty_u_functional() {
+    d := new_decoder()
+    // kitty disambiguate: esc/enter/tab/backspace arrive as CSI-u and
+    // must decode to Named keys (modal escape, cell enter) — plain
+    // codepoints stay runes (see test_decode_kitty_u).
+    evs := feed_all(d, "\x1b[27u\x1b[13u\x1b[9u\x1b[127u")
+    testing.expect_eq(len(evs), 4, "4 named")
+    n := evs[0].key as Key.Named
+    testing.expect_eq(n.code, KeyEscape, "27u escape")
+    n2 := evs[1].key as Key.Named
+    testing.expect_eq(n2.code, KeyEnter, "13u enter")
+    n3 := evs[2].key as Key.Named
+    testing.expect_eq(n3.code, KeyTab, "9u tab")
+    n4 := evs[3].key as Key.Named
+    testing.expect_eq(n4.code, KeyBackspace, "127u backspace")
+    // modifiers apply to the named result: shift+tab, ctrl+enter,
+    // alt+escape
+    evs2 := feed_all(d, "\x1b[9;2u\x1b[13;5u\x1b[27;3u")
+    testing.expect_eq(len(evs2), 3, "3")
+    n5 := evs2[0].key as Key.Named
+    testing.expect_eq(n5.code, KeyTab, "9;2u tab")
+    testing.expect(evs2[0].shift && !evs2[0].ctrl && !evs2[0].alt, "shift+tab mods")
+    n6 := evs2[1].key as Key.Named
+    testing.expect_eq(n6.code, KeyEnter, "13;5u enter")
+    testing.expect(evs2[1].ctrl && !evs2[1].shift, "ctrl+enter")
+    n7 := evs2[2].key as Key.Named
+    testing.expect_eq(n7.code, KeyEscape, "27;3u escape")
+    testing.expect(evs2[2].alt && !evs2[2].ctrl, "alt+escape")
+}
+
 fn test_session_seqs() {
     // mouse 1002+1006 on / kitty disambiguate on
     testing.expect_streq(open_seq(), "\x1b[?1002h\x1b[?1006h\x1b[>1u", "open seq")
     testing.expect_streq(close_seq(), "\x1b[?1002l\x1b[?1006l\x1b[<u", "close seq")
+}
+
+fn test_session_lifecycle_order() {
+    // Per-screen stacks: the alt screen must be entered BEFORE the
+    // kitty/mouse modes push, and the modes must pop BEFORE the screen
+    // leaves — otherwise the push lands on the main screen's stack and
+    // stays active after exit.
+    testing.expect_streq(enter_seq(), "\x1b[?1049h\x1b[?1002h\x1b[?1006h\x1b[>1u", "alt screen then modes")
+    testing.expect_streq(leave_seq(), "\x1b[?1002l\x1b[?1006l\x1b[<u\x1b[?1049l\x1b[?25h\x1b[0m", "modes pop then leave")
+}
+
+fn test_ansi_glyph_cells() {
+    // set_cell stores a complete glyph; a continuation cell stays
+    // empty so present() never emits inside a multibyte character.
+    a := new_ansi(4, 2)
+    a.set_cell(0, 0, "▸", 1, -1, 0)
+    testing.expect_streq(a.chs[0], "▸", "whole 3-byte glyph stored")
+    a.set_wide_cont(1, 0)
+    testing.expect_streq(a.chs[1], "", "continuation cell empty")
+    // empty write normalizes to a blank cell
+    a.set_cell(2, 0, "", 0, -1, 0)
+    testing.expect_streq(a.chs[2], " ", "empty → blank")
+    // truncated input still degrades to 1 byte, never mid-glyph
+    a.set_cell(3, 0, "\xc3", 0, -1, 0)
+    testing.expect_eq(len(a.chs[3]), 1, "stray byte is 1 cell")
+    a.clear()
+    testing.expect_streq(a.chs[0], " ", "clear resets glyph")
+    testing.expect_streq(a.chs[1], " ", "clear resets cont")
 }
