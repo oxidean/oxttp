@@ -1,0 +1,131 @@
+package main
+
+// Render tests — MockScreen is core/term's own AnsiScreen
+// (headless: cells land in chs/attrs, no tty writes until present).
+
+import "std/testing"
+
+import "github.com/oxidean/oxttp/core/term"
+
+fn cell_at(s: ref term.AnsiScreen, x: int, y: int) -> str {
+    return s.chs[y * s.cols + x]
+}
+
+fn row_str(s: ref term.AnsiScreen, y: int) -> str {
+    out := ""
+    x := 0
+    for x < s.cols {
+        out = out + s.chs[y * s.cols + x]
+        x = x + 1
+    }
+    return out
+}
+
+fn has_text(s: ref term.AnsiScreen, y: int, sub: str) -> bool {
+    row := row_str(s, y)
+    i := 0
+    for i + len(sub) <= len(row) {
+        if substr(row, i, i + len(sub)) == sub {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn test_render_header_url_footer() {
+    scr := term.new_ansi(80, 24)
+    a := new_app()
+    a.url.text = "https://example.com"
+    render(a, scr, "0.0.0-test")
+    testing.expect(has_text(scr, 0, "oxttp-tui 0.0.0-test"), "header")
+    testing.expect(has_text(scr, 0, "env (none)"), "env in header")
+    testing.expect(has_text(scr, 1, "[GET]"), "method cell")
+    testing.expect(has_text(scr, 1, "https://example.com"), "url text")
+    testing.expect(has_text(scr, 23, "quit"), "footer hints")
+}
+
+fn test_render_sidebar_positions() {
+    scr := term.new_ansi(80, 24)
+    a := new_app()
+    render(a, scr, "v")
+    // sidebar on by default, left → "|" at col 0 in body region
+    testing.expect_streq(cell_at(scr, 0, 10), "|", "left sidebar border")
+    testing.expect_eq(a.r_sidebar_x, 0, "sidebar rect x")
+    testing.expect(a.r_sidebar_w > 0, "sidebar w")
+    // right position
+    a.sidebar_pos = 1
+    scr2 := term.new_ansi(80, 24)
+    render(a, scr2, "v")
+    testing.expect_streq(cell_at(scr2, 79, 10), "|", "right sidebar border")
+    testing.expect_eq(a.r_sidebar_x, 80 - a.r_sidebar_w, "right x")
+    // hidden
+    a.sidebar_on = false
+    scr3 := term.new_ansi(80, 24)
+    render(a, scr3, "v")
+    testing.expect_eq(a.r_sidebar_w, 0, "hidden w=0")
+    testing.expect_eq(a.r_main_x, 0, "main takes full")
+}
+
+fn test_render_splits() {
+    a := new_app()
+    // vertical: request pane above response
+    scr := term.new_ansi(80, 24)
+    render(a, scr, "v")
+    testing.expect(a.r_req_y < a.r_resp_y, "vertical req over resp")
+    testing.expect(a.r_req_h + a.r_resp_h == 18, "stacked fills body")
+    // horizontal: side by side
+    a.layout = 1
+    scr2 := term.new_ansi(80, 24)
+    render(a, scr2, "v")
+    testing.expect_eq(a.r_req_y, a.r_resp_y, "horizontal same row")
+    // expanded: request maximized
+    a.layout = 0
+    a.expanded = 1
+    scr3 := term.new_ansi(80, 24)
+    render(a, scr3, "v")
+    testing.expect_eq(a.r_resp_h, 0, "resp hidden when req expanded")
+    a.expanded = 2
+    scr4 := term.new_ansi(80, 24)
+    render(a, scr4, "v")
+    testing.expect_eq(a.r_req_h, 0, "req hidden when resp expanded")
+}
+
+fn test_render_per_kind_tabs() {
+    a := new_app()
+    a.kind = KWs
+    scr := term.new_ansi(80, 24)
+    render(a, scr, "v")
+    testing.expect(has_text(scr, 5, "Message"), "ws tab set")
+    a.kind = KGrpc
+    scr2 := term.new_ansi(80, 24)
+    render(a, scr2, "v")
+    testing.expect(has_text(scr2, 5, "Proto"), "grpc tab set")
+}
+
+fn test_render_focused_border() {
+    a := new_app()
+    a.focus = FReqPane
+    scr := term.new_ansi(80, 24)
+    render(a, scr, "v")
+    // focused pane title bold: find "request" title attr on req top row
+    x := a.r_sidebar_w + 3
+    i := a.r_req_y * scr.cols + x
+    testing.expect(scr.attrs[i] >= term.AttrBold, "focused title bold")
+    // unfocused pane title dim
+    j := a.r_resp_y * scr.cols + x
+    testing.expect(scr.attrs[j] >= term.AttrDim, "unfocused title dim")
+}
+
+fn test_render_toast_and_modal() {
+    a := new_app()
+    a.toast(2, "oops happened")
+    scr := term.new_ansi(80, 24)
+    render(a, scr, "v")
+    testing.expect(has_text(scr, 22, "oops happened"), "toast row")
+    // palette overlay paints over the body
+    push_modal(a, MPalette)
+    scr2 := term.new_ansi(80, 24)
+    render(a, scr2, "v")
+    testing.expect(has_text(scr2, 4, "palette"), "modal title")
+}

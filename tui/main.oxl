@@ -1,9 +1,14 @@
 package main
 
 // oxttp-tui — drop-in Posting-compatible terminal HTTP client.
-// Surface contract: docs/corpus/corpus-posting.md. S8: real raw-mode
-// session via core/term (std/os/term + signal). Screens/keybindings
-// land in S9+.
+// Surface contract: docs/corpus/corpus-posting.md.
+//
+// S9: full app shell on core/term — open_session enters raw +
+// alt-screen + SGR mouse + kitty-u; the loop feeds stdin through the
+// input decoder into layered keymap dispatch, then renders the shell
+// (header / url bar / sidebar / request / response / footer) and
+// presents. SIGINT or the quit action exits; SIGWINCH rebuilds.
+
 import "std/os"
 
 import "std/time"
@@ -12,67 +17,57 @@ import "github.com/oxidean/oxttp/core/term"
 
 import "github.com/oxidean/oxttp/shared/version"
 
-fn write_banner(scr: mut term.AnsiScreen, ver: str) {
-    msg := "oxttp-tui " + ver + "  (q / Ctrl-C to quit)"
-    i := 0
-    for i < len(msg) {
-        scr.set_cell(i, 0, substr(msg, i, i + 1), 6, -1, term.AttrBold)
-        i = i + 1
-    }
-    hint := "S8 term driver · Posting screens arrive in S9"
-    j := 0
-    for j < len(hint) {
-        scr.set_cell(j, 2, substr(hint, j, j + 1), 7, -1, 0)
-        j = j + 1
-    }
-    scr.cursor(0, 4, true)
-}
-
 fn main() {
     ver := version.get()
     [sess, e] = term.open_session()
     if e != nil {
-        // Non-tty (CI / pipes): keep the old one-line banner.
+        // Non-tty (CI / pipes): keep the one-line banner.
         println("oxttp-tui " + ver)
         return
     }
     defer sess.close()
-    write_banner(sess.scr, ver)
+    a := new_app()
+    dec := term.new_decoder()
+    stdin := os.stdin()
+    buf := mkslice(byte, 256)
+    render(a, sess.scr, ver)
     pe := sess.scr.present()
     if pe != nil {
         return
     }
-    // Poll loop: SIGINT, resize, or 'q' / Ctrl-C byte on stdin.
-    stdin := os.stdin()
-    buf := mkslice(byte, 64)
-    for true {
+    for !a.quit {
         if sess.interrupted() {
             break
         }
         if sess.resized() {
-            write_banner(sess.scr, ver)
-            pe2 := sess.scr.present()
-            if pe2 != nil {
+            render(a, sess.scr, ver)
+            rpe := sess.scr.present()
+            if rpe != nil {
                 break
             }
         }
         [n, re] = stdin.read(buf)
         if n > 0 {
-            k := 0
-            for k < n {
-                c := buf[k]
-                // 'q' / 'Q' / Ctrl-C (3)
-                if c == 113 || c == 81 || c == 3 {
-                    return
+            evs := dec.feed(buf[0:n])
+            i := 0
+            for i < len(evs) {
+                fx := dispatch(a, evs[i])
+                if fx == EQuit {
+                    a.quit = true
                 }
-                k = k + 1
+                i = i + 1
+            }
+            render(a, sess.scr, ver)
+            pe2 := sess.scr.present()
+            if pe2 != nil {
+                break
             }
         }
         if re != nil && n <= 0 {
             break
         }
         if n <= 0 {
-            time.sleep_ms(50)
+            time.sleep_ms(10)
         }
     }
 }

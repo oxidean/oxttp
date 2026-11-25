@@ -1,0 +1,386 @@
+package main
+
+// Keymap tables + layered dispatch (corpus §3: 18 rebindable
+// actions, 4 fixed globals, ~95 widget bindings; precedence
+// modal > widget > global > fixed).
+
+import "std/testing"
+
+import "github.com/oxidean/oxttp/core/term"
+
+
+fn kev(ch: str, ctrl: bool, alt: bool, shift: bool) -> term.KeyEvent {
+    return term.KeyEvent{key: term.Key.Rune{ch: ch}, ctrl: ctrl, alt: alt, shift: shift, meta: false, sup: false}
+}
+
+fn knamed(code: int) -> term.KeyEvent {
+    return term.KeyEvent{key: term.Key.Named{code: code}, ctrl: false, alt: false, shift: false, meta: false, sup: false}
+}
+
+fn knamed_mod(code: int, ctrl: bool, alt: bool, shift: bool) -> term.KeyEvent {
+    return term.KeyEvent{key: term.Key.Named{code: code}, ctrl: ctrl, alt: alt, shift: shift, meta: false, sup: false}
+}
+
+fn test_parse_key() {
+    [p, e] = parse_key("ctrl+j")
+    testing.expect(e == nil, "ctrl+j parses")
+    testing.expect_streq(p.ch, "j", "ch j")
+    testing.expect(p.ctrl && !p.alt && !p.shift, "ctrl")
+    [p2, e2] = parse_key("alt+enter")
+    testing.expect(e2 == nil, "alt+enter")
+    testing.expect_eq(p2.code, term.KeyEnter, "enter code")
+    testing.expect(p2.alt, "alt")
+    [p3, e3] = parse_key("ctrl+shift+v")
+    testing.expect(e3 == nil, "csv")
+    testing.expect_streq(p3.ch, "v", "v")
+    testing.expect(p3.ctrl && p3.shift, "ctrl+shift")
+    [p4, e4] = parse_key("f1")
+    testing.expect_eq(p4.code, term.KeyF1, "f1")
+    [p5, e5] = parse_key("G")
+    testing.expect(e5 == nil, "G")
+    testing.expect_streq(p5.ch, "g", "G→g")
+    testing.expect(p5.shift, "G shift")
+    [p6, e6] = parse_key("ctrl+shift+s")
+    testing.expect(e6 == nil, "css")
+    testing.expect_streq(p6.ch, "s", "s")
+    [_p7, e7] = parse_key("bogus+key")
+    testing.expect(e7 != nil, "bad mod rejected")
+    [_p8, e8] = parse_key("nosuchkey")
+    testing.expect(e8 != nil, "bad key rejected")
+    [p9, e9] = parse_key("shift+tab")
+    testing.expect(e9 == nil, "shift+tab")
+    testing.expect_eq(p9.code, term.KeyTab, "tab")
+    testing.expect(p9.shift, "shift")
+    [p10, e10] = parse_key("space")
+    testing.expect(e10 == nil, "space")
+    testing.expect_eq(p10.code, term.KeySpace, "space named")
+    [p11, e11] = parse_key("SUPER+X")
+    testing.expect(e11 == nil, "super+x case-insensitive")
+    testing.expect_streq(p11.ch, "x", "x")
+    testing.expect(p11.sup, "super flag")
+}
+
+fn test_match_event() {
+    [p, _e] = parse_key("ctrl+j")
+    testing.expect(pat_match(p, kev("j", true, false, false)), "ctrl+j matches")
+    testing.expect(!pat_match(p, kev("j", false, false, false)), "plain j no")
+    testing.expect(!pat_match(p, kev("j", true, true, false)), "ctrl+alt+j no")
+    [p2, _e2] = parse_key("enter")
+    testing.expect(pat_match(p2, knamed(term.KeyEnter)), "enter")
+    testing.expect(pat_match(p2, knamed_mod(term.KeyEnter, false, false, false)), "enter nomods")
+    testing.expect(!pat_match(p2, knamed_mod(term.KeyEnter, true, false, false)), "ctrl+enter no")
+    // letter G = shift+g: rune "G" arrives with shift inferred
+    [pg, _eg] = parse_key("G")
+    testing.expect(pat_match(pg, kev("G", false, false, true)), "G event")
+    testing.expect(!pat_match(pg, kev("g", false, false, false)), "g plain no")
+    // alt+enter
+    [pa, _ea] = parse_key("alt+enter")
+    testing.expect(pat_match(pa, knamed_mod(term.KeyEnter, false, true, false)), "alt+enter")
+}
+
+fn test_global_table_has_all_actions() {
+    g := global_bindings()
+    ids := "send-request,stream,jump,commands,save-request,new-request,close-tab,keep-tab,next-tab,previous-tab,search-tabs,search-requests,focus-url,focus-method,toggle-collection,expand-section,variables,help"
+    parts := split_csv(ids)
+    i := 0
+    for i < len(parts) {
+        testing.expect(action_in(g, parts[i]), "missing global "+parts[i])
+        i = i + 1
+    }
+    // 19 default keys (send-request has two) + unbound keep-tab row
+    testing.expect_eq(len(g), 20, "19 bound rows (+backspace collision row) + keep-tab listed")
+    // keep-tab's empty pat matches nothing
+    i = 0
+    for i < len(g) {
+        if g[i].action == "keep-tab" {
+            testing.expect(!pat_match(g[i].pat, kev("x", false, false, false)), "keep-tab unbound")
+            testing.expect(!pat_match(g[i].pat, knamed(term.KeyEnter)), "keep-tab unbound2")
+        }
+        i = i + 1
+    }
+}
+
+fn test_global_defaults() {
+    g := global_bindings()
+    testing.expect(find_in(g, kev("j", true, false, false), "send-request"), "ctrl+j send")
+    testing.expect(find_in(g, knamed_mod(term.KeyEnter, false, true, false), "send-request"), "alt+enter send")
+    testing.expect(find_in(g, kev("o", true, false, false), "jump"), "ctrl+o jump")
+    testing.expect(find_in(g, kev("p", true, false, false), "commands"), "ctrl+p")
+    testing.expect(find_in(g, kev("s", true, false, false), "save-request"), "ctrl+s")
+    testing.expect(find_in(g, kev("n", true, false, false), "new-request"), "ctrl+n")
+    testing.expect(find_in(g, kev("w", false, true, false), "close-tab"), "alt+w")
+    testing.expect(find_in(g, knamed_mod(term.KeyRight, false, true, false), "next-tab"), "alt+right")
+    testing.expect(find_in(g, knamed_mod(term.KeyLeft, false, true, false), "previous-tab"), "alt+left")
+    testing.expect(find_in(g, knamed_mod(term.KeyDown, false, true, false), "search-tabs"), "alt+down")
+    testing.expect(find_in(g, kev("g", true, false, false), "search-requests"), "ctrl+g")
+    testing.expect(find_in(g, kev("l", true, false, false), "focus-url"), "ctrl+l")
+    testing.expect(find_in(g, kev("t", true, false, false), "focus-method"), "ctrl+t")
+    testing.expect(find_in(g, kev("h", true, false, false), "toggle-collection"), "ctrl+h")
+    testing.expect(find_in(g, kev("z", false, true, false), "expand-section"), "alt+z")
+    testing.expect(find_in(g, kev("v", true, false, true), "variables"), "ctrl+shift+v")
+    testing.expect(find_in(g, knamed(term.KeyF1), "help"), "f1")
+}
+
+fn test_fixed_table() {
+    f := fixed_bindings()
+    testing.expect(find_in(f, knamed(term.KeyEscape), "escape"), "escape")
+    testing.expect(find_in(f, kev("c", true, false, false), "quit"), "ctrl+c quit")
+    testing.expect(find_in(f, kev("z", true, false, false), "suspend-undo"), "ctrl+z")
+    testing.expect(find_in(f, kev("s", true, false, true), "screenshot"), "ctrl+shift+s")
+}
+
+fn action_in(b: []Binding, id: str) -> bool {
+    i := 0
+    for i < len(b) {
+        if b[i].action == id {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn find_in(b: []Binding, ev: term.KeyEvent, id: str) -> bool {
+    i := 0
+    for i < len(b) {
+        if b[i].action == id && pat_match(b[i].pat, ev) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn split_csv(s: str) -> []str {
+    out := mkslice(str, 0)
+    cur := ""
+    i := 0
+    for i < len(s) {
+        c := byteat(s, i)
+        if c == 44 {
+            out = push(out, cur)
+            cur = ""
+        } else {
+            cur = cur + substr(s, i, i + 1)
+        }
+        i = i + 1
+    }
+    out = push(out, cur)
+    return out
+}
+
+// --- dispatch layering ---
+
+fn test_dispatch_precedence_modal() {
+    a := new_app()
+    // open help modal: 'q' inside modal must not hit global/widget
+    push_modal(a, MHelp)
+    ev := kev("q", false, false, false)
+    dispatch(a, ev)
+    // help closed? q not bound in help → swallowed (still open)
+    testing.expect_eq(a.focus, FUrl, "focus stays")
+    // escape closes help
+    dispatch(a, knamed(term.KeyEscape))
+    testing.expect_eq(len(a.modals), 0, "help closed by escape")
+}
+
+fn test_dispatch_widget_before_global() {
+    a := new_app()
+    // focus sidebar; 'd' is a widget binding (duplicate → degrade toast)
+    // not a global
+    a.focus = FSidebar
+    dispatch(a, kev("d", false, false, false))
+    testing.expect(len(a.toasts) > 0, "widget action produced toast")
+    // ctrl+h (kitty CSI-u: rune h + ctrl) toggles the sidebar
+    a.toasts = mkslice(Toast, 0)
+    dispatch(a, kev("h", true, false, false))
+    testing.expect(!a.sidebar_on, "ctrl+h toggled sidebar off")
+}
+
+fn test_ctrlh_backspace_collision() {
+    a := new_app()
+    // in collection browser, backspace = delete-row widget binding;
+    // the 0x08 byte hits the widget table first (corpus §9 collision)
+    a.focus = FSidebar
+    a.coll = demo_tree()
+    dispatch(a, knamed(term.KeyBackspace))
+    // widget consumed it as delete-attempt → confirm or degrade toast
+    testing.expect(len(a.toasts) + len(a.modals) > 0, "widget claimed 0x08")
+    a.toasts = mkslice(Toast, 0)
+    a.modals = mkslice(int, 0)
+    // with focus url, 0x08 → backspace in the line edit
+    a.focus = FUrl
+    a.url.text = "abc"
+    a.url.cur = 3
+    dispatch(a, knamed(term.KeyBackspace))
+    testing.expect_streq(a.url.text, "ab", "backspace ate char")
+    // where NO widget binds backspace, the 0x08 falls through to the
+    // global "backspace" row → sidebar toggle (the §9 collision quirk)
+    a.url.text = ""
+    a.focus = FReqTabs
+    dispatch(a, knamed(term.KeyBackspace))
+    testing.expect(!a.sidebar_on, "0x08 toggles sidebar where unclaimed")
+    // and the kitty-path ctrl+h (rune h + ctrl) toggles everywhere
+    dispatch(a, kev("h", true, false, false))
+    testing.expect(a.sidebar_on, "ctrl+h toggles back")
+}
+
+fn test_fixed_keys_reach_everywhere() {
+    a := new_app()
+    push_modal(a, MHelp)
+    dispatch(a, kev("c", true, false, false))
+    testing.expect(a.quit, "ctrl+c quits through modal")
+    a2 := new_app()
+    push_modal(a2, MPalette)
+    dispatch(a2, kev("s", true, false, true))
+    testing.expect(a2.want_shot, "ctrl+shift+s screenshot through modal")
+}
+
+fn test_jump_mode() {
+    a := new_app()
+    dispatch(a, kev("o", true, false, false))
+    testing.expect_eq(top_modal(a), MJump, "jump opened")
+    // 'a' → response body focus
+    dispatch(a, kev("a", false, false, false))
+    testing.expect_eq(len(a.modals), 0, "jump closed")
+    testing.expect_eq(a.focus, FRespPane, "a → resp body")
+    // '4' → history overlay
+    dispatch(a, kev("o", true, false, false))
+    dispatch(a, kev("4", false, false, false))
+    testing.expect_eq(top_modal(a), MHistory, "4 → history")
+    dispatch(a, knamed(term.KeyEscape))
+    // jump letters q w e r t y u map req tabs
+    dispatch(a, kev("o", true, false, false))
+    dispatch(a, kev("w", false, false, false))
+    testing.expect_eq(a.req_tab, 1, "w → second req tab (body)")
+    testing.expect_eq(a.focus, FReqPane, "into req pane")
+}
+
+fn test_degrade_toasts() {
+    a := new_app()
+    dispatch(a, kev("j", true, false, false)) // send-request
+    testing.expect_eq(len(a.toasts), 1, "toast raised")
+    t := a.toasts[0]
+    testing.expect_eq(t.level, 2, "degrade is error level")
+    dispatch(a, kev("g", true, false, false)) // search-requests
+    testing.expect_eq(len(a.toasts), 2, "second toast")
+}
+
+fn test_new_close_tabs() {
+    a := new_app()
+    testing.expect_eq(len(a.tabs), 1, "one initial tab")
+    dispatch(a, kev("n", true, false, false))
+    testing.expect_eq(len(a.tabs), 2, "new tab")
+    testing.expect_eq(a.cur_tab, 1, "focus moved to new tab")
+    dispatch(a, knamed_mod(term.KeyRight, false, true, false)) // next-tab
+    testing.expect_eq(a.cur_tab, 0, "alt+right wraps")
+    dispatch(a, knamed_mod(term.KeyLeft, false, true, false))
+    testing.expect_eq(a.cur_tab, 1, "alt+left back")
+    dispatch(a, kev("w", false, true, false)) // close-tab
+    testing.expect_eq(len(a.tabs), 1, "closed")
+    testing.expect_eq(a.cur_tab, 0, "cur fixed")
+}
+
+fn test_toggle_collection_expand() {
+    a := new_app()
+    testing.expect(a.sidebar_on, "sidebar on default")
+    // kitty CSI-u ctrl+h: rune h + ctrl (url widget table claims only
+    // plain backspace; ctrl+h falls to global)
+    dispatch(a, kev("h", true, false, false))
+    testing.expect(!a.sidebar_on, "off")
+    dispatch(a, kev("h", true, false, false))
+    testing.expect(a.sidebar_on, "on again")
+    // expand-section on focused request pane
+    a.focus = FReqPane
+    dispatch(a, kev("z", false, true, false))
+    testing.expect_eq(a.expanded, 1, "req expanded")
+    dispatch(a, kev("z", false, true, false))
+    testing.expect_eq(a.expanded, 0, "toggle off")
+}
+
+fn test_palette() {
+    a := new_app()
+    dispatch(a, kev("p", true, false, false))
+    testing.expect_eq(top_modal(a), MPalette, "palette open")
+    // navigate + escape
+    dispatch(a, knamed(term.KeyDown))
+    dispatch(a, knamed(term.KeyEscape))
+    testing.expect_eq(len(a.modals), 0, "closed")
+    // palette quit command: open, filter "quit", enter → quits
+    dispatch(a, kev("p", true, false, false))
+    feed_text(a, "quit")
+    dispatch(a, knamed(term.KeyEnter))
+    testing.expect(a.quit, "palette Quit ran")
+}
+
+fn test_method_menu() {
+    a := new_app()
+    dispatch(a, kev("t", true, false, false))
+    testing.expect_eq(top_modal(a), MMethodMenu, "method menu")
+    dispatch(a, kev("p", false, false, false)) // p → POST
+    testing.expect_eq(top_modal(a), MNone, "menu closed")
+    testing.expect_streq(a.method, "POST", "method POST")
+    // q → graphql kind switch
+    dispatch(a, kev("t", true, false, false))
+    dispatch(a, kev("q", false, false, false))
+    testing.expect_eq(a.kind, KGraphql, "graphql kind")
+    testing.expect_eq(req_tab_count(a), 7, "graphql: Body→Params swap, still 7")
+    // back to http
+    dispatch(a, kev("t", true, false, false))
+    dispatch(a, kev("g", false, false, false))
+    testing.expect_eq(a.kind, KHttp, "http kind")
+    testing.expect_streq(a.method, "GET", "GET")
+}
+
+fn test_variables_help_overlays() {
+    a := new_app()
+    dispatch(a, kev("v", true, false, true))
+    testing.expect_eq(top_modal(a), MVariables, "variables")
+    dispatch(a, knamed(term.KeyEscape))
+    dispatch(a, knamed(term.KeyF1))
+    testing.expect_eq(top_modal(a), MHelp, "help")
+    dispatch(a, knamed(term.KeyEscape))
+    testing.expect_eq(len(a.modals), 0, "closed")
+}
+
+fn test_url_focus_and_enter_degrade() {
+    a := new_app()
+    dispatch(a, kev("l", true, false, false))
+    testing.expect_eq(a.focus, FUrl, "ctrl+l focus url")
+    dispatch(a, knamed(term.KeyEnter))
+    testing.expect_eq(len(a.toasts), 1, "send degrade toast")
+}
+
+fn test_focus_method_target() {
+    a := new_app()
+    a.focus = FMethod
+    dispatch(a, knamed(term.KeyEnter))
+    testing.expect_eq(top_modal(a), MMethodMenu, "enter opens method menu")
+    a2 := new_app()
+    a2.focus = FMethod
+    dispatch(a2, kev(" ", false, false, false))
+    testing.expect_eq(top_modal(a2), MMethodMenu, "space opens too")
+}
+
+fn test_suspend_degrade() {
+    a := new_app()
+    // from a non-text-field focus ctrl+z = suspend → degrade;
+    // inside text fields it is undo (corpus §1.6)
+    a.focus = FReqTabs
+    dispatch(a, kev("z", true, false, false))
+    testing.expect_eq(len(a.toasts), 1, "ctrl+z toast")
+    t := a.toasts[0]
+    testing.expect_eq(t.level, 2, "error toast")
+    // url-bar ctrl+z undoes instead
+    a2 := new_app()
+    a2.url.text = "ab"
+    a2.url.cur = 2
+    dispatch(a2, kev("z", true, false, false))
+    testing.expect_eq(len(a2.toasts), 0, "undo not suspend")
+}
+
+fn test_screenshot() {
+    a := new_app()
+    dispatch(a, kev("s", true, false, true))
+    testing.expect(a.want_shot, "want_shot set")
+}

@@ -1,0 +1,601 @@
+package main
+
+// Render — layout rects + region renderers (spec §Render/layout).
+// Draws into the term.Screen cell buffer; hit-test rects are cached
+// on App so dispatch_mouse can resolve clicks without re-layout.
+//
+// Rows: 0 header · 1..3 URL bar (method cell + url + preview) ·
+// 4..h-2 body (sidebar + main split) · h-1 footer. Toasts stack
+// above the footer; modals paint a centered overlay last.
+
+import "std/os"
+
+import "github.com/oxidean/oxttp/core/term"
+
+// palette ids (8-color SGR): 1 red, 2 green, 3 yellow, 4 blue,
+// 5 magenta, 6 cyan, 7 white — attrs from term.Attr*.
+
+fn put_str(scr: mut term.AnsiScreen, x: int, y: int, s: str, fg: int, attr: int) {
+    i := 0
+    for i < len(s) {
+        scr.set_cell(x + i, y, substr(s, i, i + 1), fg, -1, attr)
+        i = i + 1
+    }
+}
+
+fn put_str_max(scr: mut term.AnsiScreen, x: int, y: int, s: str, max: int, fg: int, attr: int) {
+    i := 0
+    for i < len(s) && i < max {
+        scr.set_cell(x + i, y, substr(s, i, i + 1), fg, -1, attr)
+        i = i + 1
+    }
+}
+
+fn fill_row(scr: mut term.AnsiScreen, x: int, y: int, w: int, ch: str, fg: int, attr: int) {
+    i := 0
+    for i < w {
+        scr.set_cell(x + i, y, ch, fg, -1, attr)
+        i = i + 1
+    }
+}
+
+// draw_pane draws an ascii frame + title; focused panes get a bold
+// cyan title, idle panes a dim one.
+fn draw_pane(scr: mut term.AnsiScreen, x: int, y: int, w: int, h: int, title: str, focused: bool) {
+    if w < 3 || h < 3 {
+        return
+    }
+    ta := term.AttrDim
+    tf := 7
+    if focused {
+        ta = term.AttrBold
+        tf = 6
+    }
+    i := 0
+    for i < w {
+        scr.set_cell(x + i, y, "-", 7, -1, ta)
+        scr.set_cell(x + i, y + h - 1, "-", 7, -1, ta)
+        i = i + 1
+    }
+    j := 0
+    for j < h {
+        scr.set_cell(x, y + j, "|", 7, -1, ta)
+        scr.set_cell(x + w - 1, y + j, "|", 7, -1, ta)
+        j = j + 1
+    }
+    scr.set_cell(x, y, "+", 7, -1, ta)
+    scr.set_cell(x + w - 1, y, "+", 7, -1, ta)
+    scr.set_cell(x, y + h - 1, "+", 7, -1, ta)
+    scr.set_cell(x + w - 1, y + h - 1, "+", 7, -1, ta)
+    if len(title) > 0 {
+        put_str_max(scr, x + 2, y, " " + title + " ", w - 4, tf, ta)
+    }
+}
+
+fn render_header(a: ref App, scr: mut term.AnsiScreen, ver: str) {
+    host := os.getenv("HOSTNAME")
+    user := os.getenv("USER")
+    env := a.env_name
+    if len(env) == 0 {
+        env = "(none)"
+    }
+    s := " oxttp-tui " + ver + " · env " + env
+    if len(user) > 0 && len(host) > 0 {
+        s = s + " · " + user + "@" + host
+    }
+    put_str(scr, 0, 0, s, 6, term.AttrBold)
+}
+
+fn render_url_bar(a: mut App, scr: mut term.AnsiScreen, cols: int) {
+    // method cell (clickable → method menu), then the url line-edit,
+    // then a dim preview row (verbatim until vars land S10).
+    mw := 10
+    put_str_max(scr, 1, 1, "[" + a.method + "]", mw - 1, 5, term.AttrBold)
+    put_str_max(scr, mw + 2, 1, a.url.text, cols - mw - 3, 7, 0)
+    prev := a.url.text
+    if len(prev) == 0 {
+        prev = "(empty url)"
+    }
+    put_str_max(scr, 2, 2, "→ " + prev, cols - 4, 7, term.AttrDim)
+    fill_row(scr, 0, 3, cols, "-", 7, term.AttrDim)
+    // url focus shows the text cursor inside the bar
+    if a.focus == FUrl {
+        cx := mw + 2 + a.url.cur
+        if cx >= cols {
+            cx = cols - 1
+        }
+        scr.cursor(cx, 1, true)
+    }
+}
+
+fn render_tabstrip(scr: mut term.AnsiScreen, x: int, y: int, w: int, names: []str, sel: int, focused: bool) {
+    cx := x + 1
+    i := 0
+    for i < len(names) {
+        n := names[i]
+        a := 0
+        f := 7
+        if i == sel {
+            a = term.AttrReverse
+            if focused {
+                a = term.AttrReverse + term.AttrBold
+            }
+        } else {
+            a = term.AttrDim
+        }
+        put_str(scr, cx, y, " " + n + " ", f, a)
+        cx = cx + len(n) + 2
+        if cx >= x + w - 1 {
+            return
+        }
+        i = i + 1
+    }
+}
+
+fn render_kv(scr: mut term.AnsiScreen, t: KVTable, x: int, y: int, w: int, h: int, focused: bool) {
+    put_str(scr, x + 1, y, " [x] name           value", 7, term.AttrBold + term.AttrUnderline)
+    i := 0
+    for i < len(t.rows) && i < h - 1 {
+        r := t.rows[i]
+        mark := "[ ]"
+        if r.enabled {
+            mark = "[x]"
+        }
+        line := " " + mark + " " + r.name
+        for len(line) < 20 {
+            line = line + " "
+        }
+        line = line + r.value
+        a := 0
+        if focused && i == t.cur {
+            a = term.AttrReverse
+        }
+        put_str_max(scr, x + 1, y + 1 + i, line, w - 2, 7, a)
+        i = i + 1
+    }
+}
+
+fn render_sidebar(a: mut App, scr: mut term.AnsiScreen, x: int, y: int, w: int, h: int) {
+    draw_pane(scr, x, y, w, h, "collection", a.focus == FSidebar)
+    put_str_max(scr, x + 2, y + 1, a.env_name, w - 4, 3, 0)
+    vis := a.coll.visible()
+    i := 0
+    vi := 0
+    for vi < len(vis) && i < h - 3 {
+        n := a.coll.nodes[vis[vi]]
+        pad := ""
+        d := 0
+        for d < n.depth {
+            pad = pad + "  "
+            d = d + 1
+        }
+        glyph := "· "
+        if n.is_dir {
+            if n.open {
+                glyph = "▾ "
+            } else {
+                glyph = "▸ "
+            }
+        }
+        a2 := 0
+        f := 7
+        if n.stub {
+            a2 = term.AttrDim
+        }
+        if a.focus == FSidebar && vi == a.coll.cur {
+            a2 = a2 | term.AttrReverse
+        }
+        put_str_max(scr, x + 1, y + 2 + i, pad + glyph + n.name, w - 2, f, a2)
+        i = i + 1
+        vi = vi + 1
+    }
+    if a.coll_searching {
+        put_str_max(scr, x + 1, y + h - 2, "/" + a.coll_search.text, w - 2, 3, 0)
+    }
+}
+
+fn render_req_pane(a: mut App, scr: mut term.AnsiScreen, x: int, y: int, w: int, h: int) {
+    focused := a.focus == FReqPane || a.focus == FReqTabs
+    title := "request"
+    names := req_tabs(a.kind)
+    cur := names[a.req_tab]
+    draw_pane(scr, x, y, w, h, title + " · " + cur, focused)
+    render_tabstrip(scr, x, y + 1, w, names, a.req_tab, a.focus == FReqTabs)
+    cy := y + 2
+    ch := h - 3
+    if cur == "Headers" {
+        render_kv(scr, a.headers, x, cy, w, ch, a.focus == FReqPane)
+    } else if cur == "Query" {
+        render_kv(scr, a.query_kv, x, cy, w, ch, a.focus == FReqPane)
+    } else if cur == "Path" {
+        render_kv(scr, a.path_kv, x, cy, w, ch, a.focus == FReqPane)
+    } else if cur == "Body" {
+        render_body(a, scr, x, cy, w, ch)
+    } else {
+        put_str_max(scr, x + 2, cy + 1, "(empty " + cur + ")", w - 4, 7, term.AttrDim)
+    }
+}
+
+fn render_body(a: mut App, scr: mut term.AnsiScreen, x: int, y: int, w: int, h: int) {
+    i := 0
+    for i < len(a.body.lines) && i < h {
+        ln := a.body.lines[a.body.top + i]
+        if a.body.top + i >= len(a.body.lines) {
+            return
+        }
+        put_str_max(scr, x + 1, y + i, itoa(a.body.top + i + 1) + " " + ln, w - 2, 7, 0)
+        i = i + 1
+    }
+    if a.focus == FReqPane && a.body_edit {
+        scr.cursor(x + 1 + a.body.cx, y + a.body.cy - a.body.top, true)
+    }
+}
+
+fn render_resp_pane(a: mut App, scr: mut term.AnsiScreen, x: int, y: int, w: int, h: int) {
+    focused := a.focus == FRespPane || a.focus == FRespTabs
+    draw_pane(scr, x, y, w, h, "response", focused)
+    render_tabstrip(scr, x, y + 1, w, resp_tabs(), a.resp_tab, a.focus == FRespTabs)
+    i := 0
+    for i < h - 3 && a.resp_view.top + i < len(a.resp_view.lines) {
+        ln := a.resp_view.lines[a.resp_view.top + i]
+        a2 := 0
+        if focused && a.resp_view.top + i == a.resp_view.cy {
+            a2 = term.AttrReverse
+        }
+        put_str_max(scr, x + 1, y + 2 + i, ln, w - 2, 7, a2)
+        i = i + 1
+    }
+    if len(a.resp_view.lines) == 0 {
+        put_str_max(scr, x + 2, y + 3, "(no response yet)", w - 4, 7, term.AttrDim)
+    }
+}
+
+fn render_footer(a: ref App, scr: mut term.AnsiScreen, cols: int, rows: int) {
+    hints := " ^c quit · ^p palette · f1 help · ^h sidebar"
+    if len(a.modals) > 0 {
+        hints = " esc close"
+    }
+    put_str(scr, 0, rows - 1, hints, 7, term.AttrDim)
+    f := "focus: " + focus_name(a.focus)
+    put_str(scr, cols - len(f) - 1, rows - 1, f, 7, term.AttrDim)
+}
+
+fn focus_name(f: int) -> str {
+    if f == FSidebar {
+        return "collection"
+    }
+    if f == FUrl {
+        return "url"
+    }
+    if f == FMethod {
+        return "method"
+    }
+    if f == FReqTabs {
+        return "request tabs"
+    }
+    if f == FReqPane {
+        return "request"
+    }
+    if f == FRespTabs {
+        return "response tabs"
+    }
+    if f == FRespPane {
+        return "response"
+    }
+    return "?"
+}
+
+fn render_toasts(a: ref App, scr: mut term.AnsiScreen, cols: int, rows: int) {
+    i := 0
+    for i < len(a.toasts) && i < 4 {
+        t := a.toasts[len(a.toasts) - 1 - i]
+        f := 4
+        if t.level == 1 {
+            f = 2
+        } else if t.level == 2 {
+            f = 1
+        }
+        put_str_max(scr, 1, rows - 2 - i, t.msg, cols - 2, f, term.AttrBold)
+        i = i + 1
+    }
+}
+
+// draw_modal paints a centered overlay box and returns its rect.
+fn draw_modal(scr: mut term.AnsiScreen, cols: int, rows: int, w: int, h: int, title: str) -> []int {
+    if w > cols - 4 {
+        w = cols - 4
+    }
+    if h > rows - 4 {
+        h = rows - 4
+    }
+    x := (cols - w) / 2
+    y := (rows - h) / 2
+    // clear + shadow row
+    j := 0
+    for j < h {
+        fill_row(scr, x, y + j, w, " ", 7, 0)
+        j = j + 1
+    }
+    draw_pane(scr, x, y, w, h, title, true)
+    r := mkslice(int, 4)
+    push(r, x)
+    push(r, y)
+    push(r, w)
+    push(r, h)
+    return r
+}
+
+fn render_modal(a: mut App, scr: mut term.AnsiScreen, cols: int, rows: int) {
+    m := top_modal(a)
+    if m == MNone {
+        return
+    }
+    if m == MHelp {
+        r := draw_modal(scr, cols, rows, 56, 18, "help")
+        put_str(scr, r[0] + 2, r[1] + 2, "global keys:", 6, term.AttrBold)
+        gs := global_bindings()
+        i := 0
+        for i < len(gs) && i < 12 {
+            b := gs[i]
+            put_str_max(scr, r[0] + 3, r[1] + 3 + i, pat_str(b.pat) + "  " + b.action, r[2] - 6, 7, 0)
+            i = i + 1
+        }
+        return
+    }
+    if m == MPalette {
+        r := draw_modal(scr, cols, rows, 56, 16, "palette")
+        put_str_max(scr, r[0] + 2, r[1] + 2, "> " + a.pal_query.text, r[2] - 4, 7, 0)
+        items := palette_filtered(a)
+        i := 0
+        for i < len(items) && i < r[3] - 5 {
+            p := items[i]
+            a2 := 0
+            if i == a.pal_sel {
+                a2 = term.AttrReverse
+            }
+            put_str_max(scr, r[0] + 2, r[1] + 4 + i, p.name, r[2] - 4, 7, a2)
+            i = i + 1
+        }
+        return
+    }
+    if m == MVariables {
+        r := draw_modal(scr, cols, rows, 56, 14, "variables")
+        put_str(scr, r[0] + 2, r[1] + 2, "env vars (reveal: " + btoa(a.vars_reveal) + ")", 6, 0)
+        i := 0
+        for i < a.vars.count && i < r[3] - 5 {
+            nm := "var" + itoa(i)
+            if !a.vars_reveal {
+                nm = nm + " = ••••"
+            }
+            a2 := 0
+            if i == a.vars.sel {
+                a2 = term.AttrReverse
+            }
+            put_str_max(scr, r[0] + 3, r[1] + 3 + i, nm, r[2] - 6, 7, a2)
+            i = i + 1
+        }
+        return
+    }
+    if m == MMethodMenu {
+        r := draw_modal(scr, cols, rows, 24, 14, "method")
+        ns := method_names()
+        i := 0
+        for i < len(ns) && i < r[3] - 3 {
+            a2 := 0
+            if i == a.method_sel {
+                a2 = term.AttrReverse
+            }
+            put_str_max(scr, r[0] + 2, r[1] + 2 + i, ns[i], r[2] - 4, 7, a2)
+            i = i + 1
+        }
+        return
+    }
+    if m == MConfirm {
+        r := draw_modal(scr, cols, rows, 50, 7, "confirm")
+        put_str_max(scr, r[0] + 2, r[1] + 2, a.confirm_msg, r[2] - 4, 3, 0)
+        put_str(scr, r[0] + 2, r[1] + 4, "enter = yes · escape = no", 7, term.AttrDim)
+        return
+    }
+    if m == MSaveReq {
+        r := draw_modal(scr, cols, rows, 56, 12, "save request")
+        put_str(scr, r[0] + 2, r[1] + 2, "name    " + a.save_name.text, 7, 0)
+        put_str(scr, r[0] + 2, r[1] + 3, "file    " + a.save_file.text, 7, 0)
+        put_str(scr, r[0] + 2, r[1] + 4, "folder  " + a.save_folder.text, 7, 0)
+        put_str(scr, r[0] + 2, r[1] + 5, "desc    " + a.save_desc.text, 7, 0)
+        return
+    }
+    if m == MSearchTabs {
+        r := draw_modal(scr, cols, rows, 40, 10, "tabs")
+        i := 0
+        for i < len(a.tabs) && i < r[3] - 4 {
+            a2 := 0
+            if i == a.tabsearch.sel {
+                a2 = term.AttrReverse
+            }
+            put_str_max(scr, r[0] + 2, r[1] + 2 + i, a.tabs[i].title, r[2] - 4, 7, a2)
+            i = i + 1
+        }
+        return
+    }
+    if m == MHistory {
+        r := draw_modal(scr, cols, rows, 56, 12, "history")
+        put_str(scr, r[0] + 2, r[1] + 2, "(response history — S10)", 7, term.AttrDim)
+        return
+    }
+    if m == MJump {
+        put_str(scr, 2, rows - 2, "jump: s sidebar · u url · m method · q request · w response", 3, term.AttrBold)
+        return
+    }
+    if m == MEnvSwitch {
+        r := draw_modal(scr, cols, rows, 40, 8, "environment")
+        put_str(scr, r[0] + 2, r[1] + 2, a.env_name, 3, 0)
+        return
+    }
+}
+
+fn btoa(b: bool) -> str {
+    if b {
+        return "on"
+    }
+    return "off"
+}
+
+// render draws the whole shell and caches hit rects on the app.
+fn render(a: mut App, scr: mut term.AnsiScreen, ver: str) {
+    sz := scr.size()
+    cols := sz.cols
+    rows := sz.rows
+    render_header(a, scr, ver)
+    render_url_bar(a, scr, cols)
+    by := 4
+    bh := rows - 2 - by
+    if bh < 3 {
+        bh = 3
+    }
+    // sidebar
+    sw := 0
+    sx := 0
+    if a.sidebar_on {
+        sw = cols / 4
+        if sw > 24 {
+            sw = 24
+        }
+        if sw < 10 {
+            sw = 10
+        }
+        sx = 0
+        if a.sidebar_pos == 1 {
+            sx = cols - sw
+        }
+    }
+    a.r_sidebar_x = sx
+    a.r_sidebar_w = sw
+    a.r_main_x = sw
+    a.r_main_w = cols - sw
+    if a.sidebar_pos == 1 {
+        a.r_main_x = 0
+    }
+    if a.sidebar_on {
+        render_sidebar(a, scr, sx, by, sw, bh)
+    }
+    // main split
+    mx := a.r_main_x
+    mw := a.r_main_w
+    a.r_req_y = by
+    a.r_resp_y = by
+    a.r_req_h = bh
+    a.r_resp_h = bh
+    a.r_url_y = 1
+    a.r_url_h = 2
+    if a.expanded == 1 {
+        render_req_pane(a, scr, mx, by, mw, bh)
+        a.r_resp_h = 0
+    } else if a.expanded == 2 {
+        render_resp_pane(a, scr, mx, by, mw, bh)
+        a.r_req_h = 0
+    } else if a.layout == 0 {
+        // vertical: request over response
+        rh := bh / 2
+        if bh - rh > rh {
+            rh = bh - rh
+        }
+        render_req_pane(a, scr, mx, by, mw, rh)
+        render_resp_pane(a, scr, mx, by + rh, mw, bh - rh)
+        a.r_req_h = rh
+        a.r_resp_y = by + rh
+        a.r_resp_h = bh - rh
+    } else {
+        // horizontal: side by side
+        rw := mw / 2
+        render_req_pane(a, scr, mx, by, rw, bh)
+        render_resp_pane(a, scr, mx + rw, by, mw - rw, bh)
+        a.r_req_h = bh
+        a.r_resp_y = by
+        a.r_resp_h = bh
+    }
+    render_toasts(a, scr, cols, rows)
+    render_footer(a, scr, cols, rows)
+    render_modal(a, scr, cols, rows)
+    if a.focus != FUrl && !(a.focus == FReqPane && a.body_edit) {
+        scr.cursor(0, 0, false)
+    }
+}
+
+// pat_str renders a KeyPat back to a corpus-style spec for the help
+// overlay listing.
+fn pat_str(p: KeyPat) -> str {
+    s := ""
+    if p.ctrl {
+        s = s + "ctrl+"
+    }
+    if p.alt {
+        s = s + "alt+"
+    }
+    if p.shift {
+        s = s + "shift+"
+    }
+    if p.meta {
+        s = s + "meta+"
+    }
+    if p.sup {
+        s = s + "super+"
+    }
+    if p.code >= 0 {
+        s = s + code_name(p.code)
+    } else {
+        s = s + p.ch
+    }
+    return s
+}
+
+fn code_name(c: int) -> str {
+    if c == term.KeyEnter {
+        return "enter"
+    }
+    if c == term.KeyTab {
+        return "tab"
+    }
+    if c == term.KeySpace {
+        return "space"
+    }
+    if c == term.KeyBackspace {
+        return "backspace"
+    }
+    if c == term.KeyDelete {
+        return "delete"
+    }
+    if c == term.KeyInsert {
+        return "insert"
+    }
+    if c == term.KeyEscape {
+        return "escape"
+    }
+    if c == term.KeyUp {
+        return "up"
+    }
+    if c == term.KeyDown {
+        return "down"
+    }
+    if c == term.KeyLeft {
+        return "left"
+    }
+    if c == term.KeyRight {
+        return "right"
+    }
+    if c == term.KeyHome {
+        return "home"
+    }
+    if c == term.KeyEnd {
+        return "end"
+    }
+    if c == term.KeyPgUp {
+        return "pageup"
+    }
+    if c == term.KeyPgDown {
+        return "pagedown"
+    }
+    if c >= term.KeyF1 {
+        return "f" + itoa(c - term.KeyF1 + 1)
+    }
+    return "key" + itoa(c)
+}

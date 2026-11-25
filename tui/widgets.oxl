@@ -1,0 +1,803 @@
+package main
+
+// Focused widgets — LineEdit (§4.8 text inputs), ListCur (rows),
+// TabStrip (§4.5), KVTable (§4.6), Tree (§4.9), TextView (§4.14).
+
+// LineEdit — single-line text input (URL bar, palette query, KV cell,
+// search boxes). cursor = byte offset (ASCII-fast path documented in
+// spec). sel_anchor -1 = no selection.
+
+fn new_line_edit(text: str) -> LineEdit {
+    return LineEdit{text: text, cur: len(text), sel_anchor: -1,
+        undo_text: "", undo_cur: 0, has_undo: false,
+        redo_text: "", redo_cur: 0, has_redo: false}
+}
+
+fn (e mut LineEdit) snap() {
+    e.undo_text = e.text
+    e.undo_cur = e.cur
+    e.has_undo = true
+    e.has_redo = false
+}
+
+fn (e mut LineEdit) clear_sel() {
+    e.sel_anchor = -1
+}
+
+fn (e LineEdit) has_sel() -> bool {
+    return e.sel_anchor >= 0 && e.sel_anchor != e.cur
+}
+
+// del_sel removes a live selection; returns whether one existed.
+fn (e mut LineEdit) del_sel() -> bool {
+    if !e.has_sel() {
+        e.sel_anchor = -1
+        return false
+    }
+    lo := e.sel_anchor
+    hi := e.cur
+    if hi < lo {
+        lo = e.cur
+        hi = e.sel_anchor
+    }
+    e.text = substr(e.text, 0, lo) + substr(e.text, hi, len(e.text))
+    e.cur = lo
+    e.sel_anchor = -1
+    return true
+}
+
+fn (e mut LineEdit) insert(ch: str) {
+    e.snap()
+    if e.del_sel() {
+    }
+    e.text = substr(e.text, 0, e.cur) + ch + substr(e.text, e.cur, len(e.text))
+    e.cur = e.cur + len(ch)
+}
+
+fn (e mut LineEdit) backspace() {
+    if e.del_sel() {
+        e.undo_text = e.text
+        return
+    }
+    if e.cur <= 0 {
+        return
+    }
+    e.snap()
+    e.text = substr(e.text, 0, e.cur - 1) + substr(e.text, e.cur, len(e.text))
+    e.cur = e.cur - 1
+}
+
+fn (e mut LineEdit) del_right() {
+    if e.del_sel() {
+        return
+    }
+    if e.cur >= len(e.text) {
+        return
+    }
+    e.snap()
+    e.text = substr(e.text, 0, e.cur) + substr(e.text, e.cur + 1, len(e.text))
+}
+
+fn (e mut LineEdit) home() {
+    e.cur = 0
+    e.clear_sel()
+}
+
+fn (e mut LineEdit) end() {
+    e.cur = len(e.text)
+    e.clear_sel()
+}
+
+fn is_word_byte(c: byte) -> bool {
+    if c >= 97 && c <= 122 {
+        return true
+    }
+    if c >= 65 && c <= 90 {
+        return true
+    }
+    if c >= 48 && c <= 57 {
+        return true
+    }
+    return c == 95
+}
+
+fn (e mut LineEdit) word_back() {
+    e.snap_nopos()
+    i := e.cur
+    for i > 0 && !is_word_byte(byteat(e.text, i - 1)) {
+        i = i - 1
+    }
+    for i > 0 && is_word_byte(byteat(e.text, i - 1)) {
+        i = i - 1
+    }
+    e.cur = i
+    e.clear_sel()
+}
+
+fn (e mut LineEdit) word_fwd() {
+    e.snap_nopos()
+    i := e.cur
+    n := len(e.text)
+    // w = next word start: skip current word, then the gap
+    for i < n && is_word_byte(byteat(e.text, i)) {
+        i = i + 1
+    }
+    for i < n && !is_word_byte(byteat(e.text, i)) {
+        i = i + 1
+    }
+    e.cur = i
+    e.clear_sel()
+}
+
+// snap_nopos marks a move as undoable-at-content level? No — plain
+// moves are not undoable; helper kept for symmetry (no-op).
+fn (e mut LineEdit) snap_nopos() {
+}
+
+fn (e mut LineEdit) del_word_back() {
+    if e.del_sel() {
+        return
+    }
+    i := e.cur
+    for i > 0 && !is_word_byte(byteat(e.text, i - 1)) {
+        i = i - 1
+    }
+    for i > 0 && is_word_byte(byteat(e.text, i - 1)) {
+        i = i - 1
+    }
+    if i == e.cur {
+        return
+    }
+    e.snap()
+    e.text = substr(e.text, 0, i) + substr(e.text, e.cur, len(e.text))
+    e.cur = i
+}
+
+fn (e mut LineEdit) del_to_start() {
+    if e.cur <= 0 {
+        return
+    }
+    e.snap()
+    e.text = substr(e.text, e.cur, len(e.text))
+    e.cur = 0
+    e.clear_sel()
+}
+
+fn (e mut LineEdit) del_to_end() {
+    if e.cur >= len(e.text) {
+        return
+    }
+    e.snap()
+    e.text = substr(e.text, 0, e.cur)
+    e.clear_sel()
+}
+
+fn (e mut LineEdit) select_all() {
+    e.sel_anchor = 0
+    e.cur = len(e.text)
+}
+
+// move_sel moves the cursor extending selection when shift.
+fn (e mut LineEdit) move(to: int, shift: bool) {
+    if shift {
+        if e.sel_anchor < 0 {
+            e.sel_anchor = e.cur
+        }
+    } else {
+        e.sel_anchor = -1
+    }
+    if to < 0 {
+        to = 0
+    }
+    if to > len(e.text) {
+        to = len(e.text)
+    }
+    e.cur = to
+}
+
+fn (e mut LineEdit) undo() {
+    if !e.has_undo {
+        return
+    }
+    e.redo_text = e.text
+    e.redo_cur = e.cur
+    e.has_redo = true
+    e.text = e.undo_text
+    e.cur = e.undo_cur
+    e.has_undo = false
+    e.sel_anchor = -1
+}
+
+fn (e mut LineEdit) redo() {
+    if !e.has_redo {
+        return
+    }
+    e.undo_text = e.text
+    e.undo_cur = e.cur
+    e.has_undo = true
+    e.text = e.redo_text
+    e.cur = e.redo_cur
+    e.has_redo = false
+    e.sel_anchor = -1
+}
+
+// selected_text returns the selection or "" — copies degrade (no
+// clipboard) but the helper feeds status messages.
+fn (e LineEdit) selected_text() -> str {
+    if !e.has_sel() {
+        return ""
+    }
+    lo := e.sel_anchor
+    hi := e.cur
+    if hi < lo {
+        lo = e.cur
+        hi = e.sel_anchor
+    }
+    return substr(e.text, lo, hi)
+}
+
+// ListCur — row cursor + optional selection anchor for nav-heavy
+// widgets (history, tables, palette, tab strip data).
+
+fn new_list(count: int) -> ListCur {
+    return ListCur{sel: 0, count: count, anchor: -1, top: 0}
+}
+
+fn (l mut ListCur) clamp() {
+    if l.count < 0 {
+        l.count = 0
+    }
+    if l.sel < 0 {
+        l.sel = 0
+    }
+    if l.sel >= l.count {
+        l.sel = l.count - 1
+        if l.sel < 0 {
+            l.sel = 0
+        }
+    }
+    if l.top > l.sel {
+        l.top = l.sel
+    }
+    if l.top < 0 {
+        l.top = 0
+    }
+}
+
+fn (l mut ListCur) move(d: int, shift: bool) {
+    if shift && l.anchor < 0 {
+        l.anchor = l.sel
+    }
+    if !shift {
+        l.anchor = -1
+    }
+    l.sel = l.sel + d
+    l.clamp()
+}
+
+fn (l mut ListCur) home(shift: bool) {
+    if shift && l.anchor < 0 {
+        l.anchor = l.sel
+    }
+    if !shift {
+        l.anchor = -1
+    }
+    l.sel = 0
+    l.clamp()
+}
+
+fn (l mut ListCur) end(shift: bool) {
+    if shift && l.anchor < 0 {
+        l.anchor = l.sel
+    }
+    if !shift {
+        l.anchor = -1
+    }
+    l.sel = l.count - 1
+    l.clamp()
+}
+
+// TabStrip — index cursor over n tabs (§4.5: left/h right/l switch,
+// down/j/enter into content, up/k back out).
+
+fn (t mut TabStrip) next() {
+    t.sel = t.sel + 1
+    if t.sel >= t.count {
+        t.sel = 0
+    }
+}
+
+fn (t mut TabStrip) prev() {
+    t.sel = t.sel - 1
+    if t.sel < 0 {
+        t.sel = t.count - 1
+    }
+}
+
+// KVTable — Headers/Query rows (§4.6): last empty row is the append
+// sentinel; ctrl+r toggles enabled, ctrl+x deletes, typing into the
+// sentinel appends.
+
+
+fn new_kv() -> KVTable {
+    t := KVTable{rows: mkslice(KVRow, 0), cur: 0, col: 0, editing: false, edit: new_line_edit("")}
+    // sentinel row always present
+    t.rows = push(t.rows, KVRow{name: "", value: "", enabled: true})
+    return t
+}
+
+fn (t mut KVTable) is_sentinel() -> bool {
+    return t.cur == len(t.rows) - 1 && t.rows[t.cur].name == "" && t.rows[t.cur].value == ""
+}
+
+fn (t mut KVTable) move(d: int) {
+    t.cur = t.cur + d
+    if t.cur < 0 {
+        t.cur = 0
+    }
+    if t.cur >= len(t.rows) {
+        t.cur = len(t.rows) - 1
+    }
+}
+
+fn (t mut KVTable) toggle() {
+    if t.is_sentinel() {
+        return
+    }
+    t.rows[t.cur].enabled = !t.rows[t.cur].enabled
+}
+
+fn (t mut KVTable) del_row() {
+    if t.is_sentinel() {
+        return
+    }
+    out := mkslice(KVRow, 0)
+    i := 0
+    for i < len(t.rows) {
+        if i != t.cur {
+            out = push(out, t.rows[i])
+        }
+        i = i + 1
+    }
+    t.rows = out
+    if t.cur >= len(t.rows) {
+        t.cur = len(t.rows) - 1
+    }
+}
+
+// type_char pushes a rune into the current cell (sentinel appends a
+// real row then edits). Returns true when it consumed the char.
+fn (t mut KVTable) type_char(ch: str) -> bool {
+    if t.is_sentinel() {
+        // grow: sentinel becomes a real row, new sentinel appended
+        if t.col == 0 {
+            t.rows[t.cur].name = ch
+        } else {
+            t.rows[t.cur].value = ch
+        }
+        t.rows = push(t.rows, KVRow{name: "", value: "", enabled: true})
+        t.editing = true
+        t.edit = new_line_edit(ch)
+        return true
+    }
+    if !t.editing {
+        t.editing = true
+        if t.col == 0 {
+            t.edit = new_line_edit(t.rows[t.cur].name)
+        } else {
+            t.edit = new_line_edit(t.rows[t.cur].value)
+        }
+    }
+    t.edit.insert(ch)
+    t.commit_edit()
+    return true
+}
+
+fn (t mut KVTable) commit_edit() {
+    if !t.editing {
+        return
+    }
+    if t.col == 0 {
+        t.rows[t.cur].name = t.edit.text
+    } else {
+        t.rows[t.cur].value = t.edit.text
+    }
+    t.editing = false
+}
+
+fn (t mut KVTable) cancel_edit() {
+    t.editing = false
+}
+
+// Tree — collection browser rows (§4.9): folders open/close, cursor,
+// selection anchor, flat visible-row projection.
+
+
+// visible returns indices of nodes shown under fold state.
+fn (t Tree) visible() -> []int {
+    out := mkslice(int, 0)
+    hide_depth := -1
+    i := 0
+    for i < len(t.nodes) {
+        nd := t.nodes[i]
+        if hide_depth >= 0 && nd.depth > hide_depth {
+            i = i + 1
+            // keep skipping while deeper than the closed folder
+        } else {
+            hide_depth = -1
+            out = push(out, i)
+            if nd.is_dir && !nd.open {
+                hide_depth = nd.depth
+            }
+            i = i + 1
+        }
+    }
+    return out
+}
+
+fn (t mut Tree) move(d: int, shift: bool) {
+    vis := t.visible()
+    if len(vis) == 0 {
+        return
+    }
+    pos := 0
+    i := 0
+    for i < len(vis) {
+        if vis[i] == t.cur {
+            pos = i
+        }
+        i = i + 1
+    }
+    if shift && t.anchor < 0 {
+        t.anchor = t.cur
+    }
+    if !shift {
+        t.anchor = -1
+    }
+    pos = pos + d
+    if pos < 0 {
+        pos = 0
+    }
+    if pos >= len(vis) {
+        pos = len(vis) - 1
+    }
+    t.cur = vis[pos]
+}
+
+fn (t mut Tree) first(shift: bool) {
+    vis := t.visible()
+    if len(vis) == 0 {
+        return
+    }
+    if shift && t.anchor < 0 {
+        t.anchor = t.cur
+    }
+    if !shift {
+        t.anchor = -1
+    }
+    t.cur = vis[0]
+}
+
+fn (t mut Tree) last(shift: bool) {
+    vis := t.visible()
+    if len(vis) == 0 {
+        return
+    }
+    if shift && t.anchor < 0 {
+        t.anchor = t.cur
+    }
+    if !shift {
+        t.anchor = -1
+    }
+    t.cur = vis[len(vis) - 1]
+}
+
+// left collapses the open folder else moves to parent.
+fn (t mut Tree) left() {
+    if t.cur < 0 || t.cur >= len(t.nodes) {
+        return
+    }
+    nd := t.nodes[t.cur]
+    if nd.is_dir && nd.open {
+        t.nodes[t.cur].open = false
+        return
+    }
+    p := parent_of(t.nodes, t.cur)
+    if p >= 0 {
+        t.cur = p
+    }
+    t.anchor = -1
+}
+
+// right expands the closed folder else moves to first child.
+fn (t mut Tree) right() {
+    if t.cur < 0 || t.cur >= len(t.nodes) {
+        return
+    }
+    nd := t.nodes[t.cur]
+    if nd.is_dir && !nd.open {
+        t.nodes[t.cur].open = true
+        return
+    }
+    if nd.is_dir && t.cur + 1 < len(t.nodes) && t.nodes[t.cur + 1].depth > nd.depth {
+        t.cur = t.cur + 1
+    }
+    t.anchor = -1
+}
+
+fn (t mut Tree) toggle_folder() {
+    if t.cur < 0 || t.cur >= len(t.nodes) {
+        return
+    }
+    if t.nodes[t.cur].is_dir {
+        t.nodes[t.cur].open = !t.nodes[t.cur].open
+    }
+}
+
+fn parent_of(nodes: []TreeNode, i: int) -> int {
+    if i <= 0 {
+        return -1
+    }
+    d := nodes[i].depth
+    j := i - 1
+    for j >= 0 {
+        if nodes[j].depth < d {
+            return j
+        }
+        j = j - 1
+    }
+    return -1
+}
+
+// TextView — scrollable read-only text (response body placeholder,
+// help screen). §4.14 nav: hjkl, w/b, 0^$, g/G, %, page keys,
+// half-page, search, visual select.
+
+fn new_text_view(text: str) -> TextView {
+    v := TextView{lines: mkslice(str, 0), cx: 0, cy: 0, top: 0,
+        anchor_x: -1, anchor_y: -1, search: "", search_hits: mkslice(int, 0), search_idx: 0}
+    // split on \n
+    cur := ""
+    i := 0
+    for i < len(text) {
+        if byteat(text, i) == 10 {
+            v.lines = push(v.lines, cur)
+            cur = ""
+        } else {
+            cur = cur + substr(text, i, i + 1)
+        }
+        i = i + 1
+    }
+    v.lines = push(v.lines, cur)
+    return v
+}
+
+fn (v mut TextView) clamp() {
+    if len(v.lines) == 0 {
+        v.cy = 0
+        v.cx = 0
+        return
+    }
+    if v.cy < 0 {
+        v.cy = 0
+    }
+    if v.cy >= len(v.lines) {
+        v.cy = len(v.lines) - 1
+    }
+    ln := len(v.lines[v.cy])
+    if v.cx < 0 {
+        v.cx = 0
+    }
+    if v.cx > ln {
+        v.cx = ln
+    }
+    if v.top > v.cy {
+        v.top = v.cy
+    }
+}
+
+fn (v mut TextView) move(dx: int, dy: int, shift: bool) {
+    if shift && v.anchor_x < 0 {
+        v.anchor_x = v.cx
+        v.anchor_y = v.cy
+    }
+    if !shift {
+        v.anchor_x = -1
+    }
+    v.cy = v.cy + dy
+    v.cx = v.cx + dx
+    v.clamp()
+}
+
+fn (v mut TextView) word_fwd(shift: bool) {
+    // w: next word start — skip current word then the gap; wraps to
+    // the next line's first word char.
+    if len(v.lines) == 0 {
+        return
+    }
+    line := v.lines[v.cy]
+    i := v.cx
+    n := len(line)
+    for i < n && is_word_byte(byteat(line, i)) {
+        i = i + 1
+    }
+    for i < n && !is_word_byte(byteat(line, i)) {
+        i = i + 1
+    }
+    if i >= n && v.cy < len(v.lines) - 1 {
+        if shift && v.anchor_x < 0 {
+            v.anchor_x = v.cx
+            v.anchor_y = v.cy
+        }
+        v.cx = 0
+        v.cy = v.cy + 1
+        v.word_fwd(shift)
+        return
+    }
+    if shift && v.anchor_x < 0 {
+        v.anchor_x = v.cx
+        v.anchor_y = v.cy
+    }
+    if !shift {
+        v.anchor_x = -1
+    }
+    v.cx = i
+    v.clamp()
+}
+
+fn (v mut TextView) word_back(shift: bool) {
+    line := v.lines[v.cy]
+    i := v.cx
+    for i > 0 && !is_word_byte(byteat(line, i - 1)) {
+        i = i - 1
+    }
+    for i > 0 && is_word_byte(byteat(line, i - 1)) {
+        i = i - 1
+    }
+    if i == 0 && v.cx == 0 && v.cy > 0 {
+        v.cy = v.cy - 1
+        v.cx = len(v.lines[v.cy])
+        v.clamp()
+        v.word_back(shift)
+        return
+    }
+    if shift && v.anchor_x < 0 {
+        v.anchor_x = v.cx
+        v.anchor_y = v.cy
+    }
+    if !shift {
+        v.anchor_x = -1
+    }
+    v.cx = i
+    v.clamp()
+}
+
+// pct_match jumps to the matching bracket (corpus % key).
+fn (v mut TextView) pct_match() {
+    if len(v.lines) == 0 {
+        return
+    }
+    line := v.lines[v.cy]
+    if v.cx >= len(line) {
+        return
+    }
+    c := byteat(line, v.cx)
+    open_c := 0
+    close_c := 0
+    dir := 0
+    if c == 40 {
+        open_c = 40
+        close_c = 41
+        dir = 1
+    } else if c == 91 {
+        open_c = 91
+        close_c = 93
+        dir = 1
+    } else if c == 123 {
+        open_c = 123
+        close_c = 125
+        dir = 1
+    } else if c == 41 {
+        open_c = 40
+        close_c = 41
+        dir = -1
+    } else if c == 93 {
+        open_c = 91
+        close_c = 93
+        dir = -1
+    } else if c == 125 {
+        open_c = 123
+        close_c = 125
+        dir = -1
+    } else {
+        return
+    }
+    depth := 0
+    y := v.cy
+    x := v.cx
+    for y >= 0 && y < len(v.lines) {
+        ln := v.lines[y]
+        for x >= 0 && x < len(ln) {
+            cc := byteat(ln, x)
+            if dir == 1 {
+                if cc == open_c {
+                    depth = depth + 1
+                }
+                if cc == close_c {
+                    depth = depth - 1
+                }
+            } else {
+                if cc == close_c {
+                    depth = depth + 1
+                }
+                if cc == open_c {
+                    depth = depth - 1
+                }
+            }
+            if depth == 0 {
+                v.cy = y
+                v.cx = x
+                v.clamp()
+                return
+            }
+            x = x + dir
+        }
+        y = y + dir
+        if y >= 0 && y < len(v.lines) {
+            if dir == 1 {
+                x = 0
+            } else {
+                x = len(v.lines[y]) - 1
+            }
+        }
+    }
+}
+
+// do_search finds lines containing s, sets search_hits.
+fn (v mut TextView) do_search(s: str) {
+    v.search = s
+    v.search_hits = mkslice(int, 0)
+    v.search_idx = 0
+    if len(s) == 0 {
+        return
+    }
+    i := 0
+    for i < len(v.lines) {
+        if str_contains(v.lines[i], s) {
+            v.search_hits = push(v.search_hits, i)
+        }
+        i = i + 1
+    }
+}
+
+fn (v mut TextView) search_next(dir: int) {
+    if len(v.search_hits) == 0 {
+        return
+    }
+    v.search_idx = v.search_idx + dir
+    if v.search_idx < 0 {
+        v.search_idx = len(v.search_hits) - 1
+    }
+    if v.search_idx >= len(v.search_hits) {
+        v.search_idx = 0
+    }
+    v.cy = v.search_hits[v.search_idx]
+    v.clamp()
+}
+
+fn str_contains(hay: str, needle: str) -> bool {
+    if len(needle) == 0 {
+        return true
+    }
+    if len(needle) > len(hay) {
+        return false
+    }
+    i := 0
+    for i + len(needle) <= len(hay) {
+        if substr(hay, i, i + len(needle)) == needle {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}

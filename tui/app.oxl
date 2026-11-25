@@ -1,0 +1,1877 @@
+package main
+
+// App — flat shell state (ADR-0028): focus targets, modal/overlay
+// stack, pane widget state, toast queue. Dispatch walks
+// modal > widget > global > fixed per corpus §3 precedence.
+
+import "github.com/oxidean/oxttp/core/term"
+
+fn new_app() -> own App {
+    a := new(App)
+    a.focus = FUrl // corpus focus.on_startup default "url"
+    a.modals = mkslice(int, 0)
+    a.quit = false
+    a.want_shot = false
+    a.url = new_line_edit("")
+    a.method = "GET"
+    a.kind = KHttp
+    a.method_sel = 0
+    a.req_tab = 0
+    a.resp_tab = 0
+    a.tabs = mkslice(RTab, 0)
+    a.tabs = push(a.tabs, RTab{title: "Untitled request", preview: true})
+    a.cur_tab = 0
+    a.sidebar_on = true  // collection_browser.show_on_startup
+    a.sidebar_pos = 0
+    a.layout = 0
+    a.expanded = 0
+    a.coll = stub_tree()
+    a.coll_search = new_line_edit("")
+    a.coll_searching = false
+    a.env_name = "(none)"
+    a.vars = new_list(0)
+    a.vars_filter = new_line_edit("")
+    a.vars_filtering = false
+    a.vars_reveal = false
+    a.hist = new_list(0)
+    a.headers = new_kv()
+    a.query_kv = new_kv()
+    a.path_kv = new_kv()
+    a.body = new_text_view("")
+    a.body_edit = false
+    a.body_ct = 0
+    a.resp_view = new_text_view("No response yet — send lands in S10.")
+    a.resp_rows = new_list(0)
+    a.pal_query = new_line_edit("")
+    a.pal_sel = 0
+    a.tabsearch = new_list(0)
+    a.save_name = new_line_edit("")
+    a.save_file = new_line_edit("")
+    a.save_folder = new_line_edit("")
+    a.save_desc = new_line_edit("")
+    a.save_field = 0
+    a.confirm_msg = ""
+    a.confirm_action = ""
+    a.toasts = mkslice(Toast, 0)
+    a.hinted_vars = false
+    return a
+}
+
+// stub_tree — the shell's placeholder collection (S10 loads real
+// .posting.yaml trees). One info row keeps nav bindings exercisable.
+fn stub_tree() -> Tree {
+    t := Tree{nodes: mkslice(TreeNode, 0), cur: 0, anchor: -1, filter: ""}
+    t.nodes = push(t.nodes, TreeNode{name: "(no collection loaded — lands S10)", depth: 0, is_dir: false, open: false, stub: true})
+    return t
+}
+
+// demo_tree — test fixture with folders so tree nav is real.
+fn demo_tree() -> Tree {
+    t := Tree{nodes: mkslice(TreeNode, 0), cur: 0, anchor: -1, filter: ""}
+    t.nodes = push(t.nodes, TreeNode{name: "api/", depth: 0, is_dir: true, open: true, stub: false})
+    t.nodes = push(t.nodes, TreeNode{name: "get-users", depth: 1, is_dir: false, open: false, stub: false})
+    t.nodes = push(t.nodes, TreeNode{name: "create-user", depth: 1, is_dir: false, open: false, stub: false})
+    t.nodes = push(t.nodes, TreeNode{name: "health", depth: 0, is_dir: false, open: false, stub: false})
+    return t
+}
+
+fn (a mut App) toast(level: int, msg: str) {
+    a.toasts = push(a.toasts, Toast{level: level, msg: msg})
+}
+
+fn (a mut App) degrade(msg: str) {
+    a.toast(2, msg + " — unsupported in this build")
+}
+
+fn top_modal(a: ref App) -> int {
+    if len(a.modals) == 0 {
+        return MNone
+    }
+    return a.modals[len(a.modals) - 1]
+}
+
+fn push_modal(a: mut App, m: int) {
+    a.modals = push(a.modals, m)
+    if m == MPalette {
+        a.pal_query = new_line_edit("")
+        a.pal_sel = 0
+    }
+    if m == MMethodMenu {
+        a.method_sel = method_menu_idx(a.method, a.kind)
+    }
+    if m == MSearchTabs {
+        a.tabsearch = new_list(len(a.tabs))
+        a.tabsearch.sel = a.cur_tab
+    }
+    if m == MHistory {
+        a.hist = new_list(0)
+    }
+    if m == MSaveReq {
+        a.save_field = 0
+    }
+}
+
+fn pop_modal(a: mut App) {
+    if len(a.modals) > 0 {
+        a.modals = a.modals[:len(a.modals) - 1]
+    }
+}
+
+// --- request tab sets per kind (§4.1) ---
+
+fn req_tabs(kind: int) -> []str {
+    t := mkslice(str, 0)
+    if kind == KHttp {
+        t = push(t, "Headers")
+        t = push(t, "Body")
+        t = push(t, "Path")
+        t = push(t, "Query")
+        t = push(t, "Auth")
+        t = push(t, "Info")
+        t = push(t, "Options")
+        return t
+    }
+    if kind == KGraphql {
+        t = push(t, "Headers")
+        t = push(t, "Params")
+        t = push(t, "Path")
+        t = push(t, "Query")
+        t = push(t, "Auth")
+        t = push(t, "Info")
+        t = push(t, "Options")
+        return t
+    }
+    if kind == KGrpc {
+        t = push(t, "Metadata")
+        t = push(t, "Message")
+        t = push(t, "Proto")
+        t = push(t, "Info")
+        t = push(t, "Options")
+        return t
+    }
+    // WebSocket: corpus shows Message; shell keeps a minimal set
+    t = push(t, "Message")
+    t = push(t, "Headers")
+    t = push(t, "Info")
+    t = push(t, "Options")
+    return t
+}
+
+fn req_tab_count(a: ref App) -> int {
+    return len(req_tabs(a.kind))
+}
+
+fn resp_tabs() -> []str {
+    t := mkslice(str, 0)
+    t = push(t, "Body")
+    t = push(t, "Headers")
+    t = push(t, "Cookies")
+    t = push(t, "Trace")
+    return t
+}
+
+// --- widget binding tables (§4.x per widget) ---
+
+// widget_bindings returns the focused widget's table. Called with the
+// app — the active request tab picks the inner table.
+fn widget_bindings(a: ref App) -> []Binding {
+    bs := mkslice(Binding, 0)
+    if a.focus == FUrl {
+        return url_bindings()
+    }
+    if a.focus == FMethod {
+        return method_sel_bindings()
+    }
+    if a.focus == FReqTabs || a.focus == FRespTabs {
+        return tabstrip_bindings(a.focus)
+    }
+    if a.focus == FReqPane {
+        return req_pane_bindings(a)
+    }
+    if a.focus == FRespPane {
+        return resp_pane_bindings(a)
+    }
+    if a.focus == FSidebar {
+        return sidebar_bindings()
+    }
+    return bs
+}
+
+fn url_bindings() -> []Binding {
+    bs := mkslice(Binding, 0)
+    bs = push(bs, bind("enter", "url-enter"))
+    bs = push(bs, bind("down", "focus-req-tabs"))
+    bs = push(bs, bind("ctrl+y", "copy-url"))
+    bs = push(bs, bind("ctrl+shift+z", "edit-redo"))
+    bs = push(bs, bind("ctrl+left", "edit-word-back"))
+    bs = push(bs, bind("alt+b", "edit-word-back"))
+    bs = push(bs, bind("ctrl+right", "edit-word-fwd"))
+    bs = push(bs, bind("alt+f", "edit-word-fwd"))
+    bs = push(bs, bind("home", "edit-home"))
+    bs = push(bs, bind("end", "edit-end"))
+    bs = push(bs, bind("ctrl+e", "edit-end"))
+    bs = push(bs, bind("shift+left", "edit-sel-left"))
+    bs = push(bs, bind("shift+right", "edit-sel-right"))
+    bs = push(bs, bind("shift+home", "edit-sel-home"))
+    bs = push(bs, bind("shift+end", "edit-sel-end"))
+    bs = push(bs, bind("ctrl+a", "edit-sel-all"))
+    bs = push(bs, bind("ctrl+z", "edit-undo"))
+    bs = push(bs, bind("ctrl+w", "edit-del-word"))
+    bs = push(bs, bind("alt+backspace", "edit-del-word"))
+    bs = push(bs, bind("ctrl+u", "edit-del-start"))
+    bs = push(bs, bind("ctrl+k", "edit-del-end"))
+    bs = push(bs, bind("ctrl+d", "edit-del-right"))
+    bs = push(bs, bind("delete", "edit-del-right"))
+    bs = push(bs, bind("backspace", "edit-backspace"))
+    bs = push(bs, bind("left", "edit-left"))
+    bs = push(bs, bind("right", "edit-right"))
+    return bs
+}
+
+fn method_sel_bindings() -> []Binding {
+    bs := mkslice(Binding, 0)
+    bs = push(bs, bind("enter", "method-menu"))
+    bs = push(bs, bind("space", "method-menu"))
+    bs = push(bs, bind("right", "focus-url"))
+    bs = push(bs, bind("left", "focus-sidebar"))
+    return bs
+}
+
+fn tabstrip_bindings(focus: int) -> []Binding {
+    bs := mkslice(Binding, 0)
+    bs = push(bs, bind("left", "tab-prev"))
+    bs = push(bs, bind("h", "tab-prev"))
+    bs = push(bs, bind("right", "tab-next"))
+    bs = push(bs, bind("l", "tab-next"))
+    bs = push(bs, bind("down", "tab-enter"))
+    bs = push(bs, bind("j", "tab-enter"))
+    bs = push(bs, bind("enter", "tab-enter"))
+    bs = push(bs, bind("up", "tab-exit"))
+    bs = push(bs, bind("k", "tab-exit"))
+    // §9 quirk: alt+z expands Request/Response from inside panels
+    bs = push(bs, bind("alt+z", "expand-section"))
+    return bs
+}
+
+fn req_pane_bindings(a: ref App) -> []Binding {
+    bs := mkslice(Binding, 0)
+    bs = push(bs, bind("alt+z", "expand-section"))
+    ts := req_tabs(a.kind)
+    name := ts[a.req_tab]
+    if a.kind == KHttp || a.kind == KGraphql {
+        if name == "Headers" || name == "Query" || name == "Params" {
+            // KV table bindings (§4.6)
+            bs = push(bs, bind("up", "kv-up"))
+            bs = push(bs, bind("down", "kv-down"))
+            bs = push(bs, bind("k", "kv-up"))
+            bs = push(bs, bind("j", "kv-down"))
+            bs = push(bs, bind("ctrl+r", "kv-toggle"))
+            bs = push(bs, bind("ctrl+x", "kv-delete"))
+            bs = push(bs, bind("left", "kv-left"))
+            bs = push(bs, bind("right", "kv-right"))
+            bs = push(bs, bind("h", "kv-left"))
+            bs = push(bs, bind("l", "kv-right"))
+            bs = push(bs, bind("enter", "kv-edit"))
+            bs = push(bs, bind("backspace", "edit-backspace"))
+            bs = push(bs, bind("delete", "edit-del-right"))
+        } else if name == "Path" {
+            bs = push(bs, bind("up", "kv-up"))
+            bs = push(bs, bind("down", "kv-down"))
+            bs = push(bs, bind("enter", "kv-edit"))
+            bs = push(bs, bind("backspace", "edit-backspace"))
+        } else if name == "Body" {
+            bs = push(bs, bind("f3", "body-pager"))
+            bs = push(bs, bind("f4", "body-editor"))
+            bs = push(bs, bind("up", "tv-up"))
+            bs = push(bs, bind("down", "tv-down"))
+            bs = push(bs, bind("left", "tv-left"))
+            bs = push(bs, bind("right", "tv-right"))
+            bs = push(bs, bind("enter", "body-newline"))
+            bs = push(bs, bind("backspace", "body-backspace"))
+        }
+        // Auth/Info/Options: static panes — up/down scrolls
+        if name == "Auth" || name == "Info" || name == "Options" {
+            bs = push(bs, bind("up", "tv-up"))
+            bs = push(bs, bind("down", "tv-down"))
+            bs = push(bs, bind("k", "tv-up"))
+            bs = push(bs, bind("j", "tv-down"))
+        }
+    } else {
+        // gRPC/WS panes: all degrade targets except nav
+        bs = push(bs, bind("up", "tv-up"))
+        bs = push(bs, bind("down", "tv-down"))
+    }
+    return bs
+}
+
+fn resp_pane_bindings(a: ref App) -> []Binding {
+    bs := mkslice(Binding, 0)
+    bs = push(bs, bind("alt+z", "expand-section"))
+    ts := resp_tabs()
+    name := ts[a.resp_tab]
+    if name == "Body" {
+        // §4.14 text view keys
+        bs = push(bs, bind("k", "tv-up"))
+        bs = push(bs, bind("j", "tv-down"))
+        bs = push(bs, bind("h", "tv-left"))
+        bs = push(bs, bind("l", "tv-right"))
+        bs = push(bs, bind("up", "tv-up"))
+        bs = push(bs, bind("down", "tv-down"))
+        bs = push(bs, bind("left", "tv-left"))
+        bs = push(bs, bind("right", "tv-right"))
+        bs = push(bs, bind("w", "tv-word-fwd"))
+        bs = push(bs, bind("b", "tv-word-back"))
+        bs = push(bs, bind("0", "tv-line-start"))
+        bs = push(bs, bind("^", "tv-line-start"))
+        bs = push(bs, bind("$", "tv-line-end"))
+        bs = push(bs, bind("g", "tv-top"))
+        bs = push(bs, bind("G", "tv-bottom"))
+        bs = push(bs, bind("%", "tv-match"))
+        bs = push(bs, bind("pgup", "tv-pgup"))
+        bs = push(bs, bind("ctrl+b", "tv-pgup"))
+        bs = push(bs, bind("pgdown", "tv-pgdn"))
+        bs = push(bs, bind("ctrl+u", "tv-half-up"))
+        bs = push(bs, bind("ctrl+d", "tv-half-down"))
+        bs = push(bs, bind("ctrl+f", "tv-search"))
+        bs = push(bs, bind("/", "tv-search"))
+        bs = push(bs, bind("n", "tv-search-next"))
+        bs = push(bs, bind("N", "tv-search-prev"))
+        bs = push(bs, bind("v", "tv-visual"))
+        bs = push(bs, bind("V", "tv-visual-line"))
+        bs = push(bs, bind("f6", "tv-visual-line"))
+        bs = push(bs, bind("f7", "tv-sel-all"))
+        bs = push(bs, bind("ctrl+a", "tv-line-start"))
+        bs = push(bs, bind("shift+h", "tv-sel-left"))
+        bs = push(bs, bind("shift+j", "tv-sel-down"))
+        bs = push(bs, bind("shift+k", "tv-sel-up"))
+        bs = push(bs, bind("shift+l", "tv-sel-right"))
+        bs = push(bs, bind("shift+w", "tv-sel-word-fwd"))
+        bs = push(bs, bind("shift+b", "tv-sel-word-back"))
+        bs = push(bs, bind("y", "copy-body"))
+        bs = push(bs, bind("c", "copy-body"))
+        bs = push(bs, bind("f3", "body-pager"))
+        bs = push(bs, bind("f4", "body-editor"))
+        bs = push(bs, bind("f2", "image-toggle"))
+        bs = push(bs, bind("s", "save-response"))
+        bs = push(bs, bind("e", "json-expand"))
+        bs = push(bs, bind("E", "json-collapse"))
+        bs = push(bs, bind("Y", "json-copy-path"))
+        bs = push(bs, bind("escape", "escape"))
+    } else {
+        // Headers/Cookies/Trace tables
+        bs = push(bs, bind("up", "rows-up"))
+        bs = push(bs, bind("down", "rows-down"))
+        bs = push(bs, bind("k", "rows-up"))
+        bs = push(bs, bind("j", "rows-down"))
+        bs = push(bs, bind("home", "rows-home"))
+        bs = push(bs, bind("g", "rows-home"))
+        bs = push(bs, bind("end", "rows-end"))
+        bs = push(bs, bind("G", "rows-end"))
+        bs = push(bs, bind("shift+up", "rows-ext-up"))
+        bs = push(bs, bind("shift+down", "rows-ext-down"))
+        bs = push(bs, bind("ctrl+a", "rows-sel-all"))
+        bs = push(bs, bind("y", "copy-val"))
+        bs = push(bs, bind("c", "copy-val"))
+        bs = push(bs, bind("n", "copy-name"))
+        bs = push(bs, bind("b", "copy-both"))
+        bs = push(bs, bind("escape", "escape"))
+    }
+    return bs
+}
+
+fn sidebar_bindings() -> []Binding {
+    bs := mkslice(Binding, 0)
+    bs = push(bs, bind("up", "tree-up"))
+    bs = push(bs, bind("k", "tree-up"))
+    bs = push(bs, bind("down", "tree-down"))
+    bs = push(bs, bind("j", "tree-down"))
+    bs = push(bs, bind("shift+up", "tree-ext-up"))
+    bs = push(bs, bind("shift+k", "tree-ext-up"))
+    bs = push(bs, bind("shift+down", "tree-ext-down"))
+    bs = push(bs, bind("shift+j", "tree-ext-down"))
+    bs = push(bs, bind("left", "tree-left"))
+    bs = push(bs, bind("h", "tree-left"))
+    bs = push(bs, bind("right", "tree-right"))
+    bs = push(bs, bind("l", "tree-right"))
+    bs = push(bs, bind("home", "tree-first"))
+    bs = push(bs, bind("g", "tree-first"))
+    bs = push(bs, bind("end", "tree-last"))
+    bs = push(bs, bind("G", "tree-last"))
+    bs = push(bs, bind("shift+home", "tree-ext-first"))
+    bs = push(bs, bind("shift+end", "tree-ext-last"))
+    bs = push(bs, bind("space", "tree-toggle"))
+    bs = push(bs, bind("/", "tree-search"))
+    bs = push(bs, bind("escape", "tree-escape"))
+    bs = push(bs, bind("d", "tree-dup"))
+    bs = push(bs, bind("backspace", "tree-delete"))
+    bs = push(bs, bind("delete", "tree-delete"))
+    bs = push(bs, bind("enter", "tree-open"))
+    return bs
+}
+
+// modal_bindings returns the table for modal kind m.
+fn modal_bindings(a: ref App, m: int) -> []Binding {
+    bs := mkslice(Binding, 0)
+    if m == MHelp {
+        bs = push(bs, bind("escape", "modal-close"))
+        bs = push(bs, bind("f1", "modal-close"))
+        bs = push(bs, bind("up", "tv-up"))
+        bs = push(bs, bind("down", "tv-down"))
+        bs = push(bs, bind("k", "tv-up"))
+        bs = push(bs, bind("j", "tv-down"))
+        bs = push(bs, bind("pgup", "tv-pgup"))
+        bs = push(bs, bind("pgdown", "tv-pgdn"))
+        return bs
+    }
+    if m == MVariables {
+        bs = push(bs, bind("escape", "modal-close"))
+        bs = push(bs, bind("enter", "vars-edit"))
+        bs = push(bs, bind("a", "vars-add"))
+        bs = push(bs, bind("d", "vars-revert"))
+        bs = push(bs, bind("/", "vars-filter"))
+        bs = push(bs, bind("ctrl+r", "vars-reveal"))
+        bs = push(bs, bind("up", "rows-up"))
+        bs = push(bs, bind("down", "rows-down"))
+        bs = push(bs, bind("k", "rows-up"))
+        bs = push(bs, bind("j", "rows-down"))
+        return bs
+    }
+    if m == MPalette {
+        bs = push(bs, bind("escape", "modal-close"))
+        bs = push(bs, bind("up", "pal-up"))
+        bs = push(bs, bind("down", "pal-down"))
+        bs = push(bs, bind("ctrl+p", "pal-up"))
+        bs = push(bs, bind("ctrl+n", "pal-down"))
+        bs = push(bs, bind("enter", "pal-run"))
+        bs = push(bs, bind("backspace", "pal-backspace"))
+        return bs
+    }
+    if m == MConfirm {
+        bs = push(bs, bind("escape", "modal-close"))
+        bs = push(bs, bind("enter", "confirm-yes"))
+        bs = push(bs, bind("y", "confirm-yes"))
+        bs = push(bs, bind("n", "modal-close"))
+        return bs
+    }
+    if m == MSaveReq {
+        bs = push(bs, bind("escape", "modal-close"))
+        bs = push(bs, bind("up", "save-field-up"))
+        bs = push(bs, bind("down", "save-field-down"))
+        bs = push(bs, bind("tab", "save-field-down"))
+        bs = push(bs, bind("enter", "save-confirm"))
+        bs = push(bs, bind("backspace", "edit-backspace"))
+        bs = push(bs, bind("left", "edit-left"))
+        bs = push(bs, bind("right", "edit-right"))
+        bs = push(bs, bind("home", "edit-home"))
+        bs = push(bs, bind("end", "edit-end"))
+        return bs
+    }
+    if m == MSearchTabs {
+        bs = push(bs, bind("escape", "modal-close"))
+        bs = push(bs, bind("up", "tabsearch-up"))
+        bs = push(bs, bind("down", "tabsearch-down"))
+        bs = push(bs, bind("k", "tabsearch-up"))
+        bs = push(bs, bind("j", "tabsearch-down"))
+        bs = push(bs, bind("enter", "tabsearch-pick"))
+        return bs
+    }
+    if m == MHistory {
+        bs = push(bs, bind("escape", "modal-close"))
+        bs = push(bs, bind("up", "rows-up"))
+        bs = push(bs, bind("down", "rows-down"))
+        bs = push(bs, bind("k", "rows-up"))
+        bs = push(bs, bind("j", "rows-down"))
+        bs = push(bs, bind("shift+up", "rows-ext-up"))
+        bs = push(bs, bind("shift+down", "rows-ext-down"))
+        bs = push(bs, bind("home", "rows-home"))
+        bs = push(bs, bind("g", "rows-home"))
+        bs = push(bs, bind("end", "rows-end"))
+        bs = push(bs, bind("G", "rows-end"))
+        bs = push(bs, bind("shift+home", "rows-ext-first"))
+        bs = push(bs, bind("shift+end", "rows-ext-last"))
+        bs = push(bs, bind("pgup", "rows-pgup"))
+        bs = push(bs, bind("ctrl+u", "rows-pgup"))
+        bs = push(bs, bind("pgdown", "rows-pgdn"))
+        bs = push(bs, bind("ctrl+d", "rows-pgdn"))
+        bs = push(bs, bind("enter", "hist-open"))
+        bs = push(bs, bind("backspace", "hist-delete"))
+        return bs
+    }
+    if m == MMethodMenu {
+        bs = push(bs, bind("escape", "modal-close"))
+        bs = push(bs, bind("up", "method-up"))
+        bs = push(bs, bind("down", "method-down"))
+        bs = push(bs, bind("k", "method-up"))
+        bs = push(bs, bind("j", "method-down"))
+        bs = push(bs, bind("enter", "method-pick"))
+        // letters select directly (§4.3)
+        bs = push(bs, bind("g", "method-get"))
+        bs = push(bs, bind("p", "method-post"))
+        bs = push(bs, bind("u", "method-put"))
+        bs = push(bs, bind("a", "method-patch"))
+        bs = push(bs, bind("d", "method-delete"))
+        bs = push(bs, bind("h", "method-head"))
+        bs = push(bs, bind("o", "method-options"))
+        bs = push(bs, bind("q", "kind-graphql"))
+        bs = push(bs, bind("r", "kind-grpc"))
+        bs = push(bs, bind("w", "kind-ws"))
+        return bs
+    }
+    if m == MJump {
+        bs = push(bs, bind("escape", "modal-close"))
+        bs = push(bs, bind("q", "jump-0"))
+        bs = push(bs, bind("w", "jump-1"))
+        bs = push(bs, bind("e", "jump-2"))
+        bs = push(bs, bind("r", "jump-3"))
+        bs = push(bs, bind("t", "jump-4"))
+        bs = push(bs, bind("y", "jump-5"))
+        bs = push(bs, bind("u", "jump-6"))
+        bs = push(bs, bind("a", "jump-resp-body"))
+        bs = push(bs, bind("4", "jump-history"))
+        return bs
+    }
+    if m == MEnvSwitch {
+        bs = push(bs, bind("escape", "modal-close"))
+        bs = push(bs, bind("enter", "env-pick"))
+        bs = push(bs, bind("up", "rows-up"))
+        bs = push(bs, bind("down", "rows-down"))
+        return bs
+    }
+    return bs
+}
+
+// --- dispatch ---
+
+// dispatch applies one KeyEvent; returns an E* effect code.
+fn dispatch(a: mut App, ev: term.KeyEvent) -> int {
+    // mouse events hit-test against last-render rects
+    if ev.key.kind() == 2 {
+        return dispatch_mouse(a, ev)
+    }
+    if len(a.modals) > 0 {
+        m := top_modal(a)
+        bs := modal_bindings(a, m)
+        bi := find_binding(bs, ev)
+        if bi >= 0 {
+            return modal_action(a, m, bs[bi].action, ev)
+        }
+        // fixed keys reachable inside modals: quit + screenshot +
+        // escape (unbound-modal fallback) — corpus §1.6/§3.
+        fb := find_binding(fixed_bindings(), ev)
+        if fb >= 0 {
+            fx := fixed_bindings()[fb].action
+            if fx == "quit" || fx == "screenshot" || fx == "escape" {
+                return fixed_action(a, fx)
+            }
+        }
+        // modal text inputs consume plain runes
+        if modal_wants_text(a, m) {
+            if ev.key.kind() == 0 {
+                r := ev.key as term.Key.Rune
+                if !ev.ctrl && !ev.alt {
+                    modal_text_char(a, m, r.ch)
+                }
+            }
+        }
+        return ENone
+    }
+    // widget layer
+    wbs := widget_bindings(a)
+    bi := find_binding(wbs, ev)
+    if bi >= 0 {
+        return widget_action(a, wbs[bi].action, ev)
+    }
+    // text fallthrough (url / kv cell / body)
+    if widget_wants_text(a) && ev.key.kind() == 0 {
+        r := ev.key as term.Key.Rune
+        if !ev.ctrl && !ev.alt {
+            return widget_text_char(a, r.ch)
+        }
+    }
+    // global rebindable
+    gbs := global_bindings()
+    gi := find_binding(gbs, ev)
+    if gi >= 0 {
+        return global_action(a, gbs[gi].action)
+    }
+    // fixed
+    fbs := fixed_bindings()
+    fi := find_binding(fbs, ev)
+    if fi >= 0 {
+        return fixed_action(a, fbs[fi].action)
+    }
+    return ENone
+}
+
+// fixed_action runs the 4 non-rebindable keys.
+fn fixed_action(a: mut App, act: str) -> int {
+    if act == "quit" {
+        a.quit = true
+        return EQuit
+    }
+    if act == "screenshot" {
+        a.want_shot = true
+        a.toast(0, "screenshot → posting-screenshot.txt")
+        return ENone
+    }
+    if act == "suspend-undo" {
+        a.degrade("suspend (ctrl+z) — no signal raise; lands never/upstream")
+        return ENone
+    }
+    if act == "escape" {
+        // close modal, clear widget selection/search — nothing in-flight yet
+        if len(a.modals) > 0 {
+            pop_modal(a)
+            return ENone
+        }
+        if a.focus == FSidebar {
+            if a.coll.anchor >= 0 {
+                a.coll.anchor = -1
+                return ENone
+            }
+            if a.coll_searching || len(a.coll_search.text) > 0 {
+                a.coll_searching = false
+                a.coll_search = new_line_edit("")
+                return ENone
+            }
+        }
+        return ENone
+    }
+    return ENone
+}
+
+// global_action — the 18 rebindable action ids.
+fn global_action(a: mut App, act: str) -> int {
+    if act == "send-request" {
+        a.degrade("send-request lands S10")
+    } else if act == "stream" {
+        a.degrade("streams land M4 (gRPC/WS oxl-blocked)")
+    } else if act == "jump" {
+        push_modal(a, MJump)
+    } else if act == "commands" {
+        push_modal(a, MPalette)
+    } else if act == "save-request" {
+        push_modal(a, MSaveReq)
+    } else if act == "new-request" {
+        a.tabs = push(a.tabs, RTab{title: "Untitled request", preview: true})
+        a.cur_tab = len(a.tabs) - 1
+    } else if act == "close-tab" {
+        if len(a.tabs) > 1 {
+            out := mkslice(RTab, 0)
+            i := 0
+            for i < len(a.tabs) {
+                if i != a.cur_tab {
+                    out = push(out, a.tabs[i])
+                }
+                i = i + 1
+            }
+            a.tabs = out
+            if a.cur_tab >= len(a.tabs) {
+                a.cur_tab = len(a.tabs) - 1
+            }
+        }
+    } else if act == "keep-tab" {
+        i := a.cur_tab
+        if i < len(a.tabs) {
+            a.tabs[i].preview = false
+        }
+    } else if act == "next-tab" {
+        if len(a.tabs) > 0 {
+            a.cur_tab = (a.cur_tab + 1) - ((a.cur_tab + 1) / len(a.tabs)) * len(a.tabs)
+        }
+    } else if act == "previous-tab" {
+        if len(a.tabs) > 0 {
+            a.cur_tab = a.cur_tab - 1
+            if a.cur_tab < 0 {
+                a.cur_tab = len(a.tabs) - 1
+            }
+        }
+    } else if act == "search-tabs" {
+        push_modal(a, MSearchTabs)
+    } else if act == "search-requests" {
+        a.degrade("collection search lands S10")
+    } else if act == "focus-url" {
+        a.focus = FUrl
+    } else if act == "focus-method" {
+        push_modal(a, MMethodMenu)
+    } else if act == "toggle-collection" {
+        a.sidebar_on = !a.sidebar_on
+    } else if act == "expand-section" {
+        if a.focus == FReqTabs || a.focus == FReqPane {
+            if a.expanded == 1 {
+                a.expanded = 0
+            } else {
+                a.expanded = 1
+            }
+        } else if a.focus == FRespTabs || a.focus == FRespPane {
+            if a.expanded == 2 {
+                a.expanded = 0
+            } else {
+                a.expanded = 2
+            }
+        } else {
+            a.toast(0, "expand-section: focus a request/response pane")
+        }
+    } else if act == "variables" {
+        push_modal(a, MVariables)
+    } else if act == "help" {
+        push_modal(a, MHelp)
+    }
+    return ENone
+}
+
+// widget_action — focused-widget binding outcomes.
+fn widget_action(a: mut App, act: str, ev: term.KeyEvent) -> int {
+    // line-edit shared actions
+    if act == "edit-backspace" {
+        a.url.backspace()
+        kv_commit_or_edit(a)
+    } else if act == "edit-del-right" {
+        a.url.del_right()
+    } else if act == "edit-left" {
+        a.url.move(a.url.cur - 1, false)
+    } else if act == "edit-right" {
+        a.url.move(a.url.cur + 1, false)
+    } else if act == "edit-home" {
+        a.url.move(0, false)
+    } else if act == "edit-end" {
+        a.url.move(len(a.url.text), false)
+    } else if act == "edit-word-back" {
+        a.url.word_back()
+    } else if act == "edit-word-fwd" {
+        a.url.word_fwd()
+    } else if act == "edit-sel-left" {
+        a.url.move(a.url.cur - 1, true)
+    } else if act == "edit-sel-right" {
+        a.url.move(a.url.cur + 1, true)
+    } else if act == "edit-sel-home" {
+        a.url.move(0, true)
+    } else if act == "edit-sel-end" {
+        a.url.move(len(a.url.text), true)
+    } else if act == "edit-sel-all" {
+        a.url.select_all()
+    } else if act == "edit-undo" {
+        a.url.undo()
+    } else if act == "edit-redo" {
+        a.url.redo()
+    } else if act == "edit-del-word" {
+        a.url.del_word_back()
+    } else if act == "edit-del-start" {
+        a.url.del_to_start()
+    } else if act == "edit-del-end" {
+        a.url.del_to_end()
+    } else if act == "url-enter" {
+        if is_curl_text(a.url.text) {
+            a.degrade("curl import lands S10")
+        } else {
+            a.degrade("send-request lands S10")
+        }
+    } else if act == "copy-url" {
+        a.degrade("clipboard copy — no clipboard API in std")
+    } else if act == "focus-req-tabs" {
+        a.focus = FReqTabs
+    } else if act == "focus-url" {
+        a.focus = FUrl
+    } else if act == "focus-sidebar" {
+        a.focus = FSidebar
+    } else if act == "method-menu" {
+        push_modal(a, MMethodMenu)
+    } else if act == "tab-prev" {
+        if a.focus == FReqTabs {
+            a.req_tab = a.req_tab - 1
+            if a.req_tab < 0 {
+                a.req_tab = req_tab_count(a) - 1
+            }
+        } else if a.focus == FRespTabs {
+            a.resp_tab = a.resp_tab - 1
+            if a.resp_tab < 0 {
+                a.resp_tab = len(resp_tabs()) - 1
+            }
+        }
+    } else if act == "tab-next" {
+        if a.focus == FReqTabs {
+            a.req_tab = (a.req_tab + 1) - ((a.req_tab + 1) / req_tab_count(a)) * req_tab_count(a)
+        } else if a.focus == FRespTabs {
+            a.resp_tab = (a.resp_tab + 1) - ((a.resp_tab + 1) / len(resp_tabs())) * len(resp_tabs())
+        }
+    } else if act == "tab-enter" {
+        if a.focus == FReqTabs {
+            a.focus = FReqPane
+        } else if a.focus == FRespTabs {
+            a.focus = FRespPane
+        }
+    } else if act == "tab-exit" {
+        if a.focus == FReqTabs {
+            a.focus = FUrl
+        } else if a.focus == FRespTabs {
+            a.focus = FReqTabs
+        }
+    } else if act == "expand-section" {
+        return global_action(a, "expand-section")
+    } else if act == "kv-up" {
+        kv_move(a, -1)
+    } else if act == "kv-down" {
+        kv_move(a, 1)
+    } else if act == "kv-left" {
+        kv_col(a, 0)
+    } else if act == "kv-right" {
+        kv_col(a, 1)
+    } else if act == "kv-toggle" {
+        kv_toggle(a)
+    } else if act == "kv-delete" {
+        kv_del(a)
+    } else if act == "kv-edit" {
+        kv_begin_edit(a)
+    } else if act == "body-pager" {
+        a.degrade("f3 pager — no pager handoff this build")
+    } else if act == "body-editor" {
+        a.degrade("f4 $EDITOR — no editor handoff this build")
+    } else if act == "body-newline" {
+        body_insert(a, "\n")
+    } else if act == "body-backspace" {
+        body_backspace(a)
+    } else if act == "tv-up" {
+        a.resp_view.move(0, -1, false)
+    } else if act == "tv-down" {
+        a.resp_view.move(0, 1, false)
+    } else if act == "tv-left" {
+        a.resp_view.move(-1, 0, false)
+    } else if act == "tv-right" {
+        a.resp_view.move(1, 0, false)
+    } else if act == "tv-word-fwd" {
+        a.resp_view.word_fwd(false)
+    } else if act == "tv-word-back" {
+        a.resp_view.word_back(false)
+    } else if act == "tv-line-start" {
+        a.resp_view.cx = 0
+        a.resp_view.clamp()
+    } else if act == "tv-line-end" {
+        if len(a.resp_view.lines) > 0 {
+            a.resp_view.cx = len(a.resp_view.lines[a.resp_view.cy])
+            a.resp_view.clamp()
+        }
+    } else if act == "tv-top" {
+        a.resp_view.cy = 0
+        a.resp_view.clamp()
+    } else if act == "tv-bottom" {
+        if len(a.resp_view.lines) > 0 {
+            a.resp_view.cy = len(a.resp_view.lines) - 1
+            a.resp_view.clamp()
+        }
+    } else if act == "tv-match" {
+        a.resp_view.pct_match()
+    } else if act == "tv-pgup" {
+        a.resp_view.move(0, -10, false)
+    } else if act == "tv-pgdn" {
+        a.resp_view.move(0, 10, false)
+    } else if act == "tv-half-up" {
+        a.resp_view.move(0, -5, false)
+    } else if act == "tv-half-down" {
+        a.resp_view.move(0, 5, false)
+    } else if act == "tv-search" {
+        a.degrade("response search input — lands S10 with responses")
+    } else if act == "tv-search-next" {
+        a.resp_view.search_next(1)
+    } else if act == "tv-search-prev" {
+        a.resp_view.search_next(-1)
+    } else if act == "tv-visual" || act == "tv-visual-line" || act == "tv-sel-all" {
+        if a.resp_view.anchor_x < 0 {
+            a.resp_view.anchor_x = a.resp_view.cx
+            a.resp_view.anchor_y = a.resp_view.cy
+        } else {
+            a.resp_view.anchor_x = -1
+        }
+    } else if act == "tv-sel-left" {
+        a.resp_view.move(-1, 0, true)
+    } else if act == "tv-sel-right" {
+        a.resp_view.move(1, 0, true)
+    } else if act == "tv-sel-up" {
+        a.resp_view.move(0, -1, true)
+    } else if act == "tv-sel-down" {
+        a.resp_view.move(0, 1, true)
+    } else if act == "tv-sel-word-fwd" {
+        a.resp_view.word_fwd(true)
+    } else if act == "tv-sel-word-back" {
+        a.resp_view.word_back(true)
+    } else if act == "copy-body" || act == "copy-val" || act == "copy-name" || act == "copy-both" {
+        a.degrade("clipboard copy — no clipboard API in std")
+    } else if act == "json-expand" || act == "json-collapse" || act == "json-copy-path" {
+        a.degrade("JSON tree lands S10 with responses")
+    } else if act == "image-toggle" || act == "save-response" {
+        a.degrade("response widgets land S10")
+    } else if act == "rows-up" {
+        rows_move(a, -1, false)
+    } else if act == "rows-down" {
+        rows_move(a, 1, false)
+    } else if act == "rows-ext-up" {
+        rows_move(a, -1, true)
+    } else if act == "rows-ext-down" {
+        rows_move(a, 1, true)
+    } else if act == "rows-home" {
+        rows_home(a, false)
+    } else if act == "rows-end" {
+        rows_end(a, false)
+    } else if act == "rows-ext-first" {
+        rows_home(a, true)
+    } else if act == "rows-ext-last" {
+        rows_end(a, true)
+    } else if act == "rows-sel-all" {
+        a.resp_rows.anchor = 0
+        a.resp_rows.sel = a.resp_rows.count - 1
+        a.resp_rows.clamp()
+    } else if act == "rows-pgup" {
+        rows_move(a, -10, false)
+    } else if act == "rows-pgdn" {
+        rows_move(a, 10, false)
+    } else if act == "tree-up" {
+        a.coll.move(-1, false)
+    } else if act == "tree-down" {
+        a.coll.move(1, false)
+    } else if act == "tree-ext-up" {
+        a.coll.move(-1, true)
+    } else if act == "tree-ext-down" {
+        a.coll.move(1, true)
+    } else if act == "tree-left" {
+        a.coll.left()
+    } else if act == "tree-right" {
+        a.coll.right()
+    } else if act == "tree-first" {
+        a.coll.first(false)
+    } else if act == "tree-last" {
+        a.coll.last(false)
+    } else if act == "tree-ext-first" {
+        a.coll.first(true)
+    } else if act == "tree-ext-last" {
+        a.coll.last(true)
+    } else if act == "tree-toggle" {
+        a.coll.toggle_folder()
+    } else if act == "tree-search" {
+        a.coll_searching = true
+        a.coll_search = new_line_edit("")
+    } else if act == "tree-escape" {
+        return fixed_action(a, "escape")
+    } else if act == "tree-dup" {
+        a.degrade("duplicate request — needs collections (S10)")
+    } else if act == "tree-delete" {
+        a.confirm_msg = "Delete request? (collections land S10)"
+        a.confirm_action = "tree-delete"
+        push_modal(a, MConfirm)
+    } else if act == "tree-open" {
+        a.degrade("open request — collections land S10")
+    } else if act == "escape" {
+        return fixed_action(a, "escape")
+    }
+    return ENone
+}
+
+// kv_* helpers operate on the active KV table (headers/query/path).
+fn active_kv_name(a: ref App) -> str {
+    ts := req_tabs(a.kind)
+    return ts[a.req_tab]
+}
+
+fn active_kv(a: ref App) -> int {
+    // 0 headers, 1 query/params, 2 path — sentinel: -1 not a kv tab
+    n := active_kv_name(a)
+    if n == "Headers" || n == "Metadata" {
+        return 0
+    }
+    if n == "Query" || n == "Params" {
+        return 1
+    }
+    if n == "Path" {
+        return 2
+    }
+    return -1
+}
+
+fn kv_move(a: mut App, d: int) {
+    w := active_kv(a)
+    if w < 0 {
+        return
+    }
+    if w == 0 {
+        a.headers.move(d)
+    } else if w == 1 {
+        a.query_kv.move(d)
+    } else {
+        a.path_kv.move(d)
+    }
+}
+
+fn kv_col(a: mut App, c: int) {
+    w := active_kv(a)
+    if w == 0 {
+        a.headers.col = c
+    } else if w == 1 {
+        a.query_kv.col = c
+    }
+}
+
+fn kv_toggle(a: mut App) {
+    w := active_kv(a)
+    if w == 0 {
+        a.headers.toggle()
+    } else if w == 1 {
+        a.query_kv.toggle()
+    }
+}
+
+fn kv_del(a: mut App) {
+    w := active_kv(a)
+    if w == 0 {
+        a.headers.del_row()
+    } else if w == 1 {
+        a.query_kv.del_row()
+    }
+}
+
+fn kv_begin_edit(a: mut App) {
+    w := active_kv(a)
+    if w == 0 {
+        a.headers.editing = true
+        if a.headers.col == 0 {
+            a.headers.edit = new_line_edit(a.headers.rows[a.headers.cur].name)
+        } else {
+            a.headers.edit = new_line_edit(a.headers.rows[a.headers.cur].value)
+        }
+    } else if w == 1 {
+        a.query_kv.editing = true
+        if a.query_kv.col == 0 {
+            a.query_kv.edit = new_line_edit(a.query_kv.rows[a.query_kv.cur].name)
+        } else {
+            a.query_kv.edit = new_line_edit(a.query_kv.rows[a.query_kv.cur].value)
+        }
+    } else if w == 2 {
+        a.path_kv.editing = true
+        a.path_kv.col = 1
+        a.path_kv.edit = new_line_edit(a.path_kv.rows[a.path_kv.cur].value)
+    }
+}
+
+fn kv_commit_or_edit(a: mut App) {
+    // backspace inside a live kv cell-edit routes to that edit, not url
+    if a.focus == FReqPane {
+        w := active_kv(a)
+        if w == 0 && a.headers.editing {
+            a.headers.edit.backspace()
+            a.headers.commit_edit()
+            a.headers.editing = true
+            return
+        }
+        if w == 1 && a.query_kv.editing {
+            a.query_kv.edit.backspace()
+            a.query_kv.commit_edit()
+            a.query_kv.editing = true
+            return
+        }
+        if w == 2 && a.path_kv.editing {
+            a.path_kv.edit.backspace()
+            a.path_kv.commit_edit()
+            a.path_kv.editing = true
+            return
+        }
+    }
+}
+
+fn rows_cur(a: mut App) -> int {
+    if top_modal(a) == MHistory {
+        return 1
+    }
+    return 0
+}
+
+fn rows_move(a: mut App, d: int, shift: bool) {
+    if top_modal(a) == MHistory {
+        a.hist.move(d, shift)
+        return
+    }
+    if top_modal(a) == MVariables {
+        a.vars.move(d, shift)
+        return
+    }
+    if top_modal(a) == MEnvSwitch {
+        a.vars.move(d, shift)
+        return
+    }
+    a.resp_rows.move(d, shift)
+}
+
+fn rows_home(a: mut App, shift: bool) {
+    if top_modal(a) == MHistory {
+        a.hist.home(shift)
+        return
+    }
+    a.resp_rows.home(shift)
+}
+
+fn rows_end(a: mut App, shift: bool) {
+    if top_modal(a) == MHistory {
+        a.hist.end(shift)
+        return
+    }
+    a.resp_rows.end(shift)
+}
+
+// widget_wants_text — does the focused widget eat plain runes?
+fn widget_wants_text(a: ref App) -> bool {
+    if a.focus == FUrl {
+        return true
+    }
+    if a.focus == FReqPane {
+        w := active_kv(a)
+        if w >= 0 {
+            return true
+        }
+        n := active_kv_name(a)
+        if n == "Body" || n == "Message" {
+            return true
+        }
+    }
+    return false
+}
+
+fn widget_text_char(a: mut App, ch: str) -> int {
+    if a.focus == FUrl {
+        a.url.insert(ch)
+        if ch == "$" && !a.hinted_vars {
+            a.hinted_vars = true
+            a.degrade("variable suggestions land S10/S11")
+        }
+        sync_path_kv(a)
+        return ENone
+    }
+    if a.focus == FReqPane {
+        w := active_kv(a)
+        if w >= 0 {
+            kv_type_char(a, ch)
+            return ENone
+        }
+        n := active_kv_name(a)
+        if n == "Body" || n == "Message" {
+            body_insert(a, ch)
+            return ENone
+        }
+    }
+    return ENone
+}
+
+fn kv_type_char(a: mut App, ch: str) {
+    w := active_kv(a)
+    if w == 0 {
+        a.headers.type_char(ch)
+        a.headers.editing = false
+    } else if w == 1 {
+        a.query_kv.type_char(ch)
+        a.query_kv.editing = false
+    } else if w == 2 {
+        a.path_kv.type_char(ch)
+        a.path_kv.editing = false
+    }
+}
+
+// sync_path_kv derives Path-table rows from ":name" URL segments.
+fn sync_path_kv(a: mut App) {
+    names := mkslice(str, 0)
+    i := 0
+    u := a.url.text
+    for i < len(u) {
+        if byteat(u, i) == 58 {
+            j := i + 1
+            for j < len(u) && is_word_byte(byteat(u, j)) {
+                j = j + 1
+            }
+            if j > i + 1 {
+                names = push(names, substr(u, i + 1, j))
+            }
+            i = j
+        } else {
+            i = i + 1
+        }
+    }
+    // keep values of same-named existing rows
+    out := mkslice(KVRow, 0)
+    k := 0
+    for k < len(names) {
+        val := ""
+        m := 0
+        for m < len(a.path_kv.rows) {
+            if a.path_kv.rows[m].name == names[k] {
+                val = a.path_kv.rows[m].value
+            }
+            m = m + 1
+        }
+        out = push(out, KVRow{name: names[k], value: val, enabled: true})
+        k = k + 1
+    }
+    if len(out) == 0 {
+        out = push(out, KVRow{name: "", value: "", enabled: true})
+    }
+    a.path_kv.rows = out
+    if a.path_kv.cur >= len(out) {
+        a.path_kv.cur = len(out) - 1
+    }
+}
+
+// body editor: the S9 body area is a TextView buffer the focused
+// pane appends into (full smart-edit is S10); insert + backspace +
+// pairing handled at line level.
+fn body_insert(a: mut App, ch: str) {
+    // rebuild lines: insert at (cy, cx)
+    if len(a.body.lines) == 0 {
+        a.body.lines = push(a.body.lines, "")
+    }
+    ln := a.body.lines[a.body.cy]
+    if ch == "\n" {
+        before := substr(ln, 0, a.body.cx)
+        after := substr(ln, a.body.cx, len(ln))
+        a.body.lines[a.body.cy] = before
+        // insert new line after cy
+        out := mkslice(str, 0)
+        i := 0
+        for i < len(a.body.lines) {
+            out = push(out, a.body.lines[i])
+            if i == a.body.cy {
+                out = push(out, auto_indent(after, ln))
+            }
+            i = i + 1
+        }
+        a.body.lines = out
+        a.body.cy = a.body.cy + 1
+        a.body.cx = len(a.body.lines[a.body.cy]) - len(after)
+        a.body.clamp()
+        return
+    }
+    ins := pair_char(ch, ln, a.body.cx)
+    a.body.lines[a.body.cy] = substr(ln, 0, a.body.cx) + ins + substr(ln, a.body.cx, len(ln))
+    a.body.cx = a.body.cx + len(ch)
+    a.body.clamp()
+}
+
+// pair_char: corpus §4.7 smart bracket/quote pairing.
+fn pair_char(ch: str, ln: str, cx: int) -> str {
+    if ch == "(" {
+        return "()"
+    }
+    if ch == "[" {
+        return "[]"
+    }
+    if ch == "{" {
+        return "{}"
+    }
+    if ch == "\"" {
+        // close over an existing quote right of cursor
+        if cx < len(ln) && substr(ln, cx, cx + 1) == "\"" {
+            return "\""
+        }
+        return "\"\""
+    }
+    return ch
+}
+
+// auto_indent: 2-space indent inside brackets, keep leading indent.
+fn auto_indent(after: str, ln: str) -> str {
+    ind := ""
+    i := 0
+    for i < len(ln) && byteat(ln, i) == 32 {
+        ind = ind + " "
+        i = i + 1
+    }
+    // opening bracket before newline → indent one level deeper
+    if len(ln) > 0 {
+        last := byteat(ln, len(ln) - 1)
+        if last == 123 || last == 91 || last == 40 {
+            ind = ind + "  "
+        }
+    }
+    // dedent when the continuation begins with a closer
+    if len(after) > 0 {
+        c := byteat(after, 0)
+        if c == 125 || c == 93 || c == 41 {
+            if len(ind) >= 2 {
+                ind = substr(ind, 0, len(ind) - 2)
+            } else {
+                ind = ""
+            }
+        }
+    }
+    return ind + after
+}
+
+fn body_backspace(a: mut App) {
+    if len(a.body.lines) == 0 {
+        return
+    }
+    ln := a.body.lines[a.body.cy]
+    if a.body.cx > 0 {
+        a.body.lines[a.body.cy] = substr(ln, 0, a.body.cx - 1) + substr(ln, a.body.cx, len(ln))
+        a.body.cx = a.body.cx - 1
+    } else if a.body.cy > 0 {
+        prev := a.body.lines[a.body.cy - 1]
+        a.body.lines[a.body.cy - 1] = prev + ln
+        out := mkslice(str, 0)
+        i := 0
+        for i < len(a.body.lines) {
+            if i != a.body.cy {
+                out = push(out, a.body.lines[i])
+            }
+            i = i + 1
+        }
+        a.body.lines = out
+        a.body.cy = a.body.cy - 1
+        a.body.cx = len(prev)
+    }
+    a.body.clamp()
+}
+
+// --- modal actions ---
+
+fn modal_wants_text(a: ref App, m: int) -> bool {
+    if m == MPalette || m == MSaveReq {
+        return true
+    }
+    if m == MVariables && a.vars_filtering {
+        return true
+    }
+    if a.focus == FSidebar && a.coll_searching {
+        return true
+    }
+    return false
+}
+
+fn modal_text_char(a: mut App, m: int, ch: str) {
+    if m == MPalette {
+        a.pal_query.insert(ch)
+        a.pal_sel = 0
+    } else if m == MSaveReq {
+        save_field_char(a, ch)
+    } else if m == MVariables && a.vars_filtering {
+        a.vars_filter.insert(ch)
+    }
+}
+
+fn save_field_char(a: mut App, ch: str) {
+    if a.save_field == 0 {
+        a.save_name.insert(ch)
+    } else if a.save_field == 1 {
+        a.save_file.insert(ch)
+    } else if a.save_field == 2 {
+        a.save_folder.insert(ch)
+    } else {
+        a.save_desc.insert(ch)
+    }
+}
+
+fn save_field_bs(a: mut App) {
+    if a.save_field == 0 {
+        a.save_name.backspace()
+    } else if a.save_field == 1 {
+        a.save_file.backspace()
+    } else if a.save_field == 2 {
+        a.save_folder.backspace()
+    } else {
+        a.save_desc.backspace()
+    }
+}
+
+fn save_field_move(a: mut App, to: int, shift: bool) {
+    if a.save_field == 0 {
+        a.save_name.move(to, shift)
+    } else if a.save_field == 1 {
+        a.save_file.move(to, shift)
+    } else if a.save_field == 2 {
+        a.save_folder.move(to, shift)
+    } else {
+        a.save_desc.move(to, shift)
+    }
+}
+
+fn save_field_cur(a: ref App) -> int {
+    if a.save_field == 0 {
+        return a.save_name.cur
+    }
+    if a.save_field == 1 {
+        return a.save_file.cur
+    }
+    if a.save_field == 2 {
+        return a.save_folder.cur
+    }
+    return a.save_desc.cur
+}
+
+fn save_field_len(a: ref App) -> int {
+    if a.save_field == 0 {
+        return len(a.save_name.text)
+    }
+    if a.save_field == 1 {
+        return len(a.save_file.text)
+    }
+    if a.save_field == 2 {
+        return len(a.save_folder.text)
+    }
+    return len(a.save_desc.text)
+}
+
+fn modal_action(a: mut App, m: int, act: str, ev: term.KeyEvent) -> int {
+    if act == "modal-close" {
+        if m == MVariables && a.vars_filtering {
+            a.vars_filtering = false
+            a.vars_filter = new_line_edit("")
+            return ENone
+        }
+        pop_modal(a)
+        return ENone
+    }
+    if m == MJump {
+        return jump_action(a, act)
+    }
+    if m == MMethodMenu {
+        return method_action(a, act)
+    }
+    if m == MPalette {
+        return palette_action(a, act)
+    }
+    if m == MVariables {
+        return vars_action(a, act)
+    }
+    if m == MHistory {
+        return hist_action(a, act)
+    }
+    if m == MConfirm {
+        if act == "confirm-yes" {
+            pop_modal(a)
+            a.degrade("confirmed: " + a.confirm_action + " — lands S10")
+        }
+        return ENone
+    }
+    if m == MSaveReq {
+        return save_action(a, act)
+    }
+    if m == MSearchTabs {
+        if act == "tabsearch-up" {
+            a.tabsearch.move(-1, false)
+        } else if act == "tabsearch-down" {
+            a.tabsearch.move(1, false)
+        } else if act == "tabsearch-pick" {
+            if a.tabsearch.sel < len(a.tabs) {
+                a.cur_tab = a.tabsearch.sel
+            }
+            pop_modal(a)
+        }
+        return ENone
+    }
+    if m == MEnvSwitch {
+        if act == "env-pick" {
+            pop_modal(a)
+            a.degrade("environment switch — env files land S10/S11")
+        }
+        return ENone
+    }
+    if m == MHelp {
+        if act == "tv-up" {
+            a.resp_view.move(0, -1, false)
+        } else if act == "tv-down" {
+            a.resp_view.move(0, 1, false)
+        } else if act == "tv-pgup" {
+            a.resp_view.move(0, -10, false)
+        } else if act == "tv-pgdn" {
+            a.resp_view.move(0, 10, false)
+        }
+        return ENone
+    }
+    return ENone
+}
+
+fn jump_action(a: mut App, act: str) -> int {
+    pop_modal(a)
+    if act == "jump-resp-body" {
+        a.focus = FRespPane
+        a.resp_tab = 0
+        return ENone
+    }
+    if act == "jump-history" {
+        push_modal(a, MHistory)
+        return ENone
+    }
+    // jump-0..6 → request tab index
+    if len(act) > 5 && substr(act, 0, 5) == "jump-" {
+        n := atoi_small(substr(act, 5, len(act)))
+        if n >= 0 && n < req_tab_count(a) {
+            a.req_tab = n
+            a.focus = FReqPane
+        }
+    }
+    return ENone
+}
+
+fn method_menu_idx(method: str, kind: int) -> int {
+    names := method_names()
+    i := 0
+    for i < len(names) {
+        if names[i] == method {
+            return i
+        }
+        i = i + 1
+    }
+    if kind == KGraphql {
+        return 7
+    }
+    if kind == KGrpc {
+        return 8
+    }
+    if kind == KWs {
+        return 9
+    }
+    return 0
+}
+
+fn method_names() -> []str {
+    t := mkslice(str, 0)
+    t = push(t, "GET")
+    t = push(t, "POST")
+    t = push(t, "PUT")
+    t = push(t, "PATCH")
+    t = push(t, "DELETE")
+    t = push(t, "HEAD")
+    t = push(t, "OPTIONS")
+    t = push(t, "GraphQL")
+    t = push(t, "gRPC")
+    t = push(t, "WebSocket")
+    return t
+}
+
+fn method_action(a: mut App, act: str) -> int {
+    if act == "method-up" {
+        a.method_sel = a.method_sel - 1
+        if a.method_sel < 0 {
+            a.method_sel = 9
+        }
+        return ENone
+    }
+    if act == "method-down" {
+        a.method_sel = (a.method_sel + 1) - ((a.method_sel + 1) / 10) * 10
+        return ENone
+    }
+    if act == "method-pick" {
+        apply_method_idx(a, a.method_sel)
+        pop_modal(a)
+        return ENone
+    }
+    letters := "gpudahoqrw"
+    i := 0
+    for i < len(letters) {
+        if act == "method-" + substr("get post put patch delete head options", 0, 0) + "x" {
+        }
+        i = i + 1
+    }
+    m := ""
+    if act == "method-get" {
+        m = "GET"
+    } else if act == "method-post" {
+        m = "POST"
+    } else if act == "method-put" {
+        m = "PUT"
+    } else if act == "method-patch" {
+        m = "PATCH"
+    } else if act == "method-delete" {
+        m = "DELETE"
+    } else if act == "method-head" {
+        m = "HEAD"
+    } else if act == "method-options" {
+        m = "OPTIONS"
+    }
+    if len(m) > 0 {
+        a.method = m
+        a.kind = KHttp
+        if a.req_tab >= req_tab_count(a) {
+            a.req_tab = 0
+        }
+        pop_modal(a)
+        return ENone
+    }
+    if act == "kind-graphql" {
+        a.kind = KGraphql
+        a.method = "POST" // GraphQL sends POST
+        a.req_tab = 0
+        pop_modal(a)
+        return ENone
+    }
+    if act == "kind-grpc" {
+        a.kind = KGrpc
+        a.req_tab = 0
+        pop_modal(a)
+        a.degrade("gRPC is oxl-blocked (oxidean/oxl#223) — shell only")
+        return ENone
+    }
+    if act == "kind-ws" {
+        a.kind = KWs
+        a.req_tab = 0
+        pop_modal(a)
+        a.degrade("WebSocket is oxl-blocked (oxidean/oxl#220) — shell only")
+        return ENone
+    }
+    return ENone
+}
+
+fn apply_method_idx(a: mut App, i: int) {
+    if i <= 6 {
+        a.method = method_names()[i]
+        a.kind = KHttp
+    } else if i == 7 {
+        a.kind = KGraphql
+        a.method = "POST"
+    } else if i == 8 {
+        a.kind = KGrpc
+        a.degrade("gRPC is oxl-blocked (oxidean/oxl#223) — shell only")
+    } else {
+        a.kind = KWs
+        a.degrade("WebSocket is oxl-blocked (oxidean/oxl#220) — shell only")
+    }
+    if a.req_tab >= req_tab_count(a) {
+        a.req_tab = 0
+    }
+}
+
+// palette — §4.13 command list. degrade≠"" → toast instead of run.
+fn palette_items() -> []PItem {
+    t := mkslice(PItem, 0)
+    t = push(t, PItem{name: "New request", action: "new-request", degrade: ""})
+    t = push(t, PItem{name: "Open request", action: "", degrade: "open request — collections land S10"})
+    t = push(t, PItem{name: "Duplicate request", action: "", degrade: "collections land S10"})
+    t = push(t, PItem{name: "Delete request", action: "", degrade: "collections land S10"})
+    t = push(t, PItem{name: "Close tab", action: "close-tab", degrade: ""})
+    t = push(t, PItem{name: "Pin tab (keep-tab)", action: "keep-tab", degrade: ""})
+    t = push(t, PItem{name: "Search tabs", action: "search-tabs", degrade: ""})
+    t = push(t, PItem{name: "Search requests", action: "", degrade: "collections land S10"})
+    t = push(t, PItem{name: "Send request", action: "send-request", degrade: "send lands S10"})
+    t = push(t, PItem{name: "Save request", action: "save-request", degrade: ""})
+    t = push(t, PItem{name: "Save response", action: "", degrade: "responses land S10"})
+    t = push(t, PItem{name: "Switch environment", action: "env-switch", degrade: ""})
+    t = push(t, PItem{name: "Variables", action: "variables", degrade: ""})
+    t = push(t, PItem{name: "Reload collection", action: "", degrade: "collections land S10"})
+    t = push(t, PItem{name: "OAuth sign-in", action: "", degrade: "OAuth2 lands M4"})
+    t = push(t, PItem{name: "gRPC stream open/end", action: "stream", degrade: "gRPC oxl-blocked (#223)"})
+    t = push(t, PItem{name: "WebSocket disconnect", action: "", degrade: "WS oxl-blocked (#220)"})
+    t = push(t, PItem{name: "Import curl command…", action: "", degrade: "curl import lands S10"})
+    t = push(t, PItem{name: "Import curl from clipboard", action: "", degrade: "no clipboard API in std"})
+    t = push(t, PItem{name: "Export as curl", action: "", degrade: "export lands S10"})
+    t = push(t, PItem{name: "Export as grpcurl", action: "", degrade: "gRPC oxl-blocked (#223)"})
+    t = push(t, PItem{name: "Export as YAML", action: "", degrade: "collections land S10"})
+    t = push(t, PItem{name: "Toggle collection sidebar", action: "toggle-collection", degrade: ""})
+    t = push(t, PItem{name: "Toggle layout vertical/horizontal", action: "toggle-layout", degrade: ""})
+    t = push(t, PItem{name: "Theme…", action: "", degrade: "themes land M4"})
+    t = push(t, PItem{name: "Sidebar gradient…", action: "", degrade: "themes land M4"})
+    t = push(t, PItem{name: "History", action: "history", degrade: ""})
+    t = push(t, PItem{name: "Help", action: "help", degrade: ""})
+    t = push(t, PItem{name: "Open docs", action: "", degrade: "doc launch unsupported"})
+    t = push(t, PItem{name: "Copy response body", action: "", degrade: "no clipboard API in std"})
+    t = push(t, PItem{name: "Quit", action: "quit-app", degrade: ""})
+    return t
+}
+
+fn palette_filtered(a: ref App) -> []PItem {
+    items := palette_items()
+    q := a.pal_query.text
+    if len(q) == 0 {
+        return items
+    }
+    out := mkslice(PItem, 0)
+    lq := lower_ascii(q)
+    i := 0
+    for i < len(items) {
+        if str_contains(lower_ascii(items[i].name), lq) {
+            out = push(out, items[i])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn palette_action(a: mut App, act: str) -> int {
+    if act == "pal-up" {
+        a.pal_sel = a.pal_sel - 1
+        if a.pal_sel < 0 {
+            a.pal_sel = 0
+        }
+        return ENone
+    }
+    if act == "pal-down" {
+        n := len(palette_filtered(a))
+        a.pal_sel = a.pal_sel + 1
+        if a.pal_sel >= n {
+            a.pal_sel = n - 1
+        }
+        if a.pal_sel < 0 {
+            a.pal_sel = 0
+        }
+        return ENone
+    }
+    if act == "pal-backspace" {
+        if len(a.pal_query.text) == 0 {
+            pop_modal(a)
+            return ENone
+        }
+        a.pal_query.backspace()
+        a.pal_sel = 0
+        return ENone
+    }
+    if act == "pal-run" {
+        items := palette_filtered(a)
+        if a.pal_sel >= len(items) {
+            return ENone
+        }
+        it := items[a.pal_sel]
+        pop_modal(a)
+        if len(it.degrade) > 0 {
+            a.degrade(it.degrade)
+            return ENone
+        }
+        return run_named_action(a, it.action)
+    }
+    return ENone
+}
+
+// run_named_action — palette commands reusing global/degrade paths.
+fn run_named_action(a: mut App, act: str) -> int {
+    if act == "quit-app" {
+        a.quit = true
+        return EQuit
+    }
+    if act == "env-switch" {
+        push_modal(a, MEnvSwitch)
+        return ENone
+    }
+    if act == "history" {
+        push_modal(a, MHistory)
+        return ENone
+    }
+    if act == "toggle-layout" {
+        if a.layout == 0 {
+            a.layout = 1
+        } else {
+            a.layout = 0
+        }
+        return ENone
+    }
+    return global_action(a, act)
+}
+
+fn vars_action(a: mut App, act: str) -> int {
+    if act == "vars-edit" {
+        a.degrade("session variable edit lands S11")
+    } else if act == "vars-add" {
+        a.degrade("session variable add lands S11")
+    } else if act == "vars-revert" {
+        a.degrade("revert override — env files land S11")
+    } else if act == "vars-filter" {
+        a.vars_filtering = true
+    } else if act == "vars-reveal" {
+        a.vars_reveal = !a.vars_reveal
+    } else if act == "rows-up" {
+        a.vars.move(-1, false)
+    } else if act == "rows-down" {
+        a.vars.move(1, false)
+    }
+    return ENone
+}
+
+fn hist_action(a: mut App, act: str) -> int {
+    if act == "hist-open" {
+        a.degrade("open history entry — history lands S10")
+    } else if act == "hist-delete" {
+        a.degrade("delete history entry — history lands S10")
+    }
+    return ENone
+}
+
+fn save_action(a: mut App, act: str) -> int {
+    if act == "save-field-up" {
+        a.save_field = a.save_field - 1
+        if a.save_field < 0 {
+            a.save_field = 3
+        }
+    } else if act == "save-field-down" {
+        a.save_field = (a.save_field + 1) - ((a.save_field + 1) / 4) * 4
+    } else if act == "save-confirm" {
+        pop_modal(a)
+        a.degrade("save-request — collections land S10")
+    } else if act == "edit-backspace" {
+        save_field_bs(a)
+    } else if act == "edit-left" {
+        save_field_move(a, save_field_cur(a) - 1, false)
+    } else if act == "edit-right" {
+        save_field_move(a, save_field_cur(a) + 1, false)
+    } else if act == "edit-home" {
+        save_field_move(a, 0, false)
+    } else if act == "edit-end" {
+        save_field_move(a, save_field_len(a), false)
+    }
+    return ENone
+}
+
+// is_curl_text — §4.4: enter imports when content is a curl command.
+fn is_curl_text(s: str) -> bool {
+    i := 0
+    for i < len(s) && byteat(s, i) == 32 {
+        i = i + 1
+    }
+    return substr(s, i, len(s)) == "curl" || (len(s) - i > 4 && substr(s, i, i + 5) == "curl ")
+}
+
+// --- mouse ---
+
+fn dispatch_mouse(a: mut App, ev: term.KeyEvent) -> int {
+    m := ev.key as term.Key.Mouse
+    if m.kind == term.MouseScrollUp || m.kind == term.MouseScrollDown {
+        d := -1
+        if m.kind == term.MouseScrollDown {
+            d = 1
+        }
+        // scroll the pane under the cursor
+        if m.x >= a.r_sidebar_x && m.x < a.r_sidebar_x + a.r_sidebar_w && a.sidebar_on {
+            a.coll.move(d, false)
+        } else if m.y >= a.r_resp_y {
+            a.resp_view.move(0, d, false)
+        } else {
+            a.resp_view.move(0, d, false)
+        }
+        return ENone
+    }
+    if m.kind != term.MousePress {
+        return ENone
+    }
+    // click → focus pane under point
+    if a.sidebar_on && m.x >= a.r_sidebar_x && m.x < a.r_sidebar_x + a.r_sidebar_w {
+        a.focus = FSidebar
+        vis := a.coll.visible()
+        row := m.y - a.r_url_y
+        if row >= 0 && row < len(vis) {
+            a.coll.cur = vis[row]
+        }
+        return ENone
+    }
+    if m.y >= a.r_url_y && m.y < a.r_url_y + a.r_url_h {
+        a.focus = FUrl
+        return ENone
+    }
+    if m.y >= a.r_resp_y {
+        a.focus = FRespPane
+        return ENone
+    }
+    if m.y >= a.r_req_y {
+        a.focus = FReqPane
+        return ENone
+    }
+    return ENone
+}
+
+// feed_text dispatches each char of s as a plain rune event
+// (search/palette/test helper).
+fn feed_text(a: mut App, s: str) {
+    i := 0
+    for i < len(s) {
+        ev := term.KeyEvent{key: term.Key.Rune{ch: substr(s, i, i + 1)}, ctrl: false, alt: false, shift: false, meta: false, sup: false}
+        dispatch(a, ev)
+        i = i + 1
+    }
+}

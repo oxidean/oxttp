@@ -39,8 +39,8 @@ Updated: 2026-11-22 · pin oxl 0.23.2
 | §1 CLI flags / locate/version | `next` | S11 |
 | §1 import / run / remote | `post` | M4 |
 | §2 Config 40 keys | `next` | S11 |
-| §3 Keymap ~114 | `next` | S9 (degrade unimplemented) |
-| §4 Screens / panels | `next` | S9–S10 |
+| §3 Keymap ~114 | `done` | S9: 164 bound actions / 277 rows, layered dispatch; degrades toasted |
+| §4 Screens / panels | `next`/`partial` | S9 shell+panes+modals render; widget depths land S10 |
 | §5 `.posting.yaml` collections | `next` | S10 (types in WI-0003) |
 | §6 Environments / captures | `next`/`post` | Env S10/S11; captures M4 |
 | §7.1 HTTP(+TLS) send | `next` | S10 + HTTPS WI |

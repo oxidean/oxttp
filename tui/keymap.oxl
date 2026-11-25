@@ -1,0 +1,327 @@
+package main
+
+// Keymap — corpus §3 tables as data + layered dispatch entry.
+// KeyPat is a normalized KeyEvent matcher; bindings are written as
+// corpus key specs ("ctrl+j") so the S11 `keymap:` config loader is
+// a pure rebind — entry *replaces* defaults (ADR-0028).
+
+import "std/errors"
+
+import "github.com/oxidean/oxttp/core/term"
+
+struct KeyPat {
+    code: int,  // named-key code, -1 = rune
+    ch: str,    // normalized rune (letters lowercase; shift flag carries case)
+    ctrl: bool,
+    alt: bool,
+    shift: bool,
+    meta: bool,
+    sup: bool,
+}
+
+struct Binding {
+    pat: KeyPat,
+    action: str,
+}
+
+// parse_key parses "ctrl+shift+v" / "alt+enter" / "f1" / "G" /
+// "space" (corpus §3 format, case-insensitive names).
+fn parse_key(spec: str) -> [KeyPat, err] {
+    np := KeyPat{code: -1, ch: "", ctrl: false, alt: false, shift: false, meta: false, sup: false}
+    parts := split_plus(spec)
+    if len(parts) == 0 {
+        return np, errors.new("empty key spec")
+    }
+    i := 0
+    for i < len(parts) - 1 {
+        m := upper_ascii(parts[i])
+        if m == "CTRL" {
+            np.ctrl = true
+        } else if m == "ALT" {
+            np.alt = true
+        } else if m == "SHIFT" {
+            np.shift = true
+        } else if m == "META" {
+            np.meta = true
+        } else if m == "SUPER" {
+            np.sup = true
+        } else {
+            return np, errors.new("unknown modifier: " + parts[i])
+        }
+        i = i + 1
+    }
+    key := parts[len(parts) - 1]
+    uk := upper_ascii(key)
+    code := named_code(uk)
+    if code >= 0 {
+        np.code = code
+        return np, nil
+    }
+    if len(key) == 1 {
+        c := byteat(key, 0)
+        if c >= 65 && c <= 90 {
+            np.ch = substr(lower_ascii(key), 0, 1)
+            np.shift = true
+        } else {
+            np.ch = key
+        }
+        return np, nil
+    }
+    // multi-char non-named: accept only if it contains a non-ASCII
+    // byte (a real multibyte rune); ASCII-alpha strings are bad key
+    // names and must fail so S11 rebind validation stays honest.
+    i2 := 0
+    has_hi := false
+    for i2 < len(key) {
+        if byteat(key, i2) >= 128 {
+            has_hi = true
+        }
+        i2 = i2 + 1
+    }
+    if !has_hi {
+        return np, errors.new("unknown key name: " + key)
+    }
+    np.ch = key
+    return np, nil
+}
+
+fn split_plus(s: str) -> []str {
+    out := mkslice(str, 0)
+    cur := ""
+    i := 0
+    for i < len(s) {
+        if byteat(s, i) == 43 {
+            out = push(out, cur)
+            cur = ""
+        } else {
+            cur = cur + substr(s, i, i + 1)
+        }
+        i = i + 1
+    }
+    out = push(out, cur)
+    // trailing '+' means literal '+' key: "ctrl++"
+    if len(s) > 0 && byteat(s, len(s) - 1) == 43 {
+        out[len(out) - 1] = "+"
+    }
+    return out
+}
+
+fn upper_ascii(s: str) -> str {
+    out := ""
+    i := 0
+    for i < len(s) {
+        c := byteat(s, i)
+        if c >= 97 && c <= 122 {
+            c = c - 32
+        }
+        b := mkslice(byte, 1)
+        b[0] = c
+        out = out + (b as str)
+        i = i + 1
+    }
+    return out
+}
+
+fn lower_ascii(s: str) -> str {
+    out := ""
+    i := 0
+    for i < len(s) {
+        c := byteat(s, i)
+        if c >= 65 && c <= 90 {
+            c = c + 32
+        }
+        b := mkslice(byte, 1)
+        b[0] = c
+        out = out + (b as str)
+        i = i + 1
+    }
+    return out
+}
+
+fn named_code(uk: str) -> int {
+    if uk == "ENTER" {
+        return term.KeyEnter
+    }
+    if uk == "TAB" {
+        return term.KeyTab
+    }
+    if uk == "SPACE" {
+        return term.KeySpace
+    }
+    if uk == "BACKSPACE" {
+        return term.KeyBackspace
+    }
+    if uk == "DELETE" {
+        return term.KeyDelete
+    }
+    if uk == "INSERT" {
+        return term.KeyInsert
+    }
+    if uk == "ESCAPE" {
+        return term.KeyEscape
+    }
+    if uk == "UP" {
+        return term.KeyUp
+    }
+    if uk == "DOWN" {
+        return term.KeyDown
+    }
+    if uk == "LEFT" {
+        return term.KeyLeft
+    }
+    if uk == "RIGHT" {
+        return term.KeyRight
+    }
+    if uk == "HOME" {
+        return term.KeyHome
+    }
+    if uk == "END" {
+        return term.KeyEnd
+    }
+    if uk == "PGUP" {
+        return term.KeyPgUp
+    }
+    if uk == "PGDOWN" {
+        return term.KeyPgDown
+    }
+    // f1..f12
+    if len(uk) >= 2 && byteat(uk, 0) == 70 {
+        n := atoi_small(substr(uk, 1, len(uk)))
+        if n >= 1 && n <= 12 {
+            return term.KeyF1 + n - 1
+        }
+    }
+    return -1
+}
+
+fn atoi_small(s: str) -> int {
+    if len(s) == 0 {
+        return -1
+    }
+    v := 0
+    i := 0
+    for i < len(s) {
+        c := byteat(s, i)
+        if c < 48 || c > 57 {
+            return -1
+        }
+        v = v * 10 + (c - 48)
+        i = i + 1
+    }
+    return v
+}
+
+// pat_match: a KeyPat matches a KeyEvent. For letter runes, ch is
+// compared case-folded and shift carries the case (pat "G" needs the
+// shifted event). For named keys, code + full modifier equality.
+// Special: KeySpace pat also matches rune " " (terminals send both).
+fn pat_match(p: KeyPat, ev: term.KeyEvent) -> bool {
+    kk := ev.key.kind()
+    if kk == 1 {
+        n := ev.key as term.Key.Named
+        if p.code == term.KeySpace && n.code == term.KeySpace {
+            // named space — rare
+        } else if n.code != p.code {
+            return false
+        }
+        if p.code == term.KeySpace && n.code != term.KeySpace {
+            return false
+        }
+        return ev.ctrl == p.ctrl && ev.alt == p.alt && ev.shift == p.shift && ev.meta == p.meta && ev.sup == p.sup
+    }
+    if kk == 0 {
+        r := ev.key as term.Key.Rune
+        if p.code == term.KeySpace {
+            // named space pattern matches a literal space rune
+            return r.ch == " " && ev.ctrl == p.ctrl && ev.alt == p.alt && ev.meta == p.meta && ev.sup == p.sup && ev.shift == p.shift
+        }
+        if p.code >= 0 {
+            return false
+        }
+        pc := p.ch
+        ec := r.ch
+        if len(pc) == 1 && len(ec) == 1 {
+            pb := byteat(pc, 0)
+            eb := byteat(ec, 0)
+            if eb >= 65 && eb <= 90 {
+                eb = eb + 32
+            }
+            if pb != eb {
+                return false
+            }
+        } else if pc != ec {
+            return false
+        }
+        return ev.ctrl == p.ctrl && ev.alt == p.alt && ev.shift == p.shift && ev.meta == p.meta && ev.sup == p.sup
+    }
+    return false
+}
+
+// bind builds a Binding from a corpus spec string. Panic-free: bad
+// specs become an unmatchable binding (marked by empty action "").
+fn bind(spec: str, action: str) -> Binding {
+    [p, e] = parse_key(spec)
+    if e != nil {
+        return Binding{pat: p, action: "!badkey:" + spec}
+    }
+    return Binding{pat: p, action: action}
+}
+
+// find_binding returns the index of the first binding matching ev.
+fn find_binding(bs: []Binding, ev: term.KeyEvent) -> int {
+    i := 0
+    for i < len(bs) {
+        if pat_match(bs[i].pat, ev) {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// --- corpus §3: 18 rebindable actions (19 default keys) ---
+
+fn global_bindings() -> []Binding {
+    bs := mkslice(Binding, 0)
+    bs = push(bs, bind("ctrl+j", "send-request"))
+    bs = push(bs, bind("alt+enter", "send-request"))
+    bs = push(bs, bind("alt+j", "stream"))
+    bs = push(bs, bind("ctrl+o", "jump"))
+    bs = push(bs, bind("ctrl+p", "commands"))
+    bs = push(bs, bind("ctrl+s", "save-request"))
+    bs = push(bs, bind("ctrl+n", "new-request"))
+    bs = push(bs, bind("alt+w", "close-tab"))
+    // keep-tab: no default key (corpus-exact) — listed, unbound
+    bs = push(bs, keep_tab_listed())
+    bs = push(bs, bind("alt+right", "next-tab"))
+    bs = push(bs, bind("alt+left", "previous-tab"))
+    bs = push(bs, bind("alt+down", "search-tabs"))
+    bs = push(bs, bind("ctrl+g", "search-requests"))
+    bs = push(bs, bind("ctrl+l", "focus-url"))
+    bs = push(bs, bind("ctrl+t", "focus-method"))
+    // ctrl+h: arrives as CSI-u on kitty terms; the §9 byte collision
+    // means plain 0x08 (backspace) toggles too wherever no widget
+    // claims backspace — both bound here, widget layer decides.
+    bs = push(bs, bind("ctrl+h", "toggle-collection"))
+    bs = push(bs, bind("backspace", "toggle-collection"))
+    bs = push(bs, bind("alt+z", "expand-section"))
+    bs = push(bs, bind("ctrl+shift+v", "variables"))
+    bs = push(bs, bind("f1", "help"))
+    return bs
+}
+
+// fixed globals — not rebindable (corpus §3).
+fn fixed_bindings() -> []Binding {
+    bs := mkslice(Binding, 0)
+    bs = push(bs, bind("escape", "escape"))
+    bs = push(bs, bind("ctrl+c", "quit"))
+    bs = push(bs, bind("ctrl+z", "suspend-undo"))
+    bs = push(bs, bind("ctrl+shift+s", "screenshot"))
+    return bs
+}
+
+// keep_tab_listed: keep-tab is a real action with no default —
+// surfaces (palette/help) list it; nothing dispatches to it by key.
+fn keep_tab_listed() -> Binding {
+    return Binding{pat: KeyPat{code: -1, ch: "", ctrl: false, alt: false, shift: false, meta: false, sup: false}, action: "keep-tab"}
+}

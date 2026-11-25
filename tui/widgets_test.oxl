@@ -1,0 +1,135 @@
+package main
+
+// Widget unit tests — LineEdit (§4.8), KVTable (§4.6), Tree (§4.9),
+// TextView (§4.14), ListCur.
+
+import "std/testing"
+
+fn test_line_edit_basic() {
+    e := new_line_edit("")
+    e.insert("h")
+    e.insert("i")
+    testing.expect_streq(e.text, "hi", "insert")
+    e.backspace()
+    testing.expect_streq(e.text, "h", "backspace")
+    e.insert("!")
+    e.move(0, false)
+    e.del_right()
+    testing.expect_streq(e.text, "!", "del_right at home")
+}
+
+fn test_line_edit_words() {
+    e := new_line_edit("foo  bar_baz qux")
+    e.word_back()
+    testing.expect_eq(e.cur, 13, "word_back to qux")
+    e.word_back()
+    testing.expect_eq(e.cur, 5, "word_back to bar_baz")
+    e.word_fwd()
+    testing.expect_eq(e.cur, 13, "word_fwd past bar_baz")
+    e.del_word_back()
+    testing.expect_streq(e.text, "foo  qux", "ctrl+w")
+    e.del_to_start()
+    testing.expect_streq(e.text, "qux", "ctrl+u")
+    e.end()
+    e.del_to_end()
+    testing.expect_streq(e.text, "qux", "ctrl+k noop at end")
+}
+
+fn test_line_edit_sel_undo() {
+    e := new_line_edit("hello")
+    e.select_all()
+    e.insert("bye")
+    testing.expect_streq(e.text, "bye", "type-over selection")
+    e.undo()
+    testing.expect_streq(e.text, "hello", "undo")
+    e.redo()
+    testing.expect_streq(e.text, "bye", "redo")
+    // shift-move selection
+    e2 := new_line_edit("abc")
+    e2.move(2, true)
+    e2.move(0, true)
+    testing.expect_streq(e2.selected_text(), "abc", "shift select 0..3")
+}
+
+fn test_list_cur() {
+    l := new_list(5)
+    l.move(3, false)
+    testing.expect_eq(l.sel, 3, "move")
+    l.move(-10, false)
+    testing.expect_eq(l.sel, 0, "clamp lo")
+    l.end(false)
+    testing.expect_eq(l.sel, 4, "end")
+    l.move(-2, true)
+    testing.expect_eq(l.sel, 2, "shift move")
+    testing.expect_eq(l.anchor, 4, "anchor kept")
+    l.move(1, false)
+    testing.expect_eq(l.anchor, -1, "anchor cleared")
+}
+
+fn test_kv_table() {
+    t := new_kv()
+    testing.expect_eq(len(t.rows), 1, "sentinel")
+    t.type_char("A")
+    testing.expect_eq(len(t.rows), 2, "append on type")
+    testing.expect_streq(t.rows[0].name, "A", "char landed")
+    t.cur = 0
+    t.toggle()
+    testing.expect(!t.rows[0].enabled, "toggle")
+    t.del_row()
+    testing.expect_eq(len(t.rows), 1, "delete leaves sentinel")
+}
+
+fn test_tree() {
+    tr := demo_tree()
+    vis := tr.visible()
+    testing.expect_eq(len(vis), 4, "all visible")
+    // collapse folder → children hidden
+    tr.nodes[0].open = false
+    vis2 := tr.visible()
+    testing.expect_eq(len(vis2), 2, "collapsed")
+    // right expands
+    tr.cur = 0
+    tr.right()
+    testing.expect(tr.nodes[0].open, "right expanded")
+    // left on child → parent
+    tr.cur = 1
+    tr.left()
+    testing.expect_eq(tr.cur, 0, "left to parent")
+    // space toggles
+    tr.toggle_folder()
+    testing.expect(!tr.nodes[0].open, "space closed")
+    // j/k move over visible
+    tr.toggle_folder()
+    tr.move(1, false)
+    testing.expect_eq(tr.cur, 1, "j into first child")
+    tr.move(10, false)
+    testing.expect_eq(tr.cur, 3, "clamp last")
+    tr.first(false)
+    testing.expect_eq(tr.cur, 0, "g first")
+}
+
+fn test_text_view() {
+    v := new_text_view("alpha\nbeta {\n  x: 1\n}\ngamma")
+    testing.expect_eq(len(v.lines), 5, "lines")
+    v.move(0, 1, false)
+    testing.expect_eq(v.cy, 1, "down")
+    v.word_fwd(false)
+    testing.expect_eq(v.cy, 2, "w wraps to next line")
+    testing.expect_eq(v.cx, 2, "w → x col")
+    // % on the opening brace
+    v.cy = 1
+    v.cx = 5
+    v.pct_match()
+    testing.expect_eq(v.cy, 3, "% matched closing")
+    // search
+    v.do_search("a")
+    testing.expect(len(v.search_hits) >= 3, "search hits")
+    v.search_next(1)
+    testing.expect(v.cy >= 0, "n jumps")
+}
+
+fn test_pair_char() {
+    testing.expect_streq(pair_char("{", "", 0), "{}", "brace pair")
+    testing.expect_streq(pair_char("x", "", 0), "x", "plain")
+    testing.expect_streq(auto_indent("", "{"), "  ", "indent after {")
+}
