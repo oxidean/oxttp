@@ -1,0 +1,9 @@
+schema_version: 1
+request_id: IN-0009
+work_item_id: WI-0012
+run_id: run_1795644011181_5dd20d
+kind: clarification
+question: 'Human approval required to merge PR #13 and transition WI-0012 to shipped (policy gate). PR green: commit-lint + oxl-build pass; CodeRabbit triggered.'
+status: pending
+created_by: ox-agent
+created_at: "2026-11-25T22:07:54Z"
