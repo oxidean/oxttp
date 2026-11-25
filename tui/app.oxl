@@ -1828,12 +1828,12 @@ fn dispatch_mouse(a: mut App, ev: term.KeyEvent) -> int {
             d = 1
         }
         // scroll the pane under the cursor
-        if m.x >= a.r_sidebar_x && m.x < a.r_sidebar_x + a.r_sidebar_w && a.sidebar_on {
+        if a.sidebar_on && m.x >= a.r_sidebar_x && m.x < a.r_sidebar_x + a.r_sidebar_w {
             a.coll.move(d, false)
-        } else if m.y >= a.r_resp_y {
+        } else if a.r_resp_h > 0 && in_rect(m.x, m.y, a.r_resp_x, a.r_resp_y, a.r_resp_w, a.r_resp_h) {
             a.resp_view.move(0, d, false)
-        } else {
-            a.resp_view.move(0, d, false)
+        } else if a.r_req_h > 0 && in_rect(m.x, m.y, a.r_req_x, a.r_req_y, a.r_req_w, a.r_req_h) {
+            a.body.move(0, d, false)
         }
         return ENone
     }
@@ -1844,7 +1844,8 @@ fn dispatch_mouse(a: mut App, ev: term.KeyEvent) -> int {
     if a.sidebar_on && m.x >= a.r_sidebar_x && m.x < a.r_sidebar_x + a.r_sidebar_w {
         a.focus = FSidebar
         vis := a.coll.visible()
-        row := m.y - a.r_url_y
+        // tree rows start 2 cells below the pane top (title + env row)
+        row := m.y - a.r_sidebar_y - 2
         if row >= 0 && row < len(vis) {
             a.coll.cur = vis[row]
         }
@@ -1854,15 +1855,19 @@ fn dispatch_mouse(a: mut App, ev: term.KeyEvent) -> int {
         a.focus = FUrl
         return ENone
     }
-    if m.y >= a.r_resp_y {
+    if a.r_resp_h > 0 && in_rect(m.x, m.y, a.r_resp_x, a.r_resp_y, a.r_resp_w, a.r_resp_h) {
         a.focus = FRespPane
         return ENone
     }
-    if m.y >= a.r_req_y {
+    if a.r_req_h > 0 && in_rect(m.x, m.y, a.r_req_x, a.r_req_y, a.r_req_w, a.r_req_h) {
         a.focus = FReqPane
         return ENone
     }
     return ENone
+}
+
+fn in_rect(x: int, y: int, rx: int, ry: int, rw: int, rh: int) -> bool {
+    return x >= rx && x < rx + rw && y >= ry && y < ry + rh
 }
 
 // feed_text dispatches each char of s as a plain rune event

@@ -123,7 +123,7 @@ fn render_tabstrip(scr: mut term.AnsiScreen, x: int, y: int, w: int, names: []st
         } else {
             a = term.AttrDim
         }
-        put_str(scr, cx, y, " " + n + " ", f, a)
+        put_str_max(scr, cx, y, " " + n + " ", x + w - 1 - cx, f, a)
         cx = cx + len(n) + 2
         if cx >= x + w - 1 {
             return
@@ -182,7 +182,7 @@ fn render_sidebar(a: mut App, scr: mut term.AnsiScreen, x: int, y: int, w: int, 
         if n.stub {
             a2 = term.AttrDim
         }
-        if a.focus == FSidebar && vi == a.coll.cur {
+        if a.focus == FSidebar && vis[vi] == a.coll.cur {
             a2 = a2 | term.AttrReverse
         }
         put_str_max(scr, x + 1, y + 2 + i, pad + glyph + n.name, w - 2, f, a2)
@@ -218,11 +218,8 @@ fn render_req_pane(a: mut App, scr: mut term.AnsiScreen, x: int, y: int, w: int,
 
 fn render_body(a: mut App, scr: mut term.AnsiScreen, x: int, y: int, w: int, h: int) {
     i := 0
-    for i < len(a.body.lines) && i < h {
+    for i < h && a.body.top + i < len(a.body.lines) {
         ln := a.body.lines[a.body.top + i]
-        if a.body.top + i >= len(a.body.lines) {
-            return
-        }
         put_str_max(scr, x + 1, y + i, itoa(a.body.top + i + 1) + " " + ln, w - 2, 7, 0)
         i = i + 1
     }
@@ -470,6 +467,7 @@ fn render(a: mut App, scr: mut term.AnsiScreen, ver: str) {
     }
     a.r_sidebar_x = sx
     a.r_sidebar_w = sw
+    a.r_sidebar_y = by
     a.r_main_x = sw
     a.r_main_w = cols - sw
     if a.sidebar_pos == 1 {
@@ -481,9 +479,13 @@ fn render(a: mut App, scr: mut term.AnsiScreen, ver: str) {
     // main split
     mx := a.r_main_x
     mw := a.r_main_w
+    a.r_req_x = mx
     a.r_req_y = by
-    a.r_resp_y = by
+    a.r_req_w = mw
     a.r_req_h = bh
+    a.r_resp_x = mx
+    a.r_resp_y = by
+    a.r_resp_w = mw
     a.r_resp_h = bh
     a.r_url_y = 1
     a.r_url_h = 2
@@ -509,9 +511,9 @@ fn render(a: mut App, scr: mut term.AnsiScreen, ver: str) {
         rw := mw / 2
         render_req_pane(a, scr, mx, by, rw, bh)
         render_resp_pane(a, scr, mx + rw, by, mw - rw, bh)
-        a.r_req_h = bh
-        a.r_resp_y = by
-        a.r_resp_h = bh
+        a.r_req_w = rw
+        a.r_resp_x = mx + rw
+        a.r_resp_w = mw - rw
     }
     render_toasts(a, scr, cols, rows)
     render_footer(a, scr, cols, rows)
