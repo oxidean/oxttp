@@ -1255,11 +1255,19 @@ fn resolve(m: own args.Matches, envpairs: []str) -> own Out {
         }
         j = j + 1
     }
-    // proxy env capture (only when --proxy absent) + no_proxy
+    // proxy env capture (only when --proxy absent) + no_proxy.
+    // CGI guard (curl convention, spec sem-S5): under REQUEST_METHOD
+    // the uppercase HTTP_PROXY carries attacker-supplied "Proxy:"
+    // header text — skip it (lowercase http_proxy still applies).
     if len(o.intent.proxies) == 0 {
+        [_rm, rme] = env_lookup(envpairs, "REQUEST_METHOD")
         names := "HTTP_PROXY,HTTPS_PROXY,ALL_PROXY,http_proxy,https_proxy,all_proxy"
         cur := strings.split(names, ",")
         for cur != nil {
+            if rme == nil && cur.v == "HTTP_PROXY" {
+                cur = cur.next
+                continue
+            }
             [pv, pe] = env_lookup(envpairs, cur.v)
             if pe == nil {
                 o.intent.proxy_env = new(push(o.intent.proxy_env[:], cur.v + "=" + pv))
@@ -1339,11 +1347,9 @@ fn resolve(m: own args.Matches, envpairs: []str) -> own Out {
     // Degrade routing (ADR 0024): connection-affecting flags error
     // out; --debug degrades to a warning inside execute. S7 landed
     // --continue / --curl / --pretty (format-options still deferred).
-    // WI-0013 executes --http-version 2* (ADR-0030).
-    if len(o.intent.proxies[:]) > 0 || len(o.intent.proxy_env[:]) > 0 {
-        defer_out(o, prog, "proxies are unsupported in this build")
-        return o
-    }
+    // WI-0013 executes --http-version 2* (ADR-0030) and --proxy +
+    // env proxies (spec sem-S5); non-http proxy URL schemes degrade
+    // inside the transport per-hop.
     if len(o.intent.resolves[:]) > 0 {
         defer_out(o, prog, "--resolve is unsupported in this build")
         return o

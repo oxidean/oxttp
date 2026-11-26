@@ -314,6 +314,51 @@ fn (t H1) roundtrip(req: ref model.Req, cap: mut model.Hop) -> [model.Resp, err]
         }
         hdrs = nh
     }
+    // WI-0013 P4 (spec sem-S5): per-hop proxy resolution. proxies is
+    // the verbatim --proxy list; proxy_env the captured env vars —
+    // scheme match (else all:), NO_PROXY + loopback carve-outs.
+    purl := ""
+    if len(req.proxies[:]) > 0 || len(req.proxy_env[:]) > 0 {
+        purl = pick_proxy(req, lwr(u.scheme), host)
+    }
+    via_proxy := false
+    phost := ""
+    pport := 0
+    pauth := ""
+    if len(purl) > 0 {
+        [pu, pue] = url.parse(purl)
+        if pue != nil {
+            return bad, errors.new("http: invalid proxy URL " + purl)
+        }
+        if lwr(pu.scheme) != "http" {
+            return bad, errors.new("http: proxy URL scheme \"" + pu.scheme + "\" is unsupported in this build")
+        }
+        phost = pu.hostname()
+        if len(phost) == 0 {
+            return bad, errors.new("http: invalid proxy URL " + purl)
+        }
+        if find(phost, ":") >= 0 {
+            return bad, errors.new("http: IPv6 addresses not supported")
+        }
+        pport = 80
+        pps := pu.port()
+        if len(pps) > 0 {
+            [pv2, pve] = strconv.atoi(pps)
+            if pve != nil || pv2 <= 0 || pv2 > 65535 {
+                return bad, errors.new("http: invalid proxy URL " + purl)
+            }
+            pport = pv2
+        }
+        via_proxy = true
+        if pu.hasuser {
+            pauth = "Basic " + base64.encode((pu.user + ":" + pu.password) as []byte)
+        }
+    }
+    // h2c through a CONNECT proxy is meaningless (cleartext preface
+    // inside a tunnel nobody asked for) — std rejects it outright.
+    if via_proxy && !https && req.h2 == "prior" {
+        return bad, errors.new("http: h2c through a proxy is not supported")
+    }
     [rb, rbe] = RenderBody(req.body)
     if rbe != nil {
         return bad, rbe
@@ -324,15 +369,33 @@ fn (t H1) roundtrip(req: ref model.Req, cap: mut model.Hop) -> [model.Resp, err]
     if has_body && len(rb.ctype) > 0 && !hdr_has(hdrs, "content-type") {
         hdrs = push(hdrs, model.Header{name: "Content-Type", value: rb.ctype})
     }
-    head := serialize_head(OutHead{method: req.method, uri: u.request_uri(), ver: req.httpver, host: u.host, hdrs: hdrs, body_len: len(rb.data), has_body: has_body, synth: req.synth})
+    // http target through a proxy → absolute-form request target, and
+    // Proxy-Authorization when the proxy URL carries creds (reqwest
+    // semantics — std's client sends neither, spec D4).
+    uri := u.request_uri()
+    if via_proxy && !https {
+        uri = lwr(u.scheme) + "://" + u.host + u.request_uri()
+        if len(pauth) > 0 && !hdr_has(hdrs, "proxy-authorization") {
+            hdrs = push(hdrs, model.Header{name: "Proxy-Authorization", value: pauth})
+        }
+    }
+    head := serialize_head(OutHead{method: req.method, uri: uri, ver: req.httpver, host: u.host, hdrs: hdrs, body_len: len(rb.data), has_body: has_body, synth: req.synth})
     cap.req_head = head
-    // connect — timeout<=0 gets the same 30s safety cap std uses.
+    // connect — to the proxy when one applies, else the origin.
+    // timeout<=0 gets the same 30s safety cap std uses.
     c0 := now_ms()
     dtmo := req.timeout_ms
     if dtmo <= 0 {
         dtmo = 30000
     }
-    [raw, de] = dial_h1(host, port, dtmo)
+    dhost := host
+    dport := port
+    if via_proxy {
+        dhost = phost
+        dport = pport
+    }
+    remote := dhost + ":" + itoa(dport)
+    [raw, de] = dial_h1(dhost, dport, dtmo)
     if de != nil {
         return bad, de
     }
@@ -340,6 +403,23 @@ fn (t H1) roundtrip(req: ref model.Req, cap: mut model.Hop) -> [model.Resp, err]
     deadline := 0
     if req.timeout_ms > 0 {
         deadline = t0 + req.timeout_ms
+    }
+    // HTTPS via proxy: CONNECT the origin authority over the fresh
+    // socket, bounded by the remaining request budget — then the
+    // normal TLS+protocol branch runs on the tunnel.
+    if https && via_proxy {
+        ctmo := 30000
+        if deadline > 0 {
+            ctmo = deadline - now_ms()
+            if ctmo <= 0 {
+                ctmo = 1
+            }
+        }
+        ce := proxy_connect(raw, host + ":" + itoa(port), pauth, ctmo)
+        if ce != nil {
+            raw.close()
+            return bad, ce
+        }
     }
     // HTTPS: tls.client takes ownership of the TCP socket. Plain: keep
     // raw for the whole exchange.
@@ -368,7 +448,7 @@ fn (t H1) roundtrip(req: ref model.Req, cap: mut model.Hop) -> [model.Resp, err]
         }
         if alpn == "h2" {
             cap.req_head = h2_head_synth(req, u, hdrs, has_body, len(rb.data))
-            [resp2, re2] = h2_exchange(req, tc.asreadwriter(), tc.rawfd(), hdrs, rb, u, cap, host + ":" + itoa(port), t0, c0, tr, deadline, bad, tc.s.ver)
+            [resp2, re2] = h2_exchange(req, tc.asreadwriter(), tc.rawfd(), hdrs, rb, u, cap, remote, t0, c0, tr, deadline, bad, tc.s.ver)
             tc.close()
             return resp2, re2
         }
@@ -391,7 +471,7 @@ fn (t H1) roundtrip(req: ref model.Req, cap: mut model.Hop) -> [model.Resp, err]
         tr.send_body_ms = itof(now_ms() - c0)
         trr := TmoTlsReader{c: tc, deadline: deadline, tmo: req.timeout_ms}
         br := new(bufio.newreadersize(trr.asreader(), 16384))
-        [resp, re] = finish_roundtrip(req, br, cap, host, port, t0, c0, tr, bad, tc.s.ver)
+        [resp, re] = finish_roundtrip(req, br, cap, remote, t0, c0, tr, bad, tc.s.ver)
         tc.close()
         return resp, re
     }
@@ -399,7 +479,7 @@ fn (t H1) roundtrip(req: ref model.Req, cap: mut model.Hop) -> [model.Resp, err]
     // the socket (--http-version 2-prior-knowledge, spec sem-S1).
     if req.h2 == "prior" {
         cap.req_head = h2_head_synth(req, u, hdrs, has_body, len(rb.data))
-        [resp3, re3] = h2_exchange(req, raw.asreadwriter(), raw.rawfd(), hdrs, rb, u, cap, host + ":" + itoa(port), t0, c0, tr, deadline, bad, 0)
+        [resp3, re3] = h2_exchange(req, raw.asreadwriter(), raw.rawfd(), hdrs, rb, u, cap, remote, t0, c0, tr, deadline, bad, 0)
         raw.close()
         return resp3, re3
     }
@@ -422,14 +502,14 @@ fn (t H1) roundtrip(req: ref model.Req, cap: mut model.Hop) -> [model.Resp, err]
     tr.send_body_ms = itof(now_ms() - c0)
     trr := TmoReader{c: raw, deadline: deadline, tmo: req.timeout_ms}
     br := new(bufio.newreadersize(trr.asreader(), 16384))
-    [resp, re] = finish_roundtrip(req, br, cap, host, port, t0, c0, tr, bad, 0)
+    [resp, re] = finish_roundtrip(req, br, cap, remote, t0, c0, tr, bad, 0)
     raw.close()
     return resp, re
 }
 
 // finish_roundtrip reads the HTTP response from br, fills hop cap, and
 // builds Resp (shared by cleartext and TLS paths).
-fn finish_roundtrip(req: ref model.Req, br: own bufio.Reader, cap: mut model.Hop, host: str, port: int, t0: int, c0: int, tr: own model.Trace, bad: model.Resp, tls_ver: int) -> [model.Resp, err] {
+fn finish_roundtrip(req: ref model.Req, br: own bufio.Reader, cap: mut model.Hop, remote: str, t0: int, c0: int, tr: own model.Trace, bad: model.Resp, tls_ver: int) -> [model.Resp, err] {
     h := Head{status: 0, reason: "", headers: nil, version: ""}
     for true {
         [raw, rhe] = read_head(br)
@@ -452,7 +532,7 @@ fn finish_roundtrip(req: ref model.Req, br: own bufio.Reader, cap: mut model.Hop
     cap.status = h.status
     cap.reason = h.reason
     cap.version = h.version
-    cap.remote = host + ":" + itoa(port)
+    cap.remote = remote
     // body framing: HEAD/1xx/204/304 have none by definition; chunked
     // wins over Content-Length; no framing at all reads to EOF.
     body := mkslice(byte, 0)
@@ -502,7 +582,7 @@ fn finish_roundtrip(req: ref model.Req, br: own bufio.Reader, cap: mut model.Hop
     }
     tr.closed_ms = itof(now_ms() - c0)
     let bodyb: []byte = db
-    return model.Resp{status: h.status, reason: h.reason, headers: h.headers, body: bodyb, elapsed_ms: itof(now_ms() - t0), remote: host + ":" + itoa(port), version: h.version, hops: nil, req_head: "", trace: tr, tls_ver: tls_ver}, nil
+    return model.Resp{status: h.status, reason: h.reason, headers: h.headers, body: bodyb, elapsed_ms: itof(now_ms() - t0), remote: remote, version: h.version, hops: nil, req_head: "", trace: tr, tls_ver: tls_ver}, nil
 }
 
 // --- h2 exchange (WI-0013 P3, ADR-0030) ----------------------------
@@ -840,4 +920,327 @@ fn write_all_tls(c: tls.Conn, b: []byte) -> err {
         off = off + n
     }
     return nil
+}
+
+// --- proxy resolution + CONNECT (WI-0013 P4, spec sem-S5) ----------
+// Semantics mirror std's net/http client (proxy_from_env, connect_*
+// verbatim ports) plus the reqwest Proxy-Authorization std lacks (D4).
+
+// pick_proxy resolves the proxy URL for one hop. --proxy entries
+// ("PROTO:URL") match the hop scheme — first scheme match wins, else
+// first all:; env vars select by scheme name then ALL_PROXY; NO_PROXY
+// domain match and the loopback carve-out cancel.
+fn pick_proxy(req: ref model.Req, scheme: str, host: str) -> str {
+    p := ""
+    i := 0
+    for i < len(req.proxies) {
+        ent := req.proxies[i]
+        ci := find(ent, ":")
+        if ci <= 0 {
+            i = i + 1
+            continue
+        }
+        proto := lwr(substr(ent, 0, ci))
+        if proto == scheme {
+            return substr(ent, ci + 1, len(ent))
+        }
+        if proto == "all" && len(p) == 0 {
+            p = substr(ent, ci + 1, len(ent))
+        }
+        i = i + 1
+    }
+    if len(p) > 0 || len(req.proxies) > 0 {
+        return p
+    }
+    want := ""
+    i = 0
+    for i < len(req.proxy_env) {
+        eq := find(req.proxy_env[i], "=")
+        if eq <= 0 {
+            i = i + 1
+            continue
+        }
+        nm := lwr(substr(req.proxy_env[i], 0, eq))
+        val := substr(req.proxy_env[i], eq + 1, len(req.proxy_env[i]))
+        if nm == scheme + "_proxy" {
+            want = val
+            break
+        }
+        if nm == "all_proxy" && len(want) == 0 {
+            want = val
+        }
+        i = i + 1
+    }
+    if len(want) == 0 {
+        return ""
+    }
+    if len(req.no_proxy) > 0 && no_proxy_match(req.no_proxy, host) {
+        return ""
+    }
+    if is_loopback_host(host) {
+        return ""
+    }
+    return want
+}
+
+// is_loopback_host — std port: localhost/::1 or a strict dotted-quad
+// in 127.0.0.0/8. Looser spellings route to the proxy (safe side).
+fn is_loopback_host(host: str) -> bool {
+    hl := lwr(host)
+    if hl == "localhost" || hl == "::1" {
+        return true
+    }
+    part := 0
+    val := 0
+    digits := 0
+    lz := false
+    first := -1
+    i := 0
+    n := len(hl)
+    for i < n {
+        c := byteat(hl, i)
+        if c == 46 {
+            if digits == 0 || val > 255 || lz && digits > 1 {
+                return false
+            }
+            if part == 0 {
+                first = val
+            }
+            part = part + 1
+            val = 0
+            digits = 0
+            lz = false
+        } else if c >= 48 && c <= 57 {
+            if digits == 0 {
+                lz = c == 48
+            }
+            val = val * 10 + c - 48
+            digits = digits + 1
+            if digits > 3 || val > 255 {
+                return false
+            }
+        } else {
+            return false
+        }
+        i = i + 1
+    }
+    if digits == 0 || lz && digits > 1 {
+        return false
+    }
+    return part == 3 && first == 127
+}
+
+// no_proxy_match — std port: comma list, entries match the host or
+// any subdomain; "*" disables proxying outright (curl convention).
+fn no_proxy_match(list: str, host: str) -> bool {
+    hl := lwr(host)
+    i := 0
+    for i <= len(list) {
+        j := find_from(list, ",", i)
+        if j < 0 {
+            j = len(list)
+        }
+        ent := lwr(substr(list, i, j))
+        lo := 0
+        for lo < len(ent) && (byteat(ent, lo) == 32 || byteat(ent, lo) == 9) {
+            lo = lo + 1
+        }
+        hi := len(ent)
+        for hi > lo && (byteat(ent, hi - 1) == 32 || byteat(ent, hi - 1) == 9) {
+            hi = hi - 1
+        }
+        ent = substr(ent, lo, hi)
+        if ent == "*" {
+            return true
+        }
+        ci := find(ent, ":")
+        if ci > 0 {
+            pd := true
+            k := ci + 1
+            for k < len(ent) {
+                if byteat(ent, k) < 48 || byteat(ent, k) > 57 {
+                    pd = false
+                }
+                k = k + 1
+            }
+            if pd {
+                ent = substr(ent, 0, ci)
+            }
+        }
+        if len(ent) > 0 && byteat(ent, 0) == 46 {
+            ent = substr(ent, 1, len(ent))
+        }
+        if len(ent) > 0 && (hl == ent || len(hl) > len(ent) && byteat(hl, len(hl) - len(ent) - 1) == 46 && substr(hl, len(hl) - len(ent), len(hl)) == ent) {
+            return true
+        }
+        if j >= len(list) {
+            return false
+        }
+        i = j + 1
+    }
+    return false
+}
+
+// proxy_connect runs CONNECT host:port on the already-dialed proxy
+// socket and requires a 200 (1xx preludes are skipped) — std's
+// connect_proxy port with the proxy-authorization line added (D4).
+fn proxy_connect(c: net.Conn, authority: str, auth: str, tmo: int) -> err {
+    if tmo <= 0 {
+        return errors.new("http: proxy CONNECT timeout")
+    }
+    wire := "CONNECT " + authority + " HTTP/1.1\r\nhost: " + authority + "\r\n"
+    if len(auth) > 0 {
+        wire = wire + "proxy-authorization: " + auth + "\r\n"
+    }
+    wire = wire + "proxy-connection: keep-alive\r\n\r\n"
+    set_sndtimo(c.rawfd(), (tmo + 999) / 1000)
+    we := write_all(c, wire as []byte)
+    if we != nil {
+        return errors.wrap("http: proxy CONNECT write", we)
+    }
+    response := ""
+    read_bytes := 0
+    scan_from := 0
+    deadline := now_ms() + tmo
+    buf := mkslice(byte, 1)
+    for read_bytes < 32768 {
+        remaining := deadline - now_ms()
+        if remaining <= 0 {
+            return errors.new("http: proxy CONNECT timeout")
+        }
+        set_rcvtimo_ms(c.rawfd(), remaining)
+        [n, re] = c.read(buf)
+        if n > 0 {
+            response = response + buf[0:n] as str
+            read_bytes = read_bytes + n
+            head_end := find_from(response, "\r\n\r\n", scan_from)
+            if head_end >= 0 {
+                [status, pe] = connect_response_status(response)
+                if pe != nil {
+                    return pe
+                }
+                if status >= 100 && status < 200 && status != 101 {
+                    response = ""
+                    scan_from = 0
+                } else {
+                    set_rcvtimo_ms(c.rawfd(), 0)
+                    return nil
+                }
+            } else {
+                scan_from = len(response) - 3
+                if scan_from < 0 {
+                    scan_from = 0
+                }
+            }
+        }
+        if re != nil {
+            return errors.wrap("http: proxy CONNECT read", re)
+        }
+        if n <= 0 {
+            return errors.new("http: proxy CONNECT response ended early")
+        }
+    }
+    return errors.new("http: proxy CONNECT headers too large")
+}
+
+// connect_response_status — std port verbatim: strict status-line +
+// header validation on the CONNECT reply (TE forbidden, CL must be
+// 0); non-200/1xx is an error carrying the status.
+fn connect_response_status(head: str) -> [int, err] {
+    end := find(head, "\r\n\r\n")
+    if end < 0 || end + 4 != len(head) {
+        return 0, errors.new("http: malformed CONNECT response")
+    }
+    line_end := find(head, "\r\n")
+    if line_end < 0 {
+        return 0, errors.new("http: malformed CONNECT status line")
+    }
+    line := substr(head, 0, line_end)
+    sp := find(line, " ")
+    if sp < 0 {
+        return 0, errors.new("http: malformed CONNECT status line")
+    }
+    version := substr(line, 0, sp)
+    if version != "HTTP/1.0" && version != "HTTP/1.1" {
+        return 0, errors.new("http: malformed CONNECT HTTP version")
+    }
+    rest := substr(line, sp + 1, len(line))
+    sp2 := find(rest, " ")
+    code := rest
+    if sp2 >= 0 {
+        code = substr(rest, 0, sp2)
+    }
+    if len(code) != 3 {
+        return 0, errors.new("http: malformed CONNECT status code")
+    }
+    i := 0
+    for i < 3 {
+        b := byteat(code, i)
+        if b < 48 || b > 57 {
+            return 0, errors.new("http: malformed CONNECT status code")
+        }
+        i = i + 1
+    }
+    [status, se] = strconv.atoi(code)
+    if se != nil || status < 100 || status > 599 {
+        return 0, errors.new("http: malformed CONNECT status code")
+    }
+    pos := line_end + 2
+    for pos < end {
+        eol := find_from(head, "\r\n", pos)
+        if eol < 0 || eol > end {
+            return 0, errors.new("http: malformed CONNECT headers")
+        }
+        if eol == pos {
+            break
+        }
+        field := substr(head, pos, eol)
+        colon := find(field, ":")
+        if colon <= 0 {
+            return 0, errors.new("http: malformed CONNECT header")
+        }
+        name := substr(field, 0, colon)
+        value := substr(field, colon + 1, len(field))
+        lo := 0
+        for lo < len(value) && (byteat(value, lo) == 32 || byteat(value, lo) == 9) {
+            lo = lo + 1
+        }
+        hi := len(value)
+        for hi > lo && (byteat(value, hi - 1) == 32 || byteat(value, hi - 1) == 9) {
+            hi = hi - 1
+        }
+        value = substr(value, lo, hi)
+        name = lwr(name)
+        if name == "transfer-encoding" && len(value) > 0 {
+            return 0, errors.new("http: invalid CONNECT transfer encoding")
+        }
+        if name == "content-length" {
+            [length, le] = strconv.atoi(value)
+            if le != nil || length != 0 {
+                return 0, errors.new("http: invalid CONNECT content length")
+            }
+        }
+        pos = eol + 2
+    }
+    if status != 200 && (status < 100 || status >= 200 || status == 101) {
+        return status, errors.new("http: proxy CONNECT returned status " + itoa(status))
+    }
+    return status, nil
+}
+
+// find_from is find() with a start offset — byte-wise scan (-1 absent).
+fn find_from(s: str, needle: str, from: int) -> int {
+    last := len(s) - len(needle)
+    i := from
+    for i <= last {
+        j := 0
+        for j < len(needle) && byteat(s, i + j) == byteat(needle, j) {
+            j = j + 1
+        }
+        if j == len(needle) {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
 }

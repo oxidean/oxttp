@@ -592,3 +592,133 @@ fn test_h2c_req_head_synth() {
         testing.expect_eq(find(resp.req_head, "GET /x HTTP/2.0"), 0, "synth head: " + resp.req_head)
     }
 }
+
+// --- WI-0013 P4: proxies (spec sem-S5) -----------------------------
+// Fixture is the proxy: for http targets it captures the forwarded
+// request (<ECHO> body = wire bytes); for https it captures CONNECT.
+fn test_proxy_http_absolute_form() {
+    f := fx_start(one("<ECHO>"))
+    defer f.stop()
+    r := rq("GET", "http://example.org/x?q=1")
+    r.proxies = one("http:" + f.url())
+    [resp, e] = request(r)
+    testing.expect(e == nil, "proxied http send")
+    if e != nil {
+        return
+    }
+    b := resp.body as str
+    testing.expect_eq(find(b, "GET http://example.org/x?q=1 HTTP/1.1"), 0, "absolute-form: " + b)
+    testing.expect(find(b, "Host: example.org") >= 0, "origin host hdr")
+    testing.expect_eq(sget(f.hits), 1, "proxy hit once")
+}
+
+fn test_proxy_http_auth_header() {
+    f := fx_start(one("<ECHO>"))
+    defer f.stop()
+    r := rq("GET", "http://example.org/")
+    r.proxies = one("http:http://user:pw@127.0.0.1:" + itoa(f.port))
+    [resp, e] = request(r)
+    testing.expect(e == nil, "proxied send")
+    if e != nil {
+        return
+    }
+    // base64("user:pw") = dXNlcjpwdw==
+    bb := resp.body as str
+    testing.expect(find(bb, "Proxy-Authorization: Basic dXNlcjpwdw==") >= 0, "proxy-auth hdr: " + bb)
+}
+
+fn test_proxy_all_and_scheme_match() {
+    f := fx_start(one("<ECHO>"))
+    defer f.stop()
+    // all: applies to http too; a https: entry must not
+    r := rq("GET", "http://example.org/")
+    r.proxies = one("all:" + f.url())
+    [resp, e] = request(r)
+    testing.expect(e == nil, "all: send")
+    if e == nil {
+        testing.expect_eq(find(resp.body as str, "GET http://example.org/ HTTP/1.1"), 0, "all: absolute-form")
+    }
+    r2 := rq("GET", "http://example.org/")
+    r2.proxies = one("https:" + f.url()) // scheme mismatch → direct → dial example.org fails or fixture untouched
+    [resp2, e2] = request(r2)
+    testing.expect_eq(sget(f.hits), 1, "no second proxy hit (https: skipped for http)")
+}
+
+fn test_proxy_env_selection() {
+    f := fx_start(one("<ECHO>"))
+    defer f.stop()
+    r := rq("GET", "http://example.org/")
+    r.proxy_env = one("HTTP_PROXY=" + f.url())
+    [resp, e] = request(r)
+    testing.expect(e == nil, "env proxy send")
+    if e == nil {
+        testing.expect_eq(find(resp.body as str, "GET http://example.org/ HTTP/1.1"), 0, "env absolute-form")
+    }
+}
+
+fn test_proxy_no_proxy_and_loopback() {
+    f := fx_start(one("<ECHO>"))
+    defer f.stop()
+    // NO_PROXY match → direct dial of an unresolvable host errors,
+    // fixture stays untouched
+    r := rq("GET", "http://nx.invalid/")
+    r.proxy_env = one("HTTP_PROXY=" + f.url())
+    r.no_proxy = "nx.invalid"
+    [_r1, e1] = request(r)
+    testing.expect(e1 != nil, "no_proxy bypasses (direct dial fails)")
+    testing.expect_eq(sget(f.hits), 0, "proxy untouched under NO_PROXY")
+    // loopback carve-out: 127.0.0.1 never rides the env proxy
+    r2 := rq("GET", "http://127.0.0.1:1/")
+    r2.proxy_env = one("HTTP_PROXY=" + f.url())
+    [_r2, e2] = request(r2)
+    testing.expect(e2 != nil, "loopback direct dial fails")
+    testing.expect_eq(sget(f.hits), 0, "loopback carve-out")
+}
+
+fn test_proxy_scheme_degrades() {
+    // non-http proxy URLs degrade explicitly (spec sem-S5)
+    r := rq("GET", "https://example.org/")
+    r.proxies = one("https:https://proxy.invalid:1")
+    [_r1, e1] = request(r)
+    testing.expect(e1 != nil, "https proxy URL errors")
+    if e1 != nil {
+        testing.expect(find(errors.msg(e1), "proxy URL scheme \"https\" is unsupported") >= 0, "https-scheme degrade: " + errors.msg(e1))
+    }
+    r2 := rq("GET", "http://example.org/")
+    r2.proxies = one("all:socks5://proxy.invalid:1")
+    [_r2, e2] = request(r2)
+    testing.expect(e2 != nil, "socks5 errors")
+    if e2 != nil {
+        testing.expect(find(errors.msg(e2), "proxy URL scheme \"socks5\" is unsupported") >= 0, "socks5 degrade: " + errors.msg(e2))
+    }
+}
+
+fn test_proxy_h2c_rejected() {
+    f := fx_start(one("<ECHO>"))
+    defer f.stop()
+    r := rq("GET", "http://example.org/")
+    r.h2 = "prior"
+    r.proxies = one("http:" + f.url())
+    [_r1, e1] = request(r)
+    testing.expect(e1 != nil, "h2c+proxy errors")
+    if e1 != nil {
+        testing.expect(find(errors.msg(e1), "h2c through a proxy is not supported") >= 0, "h2c+proxy text: " + errors.msg(e1))
+    }
+    testing.expect_eq(sget(f.hits), 0, "no dial attempted")
+}
+
+fn test_proxy_connect_https() {
+    f := capfx_start()
+    defer f.l.close()
+    r := rq("GET", "https://example.org/secure")
+    r.proxies = one("all:http://user:pw@127.0.0.1:" + itoa(f.port))
+    [_resp, e] = request(r)
+    // the 200'd tunnel then fails TLS (fixture can't handshake) —
+    // the assertion is the CONNECT wire shape
+    testing.expect(e != nil, "post-CONNECT TLS fails on fake server")
+    cap := f.cap[0]
+    testing.expect_eq(find(cap, "CONNECT example.org:443 HTTP/1.1"), 0, "CONNECT line: " + cap)
+    testing.expect(find(cap, "host: example.org:443") >= 0, "CONNECT host: " + cap)
+    testing.expect(find(cap, "proxy-authorization: Basic dXNlcjpwdw==") >= 0, "CONNECT auth: " + cap)
+    testing.expect(find(cap, "proxy-connection: keep-alive") >= 0, "keep-alive: " + cap)
+}
