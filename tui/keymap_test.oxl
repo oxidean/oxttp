@@ -79,7 +79,7 @@ fn test_match_event() {
 }
 
 fn test_global_table_has_all_actions() {
-    g := global_bindings()
+    g := global_bindings(new_app())
     ids := "send-request,stream,jump,commands,save-request,new-request,close-tab,keep-tab,next-tab,previous-tab,search-tabs,search-requests,focus-url,focus-method,toggle-collection,expand-section,variables,help"
     parts := split_csv(ids)
     i := 0
@@ -101,7 +101,7 @@ fn test_global_table_has_all_actions() {
 }
 
 fn test_global_defaults() {
-    g := global_bindings()
+    g := global_bindings(new_app())
     testing.expect(find_in(g, kev("j", true, false, false), "send-request"), "ctrl+j send")
     testing.expect(find_in(g, knamed_mod(term.KeyEnter, false, true, false), "send-request"), "alt+enter send")
     testing.expect(find_in(g, kev("o", true, false, false), "jump"), "ctrl+o jump")

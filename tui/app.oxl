@@ -4,6 +4,8 @@ package main
 // stack, pane widget state, toast queue. Dispatch walks
 // modal > widget > global > fixed per corpus §3 precedence.
 
+import "std/os"
+
 import "github.com/oxidean/oxttp/core/term"
 
 fn new_app() -> own App {
@@ -60,6 +62,25 @@ fn new_app() -> own App {
     a.confirm_action = ""
     a.toasts = mkslice(Toast, 0)
     a.hinted_vars = false
+    // S11: env root + exit plumbing + default theme (apply_settings
+    // overwrites; tests reach render without it).
+    a.cwd = os.fullpath(".")
+    a.exit_code = -1
+    bt := builtin_themes()
+    gi := theme_index(bt, "galaxy")
+    a.theme = bt[gi]
+    a.theme_name = "galaxy"
+    a.gradient = 0
+    a.theme_preview = true
+    a.hist_disk = true
+    a.heading_on = true
+    a.heading_host = true
+    a.heading_ver = true
+    a.url_preview_on = true
+    a.url_mask_secrets = true
+    a.resp_prettify = true
+    a.resp_size_time = true
+    a.blink = true
     return a
 }
 
@@ -250,6 +271,15 @@ fn push_modal(a: mut App, m: int) {
     }
     if m == MVariables {
         var_rows_build(a)
+    }
+    if m == MTheme || m == MGradient {
+        th_open(a, m)
+    }
+    if m == MCurl {
+        a.curl_in = new_line_edit("")
+    }
+    if m == MSaveResp {
+        a.sresp_in = new_line_edit(sresp_default(a))
     }
     if m == MSaveReq {
         a.save_field = 0
@@ -733,6 +763,46 @@ fn modal_bindings(a: ref App, m: int) -> []Binding {
         bs = push(bs, bind("down", "rows-down"))
         return bs
     }
+    if m == MTheme || m == MGradient {
+        bs = push(bs, bind("escape", "th-close"))
+        bs = push(bs, bind("up", "th-up"))
+        bs = push(bs, bind("down", "th-down"))
+        bs = push(bs, bind("k", "th-up"))
+        bs = push(bs, bind("j", "th-down"))
+        bs = push(bs, bind("enter", "th-pick"))
+        return bs
+    }
+    if m == MCurl {
+        bs = push(bs, bind("escape", "modal-close"))
+        bs = push(bs, bind("enter", "curl-run"))
+        bs = push(bs, bind("ctrl+j", "curl-run"))
+        bs = push(bs, bind("backspace", "mline-backspace"))
+        bs = push(bs, bind("left", "mline-left"))
+        bs = push(bs, bind("right", "mline-right"))
+        bs = push(bs, bind("home", "mline-home"))
+        bs = push(bs, bind("end", "mline-end"))
+        return bs
+    }
+    if m == MSaveResp {
+        bs = push(bs, bind("escape", "modal-close"))
+        bs = push(bs, bind("enter", "sresp-save"))
+        bs = push(bs, bind("backspace", "mline-backspace"))
+        bs = push(bs, bind("left", "mline-left"))
+        bs = push(bs, bind("right", "mline-right"))
+        bs = push(bs, bind("home", "mline-home"))
+        bs = push(bs, bind("end", "mline-end"))
+        return bs
+    }
+    if m == MVarEdit {
+        bs = push(bs, bind("escape", "modal-close"))
+        bs = push(bs, bind("enter", "var-commit"))
+        bs = push(bs, bind("backspace", "mline-backspace"))
+        bs = push(bs, bind("left", "mline-left"))
+        bs = push(bs, bind("right", "mline-right"))
+        bs = push(bs, bind("home", "mline-home"))
+        bs = push(bs, bind("end", "mline-end"))
+        return bs
+    }
     return bs
 }
 
@@ -832,6 +902,10 @@ fn dispatch(a: mut App, ev: term.KeyEvent) -> int {
             }
         }
     }
+    // $-suggestion list owns up/down/enter/escape while live
+    if a.vsug_on && a.focus == FUrl && vsug_dispatch(a, ev) {
+        return ENone
+    }
     // widget layer
     wbs := widget_bindings(a)
     bi := find_binding(wbs, ev)
@@ -846,7 +920,7 @@ fn dispatch(a: mut App, ev: term.KeyEvent) -> int {
         }
     }
     // global rebindable
-    gbs := global_bindings()
+    gbs := global_bindings(a)
     gi := find_binding(gbs, ev)
     if gi >= 0 {
         return global_action(a, gbs[gi].action)
@@ -1046,7 +1120,7 @@ fn widget_action(a: mut App, act: str, ev: term.KeyEvent) -> int {
         sync_path_kv(a)
     } else if act == "url-enter" {
         if is_curl_text(a.url.text) {
-            a.degrade("curl import — paste parsing lands S11")
+            apply_curl(a, a.url.text)
         } else {
             return begin_send(a)
         }
@@ -1114,9 +1188,16 @@ fn widget_action(a: mut App, act: str, ev: term.KeyEvent) -> int {
             kv_begin_edit(a)
         }
     } else if act == "body-pager" {
-        a.degrade("f3 pager — no pager handoff this build")
+        // f3 pager — resp body uses pager_json when the body is JSON.
+        cmd := a.pager
+        ext := ".txt"
+        if a.focus == FRespPane && resp_body_json(a) && len(a.pager_json) > 0 {
+            cmd = a.pager_json
+            ext = ".json"
+        }
+        return ext_stage(a, cmd, body_text_for(a), ext)
     } else if act == "body-editor" {
-        a.degrade("f4 $EDITOR — no editor handoff this build")
+        return ext_stage(a, a.editor, body_text_for(a), ".txt")
     } else if act == "body-newline" {
         body_insert(a, "\n")
     } else if act == "body-backspace" {
@@ -1204,8 +1285,10 @@ fn widget_action(a: mut App, act: str, ev: term.KeyEvent) -> int {
         a.degrade("clipboard copy — no clipboard API in std")
     } else if act == "json-expand" || act == "json-collapse" || act == "json-copy-path" {
         a.degrade("JSON tree lands S10 with responses")
-    } else if act == "image-toggle" || act == "save-response" {
-        a.degrade("response widgets land S10")
+    } else if act == "save-response" {
+        push_modal(a, MSaveResp)
+    } else if act == "image-toggle" {
+        a.degrade("image preview unsupported")
     } else if act == "rows-up" {
         rows_move(a, -1, false)
     } else if act == "rows-down" {
@@ -1556,9 +1639,10 @@ fn widget_text_char(a: mut App, ch: str) -> int {
     pin_tab(a)
     if a.focus == FUrl {
         a.url.insert(ch)
-        if ch == "$" && !a.hinted_vars {
-            a.hinted_vars = true
-            a.degrade("variable suggestions land S10/S11")
+        if ch == "$" {
+            vsug_start(a)
+        } else if a.vsug_on {
+            vsug_maybe_open(a)
         }
         sync_path_kv(a)
         return ENone
@@ -1782,6 +1866,9 @@ fn body_backspace(a: mut App) {
 // --- modal actions ---
 
 fn modal_wants_text(a: ref App, m: int) -> bool {
+    if m == MCurl || m == MSaveResp || m == MVarEdit {
+        return true
+    }
     if m == MPalette || m == MSaveReq {
         return true
     }
@@ -1795,6 +1882,10 @@ fn modal_wants_text(a: ref App, m: int) -> bool {
 }
 
 fn modal_text_char(a: mut App, m: int, ch: str) {
+    if m == MCurl || m == MSaveResp || m == MVarEdit {
+        mline_char(a, m, ch)
+        return
+    }
     if m == MPalette {
         a.pal_query.insert(ch)
         a.pal_sel = 0
@@ -1920,6 +2011,38 @@ fn modal_action(a: mut App, m: int, act: str, ev: term.KeyEvent) -> int {
             env_pick(a)
         } else {
             rows_action(a, act)
+        }
+        return ENone
+    }
+    if m == MTheme || m == MGradient {
+        if act == "th-close" {
+            th_close(a, false)
+        } else if act == "th-up" {
+            th_move(a, m, -1)
+        } else if act == "th-down" {
+            th_move(a, m, 1)
+        } else if act == "th-pick" {
+            th_apply_sel(a, m, true)
+            th_close(a, true)
+        }
+        return ENone
+    }
+    if m == MCurl || m == MSaveResp || m == MVarEdit {
+        if act == "modal-close" {
+            pop_modal(a)
+        } else if act == "curl-run" {
+            pop_modal(a)
+            apply_curl(a, a.curl_in.text)
+        } else if act == "sresp-save" {
+            if sresp_save(a) {
+                pop_modal(a)
+            }
+        } else if act == "var-commit" {
+            if vars_commit(a) {
+                pop_modal(a)
+            }
+        } else {
+            mline_action(a, m, act)
         }
         return ENone
     }
@@ -2105,22 +2228,22 @@ fn palette_items() -> []PItem {
     t = push(t, PItem{name: "Search requests", action: "search-requests", degrade: ""})
     t = push(t, PItem{name: "Send request", action: "send-request", degrade: ""})
     t = push(t, PItem{name: "Save request", action: "save-request", degrade: ""})
-    t = push(t, PItem{name: "Save response", action: "", degrade: "responses land S10"})
+    t = push(t, PItem{name: "Save response", action: "save-response", degrade: ""})
     t = push(t, PItem{name: "Switch environment", action: "env-switch", degrade: ""})
     t = push(t, PItem{name: "Variables", action: "variables", degrade: ""})
     t = push(t, PItem{name: "Reload collection", action: "reload-collection", degrade: ""})
     t = push(t, PItem{name: "OAuth sign-in", action: "", degrade: "OAuth2 lands M4"})
     t = push(t, PItem{name: "gRPC stream open/end", action: "stream", degrade: "gRPC oxl-blocked (#223)"})
     t = push(t, PItem{name: "WebSocket disconnect", action: "", degrade: "WS oxl-blocked (#220)"})
-    t = push(t, PItem{name: "Import curl command…", action: "", degrade: "curl import lands S10"})
+    t = push(t, PItem{name: "Import curl command…", action: "import-curl", degrade: ""})
     t = push(t, PItem{name: "Import curl from clipboard", action: "", degrade: "no clipboard API in std"})
     t = push(t, PItem{name: "Export as curl", action: "", degrade: "export lands S10"})
     t = push(t, PItem{name: "Export as grpcurl", action: "", degrade: "gRPC oxl-blocked (#223)"})
     t = push(t, PItem{name: "Export as YAML", action: "", degrade: "no clipboard API in std"})
     t = push(t, PItem{name: "Toggle collection sidebar", action: "toggle-collection", degrade: ""})
     t = push(t, PItem{name: "Toggle layout vertical/horizontal", action: "toggle-layout", degrade: ""})
-    t = push(t, PItem{name: "Theme…", action: "", degrade: "themes land M4"})
-    t = push(t, PItem{name: "Sidebar gradient…", action: "", degrade: "themes land M4"})
+    t = push(t, PItem{name: "Theme…", action: "theme-modal", degrade: ""})
+    t = push(t, PItem{name: "Sidebar gradient…", action: "gradient-modal", degrade: ""})
     t = push(t, PItem{name: "History", action: "history", degrade: ""})
     t = push(t, PItem{name: "Help", action: "help", degrade: ""})
     t = push(t, PItem{name: "Open docs", action: "", degrade: "doc launch unsupported"})
@@ -2201,6 +2324,22 @@ fn run_named_action(a: mut App, act: str) -> int {
         push_modal(a, MEnvSwitch)
         return ENone
     }
+    if act == "theme-modal" {
+        push_modal(a, MTheme)
+        return ENone
+    }
+    if act == "gradient-modal" {
+        push_modal(a, MGradient)
+        return ENone
+    }
+    if act == "import-curl" {
+        push_modal(a, MCurl)
+        return ENone
+    }
+    if act == "save-response" {
+        push_modal(a, MSaveResp)
+        return ENone
+    }
     if act == "history" {
         push_modal(a, MHistory)
         return ENone
@@ -2237,11 +2376,24 @@ fn run_named_action(a: mut App, act: str) -> int {
 
 fn vars_action(a: mut App, act: str) -> int {
     if act == "vars-edit" {
-        a.degrade("session variable edit lands S11")
+        if a.vars.sel < len(a.var_rows) {
+            a.var_edit_name = var_row_name(a.var_rows[a.vars.sel])
+            a.var_edit = new_line_edit(var_row_value(a, a.var_edit_name))
+            push_modal(a, MVarEdit)
+        }
     } else if act == "vars-add" {
-        a.degrade("session variable add lands S11")
+        a.var_edit_name = ""
+        a.var_edit = new_line_edit("")
+        push_modal(a, MVarEdit)
     } else if act == "vars-revert" {
-        a.degrade("revert override — env files land S11")
+        if a.vars.sel < len(a.var_rows) {
+            n := var_row_name(a.var_rows[a.vars.sel])
+            if session_unset(a, n) {
+                a.toast(1, n + " reverted to env file value")
+            } else {
+                a.toast(0, n + " has no session override")
+            }
+        }
     } else if act == "vars-filter" {
         a.vars_filtering = true
     } else if act == "vars-reveal" {

@@ -121,8 +121,8 @@ fn fill_row(scr: mut term.AnsiScreen, x: int, y: int, w: int, ch: str, fg: int, 
 }
 
 // draw_pane draws an ascii frame + title; focused panes get a bold
-// cyan title, idle panes a dim one.
-fn draw_pane(scr: mut term.AnsiScreen, x: int, y: int, w: int, h: int, title: str, focused: bool) {
+// title in the theme's primary colour (pc), idle panes a dim one.
+fn draw_pane(scr: mut term.AnsiScreen, x: int, y: int, w: int, h: int, title: str, focused: bool, pc: int) {
     if w < 3 || h < 3 {
         return
     }
@@ -130,7 +130,7 @@ fn draw_pane(scr: mut term.AnsiScreen, x: int, y: int, w: int, h: int, title: st
     tf := 7
     if focused {
         ta = term.AttrBold
-        tf = 6
+        tf = pc
     }
     i := 0
     for i < w {
@@ -154,17 +154,27 @@ fn draw_pane(scr: mut term.AnsiScreen, x: int, y: int, w: int, h: int, title: st
 }
 
 fn render_header(a: ref App, scr: mut term.AnsiScreen, ver: str) {
-    host := os.getenv("HOSTNAME")
-    user := os.getenv("USER")
     env := a.env_name
     if len(env) == 0 {
         env = "(none)"
     }
-    s := " oxttp-tui " + ver + " · env " + env
-    if len(user) > 0 && len(host) > 0 {
-        s = s + " · " + user + "@" + host
+    // heading.*: visible gates the row; hostname text replaces the
+    // composition wholesale; show_version/show_host trim the pieces.
+    s := " oxttp-tui"
+    if a.heading_ver {
+        s = s + " " + ver
     }
-    put_str(scr, 0, 0, s, 6, term.AttrBold)
+    s = s + " · env " + env
+    if len(a.heading_hostname) > 0 {
+        s = s + " · " + a.heading_hostname
+    } else if a.heading_host {
+        host := os.getenv("HOSTNAME")
+        user := os.getenv("USER")
+        if len(user) > 0 && len(host) > 0 {
+            s = s + " · " + user + "@" + host
+        }
+    }
+    put_str(scr, 0, 0, s, a.theme.secondary, term.AttrBold)
 }
 
 fn render_url_bar(a: mut App, scr: mut term.AnsiScreen, cols: int) {
@@ -189,15 +199,30 @@ fn render_url_bar(a: mut App, scr: mut term.AnsiScreen, cols: int) {
         off = g0
         j = g0
     }
-    put_str_max(scr, 1, 1, "[" + a.method + "]", mw - 1, 5, term.AttrBold)
+    put_str_max(scr, 1, 1, "[" + a.method + "]", mw - 1, a.theme.accent, term.AttrBold)
     put_str_max(scr, mw + 2, 1, substr(a.url.text, off, len(a.url.text)), avail, 7, 0)
-    prev := url_preview(a)
-    put_str_max(scr, 2, 2, "→ " + prev, cols - 4, 7, term.AttrDim)
+    // url_bar.show_value_preview=false hides the substituted preview.
+    if a.url_preview_on {
+        prev := url_preview(a)
+        put_str_max(scr, 2, 2, "→ " + prev, cols - 4, 7, term.AttrDim)
+    }
     fill_row(scr, 0, 3, cols, "-", 7, term.AttrDim)
-    // url focus shows the text cursor inside the bar — vis counts the
-    // display columns between the window start and the insertion
-    // point, so cx tracks the scrolled text.
-    if a.focus == FUrl {
+    // $-suggestions float under the bar while the list is live.
+    if a.vsug_on {
+        ns := vsug_names(a)
+        i := 0
+        for i < len(ns) && i < 5 {
+            a2 := 0
+            if i == a.vsug_sel {
+                a2 = term.AttrReverse
+            }
+            put_str_max(scr, mw + 2, 3 + i, " " + ns[i] + " ", 24, a.theme.accent, a2)
+            i = i + 1
+        }
+    }
+    // text_input.blinking_cursor=false hides the cursor (no blink
+    // pulse — static-on otherwise, deviation).
+    if a.focus == FUrl && a.blink {
         cx := mw + 2 + vis
         if cx >= cols {
             cx = cols - 1
@@ -261,7 +286,7 @@ fn render_kv(scr: mut term.AnsiScreen, t: KVTable, x: int, y: int, w: int, h: in
 }
 
 fn render_sidebar(a: mut App, scr: mut term.AnsiScreen, x: int, y: int, w: int, h: int) {
-    draw_pane(scr, x, y, w, h, "collection", a.focus == FSidebar)
+    draw_pane(scr, x, y, w, h, "collection", a.focus == FSidebar, a.theme.primary)
     put_str_max(scr, x + 2, y + 1, a.env_name, w - 4, 3, 0)
     vis := a.coll.visible()
     i := 0
@@ -282,6 +307,20 @@ fn render_sidebar(a: mut App, scr: mut term.AnsiScreen, x: int, y: int, w: int, 
                 glyph = "▸ "
             }
         }
+        // nerd_fonts resolves icon slots on the sidebar glyphs only
+        // (deviation 15): folder/file get nerd glyphs, the ASCII
+        // fallback is the triangle set above.
+        if a.nerd_icons {
+            if n.is_dir {
+                if n.open {
+                    glyph = " "
+                } else {
+                    glyph = " "
+                }
+            } else {
+                glyph = " "
+            }
+        }
         a2 := 0
         f := 7
         if n.stub {
@@ -297,6 +336,27 @@ fn render_sidebar(a: mut App, scr: mut term.AnsiScreen, x: int, y: int, w: int, 
     if a.coll_searching {
         put_str_max(scr, x + 1, y + h - 2, "/" + a.coll_search.text, w - 2, 3, 0)
     }
+    // sidebar_gradient: off = nothing; else a right-edge ramp in the
+    // gradient theme's primary — top cells lit, bottom dim (the
+    // ANSI-8 "gradient" is a dim-ramp approximation, deviation 3).
+    if a.gradient != 1 && w > 6 && h > 4 {
+        gc := a.theme.primary
+        if a.gradient == 2 {
+            [gt, ge] = theme_lookup(a, a.gradient_name)
+            if ge == nil {
+                gc = gt.primary
+            }
+        }
+        i = 0
+        for i < h - 2 {
+            ga := 0
+            if i > (h - 2) / 2 {
+                ga = term.AttrDim
+            }
+            scr.set_cell(x + w - 2, y + 1 + i, "┃", gc, -1, ga)
+            i = i + 1
+        }
+    }
 }
 
 fn render_req_pane(a: mut App, scr: mut term.AnsiScreen, x: int, y: int, w: int, h: int) {
@@ -304,7 +364,7 @@ fn render_req_pane(a: mut App, scr: mut term.AnsiScreen, x: int, y: int, w: int,
     title := "request"
     names := req_tabs(a.kind)
     cur := names[a.req_tab]
-    draw_pane(scr, x, y, w, h, title + " · " + cur, focused)
+    draw_pane(scr, x, y, w, h, title + " · " + cur, focused, a.theme.primary)
     render_tabstrip(scr, x, y + 1, w, names, a.req_tab, a.focus == FReqTabs)
     cy := y + 2
     ch := h - 3
@@ -378,7 +438,7 @@ fn render_resp_pane(a: mut App, scr: mut term.AnsiScreen, x: int, y: int, w: int
     if len(title) == 0 {
         title = "response"
     }
-    draw_pane(scr, x, y, w, h, title, focused)
+    draw_pane(scr, x, y, w, h, title, focused, a.theme.primary)
     // status class tints the title: green 2xx, yellow 3xx, red else
     if !a.sending && a.resp_class >= 0 {
         tf := 2
@@ -497,7 +557,7 @@ fn draw_modal(scr: mut term.AnsiScreen, cols: int, rows: int, w: int, h: int, ti
         fill_row(scr, x, y + j, w, " ", 7, 0)
         j = j + 1
     }
-    draw_pane(scr, x, y, w, h, title, true)
+    draw_pane(scr, x, y, w, h, title, true, 7)
     r := mkslice(int, 4)
     r[0] = x
     r[1] = y
@@ -514,7 +574,7 @@ fn render_modal(a: mut App, scr: mut term.AnsiScreen, cols: int, rows: int) {
     if m == MHelp {
         r := draw_modal(scr, cols, rows, 56, 18, "help")
         put_str(scr, r[0] + 2, r[1] + 2, "global keys:", 6, term.AttrBold)
-        gs := global_bindings()
+        gs := global_bindings(a)
         i := 0
         for i < len(gs) && i < 12 {
             b := gs[i]
@@ -647,6 +707,67 @@ fn render_modal(a: mut App, scr: mut term.AnsiScreen, cols: int, rows: int) {
     }
     if m == MJump {
         put_str(scr, 2, rows - 2, "jump: s sidebar · u url · m method · q request · w response", 3, term.AttrBold)
+        return
+    }
+    if m == MTheme || m == MGradient {
+        rows2 := th_rows(a, m)
+        h := 4 + len(rows2)
+        if h > 20 {
+            h = 20
+        }
+        ttl := "theme"
+        if m == MGradient {
+            ttl = "sidebar gradient"
+        }
+        r := draw_modal(scr, cols, rows, 44, h, ttl)
+        vis := r[3] - 3
+        if vis < 1 {
+            vis = 1
+        }
+        off := 0
+        if a.th_sel >= off + vis {
+            off = a.th_sel - vis + 1
+        }
+        i := 0
+        for i < vis && off + i < len(rows2) {
+            rr := rows2[off + i]
+            a2 := 0
+            f := 7
+            if theme_row_is_header(rr) {
+                a2 = term.AttrDim
+                f = a.theme.secondary
+            }
+            if off + i == a.th_sel {
+                a2 = a2 | term.AttrReverse
+            }
+            put_str_max(scr, r[0] + 2, r[1] + 2 + i, rr, r[2] - 4, f, a2)
+            i = i + 1
+        }
+        return
+    }
+    if m == MCurl {
+        r := draw_modal(scr, cols, rows, 60, 7, "import curl")
+        put_str_max(scr, r[0] + 2, r[1] + 2, "> " + a.curl_in.text, r[2] - 4, 7, 0)
+        put_str(scr, r[0] + 2, r[1] + 4, "enter imports · escape closes", 7, term.AttrDim)
+        return
+    }
+    if m == MSaveResp {
+        r := draw_modal(scr, cols, rows, 44, 7, "save response")
+        put_str_max(scr, r[0] + 2, r[1] + 2, "file  " + a.sresp_in.text, r[2] - 4, 7, 0)
+        put_str(scr, r[0] + 2, r[1] + 4, "enter writes · exists → error", 7, term.AttrDim)
+        return
+    }
+    if m == MVarEdit {
+        ttl := "set variable"
+        if len(a.var_edit_name) == 0 {
+            ttl = "add variable (NAME=VALUE)"
+        }
+        r := draw_modal(scr, cols, rows, 44, 7, ttl)
+        lbl := "value "
+        if len(a.var_edit_name) == 0 {
+            lbl = "pair  "
+        }
+        put_str_max(scr, r[0] + 2, r[1] + 2, lbl + a.var_edit.text, r[2] - 4, 7, 0)
         return
     }
     if m == MEnvSwitch {

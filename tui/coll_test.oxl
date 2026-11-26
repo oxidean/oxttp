@@ -14,6 +14,7 @@ import "github.com/oxidean/oxttp/core/yaml"
 
 let COLL_FIXTURE = "tests/tui-fixtures/small-app"
 let COLL_SCRATCH = "/tmp/oxttp-tui-coll-test"
+let DATA_SCRATCH = "/tmp/oxttp-tui-data-test"
 
 // scratch_coll (re)builds a tiny collection tree: a folder with a
 // nested folder, one env file pair, and a malformed file.
@@ -37,6 +38,9 @@ fn scratch_coll() {
     rm_quiet(COLL_SCRATCH + "/my-new-req.posting.yaml")
     rm_quiet(COLL_SCRATCH + "/sub/deep.posting.yaml")
     rm_quiet(COLL_SCRATCH + "/sub")
+    // env-memory + history live under the data dir — wipe so
+    // earlier runs cannot leak remembered state into assertions
+    os.remove_all(DATA_SCRATCH)
 }
 
 fn rm_quiet(p: str) {
@@ -48,6 +52,7 @@ fn rm_quiet(p: str) {
 fn app_in(dir: str) -> own App {
     a := new_app()
     a.coll_dir = dir
+    a.data_dir = DATA_SCRATCH
     load_collection(a)
     a.toasts = mkslice(Toast, 0) // scan warns are not under test here
     return a
@@ -235,12 +240,16 @@ fn test_tree_delete() {
     pop_modal(a)
     testing.expect(!os.exists(COLL_SCRATCH+"/requests/zzz-bad.posting.yaml"), "file removed")
     testing.expect(node_idx(a, "zzz-bad") < 0, "row gone after reload")
-    // folder delete degrades — no modal
+    // folder delete asks "Delete <dir>/ and its contents?" then
+    // removes the whole subtree (corpus §5.1 — recursive delete).
     a.coll.cur = 0
-    n := len(a.toasts)
     tree_delete(a)
-    testing.expect_eq(len(a.modals), 0, "no confirm for folders")
-    testing.expect_eq(len(a.toasts), n + 1, "folder delete degrades")
+    testing.expect_eq(top_modal(a), MConfirm, "folder delete asks first")
+    testing.expect(find(a.confirm_msg, "and its contents") >= 0, "recursive wording")
+    confirm_yes(a)
+    pop_modal(a)
+    testing.expect(!os.exists(COLL_SCRATCH+"/requests"), "dir removed")
+    testing.expect(node_idx(a, "nested") < 0, "subtree gone after reload")
 }
 
 fn test_save_request() {

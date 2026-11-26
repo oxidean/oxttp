@@ -1,0 +1,1368 @@
+package main
+
+// S11 app wiring — apply_settings field map, env dirs + layered
+// EnvSet builder ([cwd, coll, cfg] dirs, first-dir-wins names),
+// environments.json recall/remember, disk history (sha256 path, JSON
+// envelope, 100-entry / 50MiB caps), tool resolution (editor/pager +
+// POSTING_* env overrides), keymap rebind table, and the small modal
+// helpers (theme/gradient pickers, curl import, save-response, vars
+// edit/add/revert, $-suggestions, f3/f4 ext_cmd staging).
+
+import "std/os"
+
+import "std/errors"
+
+import "std/os/exec"
+
+import "std/encoding/json"
+
+import "std/encoding/hex"
+
+import "std/crypto/sha256"
+
+import "github.com/oxidean/oxttp/core/config"
+
+import "github.com/oxidean/oxttp/core/env"
+
+import "github.com/oxidean/oxttp/core/term"
+
+import "github.com/oxidean/oxttp/core/model"
+
+// ---------- dir seams ----------
+
+fn cfg_dir_of(a: ref App) -> str {
+    if len(a.cfg_dir) > 0 {
+        return a.cfg_dir
+    }
+    return config.config_dir()
+}
+
+fn data_dir_of(a: ref App) -> str {
+    if len(a.data_dir) > 0 {
+        return a.data_dir
+    }
+    return config.data_dir()
+}
+
+// ---------- env dirs + layered set ----------
+
+// env_dirs — upstream envDirs: [cwd, coll_dir, cfg_dir], deduped +
+// empties dropped.
+fn env_dirs(a: ref App) -> []str {
+    let out: []str = nil
+    i := 0
+    for i < 3 {
+        d := a.cwd
+        if i == 1 {
+            d = a.coll_dir
+        } else if i == 2 {
+            d = cfg_dir_of(a)
+        }
+        if len(d) > 0 {
+            seen := false
+            j := 0
+            for j < len(out) {
+                if out[j] == d {
+                    seen = true
+                }
+                j = j + 1
+            }
+            if !seen {
+                out = push(out, d)
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// env_load_file — env.load_into's logic re-exposed (the package fn is
+// private; ours names the file for the warn string).
+fn env_load_file(s: ref env.EnvSet, path: str, name: str) {
+    if !os.exists(path) || os.isdir(path) {
+        return
+    }
+    text := os.readfile_(path)
+    [p, e] = env.parse_dotenv(text, s)
+    if e != nil {
+        s.warns = push(s.warns, "dotenv: " + name + ": " + errors.msg(e))
+        return
+    }
+    i := 0
+    for i < len(p.warns) {
+        s.warns = push(s.warns, p.warns[i])
+        i = i + 1
+    }
+    s.layers = push(s.layers, env.EnvLayer{name: name, source: "file", vars: p.vars})
+}
+
+// env_file_for — first dir in dirs holding <name>.env (upstream
+// env.Named first-dir-wins). "" when no dir has it.
+fn env_file_for(dirs: []str, name: str) -> str {
+    i := 0
+    for i < len(dirs) {
+        p := dirs[i] + "/" + name + ".env"
+        if os.exists(p) && !os.isdir(p) {
+            return p
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// env_names_dirs — merged named-env list across the dirs (the env
+// switcher's pick list); "posting" never names an env.
+fn env_names_dirs(dirs: []str) -> []str {
+    let out: []str = nil
+    i := 0
+    for i < len(dirs) {
+        if !os.isdir(dirs[i]) {
+            i = i + 1
+            continue
+        }
+        names := os.ls(dirs[i])
+        j := 0
+        for j < len(names) {
+            n := names[j]
+            if len(n) > 4 && substr(n, len(n) - 4, len(n)) == ".env" {
+                stem := substr(n, 0, len(n) - 4)
+                if len(stem) > 6 && substr(stem, len(stem) - 6, len(stem)) == ".local" {
+                    stem = substr(stem, 0, len(stem) - 6)
+                }
+                if stem != "posting" && len(stem) > 0 {
+                    seen := false
+                    k := 0
+                    for k < len(out) {
+                        if out[k] == stem {
+                            seen = true
+                        }
+                        k = k + 1
+                    }
+                    if !seen {
+                        out = push(out, stem)
+                    }
+                }
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// env_files_for — the file stack a named-env pick loads: per dir the
+// base files (posting.env, posting.local.env) in dir order, then each
+// active name's first-dir-wins file (+ its .local.env sibling).
+fn env_files_for(dirs: []str, active: []str) -> []str {
+    let out: []str = nil
+    i := 0
+    for i < len(dirs) {
+        b := dirs[i] + "/posting.env"
+        if os.exists(b) && !os.isdir(b) {
+            out = push(out, b)
+        }
+        l := dirs[i] + "/posting.local.env"
+        if os.exists(l) && !os.isdir(l) {
+            out = push(out, l)
+        }
+        i = i + 1
+    }
+    i = 0
+    for i < len(active) {
+        f := env_file_for(dirs, active[i])
+        if len(f) > 0 {
+            out = push(out, f)
+            loc := substr(f, 0, len(f) - 4) + ".local.env"
+            if os.exists(loc) && !os.isdir(loc) {
+                out = push(out, loc)
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// env_set_dirs — env.build_set over the dirs list: every dir's base
+// files layer in dir order; each active name resolves first-dir-wins;
+// the session layer sits on top.
+fn env_set_dirs(dirs: []str, active: []str, session: []model.KV) -> own env.EnvSet {
+    s := new(env.EnvSet)
+    i := 0
+    for i < len(dirs) {
+        env_load_file(s, dirs[i] + "/posting.env", "posting.env")
+        env_load_file(s, dirs[i] + "/posting.local.env", "posting.local.env")
+        i = i + 1
+    }
+    i = 0
+    for i < len(active) {
+        f := env_file_for(dirs, active[i])
+        if len(f) > 0 {
+            env_load_file(s, f, active[i] + ".env")
+            loc := substr(f, 0, len(f) - 4) + ".local.env"
+            env_load_file(s, loc, active[i] + ".local.env")
+        }
+        i = i + 1
+    }
+    if len(session) > 0 {
+        s.layers = push(s.layers, env.EnvLayer{name: "session", source: "session", vars: session})
+    }
+    return s
+}
+
+// rebuild_env — the resolved set after any env-state change.
+fn rebuild_env(a: mut App) {
+    ds := env_dirs(a)
+    a.env = env_set_dirs(ds, a.env_active, a.session_vars)
+    a.env_files = env_files_for(ds, a.env_active)
+}
+
+// ---------- environments.json memory ----------
+
+// env_memory_path — <data>/environments.json: {"<abs-coll>":
+// {"name":n,"dir":d}} (upstream file shape verbatim).
+fn env_memory_path(a: ref App) -> str {
+    return data_dir_of(a) + "/environments.json"
+}
+
+// remember_recall — the remembered env name for THIS collection dir
+// ("" = none remembered / entry missing).
+fn remember_recall(a: ref App) -> str {
+    f := env_memory_path(a)
+    if !os.exists(f) {
+        return ""
+    }
+    j := json.jparse(os.readfile_(f))
+    if j == nil || j.kind != 4 {
+        return ""
+    }
+    rec := json.jget(j, os.fullpath(a.coll_dir))
+    if rec == nil {
+        return ""
+    }
+    nm := json.jget(rec, "name")
+    if nm == nil {
+        return ""
+    }
+    return nm.s
+}
+
+// remember_save — persist the active pick: name "" deletes the entry
+// (upstream "none" remembers nothing). tmp+rename like history.
+fn remember_save(a: ref App, name: str) {
+    f := env_memory_path(a)
+    dir := data_dir_of(a)
+    obj := json.jobj()
+    if os.exists(f) {
+        j := json.jparse(os.readfile_(f))
+        if j != nil && j.kind == 4 {
+            obj = j
+        }
+    }
+    key := os.fullpath(a.coll_dir)
+    // rebuild the member list — replace the key in place when present,
+    // drop it on "none", append when absent.
+    keep := json.jobj()
+    hit := false
+    m := obj.child
+    for m != nil {
+        if m.key == key {
+            hit = true
+            if len(name) > 0 {
+                rec := json.jobj()
+                json.jadd(rec, "name", json.jstr(name))
+                json.jadd(rec, "dir", json.jstr(a.coll_dir))
+                json.jadd(keep, key, rec)
+            }
+        } else {
+            json.jadd(keep, m.key, json.jclone(m))
+        }
+        m = m.next
+    }
+    if !hit && len(name) > 0 {
+        rec := json.jobj()
+        json.jadd(rec, "name", json.jstr(name))
+        json.jadd(rec, "dir", json.jstr(a.coll_dir))
+        json.jadd(keep, key, rec)
+    }
+    obj = keep
+    if !os.isdir(dir) {
+        os.mkdir_all(dir)
+    }
+    tmp := f + ".tmp"
+    n := os.writefile_(tmp, json.tojson(obj) + "\n")
+    if n >= 0 {
+        os.rename(tmp, f)
+    }
+}
+
+// ---------- disk history ----------
+// <data>/history/<sha256hex(abs-coll)>.json — {"version":1,
+// "next_id":N,"entries":[...]}. Entries carry our shape; a tolerant
+// loader also maps upstream entries ({Request,Response} blocks) so a
+// posting-2 history file still reads (deviation: foreign entries drop
+// on rewrite — no RawMessage carry-through). `.lock` is create/remove
+// advisory only (no flock; 0700/0600 perms unavailable).
+
+let HistMaxEntries = 100
+let HistMaxBytes = 52428800
+
+fn hist_file_of(a: ref App) -> str {
+    abs := os.fullpath(a.coll_dir)
+    h := sha256.new()
+    b := abs as []byte
+    [_, _we] = h.write(b)
+    dig := h.sum(mkslice(byte, 0))
+    return data_dir_of(a) + "/history/" + hex.encode(dig) + ".json"
+}
+
+// jstr_of pulls member key's string ("" when absent/non-string).
+fn jstr_of(j: ref json.Json, key: str) -> str {
+    v := json.jget(j, key)
+    if v == nil {
+        return ""
+    }
+    return v.s
+}
+
+fn jint_of(j: ref json.Json, key: str) -> int {
+    v := json.jget(j, key)
+    if v == nil {
+        return 0
+    }
+    return v.i
+}
+
+fn jfloat_of(j: ref json.Json, key: str) -> float {
+    v := json.jget(j, key)
+    if v == nil {
+        return 0.0
+    }
+    if v.kind == 2 {
+        return itof(v.i)
+    }
+    return v.f
+}
+
+fn jstrs_of(j: ref json.Json, key: str) -> []str {
+    let out: []str = nil
+    v := json.jget(j, key)
+    if v == nil || v.kind != 5 {
+        return out
+    }
+    m := v.child
+    for m != nil {
+        out = push(out, m.s)
+        m = m.next
+    }
+    return out
+}
+
+// hist_ent_json — the entry our files carry. `id` is the envelope
+// sequence; the rest is our HistEnt verbatim under short keys.
+fn hist_ent_json(he: HistEnt) -> own json.Json {
+    o := json.jobj()
+    json.jadd(o, "id", json.jint(he.id))
+    json.jadd(o, "title", json.jstr(he.title))
+    json.jadd(o, "method", json.jstr(he.method))
+    json.jadd(o, "url", json.jstr(he.url))
+    json.jadd(o, "status", json.jint(he.status))
+    json.jadd(o, "reason", json.jstr(he.reason))
+    json.jadd(o, "elapsed_ms", json.jfloat(he.elapsed_ms))
+    json.jadd(o, "size", json.jint(he.size))
+    json.jadd(o, "req_yaml", json.jstr(he.req_yaml))
+    json.jadd(o, "resp_text", json.jstr(he.resp_text))
+    hb := json.jarrb()
+    i := 0
+    for i < len(he.resp_hdr_rows) {
+        json.jarrb_add(hb, json.jstr(he.resp_hdr_rows[i]))
+        i = i + 1
+    }
+    json.jadd(o, "hdr", json.jarrb_arr(hb))
+    cb := json.jarrb()
+    i = 0
+    for i < len(he.resp_ck_rows) {
+        json.jarrb_add(cb, json.jstr(he.resp_ck_rows[i]))
+        i = i + 1
+    }
+    json.jadd(o, "ck", json.jarrb_arr(cb))
+    tb := json.jarrb()
+    i = 0
+    for i < len(he.resp_tr_rows) {
+        json.jarrb_add(tb, json.jstr(he.resp_tr_rows[i]))
+        i = i + 1
+    }
+    json.jadd(o, "tr", json.jarrb_arr(tb))
+    return o
+}
+
+// hist_ent_from — one JSON member → HistEnt. Accepts our keys first,
+// then the upstream {ID,Request,Response} shape so real posting-2
+// files still open (resp rows/body can't map → left empty).
+fn hist_ent_from(j: ref json.Json) -> HistEnt {
+    he := HistEnt{id: 0, title: "", method: "", url: "", status: 0,
+        reason: "", elapsed_ms: 0.0, size: 0, req_yaml: "", resp_text: "",
+        resp_hdr_rows: nil, resp_ck_rows: nil, resp_tr_rows: nil}
+    if j == nil {
+        return he
+    }
+    he.id = jint_of(j, "id")
+    if he.id == 0 {
+        he.id = jint_of(j, "ID")
+    }
+    if json.jget(j, "method") != nil || json.jget(j, "req_yaml") != nil {
+        he.title = jstr_of(j, "title")
+        he.method = jstr_of(j, "method")
+        he.url = jstr_of(j, "url")
+        he.status = jint_of(j, "status")
+        he.reason = jstr_of(j, "reason")
+        he.elapsed_ms = jfloat_of(j, "elapsed_ms")
+        he.size = jint_of(j, "size")
+        he.req_yaml = jstr_of(j, "req_yaml")
+        he.resp_text = jstr_of(j, "resp_text")
+        he.resp_hdr_rows = jstrs_of(j, "hdr")
+        he.resp_ck_rows = jstrs_of(j, "ck")
+        he.resp_tr_rows = jstrs_of(j, "tr")
+        return he
+    }
+    // upstream shape: {ID, Request:{Name,Method,URL},
+    // Response:{StatusCode,Reason,Headers:[{Name,Value}],Body}}
+    rq := json.jget(j, "Request")
+    rp := json.jget(j, "Response")
+    if rq != nil {
+        he.title = jstr_of(rq, "Name")
+        he.method = jstr_of(rq, "Method")
+        he.url = jstr_of(rq, "URL")
+    }
+    if rp != nil {
+        he.status = jint_of(rp, "StatusCode")
+        he.reason = jstr_of(rp, "Reason")
+        hs := json.jget(rp, "Headers")
+        if hs != nil && hs.kind == 5 {
+            m := hs.child
+            for m != nil {
+                he.resp_hdr_rows = push(he.resp_hdr_rows, jstr_of(m, "Name") + ": " + jstr_of(m, "Value"))
+                m = m.next
+            }
+        }
+    }
+    return he
+}
+
+// HistLoad is hist_read's pair — entries (oldest-first) + envelope
+// next_id (1 when the file is missing/foreign).
+struct HistLoad {
+    ents: []HistEnt,
+    next_id: int,
+}
+
+fn hist_read(f: str) -> HistLoad {
+    hl := HistLoad{ents: nil, next_id: 1}
+    if !os.exists(f) {
+        return hl
+    }
+    j := json.jparse(os.readfile_(f))
+    if j == nil || j.kind != 4 {
+        return hl
+    }
+    hl.next_id = jint_of(j, "next_id")
+    if hl.next_id <= 0 {
+        // no envelope counter — derive from the max id we read.
+        hl.next_id = 1
+        arr := json.jget(j, "entries")
+        if arr != nil && arr.kind == 5 {
+            m := arr.child
+            for m != nil {
+                e := hist_ent_from(m)
+                if e.id >= hl.next_id {
+                    hl.next_id = e.id + 1
+                }
+                hl.ents = push(hl.ents, e)
+                m = m.next
+            }
+        }
+        return hl
+    }
+    arr := json.jget(j, "entries")
+    if arr != nil && arr.kind == 5 {
+        m := arr.child
+        for m != nil {
+            hl.ents = push(hl.ents, hist_ent_from(m))
+            m = m.next
+        }
+    }
+    return hl
+}
+
+// hist_write — the full rewrite: envelope + entries, tmp + rename.
+// Trims to MaxEntries newest first, then MaxBytes newest-fitting
+// (sizes measured on the marshaled entry, like upstream).
+fn hist_write(a: mut App, f: str, ents: []HistEnt, next_id: int) {
+    for len(ents) > HistMaxEntries {
+        ents = ents[1:]
+    }
+    // build the array first so byte-fit measures real marshal size.
+    eb := json.jarrb()
+    total := 0
+    i := 0
+    for i < len(ents) {
+        ej := hist_ent_json(ents[i])
+        sz := len(json.tojson(ej))
+        json.jarrb_add(eb, ej)
+        total = total + sz
+        i = i + 1
+    }
+    // drop from the FRONT until the marshal fits — newest fitting.
+    for total > HistMaxBytes && eb.arr.child != nil {
+        drop := eb.arr.child
+        eb.arr.child = drop.next
+        sz := len(json.tojson(drop))
+        total = total - sz
+    }
+    o := json.jobj()
+    json.jadd(o, "version", json.jint(1))
+    json.jadd(o, "next_id", json.jint(next_id))
+    json.jadd(o, "entries", json.jarrb_arr(eb))
+    dir := data_dir_of(a) + "/history"
+    if !os.isdir(dir) {
+        os.mkdir_all(dir)
+    }
+    tmp := f + ".tmp"
+    n := os.writefile_(tmp, json.tojson(o) + "\n")
+    if n >= 0 {
+        os.rename(tmp, f)
+    }
+}
+
+// hist_load — populate a.history from the per-collection file when
+// disk history is enabled. Memory-only stays a no-op.
+fn hist_load(a: mut App) {
+    if !a.hist_disk {
+        return
+    }
+    hl := hist_read(hist_file_of(a))
+    a.history = hl.ents
+}
+
+// hist_append — fold the newest entry into the disk file. In-memory
+// list updates unconditionally; the file write is hist_disk-gated.
+fn hist_append(a: mut App, he: HistEnt) {
+    if !a.hist_disk {
+        return
+    }
+    f := hist_file_of(a)
+    lock := f + ".lock"
+    // advisory lock sidecar — create/remove best-effort, never blocks.
+    os.writefile_(lock, "")
+    hl := hist_read(f)
+    he.id = hl.next_id
+    hl.ents = push(hl.ents, he)
+    hist_write(a, f, hl.ents, hl.next_id + 1)
+    os.remove(lock)
+}
+
+// ---------- tools (f3 pager / f4 editor) ----------
+
+// resolve_tools — config editor/pager/pager_json, POSTING_* env wins.
+fn resolve_tools(a: mut App) {
+    a.editor = a.st.editor
+    a.pager = a.st.pager
+    a.pager_json = a.st.pager_json
+    v := os.getenv("POSTING_EDITOR")
+    if len(v) > 0 {
+        a.editor = v
+    }
+    v = os.getenv("POSTING_PAGER")
+    if len(v) > 0 {
+        a.pager = v
+    }
+    v = os.getenv("POSTING_PAGER_JSON")
+    if len(v) > 0 {
+        a.pager_json = v
+    }
+}
+
+// ext_stage — write text to a temp file and stage `cmd file` for the
+// loop's EExt arm; empty cmd toasts the corpus message.
+fn ext_stage(a: mut App, cmd: str, text: str, ext: str) -> int {
+    if len(cmd) == 0 {
+        a.toast(2, "f3/f4: no pager/editor configured")
+        return ENone
+    }
+    f := os.temp_dir() + "/posting-body" + ext
+    n := os.writefile_(f, text)
+    if n < 0 {
+        a.toast(2, "temp file failed")
+        return ENone
+    }
+    a.ext_cmd = cmd + " " + f
+    return EExt
+}
+
+// run_ext — the loop's EExt arm: suspend the session, run the staged
+// command under /bin/sh, resume + toast the outcome. Exists as a fn
+// so tests can call the staging path without a tty.
+fn run_ext(a: mut App, sess: mut term.Session) {
+    cl := a.ext_cmd
+    a.ext_cmd = ""
+    sess.suspend()
+    args := mkslice(str, 2)
+    args[0] = "-c"
+    args[1] = cl
+    cm := exec.cmd("sh", args)
+    [st, ee] = cm.run()
+    sess.resume()
+    if ee != nil {
+        a.toast(2, "exec: " + errors.msg(ee))
+        return
+    }
+    if st != 0 {
+        a.toast(2, cl + ": exit " + itoa(st))
+    }
+}
+
+// ---------- keymap rebinds ----------
+
+// reb_action_ok — the 18 corpus §3 rebindable action ids.
+fn reb_action_ok(act: str) -> bool {
+    return act == "send-request" || act == "stream" || act == "jump" ||
+        act == "commands" || act == "save-request" || act == "new-request" ||
+        act == "close-tab" || act == "keep-tab" || act == "next-tab" ||
+        act == "previous-tab" || act == "search-tabs" ||
+        act == "search-requests" || act == "focus-url" ||
+        act == "focus-method" || act == "toggle-collection" ||
+        act == "expand-section" || act == "variables" || act == "help"
+}
+
+// rebind_apply — a.st.keymap entries replace the action's default
+// keys wholesale. Unknown action ids warn; any unparseable spec in an
+// entry warns and skips the whole entry (defaults stay).
+fn rebind_apply(a: mut App) {
+    a.reb_specs = nil
+    a.reb_actions = nil
+    if a.st == nil {
+        return
+    }
+    i := 0
+    for i < len(a.st.keymap) {
+        kv := a.st.keymap[i]
+        if !reb_action_ok(kv.name) {
+            a.toast(2, "keymap: unknown action " + kv.name)
+            i = i + 1
+            continue
+        }
+        specs := mkslice(str, 0)
+        rest := kv.value
+        for len(rest) > 0 {
+            part := rest
+            c := find(rest, ",")
+            if c >= 0 {
+                part = substr(rest, 0, c)
+                rest = substr(rest, c + 1, len(rest))
+            } else {
+                rest = ""
+            }
+            part = trim_ws(lower_ascii(part))
+            if len(part) > 0 {
+                specs = push(specs, part)
+            }
+        }
+        bad := ""
+        j := 0
+        for j < len(specs) {
+            [_, pe] = parse_key(specs[j])
+            if pe != nil {
+                bad = errors.msg(pe)
+            }
+            j = j + 1
+        }
+        if len(bad) > 0 {
+            a.toast(2, "keymap: " + kv.name + " " + bad)
+            i = i + 1
+            continue
+        }
+        j = 0
+        for j < len(specs) {
+            a.reb_actions = push(a.reb_actions, kv.name)
+            a.reb_specs = push(a.reb_specs, specs[j])
+            j = j + 1
+        }
+        i = i + 1
+    }
+}
+
+// reb_specs_for — custom specs bound to action ([] = defaults apply).
+fn reb_specs_for(a: ref App, action: str) -> []str {
+    let out: []str = nil
+    i := 0
+    for i < len(a.reb_actions) {
+        if a.reb_actions[i] == action {
+            out = push(out, a.reb_specs[i])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ---------- apply_settings ----------
+
+// apply_settings — the corpus §2.2 field map. Runs after collection
+// load? No — BEFORE it: sidebar_on/show_on_startup and focus.on_start
+// feed the first paint. Startup warns toast at error level (upstream
+// puts settings problems in red toasts).
+fn apply_settings(a: mut App, st: own config.Settings) {
+    a.st = st
+    s := a.st
+    // user themes first — theme_lookup consults them.
+    if s.load_user_themes {
+        sc := scan_user_themes(config.theme_dir(s))
+        a.user_themes = sc.themes
+        i := 0
+        for i < len(sc.problems) {
+            a.toast(2, sc.problems[i])
+            i = i + 1
+        }
+    } else {
+        a.user_themes = nil
+    }
+    // theme → alias → catalog/user lookup → apply; unknown warns.
+    tn := theme_alias(s.theme)
+    [t, te] = theme_lookup(a, tn)
+    if te != nil {
+        a.toast(2, "Unknown theme \"" + tn + "\"; using galaxy")
+        tn = "galaxy"
+        [t2, _e2] = theme_lookup(a, tn)
+        t = t2
+    }
+    a.theme = t
+    a.theme_name = tn
+    // sidebar_gradient: theme | off | <name> (post-alias), else warn.
+    g := s.sidebar_gradient
+    if g == "theme" || len(g) == 0 {
+        a.gradient = 0
+        a.gradient_name = ""
+    } else if g == "off" {
+        a.gradient = 1
+        a.gradient_name = "off"
+    } else {
+        gn := theme_alias(g)
+        [_, ge] = theme_lookup(a, gn)
+        if ge != nil {
+            a.toast(2, "Unknown sidebar gradient \"" + g + "\"; following app theme")
+            a.gradient = 0
+            a.gradient_name = ""
+        } else {
+            a.gradient = 2
+            a.gradient_name = gn
+        }
+    }
+    a.nerd_icons = use_nerd_fonts(s.nerd_fonts,
+        os.getenv("TERM_PROGRAM"), os.getenv("TERM"),
+        os.getenv("GHOSTTY_RESOURCES_DIR"))
+    a.blink = s.text_input_blinking_cursor
+    a.heading_on = s.heading_visible
+    a.heading_host = s.heading_show_host
+    a.heading_ver = s.heading_show_version
+    a.heading_hostname = strip_markup(s.heading_hostname)
+    a.url_preview_on = s.url_bar_show_value_preview
+    a.url_mask_secrets = s.url_bar_hide_secrets_in_value_preview
+    a.focus_open = s.focus_on_request_open
+    a.focus_resp = s.focus_on_response
+    a.focus_start = s.focus_on_startup
+    a.resp_prettify = s.response_prettify_json
+    a.resp_size_time = s.response_show_size_and_time
+    a.hist_disk = s.history_enabled
+    if s.layout == "horizontal" {
+        a.layout = 1
+    } else {
+        a.layout = 0
+    }
+    a.sidebar_pos = 0
+    if s.collection_browser_position == "right" {
+        a.sidebar_pos = 1
+    }
+    a.sidebar_on = s.collection_browser_show_on_startup
+    a.ssl_ca = s.ssl_ca_bundle
+    a.ssl_cert = s.ssl_certificate_path
+    a.ssl_key = s.ssl_key_file
+    a.ssl_pass = s.ssl_password
+    a.curl_args = s.curl_export_extra_args
+    a.theme_preview = s.command_palette_theme_preview
+    resolve_tools(a)
+    rebind_apply(a)
+    if s.remote_control_enabled {
+        a.toast(2, "posting remote won't work: unix sockets unsupported in this build")
+    }
+    if s.use_host_environment {
+        a.toast(2, "use_host_environment: host env merge unsupported in this build")
+    }
+    // focus.on_startup: url | method | collection → focus targets.
+    if s.focus_on_startup == "method" {
+        a.focus = FMethod
+    } else if s.focus_on_startup == "collection" {
+        a.focus = FSidebar
+    } else {
+        a.focus = FUrl
+    }
+}
+
+// strip_markup — heading.hostname's [b]…[/] markup renders literal
+// (deviation: we drop the tags rather than styling them).
+fn strip_markup(s: str) -> str {
+    return str_replace(str_replace(s, "[b]", ""), "[/]", "")
+}
+
+// focus_for_name — focus.on_request_open's pane names → focus target
+// (+ request tab index via out-param style return: negative = url/
+// method-level focus).
+fn focus_for_name(name: str) -> int {
+    if name == "url" {
+        return FUrl
+    }
+    if name == "method" {
+        return FMethod
+    }
+    if name == "collection" {
+        return FSidebar
+    }
+    if name == "headers" || name == "body" || name == "path" ||
+        name == "query" || name == "info" || name == "auth" ||
+        name == "options" {
+        return FReqPane
+    }
+    return -1
+}
+
+// req_tab_for_name — request-pane focus names → req_tab index.
+fn req_tab_for_name(name: str) -> int {
+    ts := req_tabs(KHttp)
+    i := 0
+    for i < len(ts) {
+        if ascii_eq(ts[i], name) {
+            return i
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ---------- theme / gradient pickers ----------
+
+// picker rows are strs; header rows start with "─". th_sel is the
+// cursor ROW index (headers skipped on move).
+
+fn theme_row_is_header(r: str) -> bool {
+    return len(r) > 0 && byteat(r, 0) == 226
+}
+
+fn th_rows(a: ref App, m: int) -> []str {
+    if m == MGradient {
+        return gradient_rows(a)
+    }
+    return theme_rows(a)
+}
+
+// th_move walks the cursor past header rows.
+fn th_move(a: mut App, m: int, d: int) {
+    rows := th_rows(a, m)
+    if len(rows) == 0 {
+        return
+    }
+    i := a.th_sel + d
+    for i >= 0 && i < len(rows) && theme_row_is_header(rows[i]) {
+        i = i + d
+    }
+    if i < 0 || i >= len(rows) {
+        return
+    }
+    a.th_sel = i
+    // command_palette.theme_preview gates live apply on move.
+    if a.theme_preview {
+        th_apply_sel(a, m, false)
+    }
+}
+
+// th_apply_sel applies the cursor row — commit=true writes through to
+// the app state; commit=false is the live-preview path.
+fn th_apply_sel(a: mut App, m: int, commit: bool) {
+    rows := th_rows(a, m)
+    if a.th_sel < 0 || a.th_sel >= len(rows) {
+        return
+    }
+    name := rows[a.th_sel]
+    if m == MGradient {
+        gradient_apply(a, name)
+    } else {
+        theme_apply(a, name)
+    }
+}
+
+fn theme_apply(a: mut App, name: str) {
+    tn := theme_alias(name)
+    [t, e] = theme_lookup(a, tn)
+    if e != nil {
+        a.toast(2, "Unknown theme \"" + tn + "\"")
+        return
+    }
+    a.theme = t
+    a.theme_name = tn
+}
+
+fn gradient_apply(a: mut App, name: str) {
+    if name == "theme" {
+        a.gradient = 0
+        a.gradient_name = ""
+        return
+    }
+    if name == "off" {
+        a.gradient = 1
+        a.gradient_name = "off"
+        return
+    }
+    gn := theme_alias(name)
+    [_, e] = theme_lookup(a, gn)
+    if e != nil {
+        a.toast(2, "Unknown sidebar gradient \"" + name + "\"")
+        return
+    }
+    a.gradient = 2
+    a.gradient_name = gn
+}
+
+// th_open snapshots current state (escape-restore) and lands the
+// cursor on the active row.
+fn th_open(a: mut App, m: int) {
+    a.th_snap = a.theme
+    a.th_snap_name = a.theme_name
+    a.th_snap_grad = a.gradient
+    a.th_snap_gname = a.gradient_name
+    rows := th_rows(a, m)
+    a.th_sel = 0
+    cur := a.theme_name
+    if m == MGradient {
+        cur = "theme"
+        if a.gradient == 1 {
+            cur = "off"
+        } else if a.gradient == 2 {
+            cur = a.gradient_name
+        }
+    }
+    i := 0
+    for i < len(rows) {
+        if rows[i] == cur {
+            a.th_sel = i
+        }
+        i = i + 1
+    }
+    // never leave the cursor parked on a header row.
+    for a.th_sel < len(rows) && theme_row_is_header(rows[a.th_sel]) {
+        a.th_sel = a.th_sel + 1
+    }
+    if a.th_sel >= len(rows) {
+        a.th_sel = len(rows) - 1
+        for a.th_sel > 0 && theme_row_is_header(rows[a.th_sel]) {
+            a.th_sel = a.th_sel - 1
+        }
+    }
+}
+
+// th_close — escape restores the snapshot when preview mode applied
+// intermediate picks; commit keeps them.
+fn th_close(a: mut App, commit: bool) {
+    if !commit && a.theme_preview {
+        a.theme = a.th_snap
+        a.theme_name = a.th_snap_name
+        a.gradient = a.th_snap_grad
+        a.gradient_name = a.th_snap_gname
+    }
+    pop_modal(a)
+}
+
+// ---------- curl import ----------
+
+// apply_curl — import_curl → the tab's draft replaced (upstream
+// replaces the whole request; name/desc/file fields stay empty so the
+// tab title derives from method+url).
+fn apply_curl(a: mut App, cmd: str) {
+    [r, e] = import_curl(cmd)
+    if e != nil {
+        a.toast(2, "curl import: " + errors.msg(e))
+        return
+    }
+    t := r.name
+    if len(t) == 0 {
+        t = r.method
+        if len(t) == 0 {
+            t = "curl"
+        }
+        t = t + " " + r.url
+    }
+    d := draft_from_request(r, "")
+    if a.tabs[a.cur_tab].preview {
+        a.tabs[a.cur_tab].draft = d
+        a.tabs[a.cur_tab].title = t
+        draft_restore(a, d)
+    } else {
+        a.tabs = push(a.tabs, RTab{title: t, preview: true, draft: d})
+        tab_select(a, len(a.tabs) - 1)
+    }
+    a.focus = FUrl
+    a.toast(1, "curl imported")
+}
+
+// ---------- save response ----------
+
+// sresp_default — filename seed: the URL path's basename when it has
+// one, else "response".
+fn sresp_default(a: ref App) -> str {
+    u := a.url.text
+    p := find(u, "://")
+    if p >= 0 {
+        u = substr(u, p + 3, len(u))
+    }
+    // strip query+fragment
+    i := 0
+    for i < len(u) {
+        c := byteat(u, i)
+        if c == 63 || c == 35 {
+            u = substr(u, 0, i)
+            i = len(u)
+        }
+        i = i + 1
+    }
+    b := basename(u)
+    if len(b) == 0 || !str_contains(b, ".") {
+        return "response"
+    }
+    return b
+}
+
+// sresp_save — write the response body bytes; never overwrites.
+// true = written (modal pops); false = toasted (modal stays).
+fn sresp_save(a: mut App) -> bool {
+    f := a.sresp_in.text
+    if len(f) == 0 {
+        a.toast(2, "save response: filename required")
+        return false
+    }
+    if str_contains(f, "/") || str_contains(f, "..") {
+        a.toast(2, "save response: plain filename only")
+        return false
+    }
+    if os.exists(f) {
+        a.toast(2, "save response: " + f + " exists — never overwrites")
+        return false
+    }
+    body := join_lines(a.resp_view.lines)
+    n := os.writefile_(f, body)
+    if n < 0 {
+        a.toast(2, "save response: write failed")
+        return false
+    }
+    a.toast(1, "response → " + f)
+    return true
+}
+
+// ---------- variables screen ops ----------
+
+// session_set — upsert NAME=VALUE into a.session_vars + rebuild.
+fn session_set(a: mut App, name: str, value: str) {
+    i := 0
+    for i < len(a.session_vars) {
+        if a.session_vars[i].name == name {
+            a.session_vars[i].value = value
+            rebuild_env(a)
+            var_rows_build(a)
+            return
+        }
+        i = i + 1
+    }
+    a.session_vars = push(a.session_vars, model.KV{name: name, value: value, enabled: true})
+    rebuild_env(a)
+    var_rows_build(a)
+}
+
+// session_unset — drop a session override for name (d = "revert to
+// file value"); true when one existed.
+fn session_unset(a: mut App, name: str) -> bool {
+    out := mkslice(model.KV, 0)
+    hit := false
+    i := 0
+    for i < len(a.session_vars) {
+        if a.session_vars[i].name == name {
+            hit = true
+        } else {
+            out = push(out, a.session_vars[i])
+        }
+        i = i + 1
+    }
+    a.session_vars = out
+    if hit {
+        rebuild_env(a)
+        var_rows_build(a)
+    }
+    return hit
+}
+
+// var_row_name — row text "NAME = value [layer]" → NAME.
+fn var_row_name(row: str) -> str {
+    i := find(row, " = ")
+    if i < 0 {
+        i = find(row, "=")
+    }
+    if i < 0 {
+        return row
+    }
+    s := substr(row, 0, i)
+    // trim trailing space
+    for len(s) > 0 && byteat(s, len(s) - 1) == 32 {
+        s = substr(s, 0, len(s) - 1)
+    }
+    return s
+}
+
+// var_row_value — the display value (masked "••••" maps back to the
+// real session/env value for the edit seed — secrets stay masked in
+// the seed only when reveal is off).
+fn var_row_value(a: ref App, name: str) -> str {
+    if a.env == nil {
+        return ""
+    }
+    lr := a.env.lookup(name)
+    if !lr.ok {
+        return ""
+    }
+    if is_secret(name) && !a.vars_reveal {
+        return "••••"
+    }
+    return lr.value
+}
+
+// vars_commit — MVarEdit's enter: edit-mode writes the row's name;
+// add-mode parses "NAME=VALUE" (no '=' → toast, modal stays).
+fn vars_commit(a: mut App) -> bool {
+    v := a.var_edit.text
+    if len(a.var_edit_name) > 0 {
+        session_set(a, a.var_edit_name, v)
+        a.toast(1, a.var_edit_name + " set (session)")
+        return true
+    }
+    i := find(v, "=")
+    if i <= 0 {
+        a.toast(2, "variables: NAME=VALUE")
+        return false
+    }
+    session_set(a, substr(v, 0, i), substr(v, i + 1, len(v)))
+    a.toast(1, substr(v, 0, i) + " added (session)")
+    return true
+}
+
+// ---------- $-suggestions (url bar) ----------
+
+// vsug_names — env var names from every layer + session, deduped,
+// matching the prefix typed after the activating '$'.
+fn vsug_names(a: ref App) -> []str {
+    let out: []str = nil
+    // prefix = url text between '$' and the cursor.
+    if a.url.cur <= a.vsug_pos {
+        return out
+    }
+    pre := lower_ascii(substr(a.url.text, a.vsug_pos + 1, a.url.cur))
+    i := 0
+    for i < len(a.env.layers) {
+        ly := a.env.layers[i]
+        j := 0
+        for j < len(ly.vars) {
+            n := ly.vars[j].name
+            if (len(pre) == 0 || substr(lower_ascii(n), 0, len(pre)) == pre) && !str_in(out, n) {
+                out = push(out, n)
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn str_in(xs: []str, v: str) -> bool {
+    i := 0
+    for i < len(xs) {
+        if xs[i] == v {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// vsug_maybe_open — after a text mutation in the url bar, decide
+// whether the suggestion list is live (cursor sits after a '$' whose
+// text is still a var-name prefix).
+fn vsug_maybe_open(a: mut App) {
+    if a.focus != FUrl {
+        a.vsug_on = false
+        return
+    }
+    if a.vsug_on && a.url.cur <= a.vsug_pos {
+        a.vsug_on = false
+    }
+    if !a.vsug_on {
+        return
+    }
+    ns := vsug_names(a)
+    if len(ns) == 0 {
+        a.vsug_on = false
+        return
+    }
+    if a.vsug_sel >= len(ns) {
+        a.vsug_sel = len(ns) - 1
+    }
+}
+
+// vsug_start — a '$' just typed at the cursor opens the list.
+fn vsug_start(a: mut App) {
+    if a.env == nil {
+        return
+    }
+    a.vsug_pos = a.url.cur - 1
+    a.vsug_sel = 0
+    a.vsug_on = len(vsug_names(a)) > 0 || true
+    // open even when the unfiltered list would be empty-of-prefix —
+    // vsug_names with empty prefix lists everything.
+    a.vsug_on = len(vsug_names(a)) > 0
+}
+
+// vsug_dispatch — while the list is live, up/down/enter/escape are
+// consumed here; any other key returns false so normal url editing
+// proceeds (and re-filters).
+fn vsug_dispatch(a: mut App, ev: term.KeyEvent) -> bool {
+    if !a.vsug_on {
+        return false
+    }
+    if ev.key.kind() != 1 {
+        return false
+    }
+    nc := ev.key as term.Key.Named
+    if nc.code == term.KeyUp || nc.code == term.KeyDown {
+        ns := vsug_names(a)
+        if len(ns) == 0 {
+            a.vsug_on = false
+            return true
+        }
+        if nc.code == term.KeyUp {
+            a.vsug_sel = a.vsug_sel - 1
+        } else {
+            a.vsug_sel = a.vsug_sel + 1
+        }
+        if a.vsug_sel < 0 {
+            a.vsug_sel = 0
+        }
+        if a.vsug_sel >= len(ns) {
+            a.vsug_sel = len(ns) - 1
+        }
+        return true
+    }
+    if nc.code == term.KeyEnter {
+        ns := vsug_names(a)
+        if a.vsug_sel < len(ns) {
+            name := ns[a.vsug_sel]
+            // replace the '$'-to-cursor text with $NAME.
+            pre := substr(a.url.text, 0, a.vsug_pos)
+            post := substr(a.url.text, a.url.cur, len(a.url.text))
+            a.url.text = pre + "$" + name + post
+            a.url.cur = a.vsug_pos + 1 + len(name)
+        }
+        a.vsug_on = false
+        sync_path_kv(a)
+        return true
+    }
+    if nc.code == term.KeyEscape {
+        a.vsug_on = false
+        return true
+    }
+    return false
+}
+
+
+// ---------- single-line modal input (MCurl/MSaveResp/MVarEdit) ----------
+
+fn mline_char(a: mut App, m: int, ch: str) {
+    if m == MCurl {
+        a.curl_in.insert(ch)
+    } else if m == MSaveResp {
+        a.sresp_in.insert(ch)
+    } else {
+        a.var_edit.insert(ch)
+    }
+}
+
+// mline_action runs the shared named-key actions on the modal's
+// single LineEdit field. Field method calls need `a` mut — a mut
+// param can't bind a field, so the tiny switch is written per field.
+fn mline_action(a: mut App, m: int, act: str) {
+    if m == MCurl {
+        if act == "mline-backspace" {
+            a.curl_in.backspace()
+        } else if act == "mline-left" {
+            a.curl_in.move(a.curl_in.cur - 1, false)
+        } else if act == "mline-right" {
+            a.curl_in.move(a.curl_in.cur + 1, false)
+        } else if act == "mline-home" {
+            a.curl_in.move(0, false)
+        } else if act == "mline-end" {
+            a.curl_in.move(len(a.curl_in.text), false)
+        }
+    } else if m == MSaveResp {
+        if act == "mline-backspace" {
+            a.sresp_in.backspace()
+        } else if act == "mline-left" {
+            a.sresp_in.move(a.sresp_in.cur - 1, false)
+        } else if act == "mline-right" {
+            a.sresp_in.move(a.sresp_in.cur + 1, false)
+        } else if act == "mline-home" {
+            a.sresp_in.move(0, false)
+        } else if act == "mline-end" {
+            a.sresp_in.move(len(a.sresp_in.text), false)
+        }
+    } else {
+        if act == "mline-backspace" {
+            a.var_edit.backspace()
+        } else if act == "mline-left" {
+            a.var_edit.move(a.var_edit.cur - 1, false)
+        } else if act == "mline-right" {
+            a.var_edit.move(a.var_edit.cur + 1, false)
+        } else if act == "mline-home" {
+            a.var_edit.move(0, false)
+        } else if act == "mline-end" {
+            a.var_edit.move(len(a.var_edit.text), false)
+        }
+    }
+}
+
+// ---------- f3/f4 text sources ----------
+
+// body_text_for — the pane text f3/f4 pipes out: response view on the
+// response pane, request body elsewhere (corpus §8.4 runs on both).
+fn body_text_for(a: ref App) -> str {
+    if a.focus == FRespPane {
+        return join_lines(a.resp_view.lines)
+    }
+    return join_lines(a.body.lines)
+}
+
+// resp_body_json — the response's Content-Type advertises JSON (for
+// the pager_json swap). Header rows are "Name: value" strings.
+fn resp_body_json(a: ref App) -> bool {
+    i := 0
+    for i < len(a.resp_hdr_rows) {
+        h := a.resp_hdr_rows[i]
+        c := find(h, ":")
+        if c > 0 {
+            n := substr(h, 0, c)
+            if ascii_eq(n, "content-type") && str_contains(lower_ascii(h), "json") {
+                return true
+            }
+        }
+        i = i + 1
+    }
+    return false
+}

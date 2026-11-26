@@ -119,6 +119,7 @@ struct RDraft {
 // HistEnt is one in-memory history record (corpus §5.3 — S10 keeps
 // history session-only, cap 100, deviation listed in spec).
 struct HistEnt {
+    id: int,
     title: str,
     method: str,
     url: str,
@@ -290,6 +291,10 @@ struct App {
     st: own config.Settings, // loaded settings (nil until apply_settings)
     cwd: str,             // env/search root — os cwd at launch; tests override
     cfg_dir: str,         // config dir seam ("" → config.config_dir())
+    data_dir: str,        // data dir seam ("" → config.data_dir())
+    env_recalled: bool,   // remembered env applied at first load
+    exit_code: int,       // -h/-v/bad-flag exit paths (-1 = run the TUI)
+    exit_text: str,
     theme: Theme,         // resolved theme (ansi slots)
     theme_name: str,      // configured name after alias resolve
     gradient: int,        // 0 = theme, 1 = off, 2 = named
@@ -330,7 +335,10 @@ struct App {
     curl_in: LineEdit,    // import-curl modal input
     sresp_in: LineEdit,   // save-response modal input
     var_edit: LineEdit,   // variables-edit modal input
-    var_edit_name: str,
+    var_edit_name: str,   // edit-mode row name; "" = add-mode NAME=VALUE
+    vsug_on: bool,        // $-suggestion list live under the url bar
+    vsug_sel: int,
+    vsug_pos: int,        // url byte index of the activating '$'
     ext_cmd: str,         // pending external command (EExt effect)
 
     // hit-test rects cached from last render (mouse dispatch)
