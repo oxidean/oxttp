@@ -257,3 +257,51 @@ fn test_empty_containers_roundtrip() {
     testing.expect_eq(n2.pairs[ymap_idx(n2, "params")].val.kind, 2, "list survives")
     testing.expect_eq(n2.pairs[ymap_idx(n2, "xs")].val.items[0].kind, 1, "seq item map survives")
 }
+
+fn test_empty_flow_trailing_comment() {
+    // "{} # note" — a comment after the token must not push it into
+    // pscalar, which rejects the opening brace.
+    [n, e] = parse("graphql: {} # note\nparams: []   # c\n")
+    testing.expect(e == nil, "flow + comment parses")
+    testing.expect_eq(n.pairs[ymap_idx(n, "graphql")].val.kind, 1, "map kind")
+    testing.expect_eq(n.pairs[ymap_idx(n, "params")].val.kind, 2, "list kind")
+    // non-comment tails still reject
+    [n2, e2] = parse("graphql: {}junk\n")
+    testing.expect(e2 != nil, "trailing junk rejected")
+}
+
+fn test_block_scalar_unsafe_falls_back_dq() {
+    // Every line leading with spaces can't round-trip a block scalar —
+    // the min content indent is stripped on reload. Same for
+    // whitespace-only lines and a "\r" at end-of-line. Those emit as
+    // escaped double-quoted scalars instead.
+    root := new(YNode)
+    root.kind = 1
+    lead := new(YNode)
+    lead.kind = 0
+    lead.s = "  a\n  b\n"
+    root.pairs = push(root.pairs, YPair{key: "lead", val: lead})
+    ws := new(YNode)
+    ws.kind = 0
+    ws.s = "a\n   \nb\n"
+    root.pairs = push(root.pairs, YPair{key: "ws", val: ws})
+    cr := new(YNode)
+    cr.kind = 0
+    cr.s = "a\r\nb\n"
+    root.pairs = push(root.pairs, YPair{key: "cr", val: cr})
+    ok := new(YNode)
+    ok.kind = 0
+    ok.s = "a\n  b\n"
+    root.pairs = push(root.pairs, YPair{key: "ok", val: ok})
+    out := emit(root)
+    testing.expect(find(out, "lead: \"") >= 0, "indented emits double-quoted")
+    testing.expect(find(out, "ws: \"") >= 0, "ws-only line double-quoted")
+    testing.expect(find(out, "cr: \"") >= 0, "eol-cr double-quoted")
+    testing.expect(find(out, "ok: |") >= 0, "safe still block")
+    [n2, e2] = parse(out)
+    testing.expect(e2 == nil, "emit reparses")
+    testing.expect_streq(n2.pairs[ymap_idx(n2, "lead")].val.s, "  a\n  b\n", "leading kept")
+    testing.expect_streq(n2.pairs[ymap_idx(n2, "ws")].val.s, "a\n   \nb\n", "ws line kept")
+    testing.expect_streq(n2.pairs[ymap_idx(n2, "cr")].val.s, "a\r\nb\n", "cr kept")
+    testing.expect_streq(n2.pairs[ymap_idx(n2, "ok")].val.s, "a\n  b\n", "block rt")
+}

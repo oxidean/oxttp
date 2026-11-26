@@ -258,6 +258,29 @@ fn block_style(rest: str) -> BSt {
     return BSt{ok: true, style: style, chomp: chomp}
 }
 
+// empty_flow_kind recognizes a "{}" or "[]" token optionally followed
+// by a trailing " #comment" — returns the container kind (1 map,
+// 2 seq), or 0 when the text isn't an empty flow container.
+fn empty_flow_kind(rest: str) -> int {
+    if len(rest) < 2 {
+        return 0
+    }
+    kind := 0
+    if byteat(rest, 0) == 123 && byteat(rest, 1) == 125 {
+        kind = 1
+    } else if byteat(rest, 0) == 91 && byteat(rest, 1) == 93 {
+        kind = 2
+    }
+    if kind == 0 {
+        return 0
+    }
+    tail := trim_sp(substr(rest, 2, len(rest)))
+    if len(tail) == 0 || byteat(tail, 0) == 35 {
+        return kind
+    }
+    return 0
+}
+
 // pblock_scalar consumes lines deeper than base (plus blanks) into
 // a `|` or `>` scalar; cur.pos starts at the first candidate line
 // and ends after the scalar's last line.
@@ -382,13 +405,10 @@ fn pnode(ls: []YLine, cur: mut PCur, indent: int) -> [own YNode, err] {
         return nil, yerr(l.num, "multi-document streams unsupported")
     }
     ts := rtrim_sp(t)
-    if ts == "{}" || ts == "[]" {
+    fk := empty_flow_kind(ts)
+    if fk > 0 {
         n := new(YNode)
-        if ts == "{}" {
-            n.kind = 1
-        } else {
-            n.kind = 2
-        }
+        n.kind = fk
         n.line = l.num
         cur.pos = i + 1
         return n, nil
@@ -452,6 +472,7 @@ fn pmap(ls: []YLine, cur: mut PCur, indent: int) -> [own YNode, err] {
             }
         } else {
             bs := block_style(rest)
+            fk := empty_flow_kind(rest)
             if bs.ok {
                 cur.pos = j + 1
                 [s, be] = pblock_scalar(ls, cur, indent, bs.style, bs.chomp)
@@ -459,11 +480,8 @@ fn pmap(ls: []YLine, cur: mut PCur, indent: int) -> [own YNode, err] {
                     return nil, be
                 }
                 v.s = s
-            } else if rest == "{}" {
-                v.kind = 1
-                cur.pos = j + 1
-            } else if rest == "[]" {
-                v.kind = 2
+            } else if fk > 0 {
+                v.kind = fk
                 cur.pos = j + 1
             } else {
                 [sv, se] = pscalar(rest, l.num)
@@ -686,6 +704,52 @@ fn block_tag(s: str) -> str {
     return " |-"
 }
 
+// block_safe reports whether a literal block scalar round-trips s
+// exactly. pblock_scalar strips the minimum content indent from every
+// non-blank line, so a string whose every line leads with spaces loses
+// that margin on reload; all-whitespace lines reload as empty, and a
+// "\r" at end-of-line is eaten by ysplit. Those shapes emit as escaped
+// double-quoted scalars instead.
+fn block_safe(s: str) -> bool {
+    lead := 0
+    at_sol := true
+    ws_only := true
+    min_lead := -1
+    i := 0
+    for i < len(s) {
+        c := byteat(s, i)
+        if c == 10 {
+            if ws_only {
+                if lead > 0 {
+                    return false
+                }
+            } else if min_lead < 0 || lead < min_lead {
+                min_lead = lead
+            }
+            lead = 0
+            at_sol = true
+            ws_only = true
+        } else if at_sol && c == 32 {
+            lead = lead + 1
+        } else {
+            at_sol = false
+            if c == 13 && (i + 1 >= len(s) || byteat(s, i + 1) == 10) {
+                return false
+            }
+            ws_only = false
+        }
+        i = i + 1
+    }
+    if ws_only {
+        if lead > 0 {
+            return false
+        }
+    } else if min_lead < 0 || lead < min_lead {
+        min_lead = lead
+    }
+    return min_lead <= 0
+}
+
 // emit renders the DOM to YAML text.
 fn emit(n: ref YNode) -> str {
     return enode(n, 0)
@@ -704,7 +768,7 @@ fn enode(n: ref YNode, indent: int) -> str {
             if v == nil {
                 out = out + "\n"
             } else if v.kind == 0 {
-                if find(v.s, "\n") >= 0 {
+                if find(v.s, "\n") >= 0 && block_safe(v.s) {
                     out = out + block_tag(v.s) + "\n" + emit_block(v.s, indent + 2)
                 } else {
                     out = out + " " + esc_or_plain(v) + "\n"
@@ -728,7 +792,7 @@ fn enode(n: ref YNode, indent: int) -> str {
             if it == nil {
                 out = out + pad + "-\n"
             } else if it.kind == 0 {
-                if find(it.s, "\n") >= 0 {
+                if find(it.s, "\n") >= 0 && block_safe(it.s) {
                     out = out + pad + "- " + block_tag(it.s) + "\n" + emit_block(it.s, indent + 2)
                 } else {
                     out = out + pad + "- " + esc_or_plain(it) + "\n"
@@ -741,7 +805,7 @@ fn enode(n: ref YNode, indent: int) -> str {
                 if v0 == nil {
                     out = out + "\n"
                 } else if v0.kind == 0 {
-                    if find(v0.s, "\n") >= 0 {
+                    if find(v0.s, "\n") >= 0 && block_safe(v0.s) {
                         out = out + " " + block_tag(v0.s) + "\n" + emit_block(v0.s, indent + 4)
                     } else {
                         out = out + " " + esc_or_plain(v0) + "\n"
