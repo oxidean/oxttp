@@ -675,12 +675,42 @@ fn test_proxy_no_proxy_and_loopback() {
     [_r1, e1] = request(r)
     testing.expect(e1 != nil, "no_proxy bypasses (direct dial fails)")
     testing.expect_eq(sget(f.hits), 0, "proxy untouched under NO_PROXY")
-    // loopback carve-out: 127.0.0.1 never rides the env proxy
+    // upstream parity: reqwest applies env proxies to loopback too —
+    // 127.0.0.1 rides the env proxy (absolute-form) unlike Go's
+    // loopback carve-out.
     r2 := rq("GET", "http://127.0.0.1:1/")
     r2.proxy_env = one("HTTP_PROXY=" + f.url())
     [_r2, e2] = request(r2)
-    testing.expect(e2 != nil, "loopback direct dial fails")
-    testing.expect_eq(sget(f.hits), 0, "loopback carve-out")
+    testing.expect(e2 == nil, "loopback proxied like upstream")
+    testing.expect_eq(sget(f.hits), 1, "env proxy sees the loopback hop")
+}
+
+fn test_proxy_last_match_wins() {
+    // upstream reqwest intercepts run last-CLI-entry-first — an all:
+    // placed after a scheme entry shadows it for that scheme, and a
+    // later same-proto duplicate beats the earlier one.
+    f1 := fx_start(one("<ECHO>"))
+    defer f1.stop()
+    f2 := fx_start(one("<ECHO>"))
+    defer f2.stop()
+    r := rq("GET", "http://example.org/")
+    r.proxies = push(r.proxies, "http:" + f1.url())
+    r.proxies = push(r.proxies, "all:" + f2.url())
+    [_resp, e] = request(r)
+    testing.expect(e == nil, "send ok")
+    testing.expect_eq(sget(f2.hits), 1, "later all: shadows http:")
+    testing.expect_eq(sget(f1.hits), 0, "earlier http: unused")
+    f3 := fx_start(one("<ECHO>"))
+    defer f3.stop()
+    f4 := fx_start(one("<ECHO>"))
+    defer f4.stop()
+    r2 := rq("GET", "http://example.org/")
+    r2.proxies = push(r2.proxies, "http:" + f3.url())
+    r2.proxies = push(r2.proxies, "http:" + f4.url())
+    [_r2, e2] = request(r2)
+    testing.expect(e2 == nil, "send2 ok")
+    testing.expect_eq(sget(f4.hits), 1, "later http: wins over earlier")
+    testing.expect_eq(sget(f3.hits), 0, "earlier http: still unused")
 }
 
 fn test_proxy_scheme_degrades() {
@@ -726,22 +756,23 @@ fn test_proxy_connect_https() {
     testing.expect(e != nil, "post-CONNECT TLS fails on fake server")
     cap := f.cap[0]
     testing.expect_eq(find(cap, "CONNECT example.org:443 HTTP/1.1"), 0, "CONNECT line: " + cap)
-    testing.expect(find(cap, "host: example.org:443") >= 0, "CONNECT host: " + cap)
-    testing.expect(find(cap, "proxy-authorization: Basic dXNlcjpwdw==") >= 0, "CONNECT auth: " + cap)
-    testing.expect(find(cap, "proxy-connection: keep-alive") >= 0, "keep-alive: " + cap)
+    testing.expect(find(cap, "Host: example.org:443") >= 0, "CONNECT host: " + cap)
+    testing.expect(find(cap, "Proxy-Authorization: Basic dXNlcjpwdw==") >= 0, "CONNECT auth: " + cap)
+    testing.expect(find(cap, "User-Agent: oxttp/") >= 0, "CONNECT UA: " + cap)
+    testing.expect(find(cap, "proxy-connection") < 0, "no proxy-connection: " + cap)
 }
 
-fn test_proxy_connect_any_2xx() {
-    // RFC 9110: any 2xx establishes the tunnel — a 204 must not fail
-    // the CONNECT status check (review F13).
+fn test_proxy_connect_requires_200() {
+    // upstream reqwest tunnel() accepts only the literal 200 status —
+    // a 204 must fail the CONNECT check even though it is 2xx.
     f := capfx_start_reply("HTTP/1.1 204 No Content\r\n\r\n")
     defer f.l.close()
     r := rq("GET", "https://example.org/")
     r.proxies = one("all:http://127.0.0.1:" + itoa(f.port))
     [_resp, e] = request(r)
-    testing.expect(e != nil, "post-tunnel TLS fails on fake server")
+    testing.expect(e != nil, "204 errors")
     if e != nil {
-        testing.expect(find(errors.msg(e), "returned status") < 0, "204 not rejected: " + errors.msg(e))
+        testing.expect(find(errors.msg(e), "returned status 204") >= 0, "204 rejected: " + errors.msg(e))
     }
     testing.expect(find(f.cap[0], "CONNECT example.org:443") >= 0, "CONNECT sent: " + f.cap[0])
 }
@@ -763,9 +794,9 @@ fn test_proxy_connect_framing_ignored() {
 }
 
 fn test_proxy_connect_caller_auth() {
-    // a caller Proxy-Authorization rides the CONNECT instead of the
-    // URL creds, and must not reach the origin (RFC 9110 §11.7.2,
-    // review F9).
+    // upstream: CONNECT auth derives from the proxy URL's userinfo
+    // only — a caller Proxy-Authorization passes through the tunnel
+    // to the origin untouched (review R10).
     f := capfx_start()
     defer f.l.close()
     r := rq("GET", "https://example.org/")
@@ -774,9 +805,9 @@ fn test_proxy_connect_caller_auth() {
     [_resp, e] = request(r)
     testing.expect(e != nil, "post-tunnel TLS fails on fake server")
     cap := f.cap[0]
-    testing.expect(find(cap, "proxy-authorization: Bearer caller-token") >= 0, "caller auth on CONNECT: " + cap)
     urlcreds := "Basic " + base64.encode("user:pw" as []byte)
-    testing.expect(find(cap, urlcreds) < 0, "url creds not used: " + cap)
+    testing.expect(find(cap, "Proxy-Authorization: " + urlcreds) >= 0, "url creds on CONNECT: " + cap)
+    testing.expect(find(cap, "caller-token") < 0, "caller header not on CONNECT: " + cap)
 }
 
 fn test_h2_authority_from_host_header() {

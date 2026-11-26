@@ -39,6 +39,8 @@ import "std/net/url"
 
 import "github.com/oxidean/oxttp/core/model"
 
+import "github.com/oxidean/oxttp/shared/version"
+
 // a client that resets mid-write must not kill the process — same
 // extern the std server uses (rt_sigpipe_ignore).
 extern fn rt_sigpipe_ignore()
@@ -316,7 +318,7 @@ fn (t H1) roundtrip(req: ref model.Req, cap: mut model.Hop) -> [model.Resp, err]
     }
     // WI-0013 P4 (spec sem-S5): per-hop proxy resolution. proxies is
     // the verbatim --proxy list; proxy_env the captured env vars —
-    // scheme match (else all:), NO_PROXY + loopback carve-outs.
+    // last scheme/all: match wins, NO_PROXY domain match cancels.
     purl := ""
     if len(req.proxies[:]) > 0 || len(req.proxy_env[:]) > 0 {
         purl = pick_proxy(req, lwr(u.scheme), host)
@@ -381,17 +383,10 @@ fn (t H1) roundtrip(req: ref model.Req, cap: mut model.Hop) -> [model.Resp, err]
             hdrs = push(hdrs, model.Header{name: "Proxy-Authorization", value: pauth})
         }
     }
-    // a caller Proxy-Authorization on a tunneled request is consumed
-    // by the CONNECT handshake and must not ride inside it (RFC 9110
-    // §11.7.2) — it outranks URL userinfo, then drops out of the
-    // origin-bound headers before they serialize.
+    // CONNECT auth derives from the proxy URL's userinfo only — a
+    // caller-set proxy-authorization rides the tunnel to the origin
+    // untouched (upstream reqwest passes user headers through).
     connect_auth := pauth
-    if https && via_proxy {
-        if hdr_has(hdrs, "proxy-authorization") {
-            connect_auth = hdr_get(hdrs, "proxy-authorization")
-        }
-        hdrs = hdr_drop(hdrs, "proxy-authorization")
-    }
     head := serialize_head(OutHead{method: req.method, uri: uri, ver: req.httpver, host: u.host, hdrs: hdrs, body_len: len(rb.data), has_body: has_body, synth: req.synth})
     cap.req_head = head
     // connect — to the proxy when one applies, else the origin.
@@ -426,7 +421,7 @@ fn (t H1) roundtrip(req: ref model.Req, cap: mut model.Hop) -> [model.Resp, err]
             ctmo = deadline - now_ms()
             if ctmo <= 0 {
                 raw.close()
-                return bad, errors.new("http: proxy CONNECT timeout")
+                return bad, errors.new("http: proxy CONNECT timed out")
             }
         }
         ce := proxy_connect(raw, host + ":" + itoa(port), connect_auth, ctmo)
@@ -739,6 +734,11 @@ fn h2_exchange(req: ref model.Req, rw: io.ReadWriter, fd: int, hdrs: []model.Hea
     hh = push(hh, http2.Header{name: ":path", value: u.request_uri()})
     hh = h2_push(hh, hdrs)
     hh = h2_push(hh, req.synth)
+    if !h2_has(hh, "accept-encoding") {
+        // h1's serialize_head defaults this for bare Req callers —
+        // keep the h2 wire identical (decode_body handles the gzip).
+        hh = push(hh, http2.Header{name: "accept-encoding", value: "gzip, deflate"})
+    }
     has_body := req.body.kind() != 0
     if has_body && !h2_has(hh, "content-length") {
         hh = push(hh, http2.Header{name: "content-length", value: itoa(len(rb.data))})
@@ -1010,30 +1010,28 @@ fn write_all_tls(c: tls.Conn, b: []byte) -> err {
 // verbatim ports) plus the reqwest Proxy-Authorization std lacks (D4).
 
 // pick_proxy resolves the proxy URL for one hop. --proxy entries
-// ("PROTO:URL") match the hop scheme — first scheme match wins, else
-// first all:; env vars select by scheme name then ALL_PROXY; NO_PROXY
-// domain match and the loopback carve-out cancel.
+// ("PROTO:URL") match the hop scheme — last matching entry wins
+// (upstream intercept order); env vars select by scheme name then
+// ALL_PROXY; NO_PROXY domain match cancels.
 fn pick_proxy(req: ref model.Req, scheme: str, host: str) -> str {
-    p := ""
-    i := 0
-    for i < len(req.proxies) {
+    // upstream: reqwest intercepts run last-CLI-entry-first, so the
+    // LAST entry matching this scheme wins — an all: entry placed
+    // after a scheme entry shadows it for that scheme.
+    i := len(req.proxies) - 1
+    for i >= 0 {
         ent := req.proxies[i]
+        i = i - 1
         ci := find(ent, ":")
         if ci <= 0 {
-            i = i + 1
             continue
         }
         proto := lwr(substr(ent, 0, ci))
-        if proto == scheme {
+        if proto == scheme || proto == "all" {
             return substr(ent, ci + 1, len(ent))
         }
-        if proto == "all" && len(p) == 0 {
-            p = substr(ent, ci + 1, len(ent))
-        }
-        i = i + 1
     }
-    if len(p) > 0 || len(req.proxies) > 0 {
-        return p
+    if len(req.proxies) > 0 {
+        return ""
     }
     want := ""
     i = 0
@@ -1044,7 +1042,7 @@ fn pick_proxy(req: ref model.Req, scheme: str, host: str) -> str {
             continue
         }
         nm := lwr(substr(req.proxy_env[i], 0, eq))
-        val := substr(req.proxy_env[i], eq + 1, len(req.proxy_env[i]))
+        val := trim_ows(substr(req.proxy_env[i], eq + 1, len(req.proxy_env[i])))
         if nm == scheme + "_proxy" {
             want = val
             break
@@ -1060,57 +1058,7 @@ fn pick_proxy(req: ref model.Req, scheme: str, host: str) -> str {
     if len(req.no_proxy) > 0 && no_proxy_match(req.no_proxy, host) {
         return ""
     }
-    if is_loopback_host(host) {
-        return ""
-    }
     return want
-}
-
-// is_loopback_host — std port: localhost/::1 or a strict dotted-quad
-// in 127.0.0.0/8. Looser spellings route to the proxy (safe side).
-fn is_loopback_host(host: str) -> bool {
-    hl := lwr(host)
-    if hl == "localhost" || hl == "::1" {
-        return true
-    }
-    part := 0
-    val := 0
-    digits := 0
-    lz := false
-    first := -1
-    i := 0
-    n := len(hl)
-    for i < n {
-        c := byteat(hl, i)
-        if c == 46 {
-            if digits == 0 || val > 255 || lz && digits > 1 {
-                return false
-            }
-            if part == 0 {
-                first = val
-            }
-            part = part + 1
-            val = 0
-            digits = 0
-            lz = false
-        } else if c >= 48 && c <= 57 {
-            if digits == 0 {
-                lz = c == 48
-            }
-            val = val * 10 + c - 48
-            digits = digits + 1
-            if digits > 3 || val > 255 {
-                return false
-            }
-        } else {
-            return false
-        }
-        i = i + 1
-    }
-    if digits == 0 || lz && digits > 1 {
-        return false
-    }
-    return part == 3 && first == 127
 }
 
 // no_proxy_match — std port: comma list, entries match the host or
@@ -1169,19 +1117,21 @@ fn no_proxy_match(list: str, host: str) -> bool {
 // connect_proxy port with the proxy-authorization line added (D4).
 fn proxy_connect(c: net.Conn, authority: str, auth: str, tmo: int) -> err {
     if tmo <= 0 {
-        return errors.new("http: proxy CONNECT timeout")
+        return errors.new("http: proxy CONNECT timed out")
     }
-    wire := "CONNECT " + authority + " HTTP/1.1\r\nhost: " + authority + "\r\n"
+    // upstream wire shape: title-case Host + User-Agent + optional
+    // proxy auth; no proxy-connection header.
+    wire := "CONNECT " + authority + " HTTP/1.1\r\nHost: " + authority + "\r\nUser-Agent: oxttp/" + version.get() + "\r\n"
     if len(auth) > 0 {
-        wire = wire + "proxy-authorization: " + auth + "\r\n"
+        wire = wire + "Proxy-Authorization: " + auth + "\r\n"
     }
-    wire = wire + "proxy-connection: keep-alive\r\n\r\n"
+    wire = wire + "\r\n"
     // one absolute deadline for both phases — a slow write must not
     // hand the read a fresh budget (review F11).
     deadline := now_ms() + tmo
     wr := deadline - now_ms()
     if wr <= 0 {
-        return errors.new("http: proxy CONNECT timeout")
+        return errors.new("http: proxy CONNECT timed out")
     }
     set_sndtimo(c.rawfd(), (wr + 999) / 1000)
     we := write_all(c, wire as []byte)
@@ -1195,7 +1145,7 @@ fn proxy_connect(c: net.Conn, authority: str, auth: str, tmo: int) -> err {
     for read_bytes < 32768 {
         remaining := deadline - now_ms()
         if remaining <= 0 {
-            return errors.new("http: proxy CONNECT timeout")
+            return errors.new("http: proxy CONNECT timed out")
         }
         set_rcvtimo_ms(c.rawfd(), remaining)
         [n, re] = c.read(buf)
@@ -1302,9 +1252,9 @@ fn connect_response_status(head: str) -> [int, err] {
         }
         value = substr(value, lo, hi)
         name = lwr(name)
-        // RFC 9110: body-framing headers on a 2xx CONNECT reply mean
+        // RFC 9110: body-framing headers on a 200 CONNECT reply mean
         // nothing — the tunnel starts at the header terminator.
-        ok2xx := status >= 200 && status < 300
+        ok2xx := status == 200
         if name == "transfer-encoding" && len(value) > 0 && !ok2xx {
             return 0, errors.new("http: invalid CONNECT transfer encoding")
         }
@@ -1316,10 +1266,10 @@ fn connect_response_status(head: str) -> [int, err] {
         }
         pos = eol + 2
     }
-    // 2xx establishes the tunnel (any 2xx, not just 200); other
-    // informational statuses are preludes the caller skips — 101 and
-    // everything >= 300 fail here.
-    if status >= 200 && status < 300 {
+    // Only 200 establishes the tunnel (upstream requires the literal
+    // "HTTP/1.x 200" status line); other informational statuses are
+    // preludes the caller skips — 101 and everything >= 300 fail.
+    if status == 200 {
         return status, nil
     }
     if status >= 100 && status < 200 && status != 101 {

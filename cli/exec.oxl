@@ -1193,9 +1193,9 @@ fn plan(i: ref Intent, env: []str, stdin: str, stdin_tty: int) -> own ReqPlan {
     }
     // WI-0013 sem-S3: --cert/--cert-key read eagerly — upstream loads
     // them at client build, so a missing file errors even on http://
-    // or --offline. The key file appends onto the cert PEM (corpus:
-    // "Private key file appended to cert PEM").
-    if len(i.cert) > 0 {
+    // or --offline. --curl bypasses client build upstream entirely,
+    // so it emits -E verbatim and never touches the files.
+    if i.curl == 0 && len(i.cert) > 0 {
         if !os.exists(i.cert) {
             p.err = "cert file not found: " + i.cert
             return p
@@ -1241,8 +1241,8 @@ fn plan(i: ref Intent, env: []str, stdin: str, stdin_tty: int) -> own ReqPlan {
         p.req.h2 = "prior"
     }
     // WI-0013 sem-S5: --proxy entries + captured env proxies carry to
-    // the transport — per-hop resolution (scheme match else all:),
-    // NO_PROXY + loopback carve-outs live in pick_proxy.
+    // the transport — per-hop resolution (last scheme/all: match
+    // wins), NO_PROXY domain match in pick_proxy.
     p.req.proxies = i.proxies[:]
     p.req.proxy_env = i.proxy_env[:]
     p.req.no_proxy = i.no_proxy
@@ -1265,6 +1265,12 @@ fn plan(i: ref Intent, env: []str, stdin: str, stdin_tty: int) -> own ReqPlan {
                 p.resume_off = n
             }
         }
+    }
+    // --curl bypasses client build upstream, so transport-side
+    // warnings (rustls fallback, native-tls, compress…) never print —
+    // only the "Warning: Ignored" lines from curl_ignored land.
+    if i.curl != 0 {
+        p.warn = nil
     }
     return p
 }
@@ -1420,18 +1426,20 @@ fn reason_of(code: int, wire: str) -> str {
 // req_head_render draws the request head exactly as xh prints it:
 // status line + title-cased headers + blank line.
 fn req_head_render(i: ref Intent, p: ref ReqPlan) -> str {
-    ver := "HTTP/1.1"
-    if i.http_version == "1.0" {
-        ver = "HTTP/1.0"
-    } else if len(p.req.h2) > 0 {
-        ver = "HTTP/2.0" // spec D1: h2 modes render the 2.0 token
-    }
     [u, _e] = url.parse(p.req.url)
     uri := "/"
     uhost := ""
+    scheme := ""
     if _e == nil {
         uri = u.request_uri()
         uhost = u.host
+        scheme = u.scheme
+    }
+    ver := "HTTP/1.1"
+    if i.http_version == "1.0" {
+        ver = "HTTP/1.0"
+    } else if p.req.h2 == "prior" || (p.req.h2 == "hint" && scheme == "https") {
+        ver = "HTTP/2.0" // spec D1: h2 modes render the 2.0 token — cleartext hint can't reach h2, keep 1.1
     }
     hs := p.req.headers
     // display synthesis mirrors wire: Accept* / Cookie / CL / Host
@@ -1660,11 +1668,13 @@ fn curl_emit(i: ref Intent, p: ref ReqPlan) -> str {
         fl_e = "--cert"
     }
     // WI-0013 P5 (spec sem-S6): --proxy entries become env prefixes
-    // prepended to the line — first entry wins per proto, matching
-    // pick_proxy's selection; all: rides all_proxy (curl's -x would
-    // override the scheme-specific envs). When any explicit entries
-    // exist, unspecified ambient proxy envs are cleared so the emitted
-    // command can't silently inherit a proxy the request bypassed.
+    // prepended to the line — EVERY occurrence emits in CLI order
+    // (upstream to_curl does the same; shell-last-wins then matches
+    // pick_proxy's last-match selection); all: rides all_proxy
+    // (curl's -x would override the scheme-specific envs). When any
+    // explicit entries exist, unspecified ambient proxy envs are
+    // cleared so the emitted command can't silently inherit a proxy
+    // the request bypassed.
     pre := ""
     seen_http := 0
     seen_https := 0
@@ -1679,13 +1689,13 @@ fn curl_emit(i: ref Intent, p: ref ReqPlan) -> str {
         }
         proto := elwr(substr(pent, 0, ci))
         purl := substr(pent, ci + 1, len(pent))
-        if proto == "all" && seen_all == 0 {
+        if proto == "all" {
             seen_all = 1
             pre = pre + "all_proxy=" + shquote(purl) + " "
-        } else if proto == "http" && seen_http == 0 {
+        } else if proto == "http" {
             seen_http = 1
             pre = pre + "http_proxy=" + shquote(purl) + " "
-        } else if proto == "https" && seen_https == 0 {
+        } else if proto == "https" {
             seen_https = 1
             pre = pre + "https_proxy=" + shquote(purl) + " "
         }
@@ -1700,6 +1710,10 @@ fn curl_emit(i: ref Intent, p: ref ReqPlan) -> str {
         if seen_all == 0 {
             pre = pre + "all_proxy= ALL_PROXY= "
         }
+        // explicit --proxy bypasses env consultation entirely — an
+        // ambient NO_PROXY would let the emitted curl skip a proxy
+        // oxttp itself would have used.
+        pre = pre + "no_proxy= NO_PROXY= "
     }
     cmd := pre + "curl"
     if i.follow != 0 {
@@ -1707,6 +1721,9 @@ fn curl_emit(i: ref Intent, p: ref ReqPlan) -> str {
     }
     if i.http_version == "1.0" {
         cmd = cmd + " --http1.0"
+    }
+    if i.http_version == "1.1" {
+        cmd = cmd + " --http1.1"
     }
     if i.http_version == "2" {
         cmd = cmd + " --http2"

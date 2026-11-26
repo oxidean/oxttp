@@ -55,21 +55,31 @@ transport on `cur.url`:
 1. `proxies` non-empty → first entry whose `PROTO` equals the hop
    scheme, else first `all:` entry; none match → direct. Env vars are
    not consulted (sem already suppresses capture under `--proxy`).
+1.5. Multiple `--proxy` entries: the LAST entry matching the hop
+   scheme wins (`scheme:` or `all:` at each position — upstream
+   reqwest intercept order, `args.proxy.into_iter().rev()`). An
+   `all:` placed after a `scheme:` entry shadows it.
 2. `proxies` empty → `proxy_env` picked by scheme name
    (`HTTPS_PROXY`/`https_proxy` on https; `HTTP_PROXY`/`http_proxy` on
    http — **HTTP_PROXY skipped when `REQUEST_METHOD` present**, CGI
-   guard), then `ALL_PROXY`/`all_proxy`; NO_PROXY domain match then
-   loopback carve-out cancel.
+   guard), then `ALL_PROXY`/`all_proxy`; values whitespace-trimmed;
+   NO_PROXY domain match cancels. **Upstream parity:** env proxies
+   apply to loopback hosts too (reqwest has no Go-style loopback
+   carve-out).
 3. Selected URL parsed; scheme must be `http` — else error-degrade
    `http: proxy URL scheme "<sch>" is unsupported in this build`
    (covers `https://`, `socks5://`).
 4. http target via proxy → absolute-form request target
-   `GET http://authority/path` + `Proxy-Authorization: Basic <b64>`
+   `GET http://authority/path` + `Proxy-Authorization: Basic ***
    when proxy URL has userinfo and caller didn't set it.
-5. https target via proxy → `CONNECT host:port HTTP/1.1` with `host`,
-   `proxy-authorization` (when userinfo), `proxy-connection:
-   keep-alive`; 1xx-skipping 200 check; then normal TLS+protocol
-   branch on the tunnel.
+5. https target via proxy → `CONNECT host:port HTTP/1.1` with
+   title-case `Host`, `User-Agent`, `Proxy-Authorization` (when
+   userinfo) — upstream wire shape, no `proxy-connection`; tunnel
+   establishes only on literal 200 (1xx preludes skipped; 101 and
+   ≥300 fail) — then normal TLS+protocol branch on the tunnel.
+   CONNECT auth derives from proxy-URL userinfo only: a caller-set
+   `proxy-authorization` header passes through the tunnel to the
+   origin (upstream passes user headers through).
 6. Redirects re-resolve per hop (scheme may change); proxy-auth lands
    in the cross-origin strip list (corpus §4.6).
 
@@ -82,11 +92,18 @@ transport on `cur.url`:
   without http3).
 - `--ssl tlsX.Y`→`--tlsvX.Y --tls-max X.Y`; auto/ssl2.3→nothing.
 - `--cert`→`-E`/`--cert`; `--cert-key`→`--key`.
-- `--proxy all:URL`→`-x`/`--proxy URL`; `http:`/`https:`→ env
+- `--proxy all:URL`→**deviation:** env assignment `all_proxy=URL`
+  prepended to the emitted line — NOT `-x`/`--proxy`. Rationale:
+  `curl -x` overrides scheme-specific `*_proxy` env vars, so a
+  combined `all:`+`http:` set would misroute under a literal -x
+  emit; env prefixes compose correctly. `http:`/`https:`→ env
   assignments `http_proxy=URL`/`https_proxy=URL` prepended to the
-  emitted line (corpus table). Env-captured proxies: silent (curl
-  inherits the same env). The `Warning: Ignored --proxy` line
-  narrows to unreachable — remove (proxies now emit).
+  emitted line (corpus table). Explicit `--proxy` entries also emit
+  `no_proxy= NO_PROXY=` clearing — oxttp never consults env under
+  `--proxy`, and an ambient NO_PROXY would let curl skip a proxy
+  oxttp used. Env-captured proxies: silent (curl inherits the same
+  env). The `Warning: Ignored --proxy` line narrows to unreachable
+  — remove (proxies now emit).
 
 ## Warning texts (stderr, `{prog}: warning:`, -qq hides)
 
@@ -111,8 +128,10 @@ transport on `cur.url`:
   unchanged; curl short-circuit unchanged (before flag resolution).
 - `cli/exec.oxl` `plan()`: populate new Req fields; cert file reads;
   W1/W3 warnings. `execute()`: W2 post-send; curl_emit/curl_ignored
-  per sem-S6. `req_head_render`: version token `HTTP/2.0` for h2
-  modes (D1).
+  per sem-S6. `req_head_render`: version token `HTTP/2.0` when h2
+  can reach the wire — `prior` always; `hint` only on https (ALPN
+  may still pick 1.1, but h2 is possible); cleartext `hint` renders
+  HTTP/1.1 (D1).
 - `core/http/h1.oxl`: `tls_wrap` signature →
   `(c, host, req, tmo)` reading verify/ssl/alpn/cert off the Req;
   `roundtrip` gains proxy resolution + CONNECT + h2/h2c branches;
@@ -134,6 +153,17 @@ transport on `cur.url`:
   for http target).
 - **D5** W2 is an oxttp addition — upstream's 1.2-cert caveat is
   silent; ADR-0006 says say so.
+- **D6** IPv6 proxy authorities (`--proxy 'all:http://[::1]:8080'`)
+  degrade `http: IPv6 addresses not supported` — consistent with
+  the --ipv6 deferral; upstream reqwest accepts them.
+- **D7** `--curl` emits invented ambient-clearing env assignments
+  (`http_proxy= HTTP_PROXY= …`, `no_proxy= NO_PROXY=`) for
+  protos without explicit entries — upstream emits none, but its
+  emitted curl can then inherit a proxy oxttp itself bypassed.
+  Documented deviation per sem-S6.
+- **D8** `proxy-connect` CONNECT tunnel accepts only literal
+  `HTTP/1.x 200` — stricter than first drafted (any-2xx); matches
+  upstream reqwest tunnel().
 
 ## Acceptance criteria
 
