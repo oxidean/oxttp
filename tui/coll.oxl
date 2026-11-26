@@ -830,7 +830,7 @@ fn env_pick(a: mut App) {
 
 fn is_secret(n: str) -> bool {
     l := lower_ascii(n)
-    return str_contains(l, "secret") || str_contains(l, "token") || str_contains(l, "password") || str_contains(l, "passwd") || str_contains(l, "key")
+    return str_contains(l, "secret") || str_contains(l, "token") || str_contains(l, "pass") || str_contains(l, "key")
 }
 
 // var_rows_build flattens the resolved env into display rows

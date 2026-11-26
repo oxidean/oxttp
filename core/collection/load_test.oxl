@@ -284,6 +284,18 @@ fn test_plan_req_options() {
     testing.expect(sp2.req.follow, "follow default")
     testing.expect_eq(sp2.req.max_redirects, 10, "max redir default")
     testing.expect_eq(sp2.req.timeout_ms, 5000, "timeout default 5s")
+    // timeout <= 0 must never reach the transport as "unbounded" —
+    // a synchronous send with no deadline freezes the TUI; it reads
+    // as the corpus default instead. Sub-ms values clamp to 1ms.
+    [r3, e3] = decode_src("url: x.com\noptions:\n  timeout: 0\n")
+    sp3 := plan_req(r3, es, nil, "d")
+    testing.expect_eq(sp3.req.timeout_ms, 5000, "timeout 0 -> default")
+    [r4, e4] = decode_src("url: x.com\noptions:\n  timeout: -2\n")
+    sp4 := plan_req(r4, es, nil, "d")
+    testing.expect_eq(sp4.req.timeout_ms, 5000, "timeout -2 -> default")
+    [r5, e5] = decode_src("url: x.com\noptions:\n  timeout: 0.0004\n")
+    sp5 := plan_req(r5, es, nil, "d")
+    testing.expect_eq(sp5.req.timeout_ms, 1, "timeout sub-ms -> 1ms")
 }
 
 fn test_plan_req_cookies_and_unresolved() {

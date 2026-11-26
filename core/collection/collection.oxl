@@ -2076,11 +2076,18 @@ fn plan_req(r: ref PRequest, envset: ref env.EnvSet, jar: []str, coll_dir: str) 
     } else {
         rq.max_redirects = 0
     }
-    if timeout > 0.0 {
-        rq.timeout_ms = ftoi(timeout * 1000.0)
-    } else {
-        rq.timeout_ms = 0
+    // timeout <= 0 (incl. an explicit `timeout: 0`) behaves as the
+    // corpus default, never "unbounded" — a synchronous send with no
+    // deadline would freeze the TUI permanently. Sub-ms values clamp
+    // to 1ms so ftoi can't produce 0 either.
+    if timeout <= 0.0 {
+        timeout = 5.0
     }
+    t_ms := ftoi(timeout * 1000.0)
+    if t_ms <= 0 {
+        t_ms = 1
+    }
+    rq.timeout_ms = t_ms
     if verify {
         rq.verify = ""
     } else {
