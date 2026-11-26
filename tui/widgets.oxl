@@ -406,19 +406,16 @@ fn (t mut KVTable) del_row() {
     }
 }
 
-// begin_edit opens the cell editor on the current cell. Editing the
-// sentinel materializes the row: a fresh sentinel is appended behind
-// it (corpus §4.6 — "type in last empty row → new row").
+// begin_edit opens the cell editor on the current cell. Growth is
+// deferred to apply_edit: the trailing empty row only materializes a
+// fresh sentinel once real content lands — a pure open or delete on
+// an empty cell never creates a row (corpus §4.6).
 fn (t mut KVTable) begin_edit() {
-    grow := t.is_sentinel()
     t.editing = true
     if t.col == 0 {
         t.edit = new_line_edit(t.rows[t.cur].name)
     } else {
         t.edit = new_line_edit(t.rows[t.cur].value)
-    }
-    if grow {
-        t.rows = push(t.rows, KVRow{name: "", value: "", enabled: true})
     }
 }
 
@@ -432,6 +429,8 @@ fn (t mut KVTable) ensure_edit() {
 
 // apply_edit writes the live edit buffer back to the current cell
 // WITHOUT leaving edit mode — the row tracks keystrokes as they land.
+// Once the trailing row holds content it is real: append the next
+// empty sentinel behind it.
 fn (t mut KVTable) apply_edit() {
     if !t.editing {
         return
@@ -440,6 +439,10 @@ fn (t mut KVTable) apply_edit() {
         t.rows[t.cur].name = t.edit.text
     } else {
         t.rows[t.cur].value = t.edit.text
+    }
+    last := len(t.rows) - 1
+    if t.cur == last && (len(t.rows[last].name) > 0 || len(t.rows[last].value) > 0) {
+        t.rows = push(t.rows, KVRow{name: "", value: "", enabled: true})
     }
 }
 
@@ -663,6 +666,21 @@ fn (v mut TextView) move(dx: int, dy: int, shift: bool) {
     v.cy = v.cy + dy
     v.cx = v.cx + dx
     v.clamp()
+    // keep cx on a code-point boundary — a mid-glyph offset would let
+    // the next insert/backspace slice UTF-8. Snap in the direction of
+    // travel (forward on right, back on left/vertical hops).
+    if len(v.lines) > 0 {
+        line := v.lines[v.cy]
+        if dx > 0 {
+            for v.cx < len(line) && is_cont_byte(byteat(line, v.cx)) {
+                v.cx = v.cx + 1
+            }
+        } else {
+            for v.cx > 0 && is_cont_byte(byteat(line, v.cx)) {
+                v.cx = v.cx - 1
+            }
+        }
+    }
 }
 
 fn (v mut TextView) word_fwd(shift: bool) {

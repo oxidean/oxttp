@@ -458,9 +458,10 @@ fn test_url_edits_resync_path() {
     testing.expect_streq(a.path_kv.rows[0].name, "id", "undo resyncs")
     dispatch(a, knamed(term.KeyBackspace))
     dispatch(a, knamed(term.KeyBackspace))
-    dispatch(a, knamed(term.KeyBackspace))
-    // url is "http://x/:" → trailing ':' with no name → sentinel row
-    testing.expect_eq(len(a.path_kv.rows), 1, "collapsed")
+    // url is "http://x/:" — the trailing bare ':' must NOT create a
+    // param row while it's still present (no name follows it).
+    testing.expect_streq(a.url.text, "http://x/:", "bare colon still in url")
+    testing.expect_eq(len(a.path_kv.rows), 1, "no phantom row")
     testing.expect_streq(a.path_kv.rows[0].name, "", "param gone")
 }
 
@@ -512,10 +513,16 @@ fn test_modal_swallows_mouse() {
     dispatch(a, mev(term.MousePress, a.r_sidebar_x + 1, a.r_sidebar_y + 3))
     testing.expect_eq(a.focus, FSidebar, "plain click hits sidebar")
     a.focus = FUrl
+    // a scroll event that WOULD move the cursor: two-line response +
+    // scroll down — proves it advances without the modal, stays with.
+    a.resp_view = new_text_view("l1\nl2")
+    dispatch(a, mev(term.MouseScrollDown, a.r_resp_x + 1, a.r_resp_y + 1))
+    testing.expect_eq(a.resp_view.cy, 1, "scroll moves resp cursor")
+    a.resp_view.cy = 0
     push_modal(a, MPalette)
     dispatch(a, mev(term.MousePress, a.r_sidebar_x + 1, a.r_sidebar_y + 3))
     testing.expect_eq(a.focus, FUrl, "modal swallows background click")
-    dispatch(a, mev(term.MouseScrollUp, a.r_resp_x + 1, a.r_resp_y + 1))
+    dispatch(a, mev(term.MouseScrollDown, a.r_resp_x + 1, a.r_resp_y + 1))
     testing.expect_eq(a.resp_view.cy, 0, "modal swallows scroll")
 }
 
@@ -586,4 +593,85 @@ fn test_method_menu_kind_first() {
     testing.expect_eq(a.method_sel, 7, "graphql row selected")
     dispatch(a, knamed(term.KeyEnter))
     testing.expect_eq(a.kind, KGraphql, "enter keeps graphql kind")
+}
+
+
+fn test_kv_cell_undo_redo() {
+    // ctrl+z inside a live cell edit is the cell's single-level undo
+    // (§4.6) — it must not fall through to the fixed suspend toast.
+    a := new_app()
+    a.focus = FReqPane
+    feed_text(a, "ab")
+    testing.expect_streq(a.headers.rows[0].name, "ab", "typed")
+    dispatch(a, kev("z", true, false, false))
+    testing.expect_streq(a.headers.rows[0].name, "a", "undo one keystroke")
+    dispatch(a, kev("z", true, false, true))
+    testing.expect_streq(a.headers.rows[0].name, "ab", "redo restores")
+    testing.expect_streq(a.url.text, "", "url not the undo target")
+    testing.expect_eq(len(a.toasts), 0, "no suspend toast")
+}
+
+fn test_path_edit_ends_on_resync() {
+    // a live Path edit indexes rows that sync_path_kv rebuilds — the
+    // edit must end BEFORE the rebuild or its buffer lands on a
+    // shifted row (id's value over slug's).
+    a := new_app()
+    a.url.text = "http://x/:id/:slug"
+    sync_path_kv(a)
+    a.path_kv.rows[1].value = "99"
+    a.focus = FReqPane
+    a.req_tab = 2 // Path
+    // open id's value and type 42 — stays a live, uncommitted edit
+    dispatch(a, knamed(term.KeyEnter))
+    feed_text(a, "42")
+    testing.expect(a.path_kv.editing, "edit open")
+    a.url.text = "http://x/:slug"
+    sync_path_kv(a)
+    testing.expect_eq(len(a.path_kv.rows), 1, "slug only")
+    testing.expect_streq(a.path_kv.rows[0].name, "slug", "slug row0")
+    testing.expect_streq(a.path_kv.rows[0].value, "99", "value preserved")
+    testing.expect(!a.path_kv.editing, "edit ended on resync")
+    // the stale 42 buffer cannot land on slug via a plain re-open
+    dispatch(a, knamed(term.KeyEnter))
+    dispatch(a, knamed(term.KeyEnter))
+    testing.expect_streq(a.path_kv.rows[0].value, "99", "no stale write")
+}
+
+fn test_body_utf8_cursor() {
+    // body cursor moves by code point, inserts never split a glyph,
+    // and backspace drops the whole glyph — not one byte.
+    a := new_app()
+    a.focus = FReqPane
+    a.req_tab = 1 // Body
+    feed_text(a, "é")
+    testing.expect_eq(a.body.cx, 2, "cursor past 2-byte glyph")
+    dispatch(a, knamed(term.KeyLeft))
+    testing.expect_eq(a.body.cx, 0, "left jumps the whole glyph")
+    feed_text(a, "X")
+    testing.expect_streq(a.body.lines[0], "Xé", "insert before glyph — no split")
+    dispatch(a, knamed(term.KeyRight))
+    testing.expect_eq(a.body.cx, 3, "right jumps the whole glyph")
+    dispatch(a, knamed(term.KeyBackspace))
+    testing.expect_streq(a.body.lines[0], "X", "backspace drops whole glyph")
+    testing.expect_eq(a.body.cx, 1, "cursor back at boundary")
+    // vertical hops snap off a mid-glyph landing
+    a2 := new_app()
+    a2.focus = FReqPane
+    a2.req_tab = 1
+    a2.body = new_text_view("ab\né")
+    a2.body.cx = 1
+    dispatch(a2, knamed(term.KeyDown))
+    testing.expect_eq(a2.body.cx, 0, "down snapped to boundary")
+}
+
+fn test_mouse_uses_presented_layout() {
+    // ctrl+h then a click inside ONE batch must hit-test the frame
+    // the user saw — the sidebar was drawn, so its rect still owns
+    // the point even though the flag already flipped.
+    a := new_app()
+    scr := term.new_ansi(80, 24)
+    render(a, scr, "v")
+    dispatch(a, kev("h", true, false, false))
+    dispatch(a, mev(term.MousePress, a.r_sidebar_x + 1, a.r_sidebar_y + 3))
+    testing.expect_eq(a.focus, FSidebar, "presented sidebar owns the click")
 }

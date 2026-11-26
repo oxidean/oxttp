@@ -374,11 +374,21 @@ fn req_pane_bindings(a: ref App) -> []Binding {
             bs = push(bs, bind("enter", "kv-edit"))
             bs = push(bs, bind("backspace", "edit-backspace"))
             bs = push(bs, bind("delete", "edit-del-right"))
+            if kv_editing(a) {
+                // single-level cell undo (§4.6) — claims ctrl+z so
+                // the fixed suspend binding can't fire mid-edit.
+                bs = push(bs, bind("ctrl+z", "edit-undo"))
+                bs = push(bs, bind("ctrl+shift+z", "edit-redo"))
+            }
         } else if name == "Path" {
             bs = push(bs, bind("up", "kv-up"))
             bs = push(bs, bind("down", "kv-down"))
             bs = push(bs, bind("enter", "kv-edit"))
             bs = push(bs, bind("backspace", "edit-backspace"))
+            if kv_editing(a) {
+                bs = push(bs, bind("ctrl+z", "edit-undo"))
+                bs = push(bs, bind("ctrl+shift+z", "edit-redo"))
+            }
         } else if name == "Body" {
             bs = push(bs, bind("f3", "body-pager"))
             bs = push(bs, bind("f4", "body-editor"))
@@ -859,11 +869,19 @@ fn widget_action(a: mut App, act: str, ev: term.KeyEvent) -> int {
     } else if act == "edit-sel-all" {
         a.url.select_all()
     } else if act == "edit-undo" {
-        a.url.undo()
-        sync_path_kv(a)
+        if kv_editing(a) {
+            kv_cell_undo(a)
+        } else {
+            a.url.undo()
+            sync_path_kv(a)
+        }
     } else if act == "edit-redo" {
-        a.url.redo()
-        sync_path_kv(a)
+        if kv_editing(a) {
+            kv_cell_redo(a)
+        } else {
+            a.url.redo()
+            sync_path_kv(a)
+        }
     } else if act == "edit-del-word" {
         a.url.del_word_back()
         sync_path_kv(a)
@@ -1254,6 +1272,37 @@ fn kv_cell_del(a: mut App, w: int) {
     }
 }
 
+// kv_cell_undo/redo run the open cell's own LineEdit history and
+// push the restored text back into the row — bound only while a cell
+// edit is live, so ctrl+z stays the suspend key elsewhere.
+fn kv_cell_undo(a: mut App) {
+    w := active_kv(a)
+    if w == 0 {
+        a.headers.edit.undo()
+        a.headers.apply_edit()
+    } else if w == 1 {
+        a.query_kv.edit.undo()
+        a.query_kv.apply_edit()
+    } else if w == 2 {
+        a.path_kv.edit.undo()
+        a.path_kv.apply_edit()
+    }
+}
+
+fn kv_cell_redo(a: mut App) {
+    w := active_kv(a)
+    if w == 0 {
+        a.headers.edit.redo()
+        a.headers.apply_edit()
+    } else if w == 1 {
+        a.query_kv.edit.redo()
+        a.query_kv.apply_edit()
+    } else if w == 2 {
+        a.path_kv.edit.redo()
+        a.path_kv.apply_edit()
+    }
+}
+
 // edit target resolution for text mutations: a focused KV table owns
 // the press (active or implicit cell edit); otherwise the URL field.
 fn edit_backspace(a: mut App) {
@@ -1392,6 +1441,12 @@ fn kv_type_char(a: mut App, ch: str) {
 
 // sync_path_kv derives Path-table rows from ":name" URL segments.
 fn sync_path_kv(a: mut App) {
+    // an open Path edit indexes rows we're about to rebuild — commit
+    // it first so its buffer lands on its own param (name-match below
+    // carries it forward) instead of a shifted row.
+    if a.path_kv.editing {
+        a.path_kv.commit_edit()
+    }
     names := mkslice(str, 0)
     i := 0
     u := a.url.text
@@ -1524,8 +1579,11 @@ fn body_backspace(a: mut App) {
     }
     ln := a.body.lines[a.body.cy]
     if a.body.cx > 0 {
-        a.body.lines[a.body.cy] = substr(ln, 0, a.body.cx - 1) + substr(ln, a.body.cx, len(ln))
-        a.body.cx = a.body.cx - 1
+        // drop the whole code point left of the cursor — deleting one
+        // byte of a multibyte glyph leaves invalid UTF-8.
+        lo := glyph_start(ln, a.body.cx - 1)
+        a.body.lines[a.body.cy] = substr(ln, 0, lo) + substr(ln, a.body.cx, len(ln))
+        a.body.cx = lo
     } else if a.body.cy > 0 {
         prev := a.body.lines[a.body.cy - 1]
         a.body.lines[a.body.cy - 1] = prev + ln
@@ -2055,8 +2113,11 @@ fn dispatch_mouse(a: mut App, ev: term.KeyEvent) -> int {
         if m.kind == term.MouseScrollDown {
             d = 1
         }
-        // scroll the pane under the cursor
-        if a.sidebar_on && in_rect(m.x, m.y, a.r_sidebar_x, a.r_sidebar_y, a.r_sidebar_w, a.r_sidebar_h) {
+        // scroll the pane under the cursor — hit-test the PRESENTED
+        // layout (cached rects), not sidebar_on: a ctrl+h earlier in
+        // this same input batch flips the flag before the next render
+        // and would make the click fall through to nothing.
+        if a.r_sidebar_w > 0 && in_rect(m.x, m.y, a.r_sidebar_x, a.r_sidebar_y, a.r_sidebar_w, a.r_sidebar_h) {
             a.coll.move(d, false)
         } else if a.r_resp_h > 0 && in_rect(m.x, m.y, a.r_resp_x, a.r_resp_y, a.r_resp_w, a.r_resp_h) {
             a.resp_view.move(0, d, false)
@@ -2068,8 +2129,9 @@ fn dispatch_mouse(a: mut App, ev: term.KeyEvent) -> int {
     if m.kind != term.MousePress {
         return ENone
     }
-    // click → focus pane under point
-    if a.sidebar_on && in_rect(m.x, m.y, a.r_sidebar_x, a.r_sidebar_y, a.r_sidebar_w, a.r_sidebar_h) {
+    // click → focus pane under point — same presented-layout rule as
+    // the scroll branch above: test the cached sidebar rect.
+    if a.r_sidebar_w > 0 && in_rect(m.x, m.y, a.r_sidebar_x, a.r_sidebar_y, a.r_sidebar_w, a.r_sidebar_h) {
         a.focus = FSidebar
         vis := a.coll.visible()
         // tree rows start 2 cells below the pane top (title + env row)

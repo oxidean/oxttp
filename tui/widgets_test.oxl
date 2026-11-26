@@ -199,3 +199,24 @@ fn test_pair_char() {
     testing.expect_streq(pair_char("x", "", 0), "x", "plain")
     testing.expect_streq(auto_indent("", "{"), "  ", "indent after {")
 }
+
+
+fn test_kv_sentinel_grows_on_content() {
+    // the trailing empty row materializes the next sentinel only
+    // when real content lands — a pure open/delete appends nothing.
+    t := new_kv()
+    t.ensure_edit()
+    t.edit.backspace()
+    t.apply_edit()
+    testing.expect_eq(len(t.rows), 1, "empty delete creates nothing")
+    t.cancel_edit()
+    t.type_char("A")
+    testing.expect_eq(len(t.rows), 2, "content grew the next sentinel")
+    testing.expect_streq(t.rows[0].name, "A", "name written")
+    t.type_char("b")
+    testing.expect_eq(len(t.rows), 2, "grow fires once")
+    t2 := new_kv()
+    t2.begin_edit()
+    t2.commit_edit()
+    testing.expect_eq(len(t2.rows), 1, "empty open+commit creates nothing")
+}
