@@ -86,3 +86,45 @@ No `lower()` in std/strings — byte-loop lwr is a per-package helper.
 - `s as []byte` / `b as str` casts; `mkslice(byte,n)`, `push`, slice
   ranges `b[i:j]` all verified patterns in std.
 - No `Option`, no string-keyed maps — ordered Header lists per model.
+
+## oxl 0.26.0 addendum (verified WI-0013 discovery)
+
+### std/net/tls — `Config` gains
+
+`alpn []str` (empty = no ext), `min_ver`/`max_ver` (`V12=771`,
+`V13=772`; 0/0 default = **1.3 only**; `minv<V12` errors — TLS ≤1.1 is
+inexpressible), `client_cert ClientCert` via
+`load_cert_pem(cert_pem, key_pem)` (chain leaf-first + PKCS#8/RSA/SEC1
+key; mismatch is a load-time err). mTLS is **TLS 1.3 only** — a
+negotiated 1.2 session answers CertificateRequest with the empty
+certificate_list. `Conn.negotiated_alpn()` and `Conn.s.ver` (V12/V13)
+readable post-handshake cross-package. `min=V12,max=V13` = 1.2+1.3
+auto range (rustls "auto" analog).
+
+### std/net/http2 — client h2
+
+`new_conn_timeout(rw io.ReadWriter, timeout_fd, timeout_ms)` runs the
+preface+SETTINGS exchange on any ReadWriter (net.Conn/tls.Conn
+`asreadwriter()`). `open_stream(h2hdrs, end_stream)`, `send_body`
+(flow-control waits handled internally), `next_event` (kinds: 0 DATA,
+1 HEADERS, 3 RST, 7 GOAWAY; `trailers` flag), `ack_data`,
+`cancel_stream`, `close`. `dial_tls_over(socket,host,tmo,cfg)` →
+`TLSDialResult{conn,transport,closer,protocol}` — ALPN
+["h2","http/1.1"] default, h1 `transport` fallback when ALPN≠h2.
+`dial_h2c` = cleartext prior-knowledge. `encode_headers`/`read_frame`/
+`write_frame` are exported — enough to script an h2 fixture server.
+Suspension audit: deadline `set_rcvtimo` I/O only; the sole msleep in
+the stack is `lookup_ipv4` inside `net.dial_timeout` (avoid via
+`dial_h1`).
+
+### std/net/http client — semantics to mirror (not adopt)
+
+`Request.proxy`: `""` env lookup, `"direct"` bypass, else http://
+proxy URL. `proxy_from_env`: scheme var → ALL_PROXY, NO_PROXY domain
+match (`*`/`:port` strip/leading-`.`), loopback carve-out, HTTP_PROXY
+skipped when `REQUEST_METHOD` set (CGI rule). http target via proxy →
+absolute-form target; https → CONNECT (`connect_proxy`, 1xx-tolerant).
+h2c+proxy errors; `https://`/`socks5://` proxy URLs rejected. **No
+Proxy-Authorization** in std — proxy userinfo is ours to add (xh/
+reqwest sends it: CONNECT header for https targets, request header
+for http targets).
