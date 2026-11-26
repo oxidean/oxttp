@@ -2,9 +2,10 @@
   "schema_version": 1,
   "id": "WI-0015",
   "title": "S11 TUI config, flags, and subcommands",
-  "state": "intake",
+  "state": "implementing",
   "profile": "normal",
-  "current_stage": "intake",
+  "current_stage": "implementation",
   "created_at": "2026-11-26T16:46:24Z",
+  "updated_at": "2026-11-26T17:06:51Z",
   "git_baseline": "42434601c126f91f48d37b6e27219e7026e0cd08"
 }
