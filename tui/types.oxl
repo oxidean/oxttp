@@ -6,6 +6,7 @@ package main
 // Order here is the dependency order.
 
 import "github.com/oxidean/oxttp/core/collection"
+import "github.com/oxidean/oxttp/core/config"
 import "github.com/oxidean/oxttp/core/env"
 import "github.com/oxidean/oxttp/core/model"
 
@@ -151,6 +152,62 @@ struct JarEnt {
     nv: str,
 }
 
+// Theme is a resolved app theme (corpus §2.2): slots hold ANSI-8
+// ids quantized from the catalog/user hex at load.
+struct Theme {
+    name: str,
+    is_light: bool,
+    primary: int,
+    secondary: int,
+    accent: int,
+    warning: int,
+    error: int,
+    success: int,
+    text: int,
+}
+
+// ThemeHex carries the upstream terma hex strings verbatim — the
+// builtin table is auditable against the registry; builtin_themes
+// quantizes each row into Theme slots.
+struct ThemeHex {
+    name: str,
+    is_light: bool,
+    primary: str,
+    secondary: str,
+    accent: str,
+    warning: str,
+    error: str,
+    success: str,
+    text: str,
+}
+
+// ThemeScan is scan_user_themes' result: parsed themes plus the
+// per-file problem strings (upstream main.go wraps each into a
+// startup toast).
+struct ThemeScan {
+    themes: []Theme,
+    problems: []str,
+}
+
+// UserTheme is the posting-2 user theme file shape — colours stay
+// strings until validated+quantized; dark unset → dark.
+struct UserTheme {
+    name: str,
+    dark: bool,
+    dark_set: bool,
+    primary: str,
+    secondary: str,
+    accent: str,
+    background: str,
+    surface: str,
+    panel: str,
+    warning: str,
+    error: str,
+    success: str,
+    text: str,
+    foreground: str,
+}
+
 struct App {
     focus: int,
     modals: []int,
@@ -229,6 +286,53 @@ struct App {
     toasts: []Toast,
     hinted_vars: bool,  // '$' suggestion degrade shown once
 
+    // --- S11 config-driven state (corpus §2.2 apply site) ---
+    st: own config.Settings, // loaded settings (nil until apply_settings)
+    cwd: str,             // env/search root — os cwd at launch; tests override
+    cfg_dir: str,         // config dir seam ("" → config.config_dir())
+    theme: Theme,         // resolved theme (ansi slots)
+    theme_name: str,      // configured name after alias resolve
+    gradient: int,        // 0 = theme, 1 = off, 2 = named
+    gradient_name: str,
+    user_themes: []Theme,
+    th_sel: int,          // cursor in theme/gradient pickers
+    th_snap: Theme,       // escape-restore snapshot (preview mode)
+    th_snap_name: str,
+    th_snap_grad: int,
+    th_snap_gname: str,
+    theme_preview: bool,  // command_palette.theme_preview
+    env_files: []str,     // active env file stack (switcher/memory)
+    hist_disk: bool,      // history.enabled
+    nerd_icons: bool,     // resolved nerd_fonts
+    blink: bool,          // text_input.blinking_cursor
+    heading_on: bool,
+    heading_host: bool,
+    heading_ver: bool,
+    heading_hostname: str,
+    url_preview_on: bool, // url_bar.show_value_preview
+    url_mask_secrets: bool, // url_bar secrets-in-preview gate
+    focus_open: str,      // focus.on_request_open
+    focus_resp: str,      // focus.on_response
+    focus_start: str,     // focus.on_startup
+    resp_prettify: bool,  // response.prettify_json
+    resp_size_time: bool, // response.show_size_and_time
+    ssl_ca: str,
+    ssl_cert: str,
+    ssl_key: str,
+    ssl_pass: str,
+    editor: str,
+    fileman: str,
+    pager: str,
+    pager_json: str,
+    curl_args: str,       // curl_export_extra_args
+    reb_specs: []str,     // config keymap: canonical key spec → action
+    reb_actions: []str,
+    curl_in: LineEdit,    // import-curl modal input
+    sresp_in: LineEdit,   // save-response modal input
+    var_edit: LineEdit,   // variables-edit modal input
+    var_edit_name: str,
+    ext_cmd: str,         // pending external command (EExt effect)
+
     // hit-test rects cached from last render (mouse dispatch)
     r_sidebar_x: int, r_sidebar_w: int,
     r_sidebar_y: int, r_sidebar_h: int,
@@ -265,11 +369,17 @@ let MHistory = 7
 let MMethodMenu = 8
 let MJump = 9
 let MEnvSwitch = 10
+let MTheme = 11
+let MGradient = 12
+let MCurl = 13
+let MSaveResp = 14
+let MVarEdit = 15
 
 // dispatch effects returned to the loop.
 let ENone = 0
 let EQuit = 1
 let ESend = 2
+let EExt = 3 // run a.ext_cmd outside the alt screen (editor/pager/tools)
 
 
 // RTab is one open request-editor tab (new-request/close-tab/next-tab).

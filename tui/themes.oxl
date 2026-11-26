@@ -1,0 +1,532 @@
+package main
+
+// S11 themes — corpus §2.2 theme pipeline: the 37-entry builtin
+// catalog (terma v0.27.0 names + hex, registry order verbatim),
+// user-theme YAML decode + directory scan, theme/gradient picker
+// row builders. Theme slots hold ANSI-8 ids quantized from hex
+// at load; the hex table below stays byte-verbatim for audit.
+
+import "std/os"
+
+import "std/errors"
+
+import "github.com/oxidean/oxttp/core/yaml"
+
+// ---------- hex → ansi ----------
+
+fn hex_digit(c: int) -> int {
+    if c >= 48 && c <= 57 {
+        return c - 48
+    }
+    if c >= 97 && c <= 102 {
+        return c - 87
+    }
+    if c >= 65 && c <= 70 {
+        return c - 55
+    }
+    return -1
+}
+
+// hex_pair decodes the 2 hex digits at h[i..i+2] — callers must
+// have run theme_colour_ok first (digits are validated there).
+fn hex_pair(h: str, i: int) -> int {
+    return hex_digit(byteat(h, i)) * 16 + hex_digit(byteat(h, i + 1))
+}
+
+// the 8 standard xterm colours, spec palette verbatim:
+// 0 #000000 1 #CD0000 2 #00CD00 3 #CDCD00
+// 4 #0000EE 5 #CD00CD 6 #00CDCD 7 #E5E5E5
+fn pal_chan(i: int, c: int) -> int {
+    // c: 0 r, 1 g, 2 b
+    if i == 0 {
+        return 0
+    }
+    if i == 1 {
+        if c == 0 { return 205 }
+        return 0
+    }
+    if i == 2 {
+        if c == 1 { return 205 }
+        return 0
+    }
+    if i == 3 {
+        if c == 2 { return 0 }
+        return 205
+    }
+    if i == 4 {
+        if c == 2 { return 238 }
+        return 0
+    }
+    if i == 5 {
+        if c == 1 { return 0 }
+        return 205
+    }
+    if i == 6 {
+        if c == 0 { return 0 }
+        return 205
+    }
+    return 229
+}
+
+// quantize maps a hex colour to the nearest of the 8 standard
+// xterm ids by squared RGB distance. "#rgb"/"#rrggbb"/"#rrggbbaa"
+// (alpha ignored — deviation). Invalid → -1.
+fn quantize(h: str) -> int {
+    if !theme_colour_ok(h) {
+        return -1
+    }
+    r := 0
+    g := 0
+    b := 0
+    if len(h) == 4 {
+        r = hex_digit(byteat(h, 1)) * 17
+        g = hex_digit(byteat(h, 2)) * 17
+        b = hex_digit(byteat(h, 3)) * 17
+    } else {
+        r = hex_pair(h, 1)
+        g = hex_pair(h, 3)
+        b = hex_pair(h, 5)
+    }
+    best := 0
+    bestd := 2147483647
+    i := 0
+    for i < 8 {
+        dr := r - pal_chan(i, 0)
+        dg := g - pal_chan(i, 1)
+        db := b - pal_chan(i, 2)
+        d := dr * dr + dg * dg + db * db
+        if d < bestd {
+            bestd = d
+            best = i
+        }
+        i = i + 1
+    }
+    return best
+}
+
+// ---------- builtin catalog (terma v0.27.0 registry order) ----------
+
+fn theme_hexes() -> []ThemeHex {
+    let t: []ThemeHex = nil
+    // --- 28 dark ---
+    t = push(t, ThemeHex{name: "rose-pine", is_light: false, primary: "#c4a7e7", secondary: "#ebbcba", accent: "#f6c177", warning: "#f6c177", error: "#eb6f92", success: "#9ccfd8", text: "#e0def4"})
+    t = push(t, ThemeHex{name: "dracula", is_light: false, primary: "#bd93f9", secondary: "#ff79c6", accent: "#8be9fd", warning: "#ffb86c", error: "#ff5555", success: "#50fa7b", text: "#f8f8f2"})
+    t = push(t, ThemeHex{name: "tokyo-night", is_light: false, primary: "#7aa2f7", secondary: "#bb9af7", accent: "#7dcfff", warning: "#e0af68", error: "#f7768e", success: "#9ece6a", text: "#c0caf5"})
+    t = push(t, ThemeHex{name: "catppuccin", is_light: false, primary: "#cba6f7", secondary: "#f5c2e7", accent: "#94e2d5", warning: "#fab387", error: "#f38ba8", success: "#a6e3a1", text: "#cdd6f4"})
+    t = push(t, ThemeHex{name: "gruvbox", is_light: false, primary: "#d79921", secondary: "#d3869b", accent: "#8ec07c", warning: "#fe8019", error: "#fb4934", success: "#b8bb26", text: "#ebdbb2"})
+    t = push(t, ThemeHex{name: "nord", is_light: false, primary: "#88c0d0", secondary: "#81a1c1", accent: "#8fbcbb", warning: "#ebcb8b", error: "#bf616a", success: "#a3be8c", text: "#eceff4"})
+    t = push(t, ThemeHex{name: "solarized", is_light: false, primary: "#268bd2", secondary: "#6c71c4", accent: "#2aa198", warning: "#b58900", error: "#dc322f", success: "#859900", text: "#839496"})
+    t = push(t, ThemeHex{name: "kanagawa", is_light: false, primary: "#7e9cd8", secondary: "#957fb8", accent: "#7aa89f", warning: "#ff9e3b", error: "#e82424", success: "#98bb6c", text: "#dcd7ba"})
+    t = push(t, ThemeHex{name: "monokai", is_light: false, primary: "#a6e22e", secondary: "#ae81ff", accent: "#66d9ef", warning: "#fd971f", error: "#f92672", success: "#a6e22e", text: "#f8f8f2"})
+    // upstream Text: Hex("#0F0F1F").AutoText() → #f5f5f6
+    t = push(t, ThemeHex{name: "galaxy", is_light: false, primary: "#C45AFF", secondary: "#A684E8", accent: "#FF69B4", warning: "#FFD700", error: "#FF4500", success: "#00FA9A", text: "#f5f5f6"})
+    // upstream Text: Hex("#0A1A2F").AutoText() → #f5f6f7
+    t = push(t, ThemeHex{name: "aurora", is_light: false, primary: "#45FFB3", secondary: "#A1FCDF", accent: "#DF7BFF", warning: "#FFE156", error: "#FF6B6B", success: "#64FFDA", text: "#f5f6f7"})
+    // upstream Text: Hex("#0B111A").AutoText() → #f5f5f6
+    t = push(t, ThemeHex{name: "obsidian-tide", is_light: false, primary: "#5CC8FF", secondary: "#8FA7FF", accent: "#49F2C2", warning: "#FFD166", error: "#FF647C", success: "#43E6B0", text: "#f5f5f6"})
+    // upstream Text: Hex("#12100e").AutoText() → #f6f5f5
+    t = push(t, ThemeHex{name: "midnight-ember", is_light: false, primary: "#FF9A5C", secondary: "#FFB87A", accent: "#FF6B9E", warning: "#FFC861", error: "#FF7070", success: "#67E4AE", text: "#f6f5f5"})
+    t = push(t, ThemeHex{name: "hearthstone", is_light: false, primary: "#d4915c", secondary: "#c2787e", accent: "#d4a84b", warning: "#d4a84b", error: "#e06b6b", success: "#7abf7a", text: "#e8ddd4"})
+    t = push(t, ThemeHex{name: "cyberdeck", is_light: false, primary: "#f0e030", secondary: "#e040a0", accent: "#30e0f0", warning: "#f0a020", error: "#ff3050", success: "#30e070", text: "#e8e8e0"})
+    t = push(t, ThemeHex{name: "neon-reef", is_light: false, primary: "#18d5c4", secondary: "#f0728a", accent: "#4d8bff", warning: "#f0b840", error: "#f06070", success: "#40e890", text: "#e0e6f0"})
+    t = push(t, ThemeHex{name: "understory", is_light: false, primary: "#7fa87a", secondary: "#c07a58", accent: "#c9b06b", warning: "#c9b06b", error: "#cf6b6b", success: "#7fa87a", text: "#d4ddd0"})
+    t = push(t, ThemeHex{name: "dwarven", is_light: false, primary: "#6e8898", secondary: "#a09080", accent: "#c87840", warning: "#c87840", error: "#d06060", success: "#68a870", text: "#d0d4d8"})
+    t = push(t, ThemeHex{name: "abyss", is_light: false, primary: "#0098a8", secondary: "#60c8b8", accent: "#e87060", warning: "#d8a048", error: "#e87060", success: "#48b888", text: "#c8d8e8"})
+    t = push(t, ThemeHex{name: "amber", is_light: false, primary: "#e0a030", secondary: "#d8c090", accent: "#c06030", warning: "#e0a030", error: "#d85040", success: "#80a848", text: "#e8dcc8"})
+    t = push(t, ThemeHex{name: "velvet", is_light: false, primary: "#c060b0", secondary: "#e070a0", accent: "#d8b060", warning: "#d8b060", error: "#e06068", success: "#68b880", text: "#dcd0e0"})
+    t = push(t, ThemeHex{name: "phosphor", is_light: false, primary: "#40e850", secondary: "#30a840", accent: "#d0e8d0", warning: "#c0a040", error: "#e05050", success: "#40e850", text: "#b0e0b0"})
+    t = push(t, ThemeHex{name: "moonstone", is_light: false, primary: "#a7b8ff", secondary: "#83d5ce", accent: "#efbd93", warning: "#e9cc87", error: "#f18f9b", success: "#a6d49a", text: "#e4e9f2"})
+    t = push(t, ThemeHex{name: "bonsai", is_light: false, primary: "#b8ce83", secondary: "#80c6b2", accent: "#eca982", warning: "#e2c383", error: "#eb9894", success: "#98c889", text: "#e5e6d7"})
+    t = push(t, ThemeHex{name: "garnet", is_light: false, primary: "#eda4b1", secondary: "#b7abe8", accent: "#edca99", warning: "#e4c284", error: "#ef9790", success: "#a4c7a1", text: "#efe0dd"})
+    t = push(t, ThemeHex{name: "kintsugi", is_light: false, primary: "#e2b964", secondary: "#93aee0", accent: "#ef9471", warning: "#e5d49b", error: "#e8818f", success: "#9fc8a6", text: "#ece6da"})
+    t = push(t, ThemeHex{name: "amethyst", is_light: false, primary: "#c09cf5", secondary: "#8ec5f2", accent: "#ecd28c", warning: "#f2ad7c", error: "#f08394", success: "#a8d59a", text: "#ebe4f2"})
+    t = push(t, ThemeHex{name: "lantern", is_light: false, primary: "#f6ab6c", secondary: "#86cfe0", accent: "#f297b5", warning: "#f3d27c", error: "#f07a82", success: "#b3d68a", text: "#e9e5f4"})
+    // --- 9 light ---
+    t = push(t, ThemeHex{name: "rose-pine-dawn", is_light: true, primary: "#907aa9", secondary: "#d7827e", accent: "#ea9d34", warning: "#ea9d34", error: "#b4637a", success: "#56949f", text: "#575279"})
+    t = push(t, ThemeHex{name: "dracula-light", is_light: true, primary: "#9580ff", secondary: "#ff80bf", accent: "#80ffea", warning: "#ffb86c", error: "#ff5555", success: "#50fa7b", text: "#282a36"})
+    t = push(t, ThemeHex{name: "tokyo-night-day", is_light: true, primary: "#2e7de9", secondary: "#9854f1", accent: "#007197", warning: "#8c6c3e", error: "#f52a65", success: "#587539", text: "#3760bf"})
+    t = push(t, ThemeHex{name: "catppuccin-latte", is_light: true, primary: "#8839ef", secondary: "#ea76cb", accent: "#179299", warning: "#fe640b", error: "#d20f39", success: "#40a02b", text: "#4c4f69"})
+    t = push(t, ThemeHex{name: "gruvbox-light", is_light: true, primary: "#d79921", secondary: "#b16286", accent: "#689d6a", warning: "#d65d0e", error: "#cc241d", success: "#98971a", text: "#3c3836"})
+    t = push(t, ThemeHex{name: "nord-light", is_light: true, primary: "#5e81ac", secondary: "#81a1c1", accent: "#88c0d0", warning: "#d08770", error: "#bf616a", success: "#a3be8c", text: "#2e3440"})
+    t = push(t, ThemeHex{name: "solarized-light", is_light: true, primary: "#268bd2", secondary: "#6c71c4", accent: "#2aa198", warning: "#b58900", error: "#dc322f", success: "#859900", text: "#657b83"})
+    t = push(t, ThemeHex{name: "kanagawa-lotus", is_light: true, primary: "#4d699b", secondary: "#624c83", accent: "#597b75", warning: "#77713f", error: "#c84053", success: "#6f894e", text: "#545464"})
+    t = push(t, ThemeHex{name: "monokai-light", is_light: true, primary: "#7a8c21", secondary: "#8c6bc8", accent: "#0f9fbf", warning: "#fd971f", error: "#f92672", success: "#7a8c21", text: "#272822"})
+    return t
+}
+
+fn quant_theme(h: ThemeHex) -> Theme {
+    return Theme{name: h.name, is_light: h.is_light,
+        primary: quantize(h.primary), secondary: quantize(h.secondary),
+        accent: quantize(h.accent), warning: quantize(h.warning),
+        error: quantize(h.error), success: quantize(h.success),
+        text: quantize(h.text)}
+}
+
+// builtin_themes — all 37 entries quantized, registry order.
+fn builtin_themes() -> []Theme {
+    hs := theme_hexes()
+    let out: []Theme = nil
+    i := 0
+    for i < len(hs) {
+        out = push(out, quant_theme(hs[i]))
+        i = i + 1
+    }
+    return out
+}
+
+// theme_index finds a theme by name in a slice → -1 when absent.
+fn theme_index(ts: []Theme, name: str) -> int {
+    i := 0
+    for i < len(ts) {
+        if ts[i].name == name {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// theme_alias — upstream name-compat table verbatim:
+// "" / "posting" / "textual-dark" → galaxy;
+// catppuccin-{mocha,macchiato,frappe} → catppuccin;
+// "textual-light" → catppuccin-latte.
+fn theme_alias(name: str) -> str {
+    if name == "" || name == "posting" || name == "textual-dark" {
+        return "galaxy"
+    }
+    if name == "catppuccin-mocha" || name == "catppuccin-macchiato" || name == "catppuccin-frappe" {
+        return "catppuccin"
+    }
+    if name == "textual-light" {
+        return "catppuccin-latte"
+    }
+    return name
+}
+
+// ---------- user themes ----------
+
+fn cerr(s: str) -> err {
+    return errors.new(s)
+}
+
+// yaml scalars: kind 0 scalar, 1 map, 2 list (core/yaml).
+fn ym_idx(n: ref yaml.YNode, key: str) -> int {
+    if n == nil || n.kind != 1 {
+        return -1
+    }
+    i := 0
+    for i < len(n.pairs) {
+        if n.pairs[i].key == key {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn yscal(n: ref yaml.YNode, key: str) -> str {
+    i := ym_idx(n, key)
+    if i < 0 || n.pairs[i].val.kind != 0 {
+        return ""
+    }
+    return n.pairs[i].val.s
+}
+
+fn yhas(n: ref yaml.YNode, key: str) -> bool {
+    return ym_idx(n, key) >= 0
+}
+
+// theme_colour_ok — upstream hexColour regex verbatim:
+// ^#([0-9a-fA-F]{3}|{6}|{8})$.
+fn theme_colour_ok(v: str) -> bool {
+    n := len(v)
+    if n != 4 && n != 7 && n != 9 {
+        return false
+    }
+    if byteat(v, 0) != 35 {
+        return false
+    }
+    i := 1
+    for i < n {
+        if hex_digit(byteat(v, i)) < 0 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// theme_colour_err — "<field> colour "<v>" isn't a hex colour
+// like #1e88e5" (upstream text verbatim).
+fn theme_colour_err(field: str, v: str) -> err {
+    return cerr(field + " colour \"" + v + "\" isn't a hex colour like #1e88e5")
+}
+
+
+fn name_blank(s: str) -> bool {
+    i := 0
+    for i < len(s) {
+        c := byteat(s, i)
+        if c != 32 && c != 9 && c != 10 && c != 13 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// parse_user_theme decodes one user theme file (upstream
+// themes.Parse): required name + primary; each present colour
+// must match the hex regex; `dark` optional bool, unset → dark.
+fn parse_user_theme(text: str) -> [own UserTheme, err] {
+    u := new(UserTheme)
+    [root, pe] = yaml.parse(text)
+    if pe != nil {
+        return u, pe
+    }
+    if root == nil || root.kind != 1 {
+        return u, cerr("config must be a mapping")
+    }
+    u.name = yscal(root, "name")
+    u.primary = yscal(root, "primary")
+    u.secondary = yscal(root, "secondary")
+    u.accent = yscal(root, "accent")
+    u.background = yscal(root, "background")
+    u.surface = yscal(root, "surface")
+    u.panel = yscal(root, "panel")
+    u.warning = yscal(root, "warning")
+    u.error = yscal(root, "error")
+    u.success = yscal(root, "success")
+    u.text = yscal(root, "text")
+    u.foreground = yscal(root, "foreground")
+    if yhas(root, "dark") {
+        dv := yscal(root, "dark")
+        if dv == "true" {
+            u.dark = true
+            u.dark_set = true
+        } else if dv == "false" {
+            u.dark = false
+            u.dark_set = true
+        } else {
+            return u, cerr("dark must be a bool")
+        }
+    }
+    if name_blank(u.name) {
+        return u, cerr("the theme has no name")
+    }
+    if len(u.primary) == 0 {
+        return u, cerr("the theme has no primary colour")
+    }
+    // upstream iterates Colours() (map order is unstable there) —
+    // we check in declaration order; same set, same error shape.
+    if len(u.primary) > 0 && !theme_colour_ok(u.primary) { return u, theme_colour_err("primary", u.primary) }
+    if len(u.secondary) > 0 && !theme_colour_ok(u.secondary) { return u, theme_colour_err("secondary", u.secondary) }
+    if len(u.accent) > 0 && !theme_colour_ok(u.accent) { return u, theme_colour_err("accent", u.accent) }
+    if len(u.background) > 0 && !theme_colour_ok(u.background) { return u, theme_colour_err("background", u.background) }
+    if len(u.surface) > 0 && !theme_colour_ok(u.surface) { return u, theme_colour_err("surface", u.surface) }
+    if len(u.panel) > 0 && !theme_colour_ok(u.panel) { return u, theme_colour_err("panel", u.panel) }
+    if len(u.warning) > 0 && !theme_colour_ok(u.warning) { return u, theme_colour_err("warning", u.warning) }
+    if len(u.error) > 0 && !theme_colour_ok(u.error) { return u, theme_colour_err("error", u.error) }
+    if len(u.success) > 0 && !theme_colour_ok(u.success) { return u, theme_colour_err("success", u.success) }
+    if len(u.text) > 0 && !theme_colour_ok(u.text) { return u, theme_colour_err("text", u.text) }
+    if len(u.foreground) > 0 && !theme_colour_ok(u.foreground) { return u, theme_colour_err("foreground", u.foreground) }
+    return u, nil
+}
+
+// build_user_theme — registerUserThemes verbatim: base = galaxy
+// (dark) or catppuccin-latte (light); set fields override.
+// foreground applies first, text second (text wins, like upstream
+// option order). background/surface/panel have no ANSI-8 slot —
+// validated but not carried (deviation recorded).
+fn build_user_theme(u: ref UserTheme) -> Theme {
+    bs := builtin_themes()
+    bi := theme_index(bs, "galaxy")
+    light := u.dark_set && !u.dark
+    if light {
+        bi = theme_index(bs, "catppuccin-latte")
+    }
+    t := bs[bi]
+    t.name = u.name
+    t.is_light = light
+    if len(u.primary) > 0 { t.primary = quantize(u.primary) }
+    if len(u.secondary) > 0 { t.secondary = quantize(u.secondary) }
+    if len(u.accent) > 0 { t.accent = quantize(u.accent) }
+    if len(u.warning) > 0 { t.warning = quantize(u.warning) }
+    if len(u.error) > 0 { t.error = quantize(u.error) }
+    if len(u.success) > 0 { t.success = quantize(u.success) }
+    if len(u.foreground) > 0 { t.text = quantize(u.foreground) }
+    if len(u.text) > 0 { t.text = quantize(u.text) }
+    return t
+}
+
+// scan_user_themes — upstream themes.LoadDir: missing dir →
+// empty; *.yaml|*.yml only, subdirs skipped; parse errors push
+// "Couldn't load theme <file>: <err>" (the main.go wrap baked in
+// — startup toasts take these strings verbatim); themes sorted
+// by name.
+fn scan_user_themes(dir: str) -> ThemeScan {
+    sc := ThemeScan{themes: nil, problems: nil}
+    if len(dir) == 0 || !os.isdir(dir) {
+        return sc
+    }
+    names := os.ls(dir)
+    i := 0
+    for i < len(names) {
+        n := names[i]
+        i = i + 1
+        is_yaml := false
+        if len(n) > 5 && substr(n, len(n) - 5, len(n)) == ".yaml" {
+            is_yaml = true
+        }
+        if len(n) > 4 && substr(n, len(n) - 4, len(n)) == ".yml" {
+            is_yaml = true
+        }
+        if !is_yaml || os.isdir(dir + "/" + n) {
+            continue
+        }
+        text := os.readfile_(dir + "/" + n)
+        [u, e] = parse_user_theme(text)
+        if e != nil {
+            sc.problems = push(sc.problems, "Couldn't load theme " + n + ": " + errors.msg(e))
+            continue
+        }
+        sc.themes = push(sc.themes, build_user_theme(u))
+    }
+    // sort by theme name (insertion — file count is small)
+    i = 1
+    for i < len(sc.themes) {
+        j := i
+        for j > 0 && str_lt(sc.themes[j].name, sc.themes[j - 1].name) {
+            tmp := sc.themes[j - 1]
+            sc.themes[j - 1] = sc.themes[j]
+            sc.themes[j] = tmp
+            j = j - 1
+        }
+        i = i + 1
+    }
+    return sc
+}
+
+fn str_lt(a: str, b: str) -> bool {
+    n := len(a)
+    if len(b) < n {
+        n = len(b)
+    }
+    i := 0
+    for i < n {
+        ca := byteat(a, i)
+        cb := byteat(b, i)
+        if ca != cb {
+            return ca < cb
+        }
+        i = i + 1
+    }
+    return len(a) < len(b)
+}
+
+// ---------- picker rows ----------
+// theme_rows/gradient_rows build the modal lists. Sections are
+// label rows ("── Yours ──" style markers are embedded as text;
+// the modal renders rows verbatim and cursor skips headers).
+
+fn theme_rows(a: ref App) -> []str {
+    let rows: []str = nil
+    nb := 0
+    if a.st != nil && a.st.load_builtin_themes {
+        nb = 1
+    } else if a.st == nil {
+        nb = 1
+    }
+    if len(a.user_themes) > 0 {
+        rows = push(rows, "─ Yours ─")
+        i := 0
+        for i < len(a.user_themes) {
+            rows = push(rows, a.user_themes[i].name)
+            i = i + 1
+        }
+    }
+    if nb == 1 {
+        bs := builtin_themes()
+        rows = push(rows, "─ Dark ─")
+        i := 0
+        for i < len(bs) {
+            if !bs[i].is_light {
+                rows = push(rows, bs[i].name)
+            }
+            i = i + 1
+        }
+        rows = push(rows, "─ Light ─")
+        i = 0
+        for i < len(bs) {
+            if bs[i].is_light {
+                rows = push(rows, bs[i].name)
+            }
+            i = i + 1
+        }
+    }
+    return rows
+}
+
+fn gradient_rows(a: ref App) -> []str {
+    rows := mkslice(str, 0)
+    rows = push(rows, "theme")
+    rows = push(rows, "off")
+    i := 0
+    for i < len(a.user_themes) {
+        rows = push(rows, a.user_themes[i].name)
+        i = i + 1
+    }
+    nb := true
+    if a.st != nil && !a.st.load_builtin_themes {
+        nb = false
+    }
+    if nb {
+        bs := builtin_themes()
+        i = 0
+        for i < len(bs) {
+            rows = push(rows, bs[i].name)
+            i = i + 1
+        }
+    }
+    return rows
+}
+
+// theme_lookup resolves a name across user themes first (same-name
+// user theme replaces the builtin row), then builtins.
+fn theme_lookup(a: ref App, name: str) -> [Theme, err] {
+    i := theme_index(a.user_themes, name)
+    if i >= 0 {
+        return a.user_themes[i], nil
+    }
+    bs := builtin_themes()
+    i = theme_index(bs, name)
+    if i >= 0 {
+        return bs[i], nil
+    }
+    return Theme{name: "", is_light: false, primary: -1, secondary: -1,
+        accent: -1, warning: -1, error: -1, success: -1, text: -1},
+        errors.new("unknown theme " + name)
+}
+
+// ---------- nerd fonts ----------
+
+// use_nerd_fonts — upstream Settings.UseNerdFonts verbatim:
+// set → that value; else true when TERM_PROGRAM≈ghostty
+// (EqualFold) | TERM=xterm-ghostty | GHOSTTY_RESOURCES_DIR set
+// (empty counts upstream; os.getenv can't see it — deviation).
+fn use_nerd_fonts(mode: int, term_program: str, term: str, ghostty_dir: str) -> bool {
+    if mode == 1 {
+        return true
+    }
+    if mode == 0 {
+        return false
+    }
+    if str_equalfold(term_program, "ghostty") || term == "xterm-ghostty" {
+        return true
+    }
+    return len(ghostty_dir) > 0
+}
+
+fn str_equalfold(a: str, b: str) -> bool {
+    return lower_ascii(a) == lower_ascii(b)
+}
