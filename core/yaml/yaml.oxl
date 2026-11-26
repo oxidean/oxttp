@@ -161,6 +161,19 @@ fn chr(c: int) -> str {
     return b as str
 }
 
+// bcat appends s to a byte accumulator — amortized O(1) per byte so
+// scalar decode/emit stays linear on large block text (str +=
+// re-copies the whole string each step).
+fn bcat(b: []byte, s: str) -> []byte {
+    sb := s as []byte
+    i := 0
+    for i < len(sb) {
+        b = push(b, sb[i])
+        i = i + 1
+    }
+    return b
+}
+
 // pscalar parses an inline scalar: quoted or plain (comment-cut).
 fn pscalar(t: str, line: int) -> [str, err] {
     s := trim_sp(t)
@@ -169,48 +182,48 @@ fn pscalar(t: str, line: int) -> [str, err] {
     }
     c0 := byteat(s, 0)
     if c0 == 34 { // "
-        out := ""
+        out := mkslice(byte, 0)
         i := 1
         for i < len(s) {
             c := byteat(s, i)
             if c == 34 {
-                return out, nil
+                return out as str, nil
             }
             if c == 92 && i + 1 < len(s) {
                 e := byteat(s, i + 1)
                 if e == 110 {
-                    out = out + "\n"
+                    out = push(out, 10)
                 } else if e == 116 {
-                    out = out + "\t"
+                    out = push(out, 9)
                 } else if e == 114 {
-                    out = out + "\r"
+                    out = push(out, 13)
                 } else if e == 34 || e == 92 {
-                    out = out + chr(e)
+                    out = push(out, e)
                 } else {
                     return "", yerr(line, "unsupported escape in double-quoted scalar")
                 }
                 i = i + 2
             } else {
-                out = out + chr(c)
+                out = push(out, c)
                 i = i + 1
             }
         }
         return "", yerr(line, "unterminated double-quoted scalar")
     }
     if c0 == 39 { // '
-        out := ""
+        out := mkslice(byte, 0)
         i := 1
         for i < len(s) {
             c := byteat(s, i)
             if c == 39 {
                 if i + 1 < len(s) && byteat(s, i + 1) == 39 {
-                    out = out + "'"
+                    out = push(out, 39)
                     i = i + 2
                 } else {
-                    return out, nil
+                    return out as str, nil
                 }
             } else {
-                out = out + chr(c)
+                out = push(out, c)
                 i = i + 1
             }
         }
@@ -583,26 +596,28 @@ fn pseq(ls: []YLine, cur: mut PCur, indent: int) -> [own YNode, err] {
 // --- emit ---
 
 fn esc_dq(s: str) -> str {
-    out := "\""
+    out := mkslice(byte, 1)
+    out[0] = 34
     i := 0
     for i < len(s) {
         c := byteat(s, i)
         if c == 34 {
-            out = out + "\\\""
+            out = bcat(out, "\\\"")
         } else if c == 92 {
-            out = out + "\\\\"
+            out = bcat(out, "\\\\")
         } else if c == 10 {
-            out = out + "\\n"
+            out = bcat(out, "\\n")
         } else if c == 9 {
-            out = out + "\\t"
+            out = bcat(out, "\\t")
         } else if c == 13 {
-            out = out + "\\r"
+            out = bcat(out, "\\r")
         } else {
-            out = out + chr(c)
+            out = push(out, c)
         }
         i = i + 1
     }
-    return out + "\""
+    out = push(out, 34)
+    return out as str
 }
 
 fn looks_bool_null(s: str) -> bool {
@@ -841,20 +856,20 @@ fn enode(n: ref YNode, indent: int) -> str {
 fn emit_block(s: str, indent: int) -> str {
     pad := ind_str(indent)
     out := ""
-    cur := ""
+    cur := mkslice(byte, 0)
     i := 0
     for i < len(s) {
         c := byteat(s, i)
         if c == 10 {
-            out = out + pad + cur + "\n"
-            cur = ""
+            out = out + pad + (cur as str) + "\n"
+            cur = mkslice(byte, 0)
         } else {
-            cur = cur + chr(c)
+            cur = push(cur, c)
         }
         i = i + 1
     }
     if len(cur) > 0 {
-        out = out + pad + cur + "\n"
+        out = out + pad + (cur as str) + "\n"
     }
     return out
 }

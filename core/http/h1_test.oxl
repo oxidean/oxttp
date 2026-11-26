@@ -13,7 +13,7 @@ import "std/encoding/base64"
 import "github.com/oxidean/oxttp/core/model"
 
 fn rq(method: str, u: str) -> own model.Req {
-    return new(model.Req{method: method, url: u, headers: nil, body: model.Body.Empty, timeout_ms: 0, follow: false, max_redirects: 10, httpver: "", synth: nil, verify: ""})
+    return new(model.Req{method: method, url: u, headers: nil, body: model.Body.Empty, timeout_ms: 0, follow: false, max_redirects: 10, httpver: "", synth: nil, verify: "", jar_off: false})
 }
 
 fn hs1(n: str, v: str) -> []model.Header {

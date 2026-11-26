@@ -32,7 +32,14 @@ fn parse_argv(a: mut App) {
             if i + 1 < os.nargs() {
                 v := os.args(i + 1)
                 i = i + 1
-                if len(v) > 0 && os.exists(v) && !os.isdir(v) {
+                // a value that looks like a file path (has a separator
+                // or a .env suffix) must exist — otherwise upstream
+                // reports a missing env file rather than silently
+                // treating the path as an env NAME.
+                looks_file := str_contains(v, "/") || str_contains(v, "\\") || (len(v) > 4 && substr(v, len(v) - 4, len(v)) == ".env")
+                if looks_file && (!os.exists(v) || os.isdir(v)) {
+                    a.toast(2, "env file not found: " + v)
+                } else if len(v) > 0 && os.exists(v) && !os.isdir(v) {
                     // FILE: parse directly into the session layer
                     // (§6.1 — --env file paths resolve from CWD).
                     es0 := new(env.EnvSet)
@@ -447,7 +454,7 @@ fn auth_render(r: ref collection.PRequest) -> str {
     } else if au.type == "digest" && au.digest != nil {
         s = s + "username: " + au.digest.username + "\n"
         s = s + "password: " + mask_secret(au.digest.password) + "\n"
-    } else if au.type == "bearer" && au.bearer_token != nil {
+    } else if au.type == "bearer_token" && au.bearer_token != nil {
         s = s + "token: " + mask_secret(au.bearer_token.token) + "\n"
     } else if au.type == "oauth2" && au.oauth2 != nil {
         o := au.oauth2
@@ -551,17 +558,30 @@ fn draft_to_request(a: ref App) -> own collection.PRequest {
     return r
 }
 
+// bcat appends s to a byte accumulator — amortized O(1) per byte so
+// body joins and JSON re-indents stay linear on large texts (str +=
+// is O(n²) there).
+fn bcat(b: []byte, s: str) -> []byte {
+    sb := s as []byte
+    i := 0
+    for i < len(sb) {
+        b = push(b, sb[i])
+        i = i + 1
+    }
+    return b
+}
+
 fn join_lines(ls: []str) -> str {
-    s := ""
+    s := mkslice(byte, 0)
     i := 0
     for i < len(ls) {
         if i > 0 {
-            s = s + "\n"
+            s = push(s, 10)
         }
-        s = s + ls[i]
+        s = bcat(s, ls[i])
         i = i + 1
     }
-    return s
+    return s as str
 }
 
 // ---------- dup / delete / save ----------
@@ -903,12 +923,17 @@ fn begin_send_preq(a: mut App) -> int {
         es = new(env.EnvSet)
     }
     // jar cookies are origin-scoped: resolve the outgoing URL the
-    // same way plan_req will, then send only matching entries.
+    // same way plan_req will (query vars pass through, only the
+    // address part errors unresolved), then send matching entries.
     let jar: []str = nil
-    [u0, ue0] = env.substitute(a.pending_preq.url, es, true)
+    [u0, ue0] = collection.subst_url(a.pending_preq.url, es)
     if ue0 == nil {
         if find(u0, "://") < 0 {
-            u0 = "http://" + u0
+            if len(u0) > 1 && substr(u0, 0, 2) == "//" {
+                u0 = "http:" + u0
+            } else {
+                u0 = "http://" + u0
+            }
         }
         jar = jar_for(a, url_origin(u0))
     }
@@ -1008,6 +1033,26 @@ fn install_resp(a: mut App, resp: model.Resp, req_url: str) {
             }
         }
         i = i + 1
+    }
+    // redirect hops set cookies too — jar them under the origin each
+    // hop actually hit (upstream jars every hop's Set-Cookie).
+    if attach && resp.hops != nil {
+        i = 0
+        for i < len(resp.hops) {
+            hp := resp.hops[i]
+            i = i + 1
+            if len(hp.url) == 0 {
+                continue
+            }
+            org := url_origin(hp.url)
+            j := 0
+            for j < len(hp.headers) {
+                if ascii_eq(hp.headers[j].name, "set-cookie") {
+                    jar_set(a, org, cookie_nv(hp.headers[j].value))
+                }
+                j = j + 1
+            }
+        }
     }
     a.resp_ck_rows = cks
     trs := mkslice(str, 0)
@@ -1216,43 +1261,56 @@ fn indent_str(d: int) -> str {
 }
 
 fn jpretty(j: ref json.Json, depth: int) -> str {
+    return jpretty_at(j, 0) as str
+}
+
+// jpretty_at re-indents into a byte accumulator — body-sized JSON
+// would make string-concat recursion quadratic.
+fn jpretty_at(j: ref json.Json, depth: int) -> []byte {
     if j == nil || j.kind == 0 {
-        return "null"
+        return "null" as []byte
     }
     if j.kind == 1 || j.kind == 2 || j.kind == 3 || j.kind == 6 {
-        return json.tojson(j)
+        return json.tojson(j) as []byte
     }
     if j.child == nil {
         if j.kind == 4 {
-            return "{}"
+            return "{}" as []byte
         }
-        return "[]"
+        return "[]" as []byte
     }
-    s := ""
+    s := mkslice(byte, 0)
     close := "]"
     if j.kind == 4 {
-        s = "{"
+        s = push(s, 123)
         close = "}"
     } else {
-        s = "["
+        s = push(s, 91)
     }
-    s = s + "\n"
+    s = push(s, 10)
     m := j.child
     first := true
     for m != nil {
         if !first {
-            s = s + ",\n"
+            s = bcat(s, ",\n")
         }
         first = false
-        s = s + indent_str(depth + 1)
+        s = bcat(s, indent_str(depth + 1))
         if j.kind == 4 {
-            s = s + json.tojson(json.jstr(m.key)) + ": " + jpretty(m, depth + 1)
-        } else {
-            s = s + jpretty(m, depth + 1)
+            s = bcat(s, json.tojson(json.jstr(m.key)))
+            s = bcat(s, ": ")
+        }
+        sb := jpretty_at(m, depth + 1)
+        i := 0
+        for i < len(sb) {
+            s = push(s, sb[i])
+            i = i + 1
         }
         m = m.next
     }
-    s = s + "\n" + indent_str(depth) + close
+    s = push(s, 10)
+    s = bcat(s, indent_str(depth))
+    s = bcat(s, close)
     return s
 }
 

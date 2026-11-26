@@ -1604,8 +1604,14 @@ fn sync_path_kv(a: mut App) {
     names := mkslice(str, 0)
     i := 0
     u := a.url.text
+    // ":name" counts only as a path SEGMENT start — "host:8080",
+    // "scheme://", userinfo, and query text must not mint rows.
     for i < len(u) {
-        if byteat(u, i) == 58 {
+        c := byteat(u, i)
+        if c == 63 || c == 35 { // ? # — path ends
+            break
+        }
+        if c == 58 && (i == 0 || byteat(u, i - 1) == 47) {
             j := i + 1
             for j < len(u) && is_word_byte(byteat(u, j)) {
                 j = j + 1

@@ -165,7 +165,7 @@ fn test_install_resp_hops_and_nojson() {
     hops := mkslice(model.Hop, 0)
     hops = push(hops, model.Hop{req_head: "GET /a HTTP/1.1", status: 301,
         reason: "Moved", version: "1.1", headers: nil, body: nil,
-        elapsed_ms: 2.0, remote: "127.0.0.1:9"})
+        elapsed_ms: 2.0, remote: "127.0.0.1:9", url: "http://x/a"})
     r := fake_resp(200, "text/plain", "plain body stays", new(hops))
     install_resp(a, r, "http://x")
     testing.expect_eq(len(a.resp_tr_rows), 8, "stage rows + hops line")

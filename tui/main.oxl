@@ -67,12 +67,13 @@ fn main() {
                 if fx == ESend {
                     // paint a "Sending…" frame before the send blocks —
                     // exec_send installs the response or the error text.
+                    // A failed present must not swallow the send: the
+                    // response still installs (and jars/history record)
+                    // for the next successful frame.
                     a.sending = true
                     render(a, sess.scr, ver)
-                    spe := sess.scr.present()
-                    if spe == nil {
-                        exec_send(a)
-                    }
+                    sess.scr.present()
+                    exec_send(a)
                     a.sending = false
                 }
                 i = i + 1

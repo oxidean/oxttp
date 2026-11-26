@@ -155,6 +155,13 @@ fn cerr(msg: str) -> err {
     return errors.new("collection: " + msg)
 }
 
+// is_empty reports a "key:"-with-no-value node — YAML null. Container
+// decoders treat it as absent (upstream unmarshals null into zero
+// values, never errors).
+fn is_empty(v: ref yaml.YNode) -> bool {
+    return v == nil || (v.kind == 0 && len(v.s) == 0)
+}
+
 // scal reads a scalar node's text; containers error.
 fn scal(v: ref yaml.YNode, what: str) -> [str, err] {
     if v == nil {
@@ -217,7 +224,7 @@ fn ym_has(n: ref yaml.YNode, key: str) -> bool {
 // str_list decodes a seq of scalars (proto files/import_paths).
 fn str_list(v: ref yaml.YNode, what: str) -> [[]str, err] {
     let out: []str = nil
-    if v == nil {
+    if is_empty(v) {
         return out, nil
     }
     if v.kind != 2 {
@@ -227,6 +234,9 @@ fn str_list(v: ref yaml.YNode, what: str) -> [[]str, err] {
     for i < len(v.items) {
         it := v.items[i]
         i = i + 1
+        if is_empty(it) {
+            continue
+        }
         if it == nil || it.kind != 0 {
             return nil, cerr(what + " entries must be scalars")
         }
@@ -238,7 +248,7 @@ fn str_list(v: ref yaml.YNode, what: str) -> [[]str, err] {
 // kv_rows decodes [{name,value,enabled}] rows — enabled defaults true.
 fn kv_rows(v: ref yaml.YNode, what: str) -> [[]model.KV, err] {
     let out: []model.KV = nil
-    if v == nil {
+    if is_empty(v) {
         return out, nil
     }
     if v.kind != 2 {
@@ -248,6 +258,9 @@ fn kv_rows(v: ref yaml.YNode, what: str) -> [[]model.KV, err] {
     for i < len(v.items) {
         it := v.items[i]
         i = i + 1
+        if is_empty(it) {
+            continue
+        }
         if it == nil || it.kind != 1 {
             return nil, cerr(what + " rows must be maps")
         }
@@ -270,6 +283,9 @@ fn kv_rows(v: ref yaml.YNode, what: str) -> [[]model.KV, err] {
                 }
                 row.value = s2
             } else if pk == "enabled" {
+                if is_empty(pv) {
+                    continue
+                }
                 [b, be] = tobool(pv, what + ".enabled")
                 if be != nil {
                     return nil, be
@@ -285,7 +301,7 @@ fn kv_rows(v: ref yaml.YNode, what: str) -> [[]model.KV, err] {
 // pp_rows decodes [{name,value}] path-param rows.
 fn pp_rows(v: ref yaml.YNode) -> [[]PathParam, err] {
     let out: []PathParam = nil
-    if v == nil {
+    if is_empty(v) {
         return out, nil
     }
     if v.kind != 2 {
@@ -295,6 +311,9 @@ fn pp_rows(v: ref yaml.YNode) -> [[]PathParam, err] {
     for i < len(v.items) {
         it := v.items[i]
         i = i + 1
+        if is_empty(it) {
+            continue
+        }
         if it == nil || it.kind != 1 {
             return nil, cerr("path_params rows must be maps")
         }
@@ -324,7 +343,7 @@ fn pp_rows(v: ref yaml.YNode) -> [[]PathParam, err] {
 // variable_scope.variables — posting maps stay ordered here).
 fn str_map(v: ref yaml.YNode, what: str) -> [[]model.KV, err] {
     let out: []model.KV = nil
-    if v == nil {
+    if is_empty(v) {
         return out, nil
     }
     if v.kind != 1 {
@@ -348,7 +367,7 @@ fn str_map(v: ref yaml.YNode, what: str) -> [[]model.KV, err] {
 // value|file (corpus §5.2).
 fn part_rows(v: ref yaml.YNode) -> [[]model.Part, err] {
     let out: []model.Part = nil
-    if v == nil {
+    if is_empty(v) {
         return out, nil
     }
     if v.kind != 2 {
@@ -358,6 +377,9 @@ fn part_rows(v: ref yaml.YNode) -> [[]model.Part, err] {
     for i < len(v.items) {
         it := v.items[i]
         i = i + 1
+        if is_empty(it) {
+            continue
+        }
         if it == nil || it.kind != 1 {
             return nil, cerr("multipart parts must be maps")
         }
@@ -373,12 +395,17 @@ fn part_rows(v: ref yaml.YNode) -> [[]model.Part, err] {
             pv := it.pairs[j].val
             j = j + 1
             if pk == "enabled" {
+                if is_empty(pv) {
+                    continue
+                }
                 [b, be] = tobool(pv, "multipart.enabled")
                 if be != nil {
                     return nil, be
                 }
                 p.enabled = b
-            } else {
+            } else if pk == "name" || pk == "value" || pk == "file" || pk == "filename" || pk == "content_type" {
+                // non-strict block: unknown keys ignore (corpus pins
+                // strict decode only for graphql/grpc/websocket)
                 [s, se] = scal(pv, "multipart." + pk)
                 if se != nil {
                     return nil, se
@@ -391,7 +418,7 @@ fn part_rows(v: ref yaml.YNode) -> [[]model.Part, err] {
                     p.file = s
                 } else if pk == "filename" {
                     p.filename = s
-                } else if pk == "content_type" {
+                } else {
                     p.content_type = s
                 }
             }
@@ -404,7 +431,7 @@ fn part_rows(v: ref yaml.YNode) -> [[]model.Part, err] {
 // body_dec decodes the body block; >1 kind present = error.
 fn body_dec(v: ref yaml.YNode) -> [own PBody, err] {
     b := new(PBody)
-    if v == nil {
+    if is_empty(v) {
         return b, nil
     }
     if v.kind != 1 {
@@ -524,7 +551,7 @@ fn yjson(v: ref yaml.YNode) -> own json.Json {
 // gql_dec decodes the graphql block — STRICT (corpus).
 fn gql_dec(v: ref yaml.YNode) -> [own PGraphQL, err] {
     g := new(PGraphQL)
-    if v == nil {
+    if is_empty(v) {
         return g, nil
     }
     if v.kind != 1 {
@@ -559,7 +586,7 @@ fn gql_dec(v: ref yaml.YNode) -> [own PGraphQL, err] {
 // grpc_dec decodes the grpc block — STRICT (corpus).
 fn grpc_dec(v: ref yaml.YNode) -> [own PGrpc, err] {
     g := new(PGrpc)
-    if v == nil {
+    if is_empty(v) {
         return g, nil
     }
     if v.kind != 1 {
@@ -613,7 +640,7 @@ fn grpc_dec(v: ref yaml.YNode) -> [own PGrpc, err] {
 // ws_dec decodes the websocket block — STRICT (corpus).
 fn ws_dec(v: ref yaml.YNode) -> [own PWebsocket, err] {
     w := new(PWebsocket)
-    if v == nil {
+    if is_empty(v) {
         return w, nil
     }
     if v.kind != 1 {
@@ -631,11 +658,13 @@ fn ws_dec(v: ref yaml.YNode) -> [own PWebsocket, err] {
             }
             w.message = s
         } else if k == "binary" {
-            [b, be] = tobool(pv, "websocket.binary")
-            if be != nil {
-                return nil, be
+            if !is_empty(pv) {
+                [b, be] = tobool(pv, "websocket.binary")
+                if be != nil {
+                    return nil, be
+                }
+                w.binary = b
             }
-            w.binary = b
         } else {
             return nil, cerr("websocket: unknown key " + k)
         }
@@ -646,7 +675,7 @@ fn ws_dec(v: ref yaml.YNode) -> [own PWebsocket, err] {
 // basic_dec decodes a {username,password} auth block.
 fn basic_dec(v: ref yaml.YNode, what: str) -> [own PBasic, err] {
     b := new(PBasic)
-    if v == nil {
+    if is_empty(v) {
         return b, nil
     }
     if v.kind != 1 {
@@ -674,7 +703,7 @@ fn basic_dec(v: ref yaml.YNode, what: str) -> [own PBasic, err] {
 // bearer_dec decodes {token}.
 fn bearer_dec(v: ref yaml.YNode) -> [own PBearer, err] {
     b := new(PBearer)
-    if v == nil {
+    if is_empty(v) {
         return b, nil
     }
     if v.kind != 1 {
@@ -694,7 +723,7 @@ fn bearer_dec(v: ref yaml.YNode) -> [own PBearer, err] {
 // oauth_dec decodes the oauth2 block (corpus field list).
 fn oauth_dec(v: ref yaml.YNode) -> [own POAuth2, err] {
     o := new(POAuth2)
-    if v == nil {
+    if is_empty(v) {
         return o, nil
     }
     if v.kind != 1 {
@@ -705,26 +734,29 @@ fn oauth_dec(v: ref yaml.YNode) -> [own POAuth2, err] {
         k := v.pairs[i].key
         pv := v.pairs[i].val
         i = i + 1
-        [s, se] = scal(pv, "oauth2." + k)
-        if se != nil {
-            return nil, se
-        }
-        if k == "grant_type" {
-            o.grant_type = s
-        } else if k == "authorization_url" {
-            o.authorization_url = s
-        } else if k == "token_url" {
-            o.token_url = s
-        } else if k == "client_id" {
-            o.client_id = s
-        } else if k == "client_secret" {
-            o.client_secret = s
-        } else if k == "scope" {
-            o.scope = s
-        } else if k == "redirect_uri" {
-            o.redirect_uri = s
-        } else if k == "client_auth" {
-            o.client_auth = s
+        // non-strict block: unknown keys ignore
+        if k == "grant_type" || k == "authorization_url" || k == "token_url" || k == "client_id" || k == "client_secret" || k == "scope" || k == "redirect_uri" || k == "client_auth" {
+            [s, se] = scal(pv, "oauth2." + k)
+            if se != nil {
+                return nil, se
+            }
+            if k == "grant_type" {
+                o.grant_type = s
+            } else if k == "authorization_url" {
+                o.authorization_url = s
+            } else if k == "token_url" {
+                o.token_url = s
+            } else if k == "client_id" {
+                o.client_id = s
+            } else if k == "client_secret" {
+                o.client_secret = s
+            } else if k == "scope" {
+                o.scope = s
+            } else if k == "redirect_uri" {
+                o.redirect_uri = s
+            } else {
+                o.client_auth = s
+            }
         }
     }
     return o, nil
@@ -734,7 +766,7 @@ fn oauth_dec(v: ref yaml.YNode) -> [own POAuth2, err] {
 // bearer_token|oauth2 (corpus §5.2).
 fn auth_dec(v: ref yaml.YNode) -> [own PAuth, err] {
     a := new(PAuth)
-    if v == nil {
+    if is_empty(v) {
         return a, nil
     }
     if v.kind != 1 {
@@ -789,7 +821,7 @@ fn auth_dec(v: ref yaml.YNode) -> [own PAuth, err] {
 // scripts_dec decodes {setup,on_request,on_response}.
 fn scripts_dec(v: ref yaml.YNode) -> [own PScripts, err] {
     s := new(PScripts)
-    if v == nil {
+    if is_empty(v) {
         return s, nil
     }
     if v.kind != 1 {
@@ -826,7 +858,7 @@ fn scripts_dec(v: ref yaml.YNode) -> [own PScripts, err] {
 // records which keys the file set so encode writes non-defaults back.
 fn opts_dec(v: ref yaml.YNode) -> [own POptions, err] {
     o := new(POptions{follow_redirects: true, verify_ssl: true, attach_cookies: true, substitute_body_variables: true, proxy_url: "", timeout: 5.0, set_mask: 0})
-    if v == nil {
+    if is_empty(v) {
         return o, nil
     }
     if v.kind != 1 {
@@ -838,6 +870,9 @@ fn opts_dec(v: ref yaml.YNode) -> [own POptions, err] {
         pv := v.pairs[i].val
         i = i + 1
         if k == "proxy_url" {
+            if is_empty(pv) {
+                continue
+            }
             [s, se] = scal(pv, "options.proxy_url")
             if se != nil {
                 return nil, se
@@ -845,13 +880,21 @@ fn opts_dec(v: ref yaml.YNode) -> [own POptions, err] {
             o.proxy_url = s
             o.set_mask = o.set_mask | 16
         } else if k == "timeout" {
+            if is_empty(pv) {
+                continue
+            }
             [f, fe] = tofloat(pv, "options.timeout")
             if fe != nil {
                 return nil, fe
             }
             o.timeout = f
             o.set_mask = o.set_mask | 32
-        } else {
+        } else if k == "follow_redirects" || k == "verify_ssl" || k == "attach_cookies" || k == "substitute_body_variables" {
+            // non-strict block: unknown keys ignore (corpus pins
+            // strict decode only for graphql/grpc/websocket)
+            if is_empty(pv) {
+                continue
+            }
             [b, be] = tobool(pv, "options." + k)
             if be != nil {
                 return nil, be
@@ -865,7 +908,7 @@ fn opts_dec(v: ref yaml.YNode) -> [own POptions, err] {
             } else if k == "attach_cookies" {
                 o.attach_cookies = b
                 o.set_mask = o.set_mask | 4
-            } else if k == "substitute_body_variables" {
+            } else {
                 o.substitute_body_variables = b
                 o.set_mask = o.set_mask | 8
             }
@@ -877,7 +920,7 @@ fn opts_dec(v: ref yaml.YNode) -> [own POptions, err] {
 // varscope_dec decodes variable_scope{variables:{NAME:template}}.
 fn varscope_dec(v: ref yaml.YNode) -> [own PVarScope, err] {
     vs := new(PVarScope)
-    if v == nil {
+    if is_empty(v) {
         return vs, nil
     }
     if v.kind != 1 {
@@ -944,7 +987,9 @@ fn decode(n: ref yaml.YNode) -> [own PRequest, err] {
                 return nil, se4
             }
             m := strings.upper(s4)
-            if !valid_method(m) {
+            // "method:" bare is a YAML null — same as omitted (GET
+            // downstream), not a validation failure.
+            if len(m) > 0 && !valid_method(m) {
                 return nil, cerr("method must be GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS")
             }
             r.method = m
@@ -1522,9 +1567,9 @@ fn scan_into(root: str, rel: str, depth: int, sc: mut CollScan) {
     for i < len(names) {
         nm := names[i]
         i = i + 1
-        if skip_name(nm) {
-            continue
-        }
+        // corpus §5.1 skips dot-DIRECTORIES (plus __pycache__ /
+        // node_modules); a dot-prefixed *.posting.yaml file still
+        // loads like any other request file.
         if len(nm) < 13 || substr(nm, len(nm) - 13, len(nm)) != ".posting.yaml" {
             continue
         }
@@ -1673,16 +1718,105 @@ fn resolve_rel(coll_dir: str, p: str) -> str {
     return coll_dir + "/" + p
 }
 
+// subst_url substitutes $VARS in a URL per corpus §6.2: the address
+// part (scheme/authority/path — everything before the first "?" or
+// "#") errors on an unresolved name; query + fragment text passes
+// unresolved names through literally.
+fn subst_url(u: str, es: ref env.EnvSet) -> [str, err] {
+    cut := len(u)
+    qi := find(u, "?")
+    if qi >= 0 && qi < cut {
+        cut = qi
+    }
+    fi := find(u, "#")
+    if fi >= 0 && fi < cut {
+        cut = fi
+    }
+    [h, he] = env.substitute(substr(u, 0, cut), es, true)
+    if he != nil {
+        return "", he
+    }
+    [t, te] = env.substitute(substr(u, cut, len(u)), es, false)
+    if te != nil {
+        return "", te
+    }
+    return h + t, nil
+}
+
+// scoped_env layers the request's variable_scope.variables into the
+// env set: above env files, below session values (corpus §6.3). Each
+// value is a template expanded against the env + the scope vars
+// resolved so far.
+fn scoped_env(r: ref PRequest, es: ref env.EnvSet) -> own env.EnvSet {
+    out := new(env.EnvSet)
+    work := new(env.EnvSet)
+    let sess: []env.EnvLayer = nil
+    noscope := r.variable_scope == nil || len(r.variable_scope.variables) == 0
+    if es != nil {
+        out.warns = es.warns
+        i := 0
+        for i < len(es.layers) {
+            ly := es.layers[i]
+            if ly.source == "session" && !noscope {
+                sess = push(sess, ly)
+            } else {
+                out.layers = push(out.layers, ly)
+                work.layers = push(work.layers, ly)
+            }
+            i = i + 1
+        }
+    }
+    if noscope {
+        return out
+    }
+    sc := env.EnvLayer{name: "variable_scope", source: "file", vars: nil}
+    work.layers = push(work.layers, sc)
+    si := len(work.layers) - 1
+    i := 0
+    for i < len(sess) {
+        work.layers = push(work.layers, sess[i])
+        i = i + 1
+    }
+    i = 0
+    for i < len(r.variable_scope.variables) {
+        kv := r.variable_scope.variables[i]
+        val := kv.value
+        [v, ve] = env.substitute(kv.value, work, false)
+        if ve == nil {
+            val = v
+        }
+        row := model.KV{name: kv.name, value: val, enabled: kv.enabled}
+        sc.vars = push(sc.vars, row)
+        work.layers[si].vars = sc.vars
+        i = i + 1
+    }
+    out.layers = push(out.layers, sc)
+    i = 0
+    for i < len(sess) {
+        out.layers = push(out.layers, sess[i])
+        i = i + 1
+    }
+    return out
+}
+
+// bad_wire reports CR/LF in a value headed for the wire — a header
+// name/value or request-target containing them would splice extra
+// headers into the head.
+fn bad_wire(s: str) -> bool {
+    return find(s, "\r") >= 0 || find(s, "\n") >= 0
+}
+
 // plan_req maps a decoded request + environment + cookie jar into a
 // wire model.Req — corpus §7.1. err set → caller toasts; warns → info
 // toasts (proxy etc.).
-fn plan_req(r: ref PRequest, es: ref env.EnvSet, jar: []str, coll_dir: str) -> SendPlan {
+fn plan_req(r: ref PRequest, envset: ref env.EnvSet, jar: []str, coll_dir: str) -> SendPlan {
     sp := SendPlan{req: nil, warns: nil, err: ""}
     if len(r.kind) > 0 {
         sp.err = "kind " + r.kind + " sends land M4 — unsupported in this build"
         return sp
     }
-    [u, ue] = env.substitute(r.url, es, true)
+    es := scoped_env(r, envset)
+    [u, ue] = subst_url(r.url, es)
     if ue != nil {
         sp.err = errors.msg(ue)
         return sp
@@ -1692,7 +1826,13 @@ fn plan_req(r: ref PRequest, es: ref env.EnvSet, jar: []str, coll_dir: str) -> S
         return sp
     }
     if find(u, "://") < 0 {
-        u = "http://" + u
+        if len(u) > 1 && substr(u, 0, 2) == "//" {
+            // scheme-relative "//host/path" → "http://host/path"
+            // (prefixing http:// would mangle to http:////host/path)
+            u = "http:" + u
+        } else {
+            u = "http://" + u
+        }
     }
     [u2, ue2] = fill_path(u, r, es)
     if ue2 != nil {
@@ -1906,6 +2046,20 @@ fn plan_req(r: ref PRequest, es: ref env.EnvSet, jar: []str, coll_dir: str) -> S
         }
         hdrs = push(hdrs, model.Header{name: "Cookie", value: cv})
     }
+    // wire hygiene: CR/LF inside a header or the request-target
+    // splices into the head — refuse before it reaches a socket.
+    if bad_wire(u) {
+        sp.err = "url contains CR/LF characters"
+        return sp
+    }
+    i = 0
+    for i < len(hdrs) {
+        if bad_wire(hdrs[i].name) || bad_wire(hdrs[i].value) {
+            sp.err = "header " + hdrs[i].name + " contains CR/LF characters"
+            return sp
+        }
+        i = i + 1
+    }
     rq := new(model.Req)
     m := r.method
     if len(m) == 0 {
@@ -1915,6 +2069,7 @@ fn plan_req(r: ref PRequest, es: ref env.EnvSet, jar: []str, coll_dir: str) -> S
     rq.url = u
     rq.headers = hdrs
     rq.body = b
+    rq.jar_off = !cookies
     rq.follow = follow
     if follow {
         rq.max_redirects = 10

@@ -55,6 +55,9 @@ struct Req {
     // verify: "" or "yes" → system roots; "no" → accept-all Verifier
     // (IN-0005=B); otherwise a PEM path loaded into x509.Roots.
     verify: str,
+    // jar_off disables the transport's in-chain cookie jar (posting's
+    // attach_cookies=false); false keeps xh's always-on in-memory jar.
+    jar_off: bool,
 }
 
 // ReqHead is what the wire emitted for one request — kept verbatim
@@ -73,6 +76,7 @@ struct Hop {
     body: []byte,
     elapsed_ms: float,
     remote: str,
+    url: str, // resolved URL this hop requested (post-Location resolve)
 }
 
 // Trace is the per-stage timing posting shows in its Trace tab
