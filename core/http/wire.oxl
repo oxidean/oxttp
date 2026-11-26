@@ -128,20 +128,6 @@ fn hdr_has(hs: []model.Header, name: str) -> bool {
     return false
 }
 
-// hdr_drop removes every header with name (case-insensitive).
-fn hdr_drop(hs: []model.Header, name: str) -> []model.Header {
-    ln := lwr(name)
-    let out: []model.Header = nil
-    i := 0
-    for i < len(hs) {
-        if lwr(hs[i].name) != ln {
-            out = push(out, hs[i])
-        }
-        i = i + 1
-    }
-    return out
-}
-
 // render_body flattens a Body variant to (ctype, bytes) per the spec:
 // Raw verbatim; Json via tojson; Form query-escaped k=v&; Multipart
 // boundary assembly; FileBody read from disk. Disabled rows/parts

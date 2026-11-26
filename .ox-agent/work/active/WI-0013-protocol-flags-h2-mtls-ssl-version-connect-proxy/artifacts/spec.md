@@ -86,10 +86,14 @@ transport on `cur.url`:
 ### sem-S6 curl map additions (corpus §5)
 
 - `--http-version 2`→`--http2`; `2-prior-knowledge`→
-  `--http2-prior-knowledge`; `3-prior-knowledge`→`--http3-only` —
-  BUT the h3 feature-gate defer stays ahead of the curl
-  short-circuit, so 3* still errors (xh does the same on builds
-  without http3).
+  `--http2-prior-knowledge`; `3-prior-knowledge`→`--http3-only`.
+  The h3 feature-gate defer does NOT reach the `--curl` path —
+  upstream's `to_curl::print_curl_translation` short-circuit runs
+  before client build (where the `#[cfg(not(feature="http3"))]` bail
+  lives), so `--curl --http-version 3-prior-knowledge` emits
+  `--http3-only` and exits 0. Amended post-review: the code was
+  upstream-correct and this spec text was stale; pinned by golden
+  case `curl-h3-prior`.
 - `--ssl tlsX.Y`→`--tlsvX.Y --tls-max X.Y`; auto/ssl2.3→nothing.
 - `--cert`→`-E`/`--cert`; `--cert-key`→`--key`.
 - `--proxy all:URL`→**deviation:** env assignment `all_proxy=URL`

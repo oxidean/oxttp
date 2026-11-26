@@ -5,7 +5,7 @@ package http
 // is a complete client; v0.1 opens one connection per request and
 // closes it (Connection: close on the wire). HTTPS dials TCP via the
 // non-suspending path then wraps with std/net/tls.client (oxidean/oxl
-// #128 shipped; mTLS/CONNECT/TLS1.2 still parked — #221/#222/#224).
+// #128, #221-#224 shipped in 0.26.0 — mTLS/CONNECT/TLS1.2 live).
 //
 // Concurrency note: Transport.send dispatches through a vtable —
 // "vtable calls carry no task frame", so send can never suspend.
@@ -720,6 +720,7 @@ fn h2_exchange(req: ref model.Req, rw: io.ReadWriter, fd: int, hdrs: []model.Hea
     if e2 != nil {
         return bad, errors.wrap("http: h2 preface", e2)
     }
+    defer c2.close()
     let hh: []http2.Header = nil
     hh = push(hh, http2.Header{name: ":method", value: req.method})
     hh = push(hh, http2.Header{name: ":scheme", value: lwr(u.scheme)})
@@ -757,6 +758,7 @@ fn h2_exchange(req: ref model.Req, rw: io.ReadWriter, fd: int, hdrs: []model.Hea
     tr.send_body_ms = itof(now_ms() - c0)
     status := 0
     let rh: []model.Header = nil
+    n_rh_head := -1
     body := mkslice(byte, 0)
     got_final := false
     done := false
@@ -779,6 +781,9 @@ fn h2_exchange(req: ref model.Req, rw: io.ReadWriter, fd: int, hdrs: []model.Hea
         }
         if ev.kind == 1 { // HEADERS
             if ev.trailers {
+                if n_rh_head < 0 {
+                    n_rh_head = len(rh)
+                }
                 i := 0
                 for i < len(ev.headers) {
                     rh = push(rh, model.Header{name: ev.headers[i].name, value: ev.headers[i].value})
@@ -832,7 +837,13 @@ fn h2_exchange(req: ref model.Req, rw: io.ReadWriter, fd: int, hdrs: []model.Hea
     cap.body = body
     cap.elapsed_ms = itof(now_ms() - t0)
     tr.recv_body_ms = itof(now_ms() - c0)
-    le := h2_check_length(req.method, status, rh, len(body))
+    // content-length applies to response headers only — a content-length
+    // trailer field is legal and must not trip the check.
+    hdr_scope := rh
+    if n_rh_head >= 0 {
+        hdr_scope = rh[:n_rh_head]
+    }
+    le := h2_check_length(req.method, status, hdr_scope, len(body))
     if le != nil {
         return bad, le
     }
@@ -1043,7 +1054,9 @@ fn pick_proxy(req: ref model.Req, scheme: str, host: str) -> str {
         }
         nm := lwr(substr(req.proxy_env[i], 0, eq))
         val := trim_ows(substr(req.proxy_env[i], eq + 1, len(req.proxy_env[i])))
-        if nm == scheme + "_proxy" {
+        // an explicitly-empty *_proxy value is "unset" upstream — keep
+        // scanning so ALL_PROXY can still apply.
+        if nm == scheme + "_proxy" && len(val) > 0 {
             want = val
             break
         }
@@ -1161,7 +1174,9 @@ fn proxy_connect(c: net.Conn, authority: str, auth: str, tmo: int) -> err {
                     return pe
                 }
                 if status >= 100 && status < 200 && status != 101 {
-                    response = ""
+                    // keep any bytes the proxy coalesced past the 1xx head —
+                    // they may already be tunnel or final-response data.
+                    response = substr(response, head_end + 4, len(response))
                     scan_from = 0
                 } else {
                     set_rcvtimo_ms(c.rawfd(), 0)

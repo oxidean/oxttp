@@ -725,7 +725,11 @@ fn plan(i: ref Intent, env: []str, stdin: str, stdin_tty: int) -> own ReqPlan {
     // --- stdin body decision (ADR 0022)
     stdin_body := ""
     use_stdin := 0
-    if stdin_tty == 0 && i.ignore_stdin == 0 {
+    // corpus fixture pinning: an EXPLICIT method + empty stdin carries
+    // no body (xh emits a bare GET for `xh GET url </dev/null`), while
+    // redirected stdin with no explicit method still counts — it forces
+    // the default POST and sends CL:0 + json accept/ct.
+    if stdin_tty == 0 && i.ignore_stdin == 0 && (len(stdin) > 0 || len(i.method) == 0) {
         body_items := 0
         j := 0
         for j < len(i.ikinds[:]) {
@@ -1638,6 +1642,9 @@ fn curl_ignored(i: ref Intent) -> str {
     if len(i.resolves[:]) > 0 {
         out = out + "Warning: Ignored --resolve\n"
     }
+    if i.compress_n != 0 {
+        out = out + "Warning: Ignored --compress\n"
+    }
     // WI-0013 P5 (spec sem-S4/S6): --proxy now emits (-x / env
     // prefixes) so its Ignored line is gone; --native-tls joins the
     // corpus §5 ignored list instead.
@@ -1731,8 +1738,9 @@ fn curl_emit(i: ref Intent, p: ref ReqPlan) -> str {
     if i.http_version == "2-prior-knowledge" {
         cmd = cmd + " --http2-prior-knowledge"
     }
-    // 3-prior-knowledge maps to --http3-only but is unreachable: the
-    // h3 feature-gate defer fires ahead of the curl short-circuit.
+    // 3-prior-knowledge maps to --http3-only and IS reachable under
+    // --curl: upstream's to_curl short-circuit runs before client
+    // build, so the h3 feature-gate defer never sees it (spec sem-S6).
     if i.http_version == "3-prior-knowledge" {
         cmd = cmd + " --http3-only"
     }

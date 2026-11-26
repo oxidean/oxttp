@@ -295,13 +295,15 @@ fn g_norm_addr(s: str) -> str {
 }
 
 // "<Key>: <value up to EOL>" → "<Key>: <V>" — for volatile values.
+// Also stops at ' so --curl's inline `-H 'K: v'` emits don't get their
+// tail masked into the key (regression: the tail once hid -d/Accept diffs).
 fn g_norm_lineval(s: str, key: str) -> str {
     out := ""
     i := 0
     for i < len(s) {
         if i + len(key) <= len(s) && substr(s, i, i + len(key)) == key {
             j := i + len(key)
-            for j < len(s) && byteat(s, j) != 10 && byteat(s, j) != 13 {
+            for j < len(s) && byteat(s, j) != 10 && byteat(s, j) != 13 && byteat(s, j) != 39 {
                 j = j + 1
             }
             out = out + key + "<V>"
@@ -429,6 +431,7 @@ fn test_golden_download() { g_run("download") }
 // WI-0013 P5 — --curl emit pins + proxy scheme degrade texts.
 fn test_golden_curl_h2() { g_run("curl-h2") }
 fn test_golden_curl_h2_prior() { g_run("curl-h2-prior") }
+fn test_golden_curl_h3_prior() { g_run("curl-h3-prior") }
 fn test_golden_curl_ssl_cert() { g_run("curl-ssl-cert") }
 fn test_golden_curl_proxy() { g_run("curl-proxy") }
 fn test_golden_proxy_socks5() { g_run("proxy-socks5") }
