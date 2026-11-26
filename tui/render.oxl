@@ -171,18 +171,37 @@ fn render_url_bar(a: mut App, scr: mut term.AnsiScreen, cols: int) {
     // method cell (clickable → method menu), then the url line-edit,
     // then a dim preview row (verbatim until vars land S10).
     mw := 10
+    // the field h-scrolls to keep the insertion point visible: off is
+    // the byte offset the window starts at — walk back from cur until
+    // one more glyph would push the cursor past the field's last
+    // column (avail-1 leaves the cursor its own cell).
+    avail := cols - mw - 3
+    off := 0
+    vis := 0
+    j := a.url.cur
+    for j > 0 {
+        g0 := glyph_start(a.url.text, j - 1)
+        w2 := str_cols(substr(a.url.text, g0, j))
+        if vis + w2 > avail - 1 {
+            break
+        }
+        vis = vis + w2
+        off = g0
+        j = g0
+    }
     put_str_max(scr, 1, 1, "[" + a.method + "]", mw - 1, 5, term.AttrBold)
-    put_str_max(scr, mw + 2, 1, a.url.text, cols - mw - 3, 7, 0)
+    put_str_max(scr, mw + 2, 1, substr(a.url.text, off, len(a.url.text)), avail, 7, 0)
     prev := a.url.text
     if len(prev) == 0 {
         prev = "(empty url)"
     }
     put_str_max(scr, 2, 2, "→ " + prev, cols - 4, 7, term.AttrDim)
     fill_row(scr, 0, 3, cols, "-", 7, term.AttrDim)
-    // url focus shows the text cursor inside the bar — cur is a byte
-    // offset, so translate to display columns for multibyte text.
+    // url focus shows the text cursor inside the bar — vis counts the
+    // display columns between the window start and the insertion
+    // point, so cx tracks the scrolled text.
     if a.focus == FUrl {
-        cx := mw + 2 + str_cols(substr(a.url.text, 0, a.url.cur))
+        cx := mw + 2 + vis
         if cx >= cols {
             cx = cols - 1
         }
@@ -216,8 +235,15 @@ fn render_tabstrip(scr: mut term.AnsiScreen, x: int, y: int, w: int, names: []st
 
 fn render_kv(scr: mut term.AnsiScreen, t: KVTable, x: int, y: int, w: int, h: int, focused: bool) {
     put_str(scr, x + 1, y, " [x] name           value", 7, term.AttrBold + term.AttrUnderline)
-    i := 0
-    for i < len(t.rows) && i < h - 1 {
+    // scroll so the selected row stays inside the window — toggle and
+    // delete act on cur even when it sits past the last drawn row.
+    visible := h - 1
+    top := 0
+    if t.cur >= visible {
+        top = t.cur - visible + 1
+    }
+    i := top
+    for i < len(t.rows) && i < top + visible {
         r := t.rows[i]
         mark := "[ ]"
         if r.enabled {
@@ -232,7 +258,7 @@ fn render_kv(scr: mut term.AnsiScreen, t: KVTable, x: int, y: int, w: int, h: in
         if focused && i == t.cur {
             a = term.AttrReverse
         }
-        put_str_max(scr, x + 1, y + 1 + i, line, w - 2, 7, a)
+        put_str_max(scr, x + 1, y + 1 + (i - top), line, w - 2, 7, a)
         i = i + 1
     }
 }
@@ -311,7 +337,11 @@ fn render_body(a: mut App, scr: mut term.AnsiScreen, x: int, y: int, w: int, h: 
         if c0 > len(ln) {
             c0 = len(ln)
         }
-        scr.cursor(x + 1 + str_cols(substr(ln, 0, c0)), y + a.body.cy - a.body.top, true)
+        // rows paint as "N <text>" — the cursor sits past the same
+        // line-number prefix, not over it (digits are narrow, so
+        // len == display cols).
+        pre := itoa(a.body.cy + 1) + " "
+        scr.cursor(x + 1 + len(pre) + str_cols(substr(ln, 0, c0)), y + a.body.cy - a.body.top, true)
     }
 }
 

@@ -257,3 +257,83 @@ fn test_screenshot_text_write() {
     testing.expect(we2 != nil, "bad path errors")
     os.remove(p)
 }
+
+
+fn test_render_url_hscrolls_to_cursor() {
+    // a URL wider than the field h-scrolls so the insertion point
+    // stays visible — the tail (and cursor) land inside the bar.
+    a := new_app()
+    u := "http://x/"
+    i := 0
+    for i < 80 {
+        u = u + "a"
+        i = i + 1
+    }
+    u = u + "END"
+    a.url.text = u
+    a.url.cur = len(u)
+    a.focus = FUrl
+    scr := term.new_ansi(80, 24)
+    render(a, scr, "v")
+    testing.expect(has_text(scr, 1, "END"), "url tail visible")
+    testing.expect_eq(scr.cx, 78, "cursor at field edge")
+    // short url: no scroll, cursor right after the text
+    a2 := new_app()
+    a2.url.text = "http://x"
+    a2.url.cur = 8
+    a2.focus = FUrl
+    scr2 := term.new_ansi(80, 24)
+    render(a2, scr2, "v")
+    testing.expect(has_text(scr2, 1, "http://x"), "short url from col 0")
+    testing.expect_eq(scr2.cx, 20, "cursor after text")
+}
+
+fn test_render_kv_scrolls_to_selection() {
+    // selection past the visible window scrolls the table so the
+    // selected row is drawn (and highlight-able).
+    a := new_app()
+    i := 0
+    for i < 12 {
+        a.headers.rows = push(a.headers.rows, KVRow{name: "h" + itoa(i), value: "v", enabled: true})
+        i = i + 1
+    }
+    a.headers.cur = 10
+    a.focus = FReqPane
+    scr := term.new_ansi(80, 24)
+    render(a, scr, "v")
+    want := a.headers.rows[a.headers.cur].name
+    y := 0
+    found := false
+    for y < 24 {
+        if has_text(scr, y, want) {
+            found = true
+        }
+        y = y + 1
+    }
+    testing.expect(found, "selected row inside window")
+}
+
+fn test_render_body_cursor_past_lineno() {
+    // body rows paint "N <text>" — the cursor sits past the same
+    // prefix, not over the number (single- and multi-digit).
+    a := new_app()
+    a.focus = FReqPane
+    a.req_tab = 1 // Body
+    a.body_edit = true
+    a.body = new_text_view("abc")
+    a.body.cx = 1
+    scr := term.new_ansi(80, 24)
+    render(a, scr, "v")
+    testing.expect_eq(scr.cx, a.r_req_x + 4, "1-digit prefix + 1 char")
+    a2 := new_app()
+    a2.focus = FReqPane
+    a2.req_tab = 1
+    a2.body_edit = true
+    a2.body = new_text_view("l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10")
+    a2.body.top = 8
+    a2.body.cy = 9
+    a2.body.cx = 1
+    scr2 := term.new_ansi(80, 24)
+    render(a2, scr2, "v")
+    testing.expect_eq(scr2.cx, a2.r_req_x + 5, "2-digit prefix + 1 char")
+}
