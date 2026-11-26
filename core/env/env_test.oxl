@@ -199,3 +199,17 @@ fn test_build_set_layers() {
     testing.expect(!s3.lookup("WHO").ok, "inactive named skipped")
     testing.expect_streq(s3.lookup("SHARED").value, "localwin", "posting.local beats posting.env")
 }
+
+fn test_dotenv_expansion_limits() {
+    // a self-referential doubling chain ($A0$A0 style) must hit the
+    // aggregate cap instead of ballooning without bound.
+    text := "A0=x\n"
+    i := 1
+    for i <= 30 {
+        prev := "A" + itoa(i - 1)
+        text = text + "A" + itoa(i) + "=${" + prev + "}${" + prev + "}\n"
+        i = i + 1
+    }
+    [_p, e] = parse_dotenv(text, new(EnvSet))
+    testing.expect(e != nil, "expansion bomb rejected")
+}

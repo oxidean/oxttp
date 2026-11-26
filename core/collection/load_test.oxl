@@ -319,3 +319,122 @@ fn test_plan_req_cookies_and_unresolved() {
     sp3 := plan_req(r3, es, nil, "d")
     testing.expect(len(sp3.err) > 0, "unresolved url err")
 }
+
+fn test_yjson_quoted_provenance() {
+    // quoted scalars keep string type in graphql.variables — only
+    // plain scalars coerce. `code: "001"` must not become int 1.
+    [r, e] = decode_src("kind: graphql\ngraphql:\n  query: '{ q }'\n  variables:\n    code: \"001\"\n    num: 7\n")
+    testing.expect(e == nil, "decode")
+    vs := r.graphql.variables
+    testing.expect(vs != nil, "vars json")
+    csaw := false
+    nsaw := false
+    c := vs.child
+    for c != nil {
+        if c.key == "code" {
+            csaw = true
+            testing.expect_eq(c.kind, 3, "quoted stays string")
+            testing.expect_streq(c.s, "001", "leading zeros kept")
+        }
+        if c.key == "num" {
+            nsaw = true
+            testing.expect_eq(c.kind, 2, "plain coerces int")
+        }
+        c = c.next
+    }
+    testing.expect(csaw && nsaw, "both keys seen")
+    // save → reload keeps the string form
+    out := marshal(r)
+    testing.expect(find(out, "\"001\"") >= 0, "string emits quoted")
+    [r2, e2] = decode_src(out)
+    testing.expect(e2 == nil, "re-decode")
+    c2 := r2.graphql.variables.child
+    ok := false
+    for c2 != nil {
+        if c2.key == "code" {
+            ok = c2.kind == 3 && c2.s == "001"
+        }
+        c2 = c2.next
+    }
+    testing.expect(ok, "round-trip keeps string")
+}
+
+fn test_plan_req_path_param_with_query_and_frag() {
+    // :name fills only real path segments — query + fragment text
+    // is held aside, not glued onto the last segment.
+    es := plan_env()
+    [r, e] = decode_src("url: http://x/users/:id?active=1\npath_params:\n  - name: id\n    value: '7'\n")
+    testing.expect(e == nil, "decode")
+    sp := plan_req(r, es, nil, "d")
+    testing.expect(len(sp.err) == 0, "no err")
+    testing.expect_streq(sp.req.url, "http://x/users/7?active=1", ":id fills ahead of query")
+    [r2, e2] = decode_src("url: http://x/users/:id#details\npath_params:\n  - name: id\n    value: '7'\n")
+    testing.expect(e2 == nil, "decode2")
+    sp2 := plan_req(r2, es, nil, "d")
+    testing.expect_streq(sp2.req.url, "http://x/users/7#details", ":id fills ahead of fragment")
+    // a :name in the query itself is not a path segment
+    [r3, e3] = decode_src("url: http://x/users?q=:id\npath_params:\n  - name: id\n    value: '7'\n")
+    testing.expect(e3 == nil, "decode3")
+    sp3 := plan_req(r3, es, nil, "d")
+    testing.expect_streq(sp3.req.url, "http://x/users?q=:id", "query colon untouched")
+}
+
+fn test_plan_req_params_before_fragment() {
+    // params must insert ahead of "#frag" — the fragment is always
+    // the last thing on the wire URL.
+    es := plan_env()
+    [r, e] = decode_src("url: http://x/users#details\nparams:\n  - name: q\n    value: v\n")
+    testing.expect(e == nil, "decode")
+    sp := plan_req(r, es, nil, "d")
+    testing.expect(len(sp.err) == 0, "no err")
+    testing.expect_streq(sp.req.url, "http://x/users?q=v#details", "param ahead of frag")
+    [r2b, e2b] = decode_src("url: http://x/users?a=1#frag\nparams:\n  - name: q\n    value: v\n")
+    testing.expect(e2b == nil, "decode2")
+    sp2 := plan_req(r2b, es, nil, "d")
+    testing.expect_streq(sp2.req.url, "http://x/users?a=1&q=v#frag", "param appends into query, frag last")
+}
+
+fn test_plan_req_substituted_header_guards() {
+    // explicit-wins guards see POST-substitution names: a $HN row
+    // resolving to "Authorization" still blocks the auth block, and
+    // a $HC row resolving to "Cookie" suppresses the jar.
+    es := new(env.EnvSet)
+    l := env.EnvLayer{name: "s", source: "session", vars: nil}
+    l.vars = push(l.vars, model.KV{name: "HN", value: "Authorization", enabled: true})
+    l.vars = push(l.vars, model.KV{name: "TOK", value: "t1", enabled: true})
+    es.layers = push(es.layers, l)
+    [r, e] = decode_src("url: x.com\nheaders:\n  - name: $HN\n    value: Custom z\nauth:\n  type: bearer_token\n  bearer_token:\n    token: $TOK\n")
+    testing.expect(e == nil, "decode")
+    sp := plan_req(r, es, nil, "d")
+    testing.expect(len(sp.err) == 0, "no err")
+    auths := 0
+    i := 0
+    for i < len(sp.req.headers) {
+        if sp.req.headers[i].name == "Authorization" {
+            auths = auths + 1
+            testing.expect_streq(sp.req.headers[i].value, "Custom z", "substituted explicit wins")
+        }
+        i = i + 1
+    }
+    testing.expect_eq(auths, 1, "exactly one Authorization")
+    // same for Cookie vs the jar
+    es2 := new(env.EnvSet)
+    l2 := env.EnvLayer{name: "s", source: "session", vars: nil}
+    l2.vars = push(l2.vars, model.KV{name: "HC", value: "Cookie", enabled: true})
+    es2.layers = push(es2.layers, l2)
+    let jar: []str = nil
+    jar = push(jar, "s=1")
+    [r2, e2] = decode_src("url: x.com\nheaders:\n  - name: $HC\n    value: mine=1\n")
+    testing.expect(e2 == nil, "decode2")
+    sp2 := plan_req(r2, es2, jar, "d")
+    cookies := 0
+    i = 0
+    for i < len(sp2.req.headers) {
+        if sp2.req.headers[i].name == "Cookie" {
+            cookies = cookies + 1
+            testing.expect_streq(sp2.req.headers[i].value, "mine=1", "substituted cookie row wins")
+        }
+        i = i + 1
+    }
+    testing.expect_eq(cookies, 1, "jar suppressed by substituted row")
+}

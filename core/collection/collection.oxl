@@ -474,6 +474,8 @@ fn looks_null(s: str) -> bool {
 
 // yjson converts a YNode into a json tree — scalars coerce
 // bool/null/number so posting `variables:` maps arrive typed.
+// Quoted scalars keep string type: `code: "001"` is a string, only
+// plain `code: 001` reads as a number.
 fn yjson(v: ref yaml.YNode) -> own json.Json {
     if v == nil {
         return json.jnull()
@@ -499,6 +501,9 @@ fn yjson(v: ref yaml.YNode) -> own json.Json {
         return json.jarrb_arr(b)
     }
     s := v.s
+    if !v.plain {
+        return json.jstr(s)
+    }
     if looks_bool(s) {
         return json.jbool(s == "true" || s == "True" || s == "TRUE")
     }
@@ -1587,10 +1592,23 @@ fn fill_seg(seg: str, r: ref PRequest, es: ref env.EnvSet) -> [str, err] {
     return seg, nil
 }
 
-// fill_path rewrites every :name segment of the url.
+// fill_path rewrites every :name segment of the url path — query
+// and fragment text is held aside so `:name` matching only ever sees
+// real path segments (a trailing "?q=v" can't glue onto one).
 fn fill_path(u: str, r: ref PRequest, es: ref env.EnvSet) -> [str, err] {
     if find(u, ":") < 0 {
         return u, nil
+    }
+    tail := ""
+    fi := find(u, "#")
+    if fi >= 0 {
+        tail = substr(u, fi, len(u))
+        u = substr(u, 0, fi)
+    }
+    qi := find(u, "?")
+    if qi >= 0 {
+        tail = substr(u, qi, len(u)) + tail
+        u = substr(u, 0, qi)
     }
     out := ""
     seg := ""
@@ -1611,7 +1629,7 @@ fn fill_path(u: str, r: ref PRequest, es: ref env.EnvSet) -> [str, err] {
         }
         i = i + 1
     }
-    return out, nil
+    return out + tail, nil
 }
 
 fn hdr_value(rows: []model.Header, name: str) -> str {
@@ -1626,14 +1644,14 @@ fn hdr_value(rows: []model.Header, name: str) -> str {
     return ""
 }
 
-// kv_enabled_named checks the raw KV rows for an enabled row named
-// `name` (ci) — explicit-wins rules look at the source rows, not the
-// emitted headers.
-fn kv_enabled_named(rows: []model.KV, name: str) -> bool {
+// hdr_named checks the EMITTED headers for `name` (ci) — explicit-
+// wins guards must see post-substitution names: a `$HDR` row that
+// resolves to "Authorization" is still an explicit Authorization.
+fn hdr_named(rows: []model.Header, name: str) -> bool {
     ln := ascii_lower(name)
     i := 0
     for i < len(rows) {
-        if rows[i].enabled && ascii_lower(rows[i].name) == ln {
+        if ascii_lower(rows[i].name) == ln {
             return true
         }
         i = i + 1
@@ -1682,7 +1700,14 @@ fn plan_req(r: ref PRequest, es: ref env.EnvSet, jar: []str, coll_dir: str) -> S
         return sp
     }
     u = u2
-    // query params — enabled rows, query-escaped halves
+    // query params — enabled rows, query-escaped halves; a fragment
+    // always stays last (params insert ahead of "#...").
+    frag := ""
+    fi := find(u, "#")
+    if fi >= 0 {
+        frag = substr(u, fi, len(u))
+        u = substr(u, 0, fi)
+    }
     sep := "?"
     if find(u, "?") >= 0 {
         sep = "&"
@@ -1707,6 +1732,7 @@ fn plan_req(r: ref PRequest, es: ref env.EnvSet, jar: []str, coll_dir: str) -> S
         u = u + sep + url.queryescape(pn) + "=" + url.queryescape(pv)
         sep = "&"
     }
+    u = u + frag
     // headers — enabled rows, name/value substituted
     let hdrs: []model.Header = nil
     i = 0
@@ -1838,7 +1864,7 @@ fn plan_req(r: ref PRequest, es: ref env.EnvSet, jar: []str, coll_dir: str) -> S
         }
     }
     // auth — an explicit enabled Authorization row wins over the block
-    if r.auth != nil && len(r.auth.type) > 0 && !kv_enabled_named(r.headers, "Authorization") {
+    if r.auth != nil && len(r.auth.type) > 0 && !hdr_named(hdrs, "Authorization") {
         if r.auth.type == "basic" && r.auth.basic != nil {
             [usr, uer] = env.substitute(r.auth.basic.username, es, false)
             if uer != nil {
@@ -1868,7 +1894,7 @@ fn plan_req(r: ref PRequest, es: ref env.EnvSet, jar: []str, coll_dir: str) -> S
         }
     }
     // jar cookies — an explicit enabled Cookie row wins
-    if cookies && len(jar) > 0 && !kv_enabled_named(r.headers, "Cookie") {
+    if cookies && len(jar) > 0 && !hdr_named(hdrs, "Cookie") {
         cv := ""
         ci := 0
         for ci < len(jar) {
@@ -1909,7 +1935,7 @@ fn plan_req(r: ref PRequest, es: ref env.EnvSet, jar: []str, coll_dir: str) -> S
         sp.warns = push(sp.warns, "proxy unsupported in this build — sending direct")
     }
     // User-Agent synth tail — corpus §7.1: posting/<ver> unless set
-    if !kv_enabled_named(r.headers, "User-Agent") {
+    if !hdr_named(hdrs, "User-Agent") {
         rq.synth = push(rq.synth, model.Header{name: "User-Agent", value: "posting/" + version.get()})
     }
     sp.req = rq

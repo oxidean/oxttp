@@ -511,13 +511,25 @@ fn draft_to_request(a: ref App) -> own collection.PRequest {
         }
         i = i + 1
     }
-    if a.kind == KHttp || a.kind == KWs {
+    // non-editable body kinds (form_data/multipart/file): the pane
+    // shows a placeholder, never the body — keep the file's block
+    // verbatim instead of writing the placeholder out as content.
+    locked := a.preq != nil && a.preq.body != nil && !a.preq.body.has_content
+    if (a.kind == KHttp || a.kind == KWs) && !locked {
         text := join_lines(a.body.lines)
         if len(text) > 0 {
             b := new(collection.PBody)
             b.content = text
             b.has_content = true
             b.content_type = ct_str(a.body_ct)
+            // a loaded content_type survives verbatim while the
+            // selector still sits on the bucket it decoded to —
+            // ct_str's 4 slots can't name a custom type.
+            if a.preq != nil && a.preq.body != nil && a.preq.body.has_content {
+                if ct_idx(a.preq.body.content_type) == a.body_ct {
+                    b.content_type = a.preq.body.content_type
+                }
+            }
             r.body = b
         }
     }
@@ -532,7 +544,7 @@ fn draft_to_request(a: ref App) -> own collection.PRequest {
         r.graphql = a.preq.graphql
         r.grpc = a.preq.grpc
         r.websocket = a.preq.websocket
-        if r.body == nil {
+        if r.body == nil && locked {
             r.body = a.preq.body
         }
     }
@@ -890,7 +902,17 @@ fn begin_send_preq(a: mut App) -> int {
     if es == nil {
         es = new(env.EnvSet)
     }
-    sp := collection.plan_req(a.pending_preq, es, a.jar, a.coll_dir)
+    // jar cookies are origin-scoped: resolve the outgoing URL the
+    // same way plan_req will, then send only matching entries.
+    let jar: []str = nil
+    [u0, ue0] = env.substitute(a.pending_preq.url, es, true)
+    if ue0 == nil {
+        if find(u0, "://") < 0 {
+            u0 = "http://" + u0
+        }
+        jar = jar_for(a, url_origin(u0))
+    }
+    sp := collection.plan_req(a.pending_preq, es, jar, a.coll_dir)
     wi := 0
     for wi < len(sp.warns) {
         a.toast(0, sp.warns[wi])
@@ -920,14 +942,14 @@ fn exec_send_t(a: mut App, t: http.Transport) {
     if a.pending == nil {
         return
     }
+    send_url := a.pending.url
     [resp, e] = t.send(a.pending)
+    a.pending = nil
     if e != nil {
-        a.pending = nil
         send_failed(a, errors.msg(e))
         return
     }
-    a.pending = nil
-    install_resp(a, resp)
+    install_resp(a, resp, send_url)
 }
 
 // send_failed installs the transport error as the response view —
@@ -946,8 +968,9 @@ fn send_failed(a: mut App, msg: str) {
 
 // install_resp renders a response into the pane: body (JSON re-
 // indented), header/cookie/trace rows, meta title, jar update, and a
-// history entry (cap 100, drop-oldest).
-fn install_resp(a: mut App, resp: model.Resp) {
+// history entry (cap 100, drop-oldest). req_url is the wire URL the
+// response answered — jar entries scope to its origin.
+fn install_resp(a: mut App, resp: model.Resp, req_url: str) {
     text := resp.body as str
     ct := ""
     i := 0
@@ -981,7 +1004,7 @@ fn install_resp(a: mut App, resp: model.Resp) {
         if ascii_eq(resp.headers[i].name, "set-cookie") {
             cks = push(cks, resp.headers[i].value)
             if attach {
-                jar_set(a, cookie_nv(resp.headers[i].value))
+                jar_set(a, url_origin(req_url), cookie_nv(resp.headers[i].value))
             }
         }
         i = i + 1
@@ -1076,9 +1099,45 @@ fn cookie_nv(v: str) -> str {
     return substr(v, 0, i)
 }
 
-// jar_set replaces a same-named cookie else appends — jar entries are
-// "name=value" strings matching plan_req's jar form.
-fn jar_set(a: mut App, nv: str) {
+// url_origin — "scheme://authority" lowercased, path/query/fragment
+// stripped. Jar entries key on this so a response's cookies only
+// return to the origin that set them.
+fn url_origin(u: str) -> str {
+    rest := u
+    scheme := ""
+    si := find(rest, "://")
+    if si >= 0 {
+        scheme = substr(rest, 0, si)
+        rest = substr(rest, si + 3, len(rest))
+    }
+    i := 0
+    for i < len(rest) {
+        c := byteat(rest, i)
+        if c == 47 || c == 63 || c == 35 {
+            break
+        }
+        i = i + 1
+    }
+    return lower_ascii(scheme) + "://" + lower_ascii(substr(rest, 0, i))
+}
+
+// jar_for — the "name=value" strings scoped to origin (plan_req's
+// jar form). Other origins' cookies never ride along.
+fn jar_for(a: ref App, origin: str) -> []str {
+    let out: []str = nil
+    i := 0
+    for i < len(a.jar) {
+        if a.jar[i].origin == origin {
+            out = push(out, a.jar[i].nv)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// jar_set replaces a same-named cookie at the same origin else
+// appends — jar entries are {origin, "name=value"}.
+fn jar_set(a: mut App, origin: str, nv: str) {
     if len(nv) == 0 {
         return
     }
@@ -1093,20 +1152,20 @@ fn jar_set(a: mut App, nv: str) {
     j := 0
     for j < len(a.jar) {
         e := 0
-        for e < len(a.jar[j]) && byteat(a.jar[j], e) != 61 {
+        for e < len(a.jar[j].nv) && byteat(a.jar[j].nv, e) != 61 {
             e = e + 1
         }
-        cn := a.jar[j]
-        if e < len(a.jar[j]) {
-            cn = substr(a.jar[j], 0, e)
+        cn := a.jar[j].nv
+        if e < len(a.jar[j].nv) {
+            cn = substr(a.jar[j].nv, 0, e)
         }
-        if cn == nm {
-            a.jar[j] = nv
+        if a.jar[j].origin == origin && cn == nm {
+            a.jar[j].nv = nv
             return
         }
         j = j + 1
     }
-    a.jar = push(a.jar, nv)
+    a.jar = push(a.jar, JarEnt{origin: origin, nv: nv})
 }
 
 // ---------- formatting ----------

@@ -427,3 +427,83 @@ fn test_tree_filter() {
     testing.expect_eq(len(a.toasts), n, "typed d filtered, not duped")
     testing.expect_streq(a.coll.filter, "d", "query took the letter")
 }
+
+fn test_env_switch_nav_via_dispatch() {
+    // finding: Up/Down inside MEnvSwitch must move the env row —
+    // exercise the real key path (dispatch → modal_action → rows_*)
+    // rather than assigning a.vars.sel directly.
+    scratch_coll()
+    a := app_in(COLL_SCRATCH)
+    push_modal(a, MEnvSwitch)
+    testing.expect_eq(a.vars.sel, 0, "sel starts on (none)")
+    dispatch(a, knamed(term.KeyDown))
+    testing.expect_eq(a.vars.sel, 1, "down moves to dev row")
+    dispatch(a, knamed(term.KeyUp))
+    testing.expect_eq(a.vars.sel, 0, "up returns to (none)")
+    // pick the env through the same path a keypress takes
+    dispatch(a, knamed(term.KeyDown))
+    dispatch(a, knamed(term.KeyEnter))
+    testing.expect_eq(len(a.modals), 0, "enter picks and closes")
+    testing.expect_streq(a.env_name, "dev", "dev picked via dispatch")
+    testing.expect_eq(len(a.env_active), 1, "active env set")
+}
+
+fn test_draft_preserves_noneditable_body() {
+    // form_data/multipart/file bodies render as a placeholder —
+    // draft_to_request must carry the file's block over verbatim,
+    // never write the placeholder out as content.
+    scratch_coll()
+    os.writefile_(COLL_SCRATCH + "/requests/up.posting.yaml",
+        "name: Up\nmethod: post\nurl: http://x/up\nbody:\n  multipart:\n    - name: f\n      file: ./a.bin\n")
+    a := app_in(COLL_SCRATCH)
+    a.focus = FSidebar
+    a.coll.cur = node_idx(a, "Up")
+    tree_open(a)
+    testing.expect(body_locked(a), "placeholder body locked")
+    // edits are refused on a locked buffer
+    n := len(a.body.lines)
+    body_insert(a, "x")
+    testing.expect_eq(len(a.body.lines), n, "insert ignored on locked body")
+    body_backspace(a)
+    testing.expect_eq(len(a.body.lines), n, "backspace ignored on locked body")
+    r := draft_to_request(a)
+    testing.expect(r.body != nil, "body carried over")
+    testing.expect(r.body.has_multipart, "multipart kind kept")
+    testing.expect_eq(len(r.body.multipart), 1, "part kept")
+    testing.expect(!r.body.has_content, "placeholder not written as content")
+}
+
+fn test_draft_empty_buffer_deletes_body() {
+    // clearing an editable body buffer must drop the body — the
+    // loaded block is not silently resurrected.
+    scratch_coll()
+    a := app_in(COLL_SCRATCH)
+    a.focus = FSidebar
+    a.coll.cur = node_idx(a, "Create user")
+    tree_open(a)
+    testing.expect(a.preq.body != nil && a.preq.body.has_content, "loaded body")
+    testing.expect(len(a.body.lines) > 0, "buffer filled")
+    a.body.lines = mkslice(str, 0)
+    r := draft_to_request(a)
+    testing.expect(r.body == nil, "empty buffer deletes body")
+}
+
+fn test_draft_keeps_loaded_content_type() {
+    // a loaded content_type outside the 4-slot selector survives a
+    // draft round-trip verbatim while the selector is untouched.
+    scratch_coll()
+    os.writefile_(COLL_SCRATCH + "/requests/vnd.posting.yaml",
+        "name: Vnd\nmethod: post\nurl: http://x/vnd\nbody:\n  content: '{\"a\":1}'\n  content_type: application/vnd.api+json\n")
+    a := app_in(COLL_SCRATCH)
+    a.focus = FSidebar
+    a.coll.cur = node_idx(a, "Vnd")
+    tree_open(a)
+    testing.expect_eq(a.body_ct, 0, "selector bucketed json")
+    r := draft_to_request(a)
+    testing.expect(r.body != nil, "body kept")
+    testing.expect_streq(r.body.content_type, "application/vnd.api+json", "custom ct verbatim")
+    // picking a different selector emits that bucket's type instead
+    a.body_ct = 1
+    r2 := draft_to_request(a)
+    testing.expect_streq(r2.body.content_type, "text/plain", "selector switch wins")
+}

@@ -144,6 +144,13 @@ struct PItem {
     degrade: str, // non-empty → toast this instead of running action
 }
 
+// JarEnt is one jar cookie: "name=value" scoped to the origin that
+// set it — sends attach only entries matching the request origin.
+struct JarEnt {
+    origin: str,
+    nv: str,
+}
+
 struct App {
     focus: int,
     modals: []int,
@@ -174,7 +181,7 @@ struct App {
     env_names: []str,
     env: own env.EnvSet,
     session_vars: []model.KV,
-    jar: []str,
+    jar: []JarEnt,
     history: []HistEnt,
     pending: own model.Req,
     pending_preq: own collection.PRequest,

@@ -60,7 +60,9 @@ fn ysplit(src: str) -> []YLine {
     out := mkslice(YLine, 0)
     pos := 0
     num := 1
-    for pos <= len(src) {
+    // pos < len: a trailing "\n" must not spawn a phantom empty line —
+    // pblock_scalar counts blanks as keep-chomped content.
+    for pos < len(src) {
         eol := pos
         for eol < len(src) && byteat(src, eol) != 10 {
             eol = eol + 1
@@ -182,8 +184,10 @@ fn pscalar(t: str, line: int) -> [str, err] {
                     out = out + "\t"
                 } else if e == 114 {
                     out = out + "\r"
-                } else {
+                } else if e == 34 || e == 92 {
                     out = out + chr(e)
+                } else {
+                    return "", yerr(line, "unsupported escape in double-quoted scalar")
                 }
                 i = i + 2
             } else {
@@ -377,6 +381,18 @@ fn pnode(ls: []YLine, cur: mut PCur, indent: int) -> [own YNode, err] {
     if t == "---" || t == "..." {
         return nil, yerr(l.num, "multi-document streams unsupported")
     }
+    ts := rtrim_sp(t)
+    if ts == "{}" || ts == "[]" {
+        n := new(YNode)
+        if ts == "{}" {
+            n.kind = 1
+        } else {
+            n.kind = 2
+        }
+        n.line = l.num
+        cur.pos = i + 1
+        return n, nil
+    }
     [v, e] = pscalar(t, l.num)
     if e != nil {
         return nil, e
@@ -385,6 +401,7 @@ fn pnode(ls: []YLine, cur: mut PCur, indent: int) -> [own YNode, err] {
     n.kind = 0
     n.s = v
     n.line = l.num
+    n.plain = byteat(t, 0) != 34 && byteat(t, 0) != 39
     cur.pos = i + 1
     return n, nil
 }
@@ -442,12 +459,19 @@ fn pmap(ls: []YLine, cur: mut PCur, indent: int) -> [own YNode, err] {
                     return nil, be
                 }
                 v.s = s
+            } else if rest == "{}" {
+                v.kind = 1
+                cur.pos = j + 1
+            } else if rest == "[]" {
+                v.kind = 2
+                cur.pos = j + 1
             } else {
                 [sv, se] = pscalar(rest, l.num)
                 if se != nil {
                     return nil, se
                 }
                 v.s = sv
+                v.plain = byteat(rest, 0) != 34 && byteat(rest, 0) != 39
                 cur.pos = j + 1
             }
         }
@@ -511,14 +535,13 @@ fn pseq(ls: []YLine, cur: mut PCur, indent: int) -> [own YNode, err] {
                 it.kind = 0
                 it.s = s
             } else {
-                // virtual slice: first line at ccol + deeper lines
+                // virtual slice: first line at ccol + deeper lines —
+                // blanks stay: pblock_scalar reads them as content.
                 sub := mkslice(YLine, 0)
                 sub = push(sub, YLine{indent: ccol, text: rest, num: l.num, blank: false, comment: false})
                 m := j + 1
                 for m < k {
-                    if !ls[m].blank {
-                        sub = push(sub, ls[m])
-                    }
+                    sub = push(sub, ls[m])
                     m = m + 1
                 }
                 scur := new(PCur{pos: 0})
@@ -634,6 +657,35 @@ fn emit_key(k: str) -> str {
     return esc_dq(k)
 }
 
+// empty_flow renders an empty container inline — "" otherwise (a
+// block "key:" with no children reparses as a scalar, so empties
+// need the flow form to survive a save→load round-trip).
+fn empty_flow(n: ref YNode) -> str {
+    if n == nil {
+        return ""
+    }
+    if n.kind == 1 && len(n.pairs) == 0 {
+        return "{}"
+    }
+    if n.kind == 2 && len(n.items) == 0 {
+        return "[]"
+    }
+    return ""
+}
+
+// block_tag picks the chomping suffix that reloads s verbatim:
+// trailing "\n\n"+ keep ("|+"), one trailing "\n" clip ("|"), none
+// strip ("|-").
+fn block_tag(s: str) -> str {
+    if len(s) >= 2 && byteat(s, len(s) - 1) == 10 && byteat(s, len(s) - 2) == 10 {
+        return " |+"
+    }
+    if len(s) > 0 && byteat(s, len(s) - 1) == 10 {
+        return " |"
+    }
+    return " |-"
+}
+
 // emit renders the DOM to YAML text.
 fn emit(n: ref YNode) -> str {
     return enode(n, 0)
@@ -653,12 +705,17 @@ fn enode(n: ref YNode, indent: int) -> str {
                 out = out + "\n"
             } else if v.kind == 0 {
                 if find(v.s, "\n") >= 0 {
-                    out = out + " |\n" + emit_block(v.s, indent + 2)
+                    out = out + block_tag(v.s) + "\n" + emit_block(v.s, indent + 2)
                 } else {
                     out = out + " " + esc_or_plain(v) + "\n"
                 }
             } else {
-                out = out + "\n" + enode(v, indent + 2)
+                ef := empty_flow(v)
+                if len(ef) > 0 {
+                    out = out + " " + ef + "\n"
+                } else {
+                    out = out + "\n" + enode(v, indent + 2)
+                }
             }
             i = i + 1
         }
@@ -672,7 +729,7 @@ fn enode(n: ref YNode, indent: int) -> str {
                 out = out + pad + "-\n"
             } else if it.kind == 0 {
                 if find(it.s, "\n") >= 0 {
-                    out = out + pad + "- |\n" + emit_block(it.s, indent + 2)
+                    out = out + pad + "- " + block_tag(it.s) + "\n" + emit_block(it.s, indent + 2)
                 } else {
                     out = out + pad + "- " + esc_or_plain(it) + "\n"
                 }
@@ -685,19 +742,29 @@ fn enode(n: ref YNode, indent: int) -> str {
                     out = out + "\n"
                 } else if v0.kind == 0 {
                     if find(v0.s, "\n") >= 0 {
-                        out = out + " |\n" + emit_block(v0.s, indent + 4)
+                        out = out + " " + block_tag(v0.s) + "\n" + emit_block(v0.s, indent + 4)
                     } else {
                         out = out + " " + esc_or_plain(v0) + "\n"
                     }
                 } else {
-                    out = out + "\n" + enode(v0, indent + 4)
+                    ef0 := empty_flow(v0)
+                    if len(ef0) > 0 {
+                        out = out + " " + ef0 + "\n"
+                    } else {
+                        out = out + "\n" + enode(v0, indent + 4)
+                    }
                 }
                 rest := new(YNode)
                 rest.kind = 1
                 rest.pairs = it.pairs[1:]
                 out = out + enode(rest, indent + 2)
             } else {
-                out = out + pad + "-\n" + enode(it, indent + 2)
+                efi := empty_flow(it)
+                if len(efi) > 0 {
+                    out = out + pad + "- " + efi + "\n"
+                } else {
+                    out = out + pad + "-\n" + enode(it, indent + 2)
+                }
             }
             i = i + 1
         }

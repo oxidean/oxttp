@@ -182,3 +182,78 @@ fn test_parse_line_numbers_on_error() {
         testing.expect(find(errors.msg(e), "line 2") >= 0, "line number in err")
     }
 }
+
+fn test_parse_double_quoted_escape_rules() {
+    // \" and \\ are real escapes; everything else errors — YAML's
+    // full escape set is out of the DOM subset.
+    [n, e] = parse("a: \"q\\\"w\\\\z\"\n")
+    testing.expect(e == nil, "quote+backslash escapes parse")
+    testing.expect_streq(n.pairs[ymap_idx(n, "a")].val.s, "q\"w\\z", "escapes decode")
+    [_n2, e2] = parse("a: \"x\\u0041\"\n")
+    testing.expect(e2 != nil, "\\u rejected")
+    [_n3, e3] = parse("a: \"x\\q\"\n")
+    testing.expect(e3 != nil, "unknown escape rejected")
+}
+
+fn test_parse_seq_item_block_scalar_blanks() {
+    // a blank line inside a seq-item block scalar is content, not a
+    // separator — the virtual slice must carry it through.
+    src := "items:\n  - name: n1\n    note: |\n      first\n\n      last\n"
+    [n, e] = parse(src)
+    testing.expect(e == nil, "parses")
+    its := n.pairs[ymap_idx(n, "items")].val
+    it0 := its.items[0]
+    note := it0.pairs[ymap_idx(it0, "note")].val
+    testing.expect_streq(note.s, "first\n\nlast\n", "blank line kept in scalar")
+}
+
+fn test_emit_block_scalar_chomping() {
+    root := new(YNode)
+    root.kind = 1
+    root.pairs = push(root.pairs, YPair{key: "strip", val: new(YNode{kind: 0, s: "a\nb", pairs: nil, items: nil, line: 0, force_quote: false, plain: false})})
+    root.pairs = push(root.pairs, YPair{key: "clip", val: new(YNode{kind: 0, s: "a\nb\n", pairs: nil, items: nil, line: 0, force_quote: false, plain: false})})
+    root.pairs = push(root.pairs, YPair{key: "keep", val: new(YNode{kind: 0, s: "a\nb\n\n", pairs: nil, items: nil, line: 0, force_quote: false, plain: false})})
+    out := emit(root)
+    testing.expect(find(out, "strip: |-\n") >= 0, "strip tag")
+    testing.expect(find(out, "clip: |\n") >= 0, "clip tag")
+    testing.expect(find(out, "keep: |+\n") >= 0, "keep tag")
+    [n2, e2] = parse(out)
+    testing.expect(e2 == nil, "chomped emit reparses")
+    testing.expect_streq(n2.pairs[ymap_idx(n2, "strip")].val.s, "a\nb", "strip rt")
+    testing.expect_streq(n2.pairs[ymap_idx(n2, "clip")].val.s, "a\nb\n", "clip rt")
+    testing.expect_streq(n2.pairs[ymap_idx(n2, "keep")].val.s, "a\nb\n\n", "keep rt")
+}
+
+fn test_empty_containers_roundtrip() {
+    // {} / [] parse to empty containers and emit inline — a bare
+    // "key:" would reparse as an empty scalar instead.
+    [n, e] = parse("graphql: {}\nparams: []\n")
+    testing.expect(e == nil, "flow empties parse")
+    g := n.pairs[ymap_idx(n, "graphql")].val
+    testing.expect_eq(g.kind, 1, "{} is map")
+    p := n.pairs[ymap_idx(n, "params")].val
+    testing.expect_eq(p.kind, 2, "[] is list")
+    root := new(YNode)
+    root.kind = 1
+    em := new(YNode)
+    em.kind = 1
+    root.pairs = push(root.pairs, YPair{key: "graphql", val: em})
+    el := new(YNode)
+    el.kind = 2
+    root.pairs = push(root.pairs, YPair{key: "params", val: el})
+    seq := new(YNode)
+    seq.kind = 2
+    sm := new(YNode)
+    sm.kind = 1
+    seq.items = push(seq.items, sm)
+    root.pairs = push(root.pairs, YPair{key: "xs", val: seq})
+    out := emit(root)
+    testing.expect(find(out, "graphql: {}") >= 0, "empty map inline")
+    testing.expect(find(out, "params: []") >= 0, "empty list inline")
+    testing.expect(find(out, "- {}") >= 0, "empty map seq item")
+    [n2, e2] = parse(out)
+    testing.expect(e2 == nil, "emit reparses")
+    testing.expect_eq(n2.pairs[ymap_idx(n2, "graphql")].val.kind, 1, "map survives")
+    testing.expect_eq(n2.pairs[ymap_idx(n2, "params")].val.kind, 2, "list survives")
+    testing.expect_eq(n2.pairs[ymap_idx(n2, "xs")].val.items[0].kind, 1, "seq item map survives")
+}

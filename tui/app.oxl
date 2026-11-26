@@ -1642,10 +1642,20 @@ fn sync_path_kv(a: mut App) {
     }
 }
 
+// body_locked — the buffer holds a non-editable placeholder (loaded
+// form_data/multipart/file body): keystrokes must not pretend to
+// edit what draft_to_request discards anyway.
+fn body_locked(a: ref App) -> bool {
+    return a.preq != nil && a.preq.body != nil && !a.preq.body.has_content
+}
+
 // body editor: the S9 body area is a TextView buffer the focused
 // pane appends into (full smart-edit is S10); insert + backspace +
 // pairing handled at line level.
 fn body_insert(a: mut App, ch: str) {
+    if body_locked(a) {
+        return
+    }
     pin_tab(a)
     // rebuild lines: insert at (cy, cx)
     if len(a.body.lines) == 0 {
@@ -1729,6 +1739,9 @@ fn auto_indent(after: str, ln: str) -> str {
 }
 
 fn body_backspace(a: mut App) {
+    if body_locked(a) {
+        return
+    }
     pin_tab(a)
     if len(a.body.lines) == 0 {
         return
@@ -1897,6 +1910,8 @@ fn modal_action(a: mut App, m: int, act: str, ev: term.KeyEvent) -> int {
     if m == MEnvSwitch {
         if act == "env-pick" {
             env_pick(a)
+        } else {
+            rows_action(a, act)
         }
         return ENone
     }
@@ -2231,11 +2246,43 @@ fn vars_action(a: mut App, act: str) -> int {
     return ENone
 }
 
+// rows_action runs the shared rows-* nav actions against whichever
+// list the current modal/widget context owns (rows_move/home/end
+// dispatch internally). Returns false for non-rows actions.
+fn rows_action(a: mut App, act: str) -> bool {
+    if act == "rows-up" {
+        rows_move(a, -1, false)
+    } else if act == "rows-down" {
+        rows_move(a, 1, false)
+    } else if act == "rows-ext-up" {
+        rows_move(a, -1, true)
+    } else if act == "rows-ext-down" {
+        rows_move(a, 1, true)
+    } else if act == "rows-home" {
+        rows_home(a, false)
+    } else if act == "rows-end" {
+        rows_end(a, false)
+    } else if act == "rows-ext-first" {
+        rows_home(a, true)
+    } else if act == "rows-ext-last" {
+        rows_end(a, true)
+    } else if act == "rows-pgup" {
+        rows_move(a, -10, false)
+    } else if act == "rows-pgdn" {
+        rows_move(a, 10, false)
+    } else {
+        return false
+    }
+    return true
+}
+
 fn hist_action(a: mut App, act: str) -> int {
     if act == "hist-open" {
         hist_open(a)
     } else if act == "hist-delete" {
         hist_delete(a)
+    } else {
+        rows_action(a, act)
     }
     return ENone
 }
