@@ -210,11 +210,14 @@ fn h2fx_conn(c: net.Conn, resp: str, hits: shared) {
     body := ""
     sid := 0
     end_stream := false
+    end_headers := false
+    read_err := false
     frames := 0
-    for !end_stream && frames < 32 {
+    for !(end_stream && end_headers) && frames < 32 {
         frames = frames + 1
         [f, fe] = http2.read_frame(rw, 16384)
         if fe != nil {
+            read_err = true
             break
         }
         k := f.header.kind
@@ -233,6 +236,12 @@ fn h2fx_conn(c: net.Conn, resp: str, hits: shared) {
             if k == 1 {
                 sid = f.header.stream_id
             }
+            // END_HEADERS (0x4) may land on a later CONTINUATION even
+            // when END_STREAM (0x1) already closed the stream — the
+            // request is complete only when both are seen (F5/F6).
+            if (f.header.flags & 4) != 0 {
+                end_headers = true
+            }
             if (f.header.flags & 1) != 0 {
                 end_stream = true
             }
@@ -247,14 +256,27 @@ fn h2fx_conn(c: net.Conn, resp: str, hits: shared) {
             continue
         }
     }
+    complete := end_stream && end_headers && !read_err
+    if sid == 0 {
+        sid = 1
+    }
+    if !complete {
+        // an incomplete request (read error, frame limit, missing
+        // END_STREAM/END_HEADERS) fails loudly instead of echoing a
+        // partial request as success.
+        let brh: []http2.Header = nil
+        brh = push(brh, http2.Header{name: ":status", value: "500"})
+        [bblk, _bbe] = http2.encode_headers(brh)
+        http2.write_frame(rw, http2.FrameHeader{length: len(bblk), kind: 1, flags: 4, stream_id: sid}, bblk)
+        bmsg := "fx-incomplete-request"
+        http2.write_frame(rw, http2.FrameHeader{length: len(bmsg), kind: 0, flags: 1, stream_id: sid}, bmsg as []byte)
+        return
+    }
     sadd(hits, 1)
     let rh: []http2.Header = nil
     rh = push(rh, http2.Header{name: ":status", value: "200"})
     rh = push(rh, http2.Header{name: "content-type", value: "text/plain"})
     [blk, _be] = http2.encode_headers(rh)
-    if sid == 0 {
-        sid = 1
-    }
     http2.write_frame(rw, http2.FrameHeader{length: len(blk), kind: 1, flags: 4, stream_id: sid}, blk)
     out := dump + body
     if resp != "<H2ECHO>" {
@@ -274,17 +296,23 @@ struct CapFx {
 }
 
 fn capfx_start() -> own CapFx {
+    return capfx_start_reply("HTTP/1.1 200 Connection established\r\n\r\n")
+}
+
+// capfx_start_reply with a custom CONNECT reply head (2xx variants,
+// framing headers — RFC 9110 reply-shape coverage, review F12/F13).
+fn capfx_start_reply(reply: str) -> own CapFx {
     [l, e] = net.listen(0)
     testing.expect(e == nil, "capfx listen")
     f := new(CapFx)
     f.l = l
     f.port = l.port()
     f.cap = new(mkslice(str, 1))
-    spawnBlocking capfx_serve(l, f.cap)
+    spawnBlocking capfx_serve(l, f.cap, reply)
     return f
 }
 
-fn capfx_serve(l: net.Listener, cap: own []str) {
+fn capfx_serve(l: net.Listener, cap: own []str, reply: str) {
     set_rcvtimo(l.rawfd(), 30)
     [c, e] = l.accept()
     if e != nil {
@@ -304,7 +332,7 @@ fn capfx_serve(l: net.Listener, cap: own []str) {
         }
     }
     cap[0] = req
-    fx_write_all(c, "HTTP/1.1 200 Connection established\r\n\r\n" as []byte)
+    fx_write_all(c, reply as []byte)
     // drain briefly — the client now speaks TLS ClientHello we can't
     // answer; read-and-discard until it gives up or socket dies
     [_r2, _e3] = c.read(scratch)

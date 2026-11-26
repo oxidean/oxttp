@@ -328,14 +328,16 @@ fn (t H1) roundtrip(req: ref model.Req, cap: mut model.Hop) -> [model.Resp, err]
     if len(purl) > 0 {
         [pu, pue] = url.parse(purl)
         if pue != nil {
-            return bad, errors.new("http: invalid proxy URL " + purl)
+            // errors name the invalid part only — the raw URL can
+            // carry a userinfo password (review F8).
+            return bad, errors.new("http: invalid proxy URL")
         }
         if lwr(pu.scheme) != "http" {
             return bad, errors.new("http: proxy URL scheme \"" + pu.scheme + "\" is unsupported in this build")
         }
         phost = pu.hostname()
         if len(phost) == 0 {
-            return bad, errors.new("http: invalid proxy URL " + purl)
+            return bad, errors.new("http: proxy URL has no host")
         }
         if find(phost, ":") >= 0 {
             return bad, errors.new("http: IPv6 addresses not supported")
@@ -345,7 +347,7 @@ fn (t H1) roundtrip(req: ref model.Req, cap: mut model.Hop) -> [model.Resp, err]
         if len(pps) > 0 {
             [pv2, pve] = strconv.atoi(pps)
             if pve != nil || pv2 <= 0 || pv2 > 65535 {
-                return bad, errors.new("http: invalid proxy URL " + purl)
+                return bad, errors.new("http: invalid proxy port")
             }
             pport = pv2
         }
@@ -378,6 +380,17 @@ fn (t H1) roundtrip(req: ref model.Req, cap: mut model.Hop) -> [model.Resp, err]
         if len(pauth) > 0 && !hdr_has(hdrs, "proxy-authorization") {
             hdrs = push(hdrs, model.Header{name: "Proxy-Authorization", value: pauth})
         }
+    }
+    // a caller Proxy-Authorization on a tunneled request is consumed
+    // by the CONNECT handshake and must not ride inside it (RFC 9110
+    // §11.7.2) — it outranks URL userinfo, then drops out of the
+    // origin-bound headers before they serialize.
+    connect_auth := pauth
+    if https && via_proxy {
+        if hdr_has(hdrs, "proxy-authorization") {
+            connect_auth = hdr_get(hdrs, "proxy-authorization")
+        }
+        hdrs = hdr_drop(hdrs, "proxy-authorization")
     }
     head := serialize_head(OutHead{method: req.method, uri: uri, ver: req.httpver, host: u.host, hdrs: hdrs, body_len: len(rb.data), has_body: has_body, synth: req.synth})
     cap.req_head = head
@@ -412,10 +425,11 @@ fn (t H1) roundtrip(req: ref model.Req, cap: mut model.Hop) -> [model.Resp, err]
         if deadline > 0 {
             ctmo = deadline - now_ms()
             if ctmo <= 0 {
-                ctmo = 1
+                raw.close()
+                return bad, errors.new("http: proxy CONNECT timeout")
             }
         }
-        ce := proxy_connect(raw, host + ":" + itoa(port), pauth, ctmo)
+        ce := proxy_connect(raw, host + ":" + itoa(port), connect_auth, ctmo)
         if ce != nil {
             raw.close()
             return bad, ce
@@ -607,6 +621,12 @@ fn h2_push(hh: []http2.Header, hs: []model.Header) -> []http2.Header {
             i = i + 1
             continue
         }
+        // host rides :authority on h2 — a separate host field would
+        // conflict with it (RFC 9113 §8.3.1).
+        if n == "host" {
+            i = i + 1
+            continue
+        }
         if n == "te" && lwr(hs[i].value) != "trailers" {
             i = i + 1
             continue
@@ -651,6 +671,10 @@ fn h2_safe(hs: []model.Header) -> []model.Header {
             i = i + 1
             continue
         }
+        if n == "host" {
+            i = i + 1
+            continue
+        }
         if n == "te" && lwr(hs[i].value) != "trailers" {
             i = i + 1
             continue
@@ -665,7 +689,12 @@ fn h2_safe(hs: []model.Header) -> []model.Header {
 // line plus the h1-shaped header block — there is no wire text; this
 // is the display approximation spec D1 calls out.
 fn h2_head_synth(req: ref model.Req, u: ref url.URL, hdrs: []model.Header, has_body: bool, body_len: int) -> str {
-    return serialize_head(OutHead{method: req.method, uri: u.request_uri(), ver: "HTTP/2.0", host: u.host, hdrs: h2_safe(hdrs), body_len: body_len, has_body: has_body, synth: h2_safe(req.synth)})
+    authority := u.host
+    chv := hdr_get(hdrs, "host")
+    if len(chv) > 0 {
+        authority = chv
+    }
+    return serialize_head(OutHead{method: req.method, uri: u.request_uri(), ver: "HTTP/2.0", host: authority, hdrs: h2_safe(hdrs), body_len: body_len, has_body: has_body, synth: h2_safe(req.synth)})
 }
 
 // h2_exchange runs the request on a fresh http2.Conn and builds the
@@ -687,7 +716,14 @@ fn h2_exchange(req: ref model.Req, rw: io.ReadWriter, fd: int, hdrs: []model.Hea
     let hh: []http2.Header = nil
     hh = push(hh, http2.Header{name: ":method", value: req.method})
     hh = push(hh, http2.Header{name: ":scheme", value: lwr(u.scheme)})
-    hh = push(hh, http2.Header{name: ":authority", value: u.host})
+    // caller Host: wins — h2 carries it as :authority and never as a
+    // separate host field (RFC 9113 §8.3.1, review F10).
+    authority := u.host
+    chv := hdr_get(hdrs, "host")
+    if len(chv) > 0 {
+        authority = chv
+    }
+    hh = push(hh, http2.Header{name: ":authority", value: authority})
     hh = push(hh, http2.Header{name: ":path", value: u.request_uri()})
     hh = h2_push(hh, hdrs)
     hh = h2_push(hh, req.synth)
@@ -1093,7 +1129,14 @@ fn proxy_connect(c: net.Conn, authority: str, auth: str, tmo: int) -> err {
         wire = wire + "proxy-authorization: " + auth + "\r\n"
     }
     wire = wire + "proxy-connection: keep-alive\r\n\r\n"
-    set_sndtimo(c.rawfd(), (tmo + 999) / 1000)
+    // one absolute deadline for both phases — a slow write must not
+    // hand the read a fresh budget (review F11).
+    deadline := now_ms() + tmo
+    wr := deadline - now_ms()
+    if wr <= 0 {
+        return errors.new("http: proxy CONNECT timeout")
+    }
+    set_sndtimo(c.rawfd(), (wr + 999) / 1000)
     we := write_all(c, wire as []byte)
     if we != nil {
         return errors.wrap("http: proxy CONNECT write", we)
@@ -1101,7 +1144,6 @@ fn proxy_connect(c: net.Conn, authority: str, auth: str, tmo: int) -> err {
     response := ""
     read_bytes := 0
     scan_from := 0
-    deadline := now_ms() + tmo
     buf := mkslice(byte, 1)
     for read_bytes < 32768 {
         remaining := deadline - now_ms()
@@ -1115,7 +1157,9 @@ fn proxy_connect(c: net.Conn, authority: str, auth: str, tmo: int) -> err {
             read_bytes = read_bytes + n
             head_end := find_from(response, "\r\n\r\n", scan_from)
             if head_end >= 0 {
-                [status, pe] = connect_response_status(response)
+                // validate only the head — a proxy may have already
+                // pushed tunnel bytes into this read.
+                [status, pe] = connect_response_status(substr(response, 0, head_end + 4))
                 if pe != nil {
                     return pe
                 }
@@ -1211,10 +1255,13 @@ fn connect_response_status(head: str) -> [int, err] {
         }
         value = substr(value, lo, hi)
         name = lwr(name)
-        if name == "transfer-encoding" && len(value) > 0 {
+        // RFC 9110: body-framing headers on a 2xx CONNECT reply mean
+        // nothing — the tunnel starts at the header terminator.
+        ok2xx := status >= 200 && status < 300
+        if name == "transfer-encoding" && len(value) > 0 && !ok2xx {
             return 0, errors.new("http: invalid CONNECT transfer encoding")
         }
-        if name == "content-length" {
+        if name == "content-length" && !ok2xx {
             [length, le] = strconv.atoi(value)
             if le != nil || length != 0 {
                 return 0, errors.new("http: invalid CONNECT content length")
@@ -1222,10 +1269,16 @@ fn connect_response_status(head: str) -> [int, err] {
         }
         pos = eol + 2
     }
-    if status != 200 && (status < 100 || status >= 200 || status == 101) {
-        return status, errors.new("http: proxy CONNECT returned status " + itoa(status))
+    // 2xx establishes the tunnel (any 2xx, not just 200); other
+    // informational statuses are preludes the caller skips — 101 and
+    // everything >= 300 fail here.
+    if status >= 200 && status < 300 {
+        return status, nil
     }
-    return status, nil
+    if status >= 100 && status < 200 && status != 101 {
+        return status, nil
+    }
+    return status, errors.new("http: proxy CONNECT returned status " + itoa(status))
 }
 
 // find_from is find() with a start offset — byte-wise scan (-1 absent).

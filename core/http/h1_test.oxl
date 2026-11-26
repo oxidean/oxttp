@@ -638,9 +638,17 @@ fn test_proxy_all_and_scheme_match() {
     if e == nil {
         testing.expect_eq(find(resp.body as str, "GET http://example.org/ HTTP/1.1"), 0, "all: absolute-form")
     }
-    r2 := rq("GET", "http://example.org/")
-    r2.proxies = one("https:" + f.url()) // scheme mismatch → direct → dial example.org fails or fixture untouched
+    // scheme mismatch → direct to a second loopback origin (never
+    // public DNS): it must see an origin-form request, proxy untouched.
+    o2 := fx_start(one("<ECHO>"))
+    defer o2.stop()
+    r2 := rq("GET", "http://127.0.0.1:" + itoa(o2.port) + "/y")
+    r2.proxies = one("https:" + f.url())
     [resp2, e2] = request(r2)
+    testing.expect(e2 == nil, "direct send after scheme mismatch")
+    if e2 == nil {
+        testing.expect_eq(find(resp2.body as str, "GET /y HTTP/1.1"), 0, "origin-form at real origin: " + resp2.body as str)
+    }
     testing.expect_eq(sget(f.hits), 1, "no second proxy hit (https: skipped for http)")
 }
 
@@ -721,4 +729,82 @@ fn test_proxy_connect_https() {
     testing.expect(find(cap, "host: example.org:443") >= 0, "CONNECT host: " + cap)
     testing.expect(find(cap, "proxy-authorization: Basic dXNlcjpwdw==") >= 0, "CONNECT auth: " + cap)
     testing.expect(find(cap, "proxy-connection: keep-alive") >= 0, "keep-alive: " + cap)
+}
+
+fn test_proxy_connect_any_2xx() {
+    // RFC 9110: any 2xx establishes the tunnel — a 204 must not fail
+    // the CONNECT status check (review F13).
+    f := capfx_start_reply("HTTP/1.1 204 No Content\r\n\r\n")
+    defer f.l.close()
+    r := rq("GET", "https://example.org/")
+    r.proxies = one("all:http://127.0.0.1:" + itoa(f.port))
+    [_resp, e] = request(r)
+    testing.expect(e != nil, "post-tunnel TLS fails on fake server")
+    if e != nil {
+        testing.expect(find(errors.msg(e), "returned status") < 0, "204 not rejected: " + errors.msg(e))
+    }
+    testing.expect(find(f.cap[0], "CONNECT example.org:443") >= 0, "CONNECT sent: " + f.cap[0])
+}
+
+fn test_proxy_connect_framing_ignored() {
+    // body-framing headers on a 2xx CONNECT reply are ignored — the
+    // tunnel starts at the header terminator (review F12).
+    f := capfx_start_reply("HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\n")
+    defer f.l.close()
+    r := rq("GET", "https://example.org/")
+    r.proxies = one("all:http://127.0.0.1:" + itoa(f.port))
+    [_resp, e] = request(r)
+    testing.expect(e != nil, "post-tunnel TLS fails on fake server")
+    if e != nil {
+        testing.expect(find(errors.msg(e), "content length") < 0, "CL not rejected: " + errors.msg(e))
+        testing.expect(find(errors.msg(e), "returned status") < 0, "200 accepted: " + errors.msg(e))
+    }
+    testing.expect(find(f.cap[0], "CONNECT example.org:443") >= 0, "CONNECT sent: " + f.cap[0])
+}
+
+fn test_proxy_connect_caller_auth() {
+    // a caller Proxy-Authorization rides the CONNECT instead of the
+    // URL creds, and must not reach the origin (RFC 9110 §11.7.2,
+    // review F9).
+    f := capfx_start()
+    defer f.l.close()
+    r := rq("GET", "https://example.org/")
+    r.proxies = one("all:http://user:pw@127.0.0.1:" + itoa(f.port))
+    r.headers = hs1("Proxy-Authorization", "Bearer caller-token")
+    [_resp, e] = request(r)
+    testing.expect(e != nil, "post-tunnel TLS fails on fake server")
+    cap := f.cap[0]
+    testing.expect(find(cap, "proxy-authorization: Bearer caller-token") >= 0, "caller auth on CONNECT: " + cap)
+    urlcreds := "Basic " + base64.encode("user:pw" as []byte)
+    testing.expect(find(cap, urlcreds) < 0, "url creds not used: " + cap)
+}
+
+fn test_h2_authority_from_host_header() {
+    // caller Host: becomes :authority — never a separate host field
+    // (RFC 9113 §8.3.1, review F10).
+    f := h2_start(one("<H2ECHO>"))
+    defer f.stop()
+    r := rq("GET", f.url() + "/")
+    r.h2 = "prior"
+    r.headers = hs1("Host", "vhost.example")
+    [resp, e] = request(r)
+    testing.expect(e == nil, "h2 send")
+    if e != nil {
+        return
+    }
+    b := resp.body as str
+    testing.expect(find(b, ":authority: vhost.example") >= 0, ":authority override: " + b)
+    testing.expect(find(b, "host:") < 0, "no host field on h2: " + b)
+}
+
+fn test_proxy_error_hides_password() {
+    // proxy URL validation errors must not echo the raw URL — it can
+    // carry a userinfo password (review F8).
+    r := rq("GET", "http://example.org/")
+    r.proxies = one("all:http://user:sekretpw@127.0.0.1:0/")
+    [_resp, e] = request(r)
+    testing.expect(e != nil, "bad proxy port errors")
+    if e != nil {
+        testing.expect(find(errors.msg(e), "sekretpw") < 0, "no password in error: " + errors.msg(e))
+    }
 }

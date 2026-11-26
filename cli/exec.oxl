@@ -1207,6 +1207,13 @@ fn plan(i: ref Intent, env: []str, stdin: str, stdin_tty: int) -> own ReqPlan {
                 return p
             }
             p.req.key_pem = os.readfile_(i.cert_key)
+            // an explicitly supplied key file must carry a key —
+            // empty content errors rather than silently falling back
+            // to the cert PEM (review F1).
+            if len(p.req.key_pem) == 0 {
+                p.err = "cert-key file is empty: " + i.cert_key
+                return p
+            }
         }
         // Upstream builds the client (and its identity) eagerly, so a
         // bad PEM errors even on http:// or --offline — same load the
@@ -1643,7 +1650,6 @@ fn curl_emit(i: ref Intent, p: ref ReqPlan) -> str {
     fl_c := "-C"
     fl_o := "-o"
     fl_e := "-E"
-    fl_px := "-x"
     if long != 0 {
         fl_loc = "--location"
         fl_x = "--request"
@@ -1652,14 +1658,17 @@ fn curl_emit(i: ref Intent, p: ref ReqPlan) -> str {
         fl_c = "--continue-at"
         fl_o = "--output"
         fl_e = "--cert"
-        fl_px = "--proxy"
     }
-    // WI-0013 P5 (spec sem-S6): --proxy http:/https: entries become
-    // env prefixes prepended to the line; all: becomes -x (last
-    // wins, matching curl's own last-flag semantics). Env-captured
-    // proxies stay silent — curl inherits the same environment.
+    // WI-0013 P5 (spec sem-S6): --proxy entries become env prefixes
+    // prepended to the line — first entry wins per proto, matching
+    // pick_proxy's selection; all: rides all_proxy (curl's -x would
+    // override the scheme-specific envs). When any explicit entries
+    // exist, unspecified ambient proxy envs are cleared so the emitted
+    // command can't silently inherit a proxy the request bypassed.
     pre := ""
-    allp := ""
+    seen_http := 0
+    seen_https := 0
+    seen_all := 0
     pxi := 0
     for pxi < len(i.proxies[:]) {
         pent := i.proxies[pxi]
@@ -1670,12 +1679,26 @@ fn curl_emit(i: ref Intent, p: ref ReqPlan) -> str {
         }
         proto := elwr(substr(pent, 0, ci))
         purl := substr(pent, ci + 1, len(pent))
-        if proto == "all" {
-            allp = purl
-        } else if proto == "http" {
+        if proto == "all" && seen_all == 0 {
+            seen_all = 1
+            pre = pre + "all_proxy=" + shquote(purl) + " "
+        } else if proto == "http" && seen_http == 0 {
+            seen_http = 1
             pre = pre + "http_proxy=" + shquote(purl) + " "
-        } else if proto == "https" {
+        } else if proto == "https" && seen_https == 0 {
+            seen_https = 1
             pre = pre + "https_proxy=" + shquote(purl) + " "
+        }
+    }
+    if seen_http + seen_https + seen_all > 0 {
+        if seen_http == 0 {
+            pre = pre + "http_proxy= HTTP_PROXY= "
+        }
+        if seen_https == 0 {
+            pre = pre + "https_proxy= HTTPS_PROXY= "
+        }
+        if seen_all == 0 {
+            pre = pre + "all_proxy= ALL_PROXY= "
         }
     }
     cmd := pre + "curl"
@@ -1718,9 +1741,6 @@ fn curl_emit(i: ref Intent, p: ref ReqPlan) -> str {
     }
     if len(sslv) > 0 {
         cmd = cmd + " --tlsv" + sslv + " --tls-max " + sslv
-    }
-    if len(allp) > 0 {
-        cmd = cmd + " " + fl_px + " " + shquote(allp)
     }
     if p.resume_off > 0 {
         cmd = cmd + " " + fl_c + " -"

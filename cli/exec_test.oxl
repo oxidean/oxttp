@@ -245,9 +245,11 @@ fn test_exec_curl_native_tls_ignored() {
     r2 := xrun("--curl\n--proxy\nall:http://p:1\nhttps://example.org/x", "", 1)
     testing.expect_eq(r2.code, 0, "curl exit")
     testing.expect(find(r2.stderr, "Ignored --proxy") < 0, "proxy emits now: " + r2.stderr)
-    testing.expect(find(r2.stdout, "-x 'http://p:1'") >= 0, "-x emitted: " + r2.stdout)
+    // all: rides all_proxy env — curl's -x would override scheme envs (F4)
+    testing.expect(find(r2.stdout, "all_proxy='http://p:1'") >= 0, "all_proxy emitted: " + r2.stdout)
+    testing.expect(find(r2.stdout, "-x ") < 0, "no -x flag: " + r2.stdout)
     r3 := xrun("--curl-long\n--proxy\nall:http://p:1\n--cert\ntests/golden/fixtures/dev-cert.pem\n--cert-key\ntests/golden/fixtures/dev-key.pem\nhttps://example.org/x", "", 1)
-    testing.expect(find(r3.stdout, "--proxy 'http://p:1'") >= 0, "long --proxy: " + r3.stdout)
+    testing.expect(find(r3.stdout, "all_proxy='http://p:1'") >= 0, "long all_proxy: " + r3.stdout)
     testing.expect(find(r3.stdout, "--cert 'tests/golden/fixtures/dev-cert.pem'") >= 0, "long --cert: " + r3.stdout)
     testing.expect(find(r3.stdout, "--key 'tests/golden/fixtures/dev-key.pem'") >= 0, "long --key: " + r3.stdout)
 }
@@ -300,4 +302,36 @@ fn test_exec_cert_files() {
     r5 := xrun("--cert-key\n/no/such/key.pem\n--offline\nexample.org", "", 1)
     testing.expect_eq(r5.code, 0, "lone cert-key ignored: " + r5.stderr)
     os.remove("/tmp/oxttp-ctest.pem")
+}
+
+// CodeRabbit review F2/F3/F4 — --curl proxy emit: first entry wins
+// per proto (pick_proxy parity), all: -> all_proxy env, and explicit
+// entries clear unspecified ambient proxy envs.
+fn test_exec_curl_proxy_emit() {
+    r := xrun("--curl\n--offline\n--proxy\nall:http://pa:1\n--proxy\nhttp:http://ph:2\n--proxy\nhttp:http://second:3\n--proxy\nhttps:http://ps:4\nhttp://example.org/", "", 1)
+    testing.expect_eq(r.code, 0, "curl exit: " + r.stderr)
+    o := r.stdout
+    testing.expect(find(o, "all_proxy='http://pa:1'") >= 0, "all_proxy env: " + o)
+    testing.expect(find(o, " -x ") < 0, "no -x flag: " + o)
+    testing.expect(find(o, "http_proxy='http://ph:2'") >= 0, "first http proxy: " + o)
+    testing.expect(find(o, "second:3") < 0, "second http entry dropped (first wins): " + o)
+    testing.expect(find(o, "https_proxy='http://ps:4'") >= 0, "https proxy: " + o)
+    // all protos covered -> no ambient clearing emitted
+    testing.expect(find(o, "HTTP_PROXY=") < 0, "no clearing needed: " + o)
+    // only http: set -> https/all ambient envs cleared in the emit
+    r2 := xrun("--curl\n--offline\n--proxy\nhttp:http://ph:2\nhttp://example.org/", "", 1)
+    o2 := r2.stdout
+    testing.expect(find(o2, "https_proxy= HTTPS_PROXY=") >= 0, "https ambient cleared: " + o2)
+    testing.expect(find(o2, "all_proxy= ALL_PROXY=") >= 0, "all ambient cleared: " + o2)
+    testing.expect(find(o2, "http_proxy='http://ph:2'") >= 0, "explicit http kept: " + o2)
+}
+
+// CodeRabbit review F1 — an explicitly supplied but empty --cert-key
+// file errors instead of falling back to the cert PEM.
+fn test_exec_cert_key_empty() {
+    os.writefile_("/tmp/oxttp-ckey-empty.pem", "")
+    r := xrun("--cert\ntests/golden/fixtures/dev-cert.pem\n--cert-key\n/tmp/oxttp-ckey-empty.pem\n--offline\nexample.org", "", 1)
+    testing.expect_eq(r.code, 1, "empty key exit 1")
+    testing.expect(find(r.stderr, "cert-key file is empty") >= 0, "empty key err: " + r.stderr)
+    os.remove("/tmp/oxttp-ckey-empty.pem")
 }
