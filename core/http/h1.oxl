@@ -21,6 +21,8 @@ import "std/io"
 
 import "std/net"
 
+import "std/net/http2"
+
 import "std/net/tls"
 
 import "std/crypto/x509"
@@ -357,6 +359,19 @@ fn (t H1) roundtrip(req: ref model.Req, cap: mut model.Hop) -> [model.Resp, err]
             return bad, te
         }
         tr.tls_ms = itof(now_ms() - t0tls)
+        // WI-0013 P3 (ADR-0030): negotiated h2 → the frame exchange
+        // on this conn; prior-knowledge requires it (spec D3).
+        alpn := tc.negotiated_alpn()
+        if req.h2 == "prior" && alpn != "h2" {
+            tc.close()
+            return bad, errors.new("http: prior-knowledge HTTP/2 requires h2 negotiation")
+        }
+        if alpn == "h2" {
+            cap.req_head = h2_head_synth(req, u, hdrs, has_body, len(rb.data))
+            [resp2, re2] = h2_exchange(req, tc.asreadwriter(), tc.rawfd(), hdrs, rb, u, cap, host + ":" + itoa(port), t0, c0, tr, deadline, bad, tc.s.ver)
+            tc.close()
+            return resp2, re2
+        }
         if req.timeout_ms > 0 {
             set_sndtimo(tc.rawfd(), (req.timeout_ms + 999) / 1000)
         }
@@ -379,6 +394,14 @@ fn (t H1) roundtrip(req: ref model.Req, cap: mut model.Hop) -> [model.Resp, err]
         [resp, re] = finish_roundtrip(req, br, cap, host, port, t0, c0, tr, bad, tc.s.ver)
         tc.close()
         return resp, re
+    }
+    // h2c prior-knowledge: no TLS — run the h2 exchange straight on
+    // the socket (--http-version 2-prior-knowledge, spec sem-S1).
+    if req.h2 == "prior" {
+        cap.req_head = h2_head_synth(req, u, hdrs, has_body, len(rb.data))
+        [resp3, re3] = h2_exchange(req, raw.asreadwriter(), raw.rawfd(), hdrs, rb, u, cap, host + ":" + itoa(port), t0, c0, tr, deadline, bad, 0)
+        raw.close()
+        return resp3, re3
     }
     if req.timeout_ms > 0 {
         set_sndtimo(raw.rawfd(), (req.timeout_ms + 999) / 1000)
@@ -480,6 +503,214 @@ fn finish_roundtrip(req: ref model.Req, br: own bufio.Reader, cap: mut model.Hop
     tr.closed_ms = itof(now_ms() - c0)
     let bodyb: []byte = db
     return model.Resp{status: h.status, reason: h.reason, headers: h.headers, body: bodyb, elapsed_ms: itof(now_ms() - t0), remote: host + ":" + itoa(port), version: h.version, hops: nil, req_head: "", trace: tr, tls_ver: tls_ver}, nil
+}
+
+// --- h2 exchange (WI-0013 P3, ADR-0030) ----------------------------
+// One request/response pair over http2.Conn: pseudo-headers plus the
+// caller/synth headers minus connection-specific names the frame
+// layer rejects, DATA body with flow-control acks, trailers folded
+// into the header list. cap gets the same fields finish_roundtrip
+// fills on the h1 path.
+
+// h2_forbidden: hop-by-hop names illegal inside h2 frames.
+fn h2_forbidden(n: str) -> bool {
+    return n == "connection" || n == "keep-alive" || n == "proxy-connection" || n == "transfer-encoding" || n == "upgrade"
+}
+
+// h2_push appends model headers as lowercase h2 headers, dropping
+// h2-illegal names and any "te" value but "trailers".
+fn h2_push(hh: []http2.Header, hs: []model.Header) -> []http2.Header {
+    i := 0
+    for i < len(hs) {
+        n := lwr(hs[i].name)
+        if len(n) == 0 || h2_forbidden(n) {
+            i = i + 1
+            continue
+        }
+        if n == "te" && lwr(hs[i].value) != "trailers" {
+            i = i + 1
+            continue
+        }
+        hh = push(hh, http2.Header{name: n, value: hs[i].value})
+        i = i + 1
+    }
+    return hh
+}
+
+fn h2_has(hh: []http2.Header, name: str) -> bool {
+    i := 0
+    for i < len(hh) {
+        if hh[i].name == name {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// h2_status pulls :status out of a response HEADERS event (0 absent).
+fn h2_status(hs: []http2.Header) -> int {
+    i := 0
+    for i < len(hs) {
+        if hs[i].name == ":status" {
+            [n, _e] = strconv.atoi(hs[i].value)
+            return n
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// h2_safe is h2_push for model lists — used by the synthesized head.
+fn h2_safe(hs: []model.Header) -> []model.Header {
+    let out: []model.Header = nil
+    i := 0
+    for i < len(hs) {
+        n := lwr(hs[i].name)
+        if len(n) == 0 || h2_forbidden(n) {
+            i = i + 1
+            continue
+        }
+        if n == "te" && lwr(hs[i].value) != "trailers" {
+            i = i + 1
+            continue
+        }
+        out = push(out, hs[i])
+        i = i + 1
+    }
+    return out
+}
+
+// h2_head_synth renders the h2 request head as an HTTP/2.0 status
+// line plus the h1-shaped header block — there is no wire text; this
+// is the display approximation spec D1 calls out.
+fn h2_head_synth(req: ref model.Req, u: ref url.URL, hdrs: []model.Header, has_body: bool, body_len: int) -> str {
+    return serialize_head(OutHead{method: req.method, uri: u.request_uri(), ver: "HTTP/2.0", host: u.host, hdrs: h2_safe(hdrs), body_len: body_len, has_body: has_body, synth: h2_safe(req.synth)})
+}
+
+// h2_exchange runs the request on a fresh http2.Conn and builds the
+// Resp — the h2 twin of finish_roundtrip. rw/fd are the transport
+// (raw socket for h2c, TLS conn for negotiated h2); deadline carries
+// the whole-request budget (0 = 30s cap like h1).
+fn h2_exchange(req: ref model.Req, rw: io.ReadWriter, fd: int, hdrs: []model.Header, rb: RenderedBody, u: ref url.URL, cap: mut model.Hop, remote: str, t0: int, c0: int, tr: own model.Trace, deadline: int, bad: model.Resp, tls_ver: int) -> [model.Resp, err] {
+    tmo := 30000
+    if deadline > 0 {
+        tmo = deadline - now_ms()
+        if tmo <= 0 {
+            tmo = 1
+        }
+    }
+    [c2, e2] = http2.new_conn_timeout(rw, fd, tmo)
+    if e2 != nil {
+        return bad, errors.wrap("http: h2 preface", e2)
+    }
+    let hh: []http2.Header = nil
+    hh = push(hh, http2.Header{name: ":method", value: req.method})
+    hh = push(hh, http2.Header{name: ":scheme", value: lwr(u.scheme)})
+    hh = push(hh, http2.Header{name: ":authority", value: u.host})
+    hh = push(hh, http2.Header{name: ":path", value: u.request_uri()})
+    hh = h2_push(hh, hdrs)
+    hh = h2_push(hh, req.synth)
+    has_body := req.body.kind() != 0
+    if has_body && !h2_has(hh, "content-length") {
+        hh = push(hh, http2.Header{name: "content-length", value: itoa(len(rb.data))})
+    }
+    [sid, oe] = c2.open_stream(hh, !has_body || len(rb.data) == 0)
+    if oe != nil {
+        return bad, oe
+    }
+    tr.send_headers_ms = itof(now_ms() - c0)
+    if len(rb.data) > 0 {
+        be := c2.send_body(sid, rb.data)
+        if be != nil {
+            return bad, be
+        }
+    }
+    tr.send_body_ms = itof(now_ms() - c0)
+    status := 0
+    let rh: []model.Header = nil
+    body := mkslice(byte, 0)
+    got_final := false
+    done := false
+    for !done {
+        [ev, ee] = c2.next_event()
+        if ee != nil {
+            return bad, ee
+        }
+        if ev.kind == 7 { // GOAWAY
+            if ev.last_stream_id < sid {
+                return bad, errors.new("http: connection closed by GOAWAY before response")
+            }
+            continue
+        }
+        if ev.stream_id != sid {
+            continue
+        }
+        if ev.kind == 3 { // RST_STREAM
+            return bad, errors.new("http: stream reset by peer")
+        }
+        if ev.kind == 1 { // HEADERS
+            if ev.trailers {
+                i := 0
+                for i < len(ev.headers) {
+                    rh = push(rh, model.Header{name: ev.headers[i].name, value: ev.headers[i].value})
+                    i = i + 1
+                }
+            } else {
+                st := h2_status(ev.headers)
+                if st >= 100 && st < 200 {
+                    continue // interim 1xx — final HEADERS follows
+                }
+                status = st
+                i := 0
+                for i < len(ev.headers) {
+                    n := ev.headers[i].name
+                    if len(n) > 0 && byteat(n, 0) != 58 {
+                        rh = push(rh, model.Header{name: n, value: ev.headers[i].value})
+                    }
+                    i = i + 1
+                }
+                got_final = true
+                tr.recv_headers_ms = itof(now_ms() - c0)
+            }
+            if (ev.flags & 1) != 0 {
+                done = true
+            }
+            continue
+        }
+        if ev.kind == 0 { // DATA
+            i := 0
+            for i < len(ev.payload) {
+                body = push(body, ev.payload[i])
+                i = i + 1
+            }
+            if ev.flow_bytes > 0 {
+                c2.ack_data(ev.stream_id, ev.flow_bytes)
+            }
+            if (ev.flags & 1) != 0 {
+                done = true
+            }
+            continue
+        }
+    }
+    if !got_final {
+        return bad, errors.new("http: h2 stream ended without response headers")
+    }
+    cap.status = status
+    cap.reason = ""
+    cap.version = "2.0"
+    cap.remote = remote
+    cap.headers = rh
+    cap.body = body
+    cap.elapsed_ms = itof(now_ms() - t0)
+    tr.recv_body_ms = itof(now_ms() - c0)
+    [db, dbe] = decode_body(body, hdr_get(rh, "content-encoding"))
+    if dbe != nil {
+        return bad, dbe
+    }
+    tr.closed_ms = itof(now_ms() - c0)
+    let bodyb: []byte = db
+    return model.Resp{status: status, reason: "", headers: rh, body: bodyb, elapsed_ms: itof(now_ms() - t0), remote: remote, version: "2.0", hops: nil, req_head: "", trace: tr, tls_ver: tls_ver}, nil
 }
 
 // check_url gates the scheme surface: http and https. Other schemes

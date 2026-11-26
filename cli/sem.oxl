@@ -1339,10 +1339,7 @@ fn resolve(m: own args.Matches, envpairs: []str) -> own Out {
     // Degrade routing (ADR 0024): connection-affecting flags error
     // out; --debug degrades to a warning inside execute. S7 landed
     // --continue / --curl / --pretty (format-options still deferred).
-    if o.intent.http_version == "2" || o.intent.http_version == "2-prior-knowledge" {
-        defer_out(o, prog, "HTTP/2 requests are unsupported in this build")
-        return o
-    }
+    // WI-0013 executes --http-version 2* (ADR-0030).
     if len(o.intent.proxies[:]) > 0 || len(o.intent.proxy_env[:]) > 0 {
         defer_out(o, prog, "proxies are unsupported in this build")
         return o

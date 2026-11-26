@@ -1214,6 +1214,13 @@ fn plan(i: ref Intent, env: []str, stdin: str, stdin_tty: int) -> own ReqPlan {
     } else {
         p.req.httpver = "HTTP/1.1"
     }
+    // WI-0013 sem-S1: --http-version 2 is an ALPN hint; 2-prior-
+    // knowledge forces h2c on http / requires negotiated h2 on https.
+    if i.http_version == "2" {
+        p.req.h2 = "hint"
+    } else if i.http_version == "2-prior-knowledge" {
+        p.req.h2 = "prior"
+    }
     if i.compress_n > 0 {
         p.warn = push(p.warn, "--compress is unsupported in this build; request body sent uncompressed.")
     }
@@ -1391,6 +1398,8 @@ fn req_head_render(i: ref Intent, p: ref ReqPlan) -> str {
     ver := "HTTP/1.1"
     if i.http_version == "1.0" {
         ver = "HTTP/1.0"
+    } else if len(p.req.h2) > 0 {
+        ver = "HTTP/2.0" // spec D1: h2 modes render the 2.0 token
     }
     [u, _e] = url.parse(p.req.url)
     uri := "/"

@@ -524,3 +524,71 @@ fn test_host_last() {
     tail := "Host: 127.0.0.1:" + itoa(f.port) + "\r\n\r\n"
     testing.expect(len(b) >= len(tail) && substr(b, len(b) - len(tail), len(b)) == tail, "host is last header: " + b)
 }
+
+// --- WI-0013 P3: h2/h2c over the owned transport (ADR-0030) --------
+fn test_h2c_prior_knowledge() {
+    f := h2_start(one("<H2ECHO>"))
+    defer f.stop()
+    r := rq("GET", f.url() + "/p?q=1")
+    r.h2 = "prior"
+    [resp, e] = request(r)
+    testing.expect(e == nil, "h2c send")
+    if e != nil {
+        return
+    }
+    testing.expect_eq(resp.status, 200, "h2 200")
+    testing.expect_streq(resp.version, "2.0", "h2 version token")
+    b := resp.body as str
+    testing.expect(find(b, ":method: GET") >= 0, "h2 :method: " + b)
+    testing.expect(find(b, ":scheme: http") >= 0, "h2 :scheme")
+    testing.expect(find(b, ":path: /p?q=1") >= 0, "h2 :path")
+    testing.expect(find(b, ":authority: 127.0.0.1:") >= 0, "h2 :authority")
+    // connection-specific headers must not cross into h2 frames
+    testing.expect(find(b, "connection:") < 0, "no connection header")
+    testing.expect_eq(sget(f.hits), 1, "one exchange")
+}
+
+fn test_h2c_post_body() {
+    f := h2_start(one("<H2ECHO>"))
+    defer f.stop()
+    r := rq("POST", f.url() + "/up")
+    r.h2 = "prior"
+    r.body = model.Body.Raw{ctype: "text/plain", text: "h2body!"}
+    r.headers = hs1("Content-Type", "text/plain")
+    [resp, e] = request(r)
+    testing.expect(e == nil, "h2 post")
+    if e != nil {
+        return
+    }
+    b := resp.body as str
+    testing.expect(find(b, "content-length: 7") >= 0, "h2 CL sent: " + b)
+    testing.expect(strings_ends(b, "h2body!"), "h2 body bytes: " + b)
+}
+
+fn test_h2c_scripted_body() {
+    f := h2_start(one("scripted-h2"))
+    defer f.stop()
+    r := rq("GET", f.url() + "/")
+    r.h2 = "prior"
+    [resp, e] = request(r)
+    testing.expect(e == nil, "send")
+    if e == nil {
+        testing.expect_streq(resp.body as str, "scripted-h2", "script body")
+        testing.expect_eq(resp.status, 200, "status")
+        testing.expect_streq(hdr_get(resp.headers, "content-type"), "text/plain", "resp hdrs decoded")
+    }
+}
+
+fn test_h2c_req_head_synth() {
+    // h2 has no wire head — the captured head is the synthesized
+    // HTTP/2.0 approximation (spec D1).
+    f := h2_start(one("<H2ECHO>"))
+    defer f.stop()
+    r := rq("GET", f.url() + "/x")
+    r.h2 = "prior"
+    [resp, e] = request(r)
+    testing.expect(e == nil, "send")
+    if e == nil {
+        testing.expect_eq(find(resp.req_head, "GET /x HTTP/2.0"), 0, "synth head: " + resp.req_head)
+    }
+}

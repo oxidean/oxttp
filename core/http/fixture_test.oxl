@@ -12,6 +12,8 @@ package http
 // (context/references/std-net-transport-surface.md).
 import "std/net"
 
+import "std/net/http2"
+
 import "std/strconv"
 
 import "std/testing"
@@ -158,4 +160,105 @@ fn fx_write_all(c: net.Conn, b: []byte) {
         }
         off = off + n
     }
+}
+
+// --- h2 fixture (WI-0013 P3) --------------------------------------
+// A minimal server-side h2 peer built on the exported frame/hpack
+// surface: reads the client preface + SETTINGS, answers SETTINGS,
+// reads HEADERS/CONTINUATION/DATA on the client's stream, then sends
+// a scripted response. Script entry "<H2ECHO>" returns a body that
+// dumps the decoded request pseudo-headers + request body — the
+// h2 twin of <ECHO>.
+
+fn h2_start(script: []str) -> own Fx {
+    [l, e] = net.listen(0)
+    testing.expect(e == nil, "h2fx listen")
+    f := new(Fx)
+    f.l = l
+    f.port = l.port()
+    f.hits = mkshared(0)
+    spawnBlocking h2fx_serve(l, new(script), f.hits)
+    return f
+}
+
+fn h2fx_serve(l: net.Listener, script: own []str, hits: shared) {
+    set_rcvtimo(l.rawfd(), 30)
+    i := 0
+    for i < len(script) {
+        [c, e] = l.accept()
+        if e != nil {
+            l.close()
+            return
+        }
+        h2fx_conn(c, script[i], hits)
+        i = i + 1
+    }
+    l.close()
+}
+
+fn h2fx_conn(c: net.Conn, resp: str, hits: shared) {
+    defer c.close()
+    set_rcvtimo(c.rawfd(), 20)
+    rw := c.asreadwriter()
+    scratch := mkslice(byte, 24)
+    [_pre, _re] = http2.read_exact(rw, 24)
+    // client SETTINGS (ignored) then server SETTINGS then its ack
+    [_sf, _se] = http2.read_frame(rw, 16384)
+    http2.write_frame(rw, http2.FrameHeader{length: 0, kind: 4, flags: 0, stream_id: 0}, mkslice(byte, 0))
+    [dec, _de] = http2.new_decoder(4096, 65536)
+    dump := ""
+    body := ""
+    sid := 0
+    end_stream := false
+    frames := 0
+    for !end_stream && frames < 32 {
+        frames = frames + 1
+        [f, fe] = http2.read_frame(rw, 16384)
+        if fe != nil {
+            break
+        }
+        k := f.header.kind
+        if k == 4 || k == 8 || k == 6 {
+            continue // SETTINGS ack / WINDOW_UPDATE / PING
+        }
+        if k == 1 || k == 9 { // HEADERS / CONTINUATION
+            [hs2, he] = http2.decode_headers(dec, f.payload)
+            if he == nil {
+                j := 0
+                for j < len(hs2) {
+                    dump = dump + hs2[j].name + ": " + hs2[j].value + "\n"
+                    j = j + 1
+                }
+            }
+            if k == 1 {
+                sid = f.header.stream_id
+            }
+            if (f.header.flags & 1) != 0 {
+                end_stream = true
+            }
+            continue
+        }
+        if k == 0 { // DATA
+            sid = f.header.stream_id
+            body = body + f.payload as str
+            if (f.header.flags & 1) != 0 {
+                end_stream = true
+            }
+            continue
+        }
+    }
+    sadd(hits, 1)
+    let rh: []http2.Header = nil
+    rh = push(rh, http2.Header{name: ":status", value: "200"})
+    rh = push(rh, http2.Header{name: "content-type", value: "text/plain"})
+    [blk, _be] = http2.encode_headers(rh)
+    if sid == 0 {
+        sid = 1
+    }
+    http2.write_frame(rw, http2.FrameHeader{length: len(blk), kind: 1, flags: 4, stream_id: sid}, blk)
+    out := dump + body
+    if resp != "<H2ECHO>" {
+        out = resp
+    }
+    http2.write_frame(rw, http2.FrameHeader{length: len(out), kind: 0, flags: 1, stream_id: sid}, out as []byte)
 }

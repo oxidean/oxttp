@@ -273,8 +273,11 @@ fn test_deferrals() {
     deferr(r("--generate\nman"), "--generate is unsupported in this build")
     deferr(r("--unstable-m-sig-id\ni\n--unstable-m-sig-key\nk\nexample.org"), "This binary was built without message signature support. Enable the `http-message-signatures` feature.")
     deferr(r("--http-version\n3-prior-knowledge\nexample.org"), "This binary was built without support for HTTP/3. Enable the `http3` feature.")
+    // WI-0013: --http-version 2* executes (ADR-0030); only h3 defers
     o := r("--http-version\n2-prior-knowledge\nexample.org")
-    deferr(o, "HTTP/2 requests are unsupported in this build")
+    testing.expect_eq(o.exec, 1, "2-prior-knowledge execs")
+    o1b := r("--http-version\n2\nexample.org")
+    testing.expect_eq(o1b.exec, 1, "h2 hint execs")
     o2 := r("--offline\nexample.org")
     testing.expect_eq(o2.code, 0, "offline routes to exec")
     testing.expect_eq(o2.exec, 1, "offline execs")
