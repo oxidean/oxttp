@@ -1208,6 +1208,18 @@ fn plan(i: ref Intent, env: []str, stdin: str, stdin_tty: int) -> own ReqPlan {
             }
             p.req.key_pem = os.readfile_(i.cert_key)
         }
+        // Upstream builds the client (and its identity) eagerly, so a
+        // bad PEM errors even on http:// or --offline — same load the
+        // transport runs, with the cert-file key fallback.
+        kp := p.req.key_pem
+        if len(kp) == 0 {
+            kp = p.req.cert_pem
+        }
+        [_, cce] = tls.load_cert_pem(p.req.cert_pem, kp)
+        if cce != nil {
+            p.err = "couldn't load client certificate: " + errors.msg(cce)
+            return p
+        }
     }
     if i.http_version == "1.0" {
         p.req.httpver = "HTTP/1.0"

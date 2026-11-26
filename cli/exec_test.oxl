@@ -246,9 +246,10 @@ fn test_exec_curl_native_tls_ignored() {
     testing.expect_eq(r2.code, 0, "curl exit")
     testing.expect(find(r2.stderr, "Ignored --proxy") < 0, "proxy emits now: " + r2.stderr)
     testing.expect(find(r2.stdout, "-x 'http://p:1'") >= 0, "-x emitted: " + r2.stdout)
-    r3 := xrun("--curl-long\n--proxy\nall:http://p:1\n--cert\ntests/golden/fixtures/dev-cert.pem\nhttps://example.org/x", "", 1)
+    r3 := xrun("--curl-long\n--proxy\nall:http://p:1\n--cert\ntests/golden/fixtures/dev-cert.pem\n--cert-key\ntests/golden/fixtures/dev-key.pem\nhttps://example.org/x", "", 1)
     testing.expect(find(r3.stdout, "--proxy 'http://p:1'") >= 0, "long --proxy: " + r3.stdout)
     testing.expect(find(r3.stdout, "--cert 'tests/golden/fixtures/dev-cert.pem'") >= 0, "long --cert: " + r3.stdout)
+    testing.expect(find(r3.stdout, "--key 'tests/golden/fixtures/dev-key.pem'") >= 0, "long --key: " + r3.stdout)
 }
 
 // WI-0013 P2 — ADR-0031: --native-tls on https is a warning-degrade
@@ -287,10 +288,16 @@ fn test_exec_cert_files() {
     r2 := xrun("--cert\n/tmp/oxttp-ctest.pem\n--cert-key\n/no/such/key.pem\n--offline\nexample.org", "", 1)
     testing.expect_eq(r2.code, 1, "missing cert-key exit 1")
     testing.expect(find(r2.stderr, "cert-key file not found") >= 0, "names key: " + r2.stderr)
+    // bad PEM errors eagerly (upstream validates at client build) —
+    // even --offline. spec AC6.
     r3 := xrun("--cert\n/tmp/oxttp-ctest.pem\n--offline\nexample.org", "", 1)
-    testing.expect_eq(r3.code, 0, "offline cert passes (no TLS): " + r3.stderr)
+    testing.expect_eq(r3.code, 1, "bad pem exit 1: " + r3.stderr)
+    testing.expect(find(r3.stderr, "couldn't load client certificate") >= 0, "pem err text: " + r3.stderr)
+    // a valid identity parses eagerly and offline still passes
+    r4 := xrun("--cert\ntests/golden/fixtures/dev-cert.pem\n--cert-key\ntests/golden/fixtures/dev-key.pem\n--offline\nexample.org", "", 1)
+    testing.expect_eq(r4.code, 0, "valid pem offline passes: " + r4.stderr)
     // --cert-key alone (no --cert) is ignored, matching upstream
-    r4 := xrun("--cert-key\n/no/such/key.pem\n--offline\nexample.org", "", 1)
-    testing.expect_eq(r4.code, 0, "lone cert-key ignored: " + r4.stderr)
+    r5 := xrun("--cert-key\n/no/such/key.pem\n--offline\nexample.org", "", 1)
+    testing.expect_eq(r5.code, 0, "lone cert-key ignored: " + r5.stderr)
     os.remove("/tmp/oxttp-ctest.pem")
 }
