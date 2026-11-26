@@ -10,25 +10,106 @@ package main
 
 import "std/os"
 
+import "std/errors"
+
 import "github.com/oxidean/oxttp/core/term"
 
 // palette ids (8-color SGR): 1 red, 2 green, 3 yellow, 4 blue,
 // 5 magenta, 6 cyan, 7 white — attrs from term.Attr*.
 
-fn put_str(scr: mut term.AnsiScreen, x: int, y: int, s: str, fg: int, attr: int) {
+// rune_at decodes the codepoint of the glyph at byte offset i —
+// called only after term.glyph_len validated the sequence.
+fn rune_at(s: str, i: int) -> int {
+    c := byteat(s, i)
+    if c < 128 {
+        return c
+    }
+    if c < 224 {
+        return (c - 192) * 64 + byteat(s, i + 1) - 128
+    }
+    if c < 240 {
+        return (c - 224) * 4096 + (byteat(s, i + 1) - 128) * 64 + byteat(s, i + 2) - 128
+    }
+    return (c - 240) * 262144 + (byteat(s, i + 1) - 128) * 4096 + (byteat(s, i + 2) - 128) * 64 + byteat(s, i + 3) - 128
+}
+
+// glyph_cols — display width in cells of the glyph at s[i] (gl
+// bytes): 1 for narrow/invalid, 2 for the standard wcwidth wide
+// ranges (decimal literals; hex in comments).
+fn glyph_cols(s: str, i: int, gl: int) -> int {
+    if gl <= 1 {
+        return 1
+    }
+    cp := rune_at(s, i)
+    if cp >= 4352 && cp <= 4447 { // 0x1100..0x115F
+        return 2
+    }
+    if cp == 9001 || cp == 9002 { // 0x2329/0x232A
+        return 2
+    }
+    if cp >= 11904 && cp <= 42191 && cp != 12351 { // 0x2E80..0xA4CF !0x303F
+        return 2
+    }
+    if cp >= 44032 && cp <= 55203 { // 0xAC00..0xD7A3
+        return 2
+    }
+    if cp >= 63744 && cp <= 64255 { // 0xF900..0xFAFF
+        return 2
+    }
+    if cp >= 65072 && cp <= 65135 { // 0xFE30..0xFE6F
+        return 2
+    }
+    if cp >= 65280 && cp <= 65376 { // 0xFF00..0xFF60
+        return 2
+    }
+    if cp >= 65504 && cp <= 65510 { // 0xFFE0..0xFFE6
+        return 2
+    }
+    if cp >= 127744 && cp <= 129791 { // 0x1F300..0x1FAFF emoji
+        return 2
+    }
+    if cp >= 131072 && cp <= 262141 { // 0x20000..0x3FFFD
+        return 2
+    }
+    return 1
+}
+
+// str_cols — total display columns of s (sum of glyph widths).
+fn str_cols(s: str) -> int {
+    n := 0
     i := 0
     for i < len(s) {
-        scr.set_cell(x + i, y, substr(s, i, i + 1), fg, -1, attr)
-        i = i + 1
+        gl := term.glyph_len(s, i)
+        n = n + glyph_cols(s, i, gl)
+        i = i + gl
+    }
+    return n
+}
+
+// put_str_max writes s clipped to `max` display columns, iterating
+// GLYPHS never bytes: multibyte chars land whole in cells, and a
+// 2-column glyph that doesn't fit is dropped — never half-drawn.
+fn put_str_max(scr: mut term.AnsiScreen, x: int, y: int, s: str, max: int, fg: int, attr: int) {
+    i := 0
+    cx := x
+    end := x + max
+    for i < len(s) && cx < end {
+        gl := term.glyph_len(s, i)
+        w := glyph_cols(s, i, gl)
+        if cx + w > end {
+            return
+        }
+        scr.set_cell(cx, y, substr(s, i, i + gl), fg, -1, attr)
+        if w == 2 {
+            scr.set_wide_cont(cx + 1, y)
+        }
+        cx = cx + w
+        i = i + gl
     }
 }
 
-fn put_str_max(scr: mut term.AnsiScreen, x: int, y: int, s: str, max: int, fg: int, attr: int) {
-    i := 0
-    for i < len(s) && i < max {
-        scr.set_cell(x + i, y, substr(s, i, i + 1), fg, -1, attr)
-        i = i + 1
-    }
+fn put_str(scr: mut term.AnsiScreen, x: int, y: int, s: str, fg: int, attr: int) {
+    put_str_max(scr, x, y, s, scr.cols - x, fg, attr)
 }
 
 fn fill_row(scr: mut term.AnsiScreen, x: int, y: int, w: int, ch: str, fg: int, attr: int) {
@@ -98,9 +179,10 @@ fn render_url_bar(a: mut App, scr: mut term.AnsiScreen, cols: int) {
     }
     put_str_max(scr, 2, 2, "→ " + prev, cols - 4, 7, term.AttrDim)
     fill_row(scr, 0, 3, cols, "-", 7, term.AttrDim)
-    // url focus shows the text cursor inside the bar
+    // url focus shows the text cursor inside the bar — cur is a byte
+    // offset, so translate to display columns for multibyte text.
     if a.focus == FUrl {
-        cx := mw + 2 + a.url.cur
+        cx := mw + 2 + str_cols(substr(a.url.text, 0, a.url.cur))
         if cx >= cols {
             cx = cols - 1
         }
@@ -223,8 +305,13 @@ fn render_body(a: mut App, scr: mut term.AnsiScreen, x: int, y: int, w: int, h: 
         put_str_max(scr, x + 1, y + i, itoa(a.body.top + i + 1) + " " + ln, w - 2, 7, 0)
         i = i + 1
     }
-    if a.focus == FReqPane && a.body_edit {
-        scr.cursor(x + 1 + a.body.cx, y + a.body.cy - a.body.top, true)
+    if a.focus == FReqPane && a.body_edit && len(a.body.lines) > 0 && a.body.cy < len(a.body.lines) {
+        ln := a.body.lines[a.body.cy]
+        c0 := a.body.cx
+        if c0 > len(ln) {
+            c0 = len(ln)
+        }
+        scr.cursor(x + 1 + str_cols(substr(ln, 0, c0)), y + a.body.cy - a.body.top, true)
     }
 }
 
@@ -315,10 +402,10 @@ fn draw_modal(scr: mut term.AnsiScreen, cols: int, rows: int, w: int, h: int, ti
     }
     draw_pane(scr, x, y, w, h, title, true)
     r := mkslice(int, 4)
-    push(r, x)
-    push(r, y)
-    push(r, w)
-    push(r, h)
+    r[0] = x
+    r[1] = y
+    r[2] = w
+    r[3] = h
     return r
 }
 
@@ -343,11 +430,21 @@ fn render_modal(a: mut App, scr: mut term.AnsiScreen, cols: int, rows: int) {
         r := draw_modal(scr, cols, rows, 56, 16, "palette")
         put_str_max(scr, r[0] + 2, r[1] + 2, "> " + a.pal_query.text, r[2] - 4, 7, 0)
         items := palette_filtered(a)
+        // scroll the visible window to keep pal_sel on screen — Enter
+        // still resolves the absolute index into items.
+        vis := r[3] - 5
+        if vis < 1 {
+            vis = 1
+        }
+        off := 0
+        if a.pal_sel >= vis {
+            off = a.pal_sel - vis + 1
+        }
         i := 0
-        for i < len(items) && i < r[3] - 5 {
-            p := items[i]
+        for off + i < len(items) && i < vis {
+            p := items[off + i]
             a2 := 0
-            if i == a.pal_sel {
+            if off + i == a.pal_sel {
                 a2 = term.AttrReverse
             }
             put_str_max(scr, r[0] + 2, r[1] + 4 + i, p.name, r[2] - 4, 7, a2)
@@ -439,6 +536,9 @@ fn btoa(b: bool) -> str {
 
 // render draws the whole shell and caches hit rects on the app.
 fn render(a: mut App, scr: mut term.AnsiScreen, ver: str) {
+    // reset every cell first — deleted chars / closed modals must not
+    // leave stale glyphs behind in the persistent buffer.
+    scr.clear()
     sz := scr.size()
     cols := sz.cols
     rows := sz.rows
@@ -522,6 +622,42 @@ fn render(a: mut App, scr: mut term.AnsiScreen, ver: str) {
     if a.focus != FUrl && !(a.focus == FReqPane && a.body_edit) {
         scr.cursor(0, 0, false)
     }
+}
+
+// screen_text flattens the cell buffer to plain text with trailing
+// blanks trimmed — the ctrl+shift+s text-screenshot content (corpus
+// §1.6: "text screenshot to CWD").
+fn screen_text(scr: ref term.AnsiScreen) -> str {
+    out := ""
+    y := 0
+    for y < scr.rows {
+        row := ""
+        x := 0
+        for x < scr.cols {
+            row = row + scr.chs[y * scr.cols + x]
+            x = x + 1
+        }
+        n := len(row)
+        for n > 0 && byteat(row, n - 1) == 32 {
+            n = n - 1
+        }
+        out = out + substr(row, 0, n)
+        if y < scr.rows - 1 {
+            out = out + "\n"
+        }
+        y = y + 1
+    }
+    return out
+}
+
+// write_screenshot writes the current frame's text to path; err on
+// any open/write/close failure so the UI can toast honestly.
+fn write_screenshot(scr: ref term.AnsiScreen, path: str) -> err {
+    n := os.writefile_(path, screen_text(scr))
+    if n < 0 {
+        return errors.new("write " + path + ": errno " + itoa(-n))
+    }
+    return nil
 }
 
 // pat_str renders a KeyPat back to a corpus-style spec for the help

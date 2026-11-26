@@ -710,8 +710,9 @@ fn fixed_action(a: mut App, act: str) -> int {
         return EQuit
     }
     if act == "screenshot" {
+        // flag only — the loop writes posting-screenshot.txt after the
+        // next present and toasts on the real outcome.
         a.want_shot = true
-        a.toast(0, "screenshot → posting-screenshot.txt")
         return ENone
     }
     if act == "suspend-undo" {

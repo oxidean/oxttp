@@ -11,6 +11,8 @@ package main
 
 import "std/os"
 
+import "std/errors"
+
 import "std/time"
 
 import "github.com/oxidean/oxttp/core/term"
@@ -61,6 +63,17 @@ fn main() {
             pe2 := sess.scr.present()
             if pe2 != nil {
                 break
+            }
+            // consume a queued text-screenshot (corpus §1.6): write the
+            // just-presented frame, toast only on the outcome.
+            if a.want_shot {
+                a.want_shot = false
+                we := write_screenshot(sess.scr, "posting-screenshot.txt")
+                if we != nil {
+                    a.toast(2, "screenshot failed: " + errors.msg(we))
+                } else {
+                    a.toast(1, "screenshot → posting-screenshot.txt")
+                }
             }
         }
         if re != nil && n <= 0 {
