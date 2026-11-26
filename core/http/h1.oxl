@@ -627,7 +627,14 @@ fn h2_push(hh: []http2.Header, hs: []model.Header) -> []http2.Header {
             i = i + 1
             continue
         }
-        if n == "te" && lwr(hs[i].value) != "trailers" {
+        if n == "te" {
+            if lwr(hs[i].value) != "trailers" {
+                i = i + 1
+                continue
+            }
+            // std's h2 validator requires the exact token — emit the
+            // canonical form regardless of the caller's casing.
+            hh = push(hh, http2.Header{name: n, value: "trailers"})
             i = i + 1
             continue
         }
@@ -675,7 +682,12 @@ fn h2_safe(hs: []model.Header) -> []model.Header {
             i = i + 1
             continue
         }
-        if n == "te" && lwr(hs[i].value) != "trailers" {
+        if n == "te" {
+            if lwr(hs[i].value) != "trailers" {
+                i = i + 1
+                continue
+            }
+            out = push(out, model.Header{name: n, value: "trailers"})
             i = i + 1
             continue
         }
@@ -820,6 +832,10 @@ fn h2_exchange(req: ref model.Req, rw: io.ReadWriter, fd: int, hdrs: []model.Hea
     cap.body = body
     cap.elapsed_ms = itof(now_ms() - t0)
     tr.recv_body_ms = itof(now_ms() - c0)
+    le := h2_check_length(req.method, status, rh, len(body))
+    if le != nil {
+        return bad, le
+    }
     [db, dbe] = decode_body(body, hdr_get(rh, "content-encoding"))
     if dbe != nil {
         return bad, dbe
@@ -827,6 +843,37 @@ fn h2_exchange(req: ref model.Req, rw: io.ReadWriter, fd: int, hdrs: []model.Hea
     tr.closed_ms = itof(now_ms() - c0)
     let bodyb: []byte = db
     return model.Resp{status: status, reason: "", headers: rh, body: bodyb, elapsed_ms: itof(now_ms() - t0), remote: remote, version: "2.0", hops: nil, req_head: "", trace: tr, tls_ver: tls_ver}, nil
+}
+
+// h2_check_length enforces RFC 9113 §8.1.1: received DATA content
+// bytes must match the declared content-length, and duplicated fields
+// must agree. HEAD/204/304 are exempt — their content-length describes
+// a hypothetical body, not the received one.
+fn h2_check_length(method: str, status: int, rh: []model.Header, nbytes: int) -> err {
+    if lwr(method) == "head" || status == 204 || status == 304 {
+        return nil
+    }
+    declared := -1
+    i := 0
+    for i < len(rh) {
+        if lwr(rh[i].name) != "content-length" {
+            i = i + 1
+            continue
+        }
+        [n, ae] = strconv.atoi(rh[i].value)
+        if ae != nil || n < 0 {
+            return errors.new("http: h2 malformed content-length")
+        }
+        if declared >= 0 && n != declared {
+            return errors.new("http: h2 conflicting content-length values")
+        }
+        declared = n
+        i = i + 1
+    }
+    if declared >= 0 && declared != nbytes {
+        return errors.new("http: h2 content-length " + itoa(declared) + " declared, " + itoa(nbytes) + " content bytes received")
+    }
+    return nil
 }
 
 // check_url gates the scheme surface: http and https. Other schemes
