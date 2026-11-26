@@ -5,7 +5,7 @@ package http
 // is a complete client; v0.1 opens one connection per request and
 // closes it (Connection: close on the wire). HTTPS dials TCP via the
 // non-suspending path then wraps with std/net/tls.client (oxidean/oxl
-// #128 shipped; mTLS/CONNECT/TLS1.2 still parked — #221/#222/#224).
+// #128, #221-#224 shipped in 0.26.0 — mTLS/CONNECT/TLS1.2 live).
 //
 // Concurrency note: Transport.send dispatches through a vtable —
 // "vtable calls carry no task frame", so send can never suspend.
@@ -20,6 +20,8 @@ import "std/bufio"
 import "std/io"
 
 import "std/net"
+
+import "std/net/http2"
 
 import "std/net/tls"
 
@@ -36,6 +38,8 @@ import "std/encoding/base64"
 import "std/net/url"
 
 import "github.com/oxidean/oxttp/core/model"
+
+import "github.com/oxidean/oxttp/shared/version"
 
 // a client that resets mid-write must not kill the process — same
 // extern the std server uses (rt_sigpipe_ignore).
@@ -114,7 +118,7 @@ fn (t mut TmoTlsReader) asreader() -> io.Reader {
 // req.follow) through roundtrip; the final Resp is returned.
 fn (t H1) send(req: ref model.Req) -> [model.Resp, err] {
     rt_sigpipe_ignore()
-    cur := new(model.Req{method: req.method, url: req.url, headers: req.headers, body: req.body, timeout_ms: req.timeout_ms, follow: req.follow, max_redirects: req.max_redirects, httpver: req.httpver, synth: req.synth, verify: req.verify})
+    cur := new(model.Req{method: req.method, url: req.url, headers: req.headers, body: req.body, timeout_ms: req.timeout_ms, follow: req.follow, max_redirects: req.max_redirects, httpver: req.httpver, synth: req.synth, verify: req.verify, h2: req.h2, ssl_min: req.ssl_min, ssl_max: req.ssl_max, cert_pem: req.cert_pem, key_pem: req.key_pem, proxies: req.proxies, proxy_env: req.proxy_env, no_proxy: req.no_proxy})
     hops := 0
     jar := "" // jar-lite: "n=v; n=v" accumulated across hops (ADR 0023)
     let hs: []model.Hop = nil
@@ -204,7 +208,7 @@ fn (t H1) send(req: ref model.Req) -> [model.Resp, err] {
         }
         cur.url = nu.string()
     }
-    return model.Resp{status: 0, reason: "", headers: nil, body: nil, elapsed_ms: 0.0, remote: "", version: "", hops: nil, req_head: "", trace: nil}, nil
+    return model.Resp{status: 0, reason: "", headers: nil, body: nil, elapsed_ms: 0.0, remote: "", version: "", hops: nil, req_head: "", trace: nil, tls_ver: 0}, nil
 }
 
 // request is the package-level convenience on a shared zero-value
@@ -271,7 +275,7 @@ fn dial_h1(host: str, port: int, tmo_ms: int) -> [net.Conn, err] {
 // roundtrip performs one request/response exchange on a fresh
 // connection and fills the stage timings on the way out.
 fn (t H1) roundtrip(req: ref model.Req, cap: mut model.Hop) -> [model.Resp, err] {
-    bad := model.Resp{status: 0, reason: "", headers: nil, body: nil, elapsed_ms: 0.0, remote: "", version: "", hops: nil, req_head: "", trace: nil}
+    bad := model.Resp{status: 0, reason: "", headers: nil, body: nil, elapsed_ms: 0.0, remote: "", version: "", hops: nil, req_head: "", trace: nil, tls_ver: 0}
     t0 := now_ms()
     tr := new(model.Trace)
     [u, ue] = check_url(req.url)
@@ -312,6 +316,53 @@ fn (t H1) roundtrip(req: ref model.Req, cap: mut model.Hop) -> [model.Resp, err]
         }
         hdrs = nh
     }
+    // WI-0013 P4 (spec sem-S5): per-hop proxy resolution. proxies is
+    // the verbatim --proxy list; proxy_env the captured env vars —
+    // last scheme/all: match wins, NO_PROXY domain match cancels.
+    purl := ""
+    if len(req.proxies[:]) > 0 || len(req.proxy_env[:]) > 0 {
+        purl = pick_proxy(req, lwr(u.scheme), host)
+    }
+    via_proxy := false
+    phost := ""
+    pport := 0
+    pauth := ""
+    if len(purl) > 0 {
+        [pu, pue] = url.parse(purl)
+        if pue != nil {
+            // errors name the invalid part only — the raw URL can
+            // carry a userinfo password (review F8).
+            return bad, errors.new("http: invalid proxy URL")
+        }
+        if lwr(pu.scheme) != "http" {
+            return bad, errors.new("http: proxy URL scheme \"" + pu.scheme + "\" is unsupported in this build")
+        }
+        phost = pu.hostname()
+        if len(phost) == 0 {
+            return bad, errors.new("http: proxy URL has no host")
+        }
+        if find(phost, ":") >= 0 {
+            return bad, errors.new("http: IPv6 addresses not supported")
+        }
+        pport = 80
+        pps := pu.port()
+        if len(pps) > 0 {
+            [pv2, pve] = strconv.atoi(pps)
+            if pve != nil || pv2 <= 0 || pv2 > 65535 {
+                return bad, errors.new("http: invalid proxy port")
+            }
+            pport = pv2
+        }
+        via_proxy = true
+        if pu.hasuser {
+            pauth = "Basic " + base64.encode((pu.user + ":" + pu.password) as []byte)
+        }
+    }
+    // h2c through a CONNECT proxy is meaningless (cleartext preface
+    // inside a tunnel nobody asked for) — std rejects it outright.
+    if via_proxy && !https && req.h2 == "prior" {
+        return bad, errors.new("http: h2c through a proxy is not supported")
+    }
     [rb, rbe] = RenderBody(req.body)
     if rbe != nil {
         return bad, rbe
@@ -322,15 +373,37 @@ fn (t H1) roundtrip(req: ref model.Req, cap: mut model.Hop) -> [model.Resp, err]
     if has_body && len(rb.ctype) > 0 && !hdr_has(hdrs, "content-type") {
         hdrs = push(hdrs, model.Header{name: "Content-Type", value: rb.ctype})
     }
-    head := serialize_head(OutHead{method: req.method, uri: u.request_uri(), ver: req.httpver, host: u.host, hdrs: hdrs, body_len: len(rb.data), has_body: has_body, synth: req.synth})
+    // http target through a proxy → absolute-form request target, and
+    // Proxy-Authorization when the proxy URL carries creds (reqwest
+    // semantics — std's client sends neither, spec D4).
+    uri := u.request_uri()
+    if via_proxy && !https {
+        uri = lwr(u.scheme) + "://" + u.host + u.request_uri()
+        if len(pauth) > 0 && !hdr_has(hdrs, "proxy-authorization") {
+            hdrs = push(hdrs, model.Header{name: "Proxy-Authorization", value: pauth})
+        }
+    }
+    // CONNECT auth derives from the proxy URL's userinfo only — a
+    // caller-set proxy-authorization rides the tunnel to the origin
+    // untouched (upstream reqwest passes user headers through).
+    connect_auth := pauth
+    head := serialize_head(OutHead{method: req.method, uri: uri, ver: req.httpver, host: u.host, hdrs: hdrs, body_len: len(rb.data), has_body: has_body, synth: req.synth})
     cap.req_head = head
-    // connect — timeout<=0 gets the same 30s safety cap std uses.
+    // connect — to the proxy when one applies, else the origin.
+    // timeout<=0 gets the same 30s safety cap std uses.
     c0 := now_ms()
     dtmo := req.timeout_ms
     if dtmo <= 0 {
         dtmo = 30000
     }
-    [raw, de] = dial_h1(host, port, dtmo)
+    dhost := host
+    dport := port
+    if via_proxy {
+        dhost = phost
+        dport = pport
+    }
+    remote := dhost + ":" + itoa(dport)
+    [raw, de] = dial_h1(dhost, dport, dtmo)
     if de != nil {
         return bad, de
     }
@@ -338,6 +411,24 @@ fn (t H1) roundtrip(req: ref model.Req, cap: mut model.Hop) -> [model.Resp, err]
     deadline := 0
     if req.timeout_ms > 0 {
         deadline = t0 + req.timeout_ms
+    }
+    // HTTPS via proxy: CONNECT the origin authority over the fresh
+    // socket, bounded by the remaining request budget — then the
+    // normal TLS+protocol branch runs on the tunnel.
+    if https && via_proxy {
+        ctmo := 30000
+        if deadline > 0 {
+            ctmo = deadline - now_ms()
+            if ctmo <= 0 {
+                raw.close()
+                return bad, errors.new("http: proxy CONNECT timed out")
+            }
+        }
+        ce := proxy_connect(raw, host + ":" + itoa(port), connect_auth, ctmo)
+        if ce != nil {
+            raw.close()
+            return bad, ce
+        }
     }
     // HTTPS: tls.client takes ownership of the TCP socket. Plain: keep
     // raw for the whole exchange.
@@ -352,11 +443,24 @@ fn (t H1) roundtrip(req: ref model.Req, cap: mut model.Hop) -> [model.Resp, err]
                 htmo = 1
             }
         }
-        [tc, te] = tls_wrap(raw, host, req.verify, htmo)
+        [tc, te] = tls_wrap(raw, host, req, htmo)
         if te != nil {
             return bad, te
         }
         tr.tls_ms = itof(now_ms() - t0tls)
+        // WI-0013 P3 (ADR-0030): negotiated h2 → the frame exchange
+        // on this conn; prior-knowledge requires it (spec D3).
+        alpn := tc.negotiated_alpn()
+        if req.h2 == "prior" && alpn != "h2" {
+            tc.close()
+            return bad, errors.new("http: prior-knowledge HTTP/2 requires h2 negotiation")
+        }
+        if alpn == "h2" {
+            cap.req_head = h2_head_synth(req, u, hdrs, has_body, len(rb.data))
+            [resp2, re2] = h2_exchange(req, tc.asreadwriter(), tc.rawfd(), hdrs, rb, u, cap, remote, t0, c0, tr, deadline, bad, tc.s.ver)
+            tc.close()
+            return resp2, re2
+        }
         if req.timeout_ms > 0 {
             set_sndtimo(tc.rawfd(), (req.timeout_ms + 999) / 1000)
         }
@@ -376,9 +480,17 @@ fn (t H1) roundtrip(req: ref model.Req, cap: mut model.Hop) -> [model.Resp, err]
         tr.send_body_ms = itof(now_ms() - c0)
         trr := TmoTlsReader{c: tc, deadline: deadline, tmo: req.timeout_ms}
         br := new(bufio.newreadersize(trr.asreader(), 16384))
-        [resp, re] = finish_roundtrip(req, br, cap, host, port, t0, c0, tr, bad)
+        [resp, re] = finish_roundtrip(req, br, cap, remote, t0, c0, tr, bad, tc.s.ver)
         tc.close()
         return resp, re
+    }
+    // h2c prior-knowledge: no TLS — run the h2 exchange straight on
+    // the socket (--http-version 2-prior-knowledge, spec sem-S1).
+    if req.h2 == "prior" {
+        cap.req_head = h2_head_synth(req, u, hdrs, has_body, len(rb.data))
+        [resp3, re3] = h2_exchange(req, raw.asreadwriter(), raw.rawfd(), hdrs, rb, u, cap, remote, t0, c0, tr, deadline, bad, 0)
+        raw.close()
+        return resp3, re3
     }
     if req.timeout_ms > 0 {
         set_sndtimo(raw.rawfd(), (req.timeout_ms + 999) / 1000)
@@ -399,14 +511,14 @@ fn (t H1) roundtrip(req: ref model.Req, cap: mut model.Hop) -> [model.Resp, err]
     tr.send_body_ms = itof(now_ms() - c0)
     trr := TmoReader{c: raw, deadline: deadline, tmo: req.timeout_ms}
     br := new(bufio.newreadersize(trr.asreader(), 16384))
-    [resp, re] = finish_roundtrip(req, br, cap, host, port, t0, c0, tr, bad)
+    [resp, re] = finish_roundtrip(req, br, cap, remote, t0, c0, tr, bad, 0)
     raw.close()
     return resp, re
 }
 
 // finish_roundtrip reads the HTTP response from br, fills hop cap, and
 // builds Resp (shared by cleartext and TLS paths).
-fn finish_roundtrip(req: ref model.Req, br: own bufio.Reader, cap: mut model.Hop, host: str, port: int, t0: int, c0: int, tr: own model.Trace, bad: model.Resp) -> [model.Resp, err] {
+fn finish_roundtrip(req: ref model.Req, br: own bufio.Reader, cap: mut model.Hop, remote: str, t0: int, c0: int, tr: own model.Trace, bad: model.Resp, tls_ver: int) -> [model.Resp, err] {
     h := Head{status: 0, reason: "", headers: nil, version: ""}
     for true {
         [raw, rhe] = read_head(br)
@@ -429,7 +541,7 @@ fn finish_roundtrip(req: ref model.Req, br: own bufio.Reader, cap: mut model.Hop
     cap.status = h.status
     cap.reason = h.reason
     cap.version = h.version
-    cap.remote = host + ":" + itoa(port)
+    cap.remote = remote
     // body framing: HEAD/1xx/204/304 have none by definition; chunked
     // wins over Content-Length; no framing at all reads to EOF.
     body := mkslice(byte, 0)
@@ -479,7 +591,300 @@ fn finish_roundtrip(req: ref model.Req, br: own bufio.Reader, cap: mut model.Hop
     }
     tr.closed_ms = itof(now_ms() - c0)
     let bodyb: []byte = db
-    return model.Resp{status: h.status, reason: h.reason, headers: h.headers, body: bodyb, elapsed_ms: itof(now_ms() - t0), remote: host + ":" + itoa(port), version: h.version, hops: nil, req_head: "", trace: tr}, nil
+    return model.Resp{status: h.status, reason: h.reason, headers: h.headers, body: bodyb, elapsed_ms: itof(now_ms() - t0), remote: remote, version: h.version, hops: nil, req_head: "", trace: tr, tls_ver: tls_ver}, nil
+}
+
+// --- h2 exchange (WI-0013 P3, ADR-0030) ----------------------------
+// One request/response pair over http2.Conn: pseudo-headers plus the
+// caller/synth headers minus connection-specific names the frame
+// layer rejects, DATA body with flow-control acks, trailers folded
+// into the header list. cap gets the same fields finish_roundtrip
+// fills on the h1 path.
+
+// h2_forbidden: hop-by-hop names illegal inside h2 frames.
+fn h2_forbidden(n: str) -> bool {
+    return n == "connection" || n == "keep-alive" || n == "proxy-connection" || n == "transfer-encoding" || n == "upgrade"
+}
+
+// h2_push appends model headers as lowercase h2 headers, dropping
+// h2-illegal names and any "te" value but "trailers".
+fn h2_push(hh: []http2.Header, hs: []model.Header) -> []http2.Header {
+    i := 0
+    for i < len(hs) {
+        n := lwr(hs[i].name)
+        if len(n) == 0 || h2_forbidden(n) {
+            i = i + 1
+            continue
+        }
+        // host rides :authority on h2 — a separate host field would
+        // conflict with it (RFC 9113 §8.3.1).
+        if n == "host" {
+            i = i + 1
+            continue
+        }
+        if n == "te" {
+            if lwr(hs[i].value) != "trailers" {
+                i = i + 1
+                continue
+            }
+            // std's h2 validator requires the exact token — emit the
+            // canonical form regardless of the caller's casing.
+            hh = push(hh, http2.Header{name: n, value: "trailers"})
+            i = i + 1
+            continue
+        }
+        hh = push(hh, http2.Header{name: n, value: hs[i].value})
+        i = i + 1
+    }
+    return hh
+}
+
+fn h2_has(hh: []http2.Header, name: str) -> bool {
+    i := 0
+    for i < len(hh) {
+        if hh[i].name == name {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// h2_status pulls :status out of a response HEADERS event (0 absent).
+fn h2_status(hs: []http2.Header) -> int {
+    i := 0
+    for i < len(hs) {
+        if hs[i].name == ":status" {
+            [n, _e] = strconv.atoi(hs[i].value)
+            return n
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// h2_safe is h2_push for model lists — used by the synthesized head.
+fn h2_safe(hs: []model.Header) -> []model.Header {
+    let out: []model.Header = nil
+    i := 0
+    for i < len(hs) {
+        n := lwr(hs[i].name)
+        if len(n) == 0 || h2_forbidden(n) {
+            i = i + 1
+            continue
+        }
+        if n == "host" {
+            i = i + 1
+            continue
+        }
+        if n == "te" {
+            if lwr(hs[i].value) != "trailers" {
+                i = i + 1
+                continue
+            }
+            out = push(out, model.Header{name: n, value: "trailers"})
+            i = i + 1
+            continue
+        }
+        out = push(out, hs[i])
+        i = i + 1
+    }
+    return out
+}
+
+// h2_head_synth renders the h2 request head as an HTTP/2.0 status
+// line plus the h1-shaped header block — there is no wire text; this
+// is the display approximation spec D1 calls out.
+fn h2_head_synth(req: ref model.Req, u: ref url.URL, hdrs: []model.Header, has_body: bool, body_len: int) -> str {
+    authority := u.host
+    chv := hdr_get(hdrs, "host")
+    if len(chv) > 0 {
+        authority = chv
+    }
+    return serialize_head(OutHead{method: req.method, uri: u.request_uri(), ver: "HTTP/2.0", host: authority, hdrs: h2_safe(hdrs), body_len: body_len, has_body: has_body, synth: h2_safe(req.synth)})
+}
+
+// h2_exchange runs the request on a fresh http2.Conn and builds the
+// Resp — the h2 twin of finish_roundtrip. rw/fd are the transport
+// (raw socket for h2c, TLS conn for negotiated h2); deadline carries
+// the whole-request budget (0 = 30s cap like h1).
+fn h2_exchange(req: ref model.Req, rw: io.ReadWriter, fd: int, hdrs: []model.Header, rb: RenderedBody, u: ref url.URL, cap: mut model.Hop, remote: str, t0: int, c0: int, tr: own model.Trace, deadline: int, bad: model.Resp, tls_ver: int) -> [model.Resp, err] {
+    tmo := 30000
+    if deadline > 0 {
+        tmo = deadline - now_ms()
+        if tmo <= 0 {
+            tmo = 1
+        }
+    }
+    [c2, e2] = http2.new_conn_timeout(rw, fd, tmo)
+    if e2 != nil {
+        return bad, errors.wrap("http: h2 preface", e2)
+    }
+    defer c2.close()
+    let hh: []http2.Header = nil
+    hh = push(hh, http2.Header{name: ":method", value: req.method})
+    hh = push(hh, http2.Header{name: ":scheme", value: lwr(u.scheme)})
+    // caller Host: wins — h2 carries it as :authority and never as a
+    // separate host field (RFC 9113 §8.3.1, review F10).
+    authority := u.host
+    chv := hdr_get(hdrs, "host")
+    if len(chv) > 0 {
+        authority = chv
+    }
+    hh = push(hh, http2.Header{name: ":authority", value: authority})
+    hh = push(hh, http2.Header{name: ":path", value: u.request_uri()})
+    hh = h2_push(hh, hdrs)
+    hh = h2_push(hh, req.synth)
+    if !h2_has(hh, "accept-encoding") {
+        // h1's serialize_head defaults this for bare Req callers —
+        // keep the h2 wire identical (decode_body handles the gzip).
+        hh = push(hh, http2.Header{name: "accept-encoding", value: "gzip, deflate"})
+    }
+    has_body := req.body.kind() != 0
+    if has_body && !h2_has(hh, "content-length") {
+        hh = push(hh, http2.Header{name: "content-length", value: itoa(len(rb.data))})
+    }
+    [sid, oe] = c2.open_stream(hh, !has_body || len(rb.data) == 0)
+    if oe != nil {
+        return bad, oe
+    }
+    tr.send_headers_ms = itof(now_ms() - c0)
+    if len(rb.data) > 0 {
+        be := c2.send_body(sid, rb.data)
+        if be != nil {
+            return bad, be
+        }
+    }
+    tr.send_body_ms = itof(now_ms() - c0)
+    status := 0
+    let rh: []model.Header = nil
+    n_rh_head := -1
+    body := mkslice(byte, 0)
+    got_final := false
+    done := false
+    for !done {
+        [ev, ee] = c2.next_event()
+        if ee != nil {
+            return bad, ee
+        }
+        if ev.kind == 7 { // GOAWAY
+            if ev.last_stream_id < sid {
+                return bad, errors.new("http: connection closed by GOAWAY before response")
+            }
+            continue
+        }
+        if ev.stream_id != sid {
+            continue
+        }
+        if ev.kind == 3 { // RST_STREAM
+            return bad, errors.new("http: stream reset by peer")
+        }
+        if ev.kind == 1 { // HEADERS
+            if ev.trailers {
+                if n_rh_head < 0 {
+                    n_rh_head = len(rh)
+                }
+                i := 0
+                for i < len(ev.headers) {
+                    rh = push(rh, model.Header{name: ev.headers[i].name, value: ev.headers[i].value})
+                    i = i + 1
+                }
+            } else {
+                st := h2_status(ev.headers)
+                if st >= 100 && st < 200 {
+                    continue // interim 1xx — final HEADERS follows
+                }
+                status = st
+                i := 0
+                for i < len(ev.headers) {
+                    n := ev.headers[i].name
+                    if len(n) > 0 && byteat(n, 0) != 58 {
+                        rh = push(rh, model.Header{name: n, value: ev.headers[i].value})
+                    }
+                    i = i + 1
+                }
+                got_final = true
+                tr.recv_headers_ms = itof(now_ms() - c0)
+            }
+            if (ev.flags & 1) != 0 {
+                done = true
+            }
+            continue
+        }
+        if ev.kind == 0 { // DATA
+            i := 0
+            for i < len(ev.payload) {
+                body = push(body, ev.payload[i])
+                i = i + 1
+            }
+            if ev.flow_bytes > 0 {
+                c2.ack_data(ev.stream_id, ev.flow_bytes)
+            }
+            if (ev.flags & 1) != 0 {
+                done = true
+            }
+            continue
+        }
+    }
+    if !got_final {
+        return bad, errors.new("http: h2 stream ended without response headers")
+    }
+    cap.status = status
+    cap.reason = ""
+    cap.version = "2.0"
+    cap.remote = remote
+    cap.headers = rh
+    cap.body = body
+    cap.elapsed_ms = itof(now_ms() - t0)
+    tr.recv_body_ms = itof(now_ms() - c0)
+    // content-length applies to response headers only — a content-length
+    // trailer field is legal and must not trip the check.
+    hdr_scope := rh
+    if n_rh_head >= 0 {
+        hdr_scope = rh[:n_rh_head]
+    }
+    le := h2_check_length(req.method, status, hdr_scope, len(body))
+    if le != nil {
+        return bad, le
+    }
+    [db, dbe] = decode_body(body, hdr_get(rh, "content-encoding"))
+    if dbe != nil {
+        return bad, dbe
+    }
+    tr.closed_ms = itof(now_ms() - c0)
+    let bodyb: []byte = db
+    return model.Resp{status: status, reason: "", headers: rh, body: bodyb, elapsed_ms: itof(now_ms() - t0), remote: remote, version: "2.0", hops: nil, req_head: "", trace: tr, tls_ver: tls_ver}, nil
+}
+
+// h2_check_length enforces RFC 9113 §8.1.1: received DATA content
+// bytes must match the declared content-length, and duplicated fields
+// must agree. HEAD/204/304 are exempt — their content-length describes
+// a hypothetical body, not the received one.
+fn h2_check_length(method: str, status: int, rh: []model.Header, nbytes: int) -> err {
+    if lwr(method) == "head" || status == 204 || status == 304 {
+        return nil
+    }
+    declared := -1
+    i := 0
+    for i < len(rh) {
+        if lwr(rh[i].name) != "content-length" {
+            i = i + 1
+            continue
+        }
+        [n, ae] = strconv.atoi(rh[i].value)
+        if ae != nil || n < 0 {
+            return errors.new("http: h2 malformed content-length")
+        }
+        if declared >= 0 && n != declared {
+            return errors.new("http: h2 conflicting content-length values")
+        }
+        declared = n
+        i = i + 1
+    }
+    if declared >= 0 && declared != nbytes {
+        return errors.new("http: h2 content-length " + itoa(declared) + " declared, " + itoa(nbytes) + " content bytes received")
+    }
+    return nil
 }
 
 // check_url gates the scheme surface: http and https. Other schemes
@@ -501,23 +906,26 @@ fn check_url(raw: str) -> [own url.URL, err] {
 
 // tls_wrap handshakes over an already-connected TCP socket. verify:
 // ""/"yes" → system roots; "no" → AcceptAll; else PEM path.
-fn tls_wrap(c: net.Conn, host: str, verify: str, tmo_ms: int) -> [tls.Conn, err] {
+// ssl_min/ssl_max pin the negotiated range (0 = build default
+// [V12,V13], ADR-0032); h2 modes set ALPN; cert_pem (combined PEM,
+// corpus convention) becomes Config.client_cert.
+fn tls_wrap(c: net.Conn, host: str, req: ref model.Req, tmo_ms: int) -> [tls.Conn, err] {
     if tmo_ms < 0 {
         tmo_ms = 0
     }
     cfg := tls.default_cfg()
     cfg.server_name = host
-    v := lwr(verify)
+    v := lwr(req.verify)
     if v == "no" {
         let a: tls.Verifier = AcceptAll{}
         cfg.verify = a
     } else if len(v) > 0 && v != "yes" {
-        if !os.exists(verify) {
+        if !os.exists(req.verify) {
             c.close()
             let z: tls.Conn
-            return z, errors.new("http: verify CA file not found: " + verify)
+            return z, errors.new("http: verify CA file not found: " + req.verify)
         }
-        text := os.readfile_(verify)
+        text := os.readfile_(req.verify)
         roots := x509.Roots{cas: new(mkslice(x509.Cert, 0))}
         [_, le] = roots.load_pem(text)
         if le != nil {
@@ -526,6 +934,37 @@ fn tls_wrap(c: net.Conn, host: str, verify: str, tmo_ms: int) -> [tls.Conn, err]
             return z, le
         }
         cfg.roots = roots
+    }
+    cfg.min_ver = req.ssl_min
+    cfg.max_ver = req.ssl_max
+    if cfg.min_ver == 0 {
+        cfg.min_ver = tls.V12
+    }
+    if cfg.max_ver == 0 {
+        cfg.max_ver = tls.V13
+    }
+    if req.h2 == "hint" {
+        al := mkslice(str, 2)
+        al[0] = "h2"
+        al[1] = "http/1.1"
+        cfg.alpn = al
+    } else if req.h2 == "prior" {
+        al2 := mkslice(str, 1)
+        al2[0] = "h2"
+        cfg.alpn = al2
+    }
+    if len(req.cert_pem) > 0 {
+        kp := req.key_pem
+        if len(kp) == 0 {
+            kp = req.cert_pem
+        }
+        [cc, cce] = tls.load_cert_pem(req.cert_pem, kp)
+        if cce != nil {
+            c.close()
+            let z: tls.Conn
+            return z, cce
+        }
+        cfg.client_cert = cc
     }
     if tmo_ms <= 0 {
         tmo_ms = 30000
@@ -575,4 +1014,298 @@ fn write_all_tls(c: tls.Conn, b: []byte) -> err {
         off = off + n
     }
     return nil
+}
+
+// --- proxy resolution + CONNECT (WI-0013 P4, spec sem-S5) ----------
+// Semantics mirror std's net/http client (proxy_from_env, connect_*
+// verbatim ports) plus the reqwest Proxy-Authorization std lacks (D4).
+
+// pick_proxy resolves the proxy URL for one hop. --proxy entries
+// ("PROTO:URL") match the hop scheme — last matching entry wins
+// (upstream intercept order); env vars select by scheme name then
+// ALL_PROXY; NO_PROXY domain match cancels.
+fn pick_proxy(req: ref model.Req, scheme: str, host: str) -> str {
+    // upstream: reqwest intercepts run last-CLI-entry-first, so the
+    // LAST entry matching this scheme wins — an all: entry placed
+    // after a scheme entry shadows it for that scheme.
+    i := len(req.proxies) - 1
+    for i >= 0 {
+        ent := req.proxies[i]
+        i = i - 1
+        ci := find(ent, ":")
+        if ci <= 0 {
+            continue
+        }
+        proto := lwr(substr(ent, 0, ci))
+        if proto == scheme || proto == "all" {
+            return substr(ent, ci + 1, len(ent))
+        }
+    }
+    if len(req.proxies) > 0 {
+        return ""
+    }
+    want := ""
+    i = 0
+    for i < len(req.proxy_env) {
+        eq := find(req.proxy_env[i], "=")
+        if eq <= 0 {
+            i = i + 1
+            continue
+        }
+        nm := lwr(substr(req.proxy_env[i], 0, eq))
+        val := trim_ows(substr(req.proxy_env[i], eq + 1, len(req.proxy_env[i])))
+        // an explicitly-empty *_proxy value is "unset" upstream — keep
+        // scanning so ALL_PROXY can still apply.
+        if nm == scheme + "_proxy" && len(val) > 0 {
+            want = val
+            break
+        }
+        if nm == "all_proxy" && len(want) == 0 {
+            want = val
+        }
+        i = i + 1
+    }
+    if len(want) == 0 {
+        return ""
+    }
+    if len(req.no_proxy) > 0 && no_proxy_match(req.no_proxy, host) {
+        return ""
+    }
+    return want
+}
+
+// no_proxy_match — std port: comma list, entries match the host or
+// any subdomain; "*" disables proxying outright (curl convention).
+fn no_proxy_match(list: str, host: str) -> bool {
+    hl := lwr(host)
+    i := 0
+    for i <= len(list) {
+        j := find_from(list, ",", i)
+        if j < 0 {
+            j = len(list)
+        }
+        ent := lwr(substr(list, i, j))
+        lo := 0
+        for lo < len(ent) && (byteat(ent, lo) == 32 || byteat(ent, lo) == 9) {
+            lo = lo + 1
+        }
+        hi := len(ent)
+        for hi > lo && (byteat(ent, hi - 1) == 32 || byteat(ent, hi - 1) == 9) {
+            hi = hi - 1
+        }
+        ent = substr(ent, lo, hi)
+        if ent == "*" {
+            return true
+        }
+        ci := find(ent, ":")
+        if ci > 0 {
+            pd := true
+            k := ci + 1
+            for k < len(ent) {
+                if byteat(ent, k) < 48 || byteat(ent, k) > 57 {
+                    pd = false
+                }
+                k = k + 1
+            }
+            if pd {
+                ent = substr(ent, 0, ci)
+            }
+        }
+        if len(ent) > 0 && byteat(ent, 0) == 46 {
+            ent = substr(ent, 1, len(ent))
+        }
+        if len(ent) > 0 && (hl == ent || len(hl) > len(ent) && byteat(hl, len(hl) - len(ent) - 1) == 46 && substr(hl, len(hl) - len(ent), len(hl)) == ent) {
+            return true
+        }
+        if j >= len(list) {
+            return false
+        }
+        i = j + 1
+    }
+    return false
+}
+
+// proxy_connect runs CONNECT host:port on the already-dialed proxy
+// socket and requires a 200 (1xx preludes are skipped) — std's
+// connect_proxy port with the proxy-authorization line added (D4).
+fn proxy_connect(c: net.Conn, authority: str, auth: str, tmo: int) -> err {
+    if tmo <= 0 {
+        return errors.new("http: proxy CONNECT timed out")
+    }
+    // upstream wire shape: title-case Host + User-Agent + optional
+    // proxy auth; no proxy-connection header.
+    wire := "CONNECT " + authority + " HTTP/1.1\r\nHost: " + authority + "\r\nUser-Agent: oxttp/" + version.get() + "\r\n"
+    if len(auth) > 0 {
+        wire = wire + "Proxy-Authorization: " + auth + "\r\n"
+    }
+    wire = wire + "\r\n"
+    // one absolute deadline for both phases — a slow write must not
+    // hand the read a fresh budget (review F11).
+    deadline := now_ms() + tmo
+    wr := deadline - now_ms()
+    if wr <= 0 {
+        return errors.new("http: proxy CONNECT timed out")
+    }
+    set_sndtimo(c.rawfd(), (wr + 999) / 1000)
+    we := write_all(c, wire as []byte)
+    if we != nil {
+        return errors.wrap("http: proxy CONNECT write", we)
+    }
+    response := ""
+    read_bytes := 0
+    scan_from := 0
+    buf := mkslice(byte, 1)
+    for read_bytes < 32768 {
+        remaining := deadline - now_ms()
+        if remaining <= 0 {
+            return errors.new("http: proxy CONNECT timed out")
+        }
+        set_rcvtimo_ms(c.rawfd(), remaining)
+        [n, re] = c.read(buf)
+        if n > 0 {
+            response = response + buf[0:n] as str
+            read_bytes = read_bytes + n
+            head_end := find_from(response, "\r\n\r\n", scan_from)
+            if head_end >= 0 {
+                // validate only the head — a proxy may have already
+                // pushed tunnel bytes into this read.
+                [status, pe] = connect_response_status(substr(response, 0, head_end + 4))
+                if pe != nil {
+                    return pe
+                }
+                if status >= 100 && status < 200 && status != 101 {
+                    // keep any bytes the proxy coalesced past the 1xx head —
+                    // they may already be tunnel or final-response data.
+                    response = substr(response, head_end + 4, len(response))
+                    scan_from = 0
+                } else {
+                    set_rcvtimo_ms(c.rawfd(), 0)
+                    return nil
+                }
+            } else {
+                scan_from = len(response) - 3
+                if scan_from < 0 {
+                    scan_from = 0
+                }
+            }
+        }
+        if re != nil {
+            return errors.wrap("http: proxy CONNECT read", re)
+        }
+        if n <= 0 {
+            return errors.new("http: proxy CONNECT response ended early")
+        }
+    }
+    return errors.new("http: proxy CONNECT headers too large")
+}
+
+// connect_response_status — std port verbatim: strict status-line +
+// header validation on the CONNECT reply (TE forbidden, CL must be
+// 0); non-200/1xx is an error carrying the status.
+fn connect_response_status(head: str) -> [int, err] {
+    end := find(head, "\r\n\r\n")
+    if end < 0 || end + 4 != len(head) {
+        return 0, errors.new("http: malformed CONNECT response")
+    }
+    line_end := find(head, "\r\n")
+    if line_end < 0 {
+        return 0, errors.new("http: malformed CONNECT status line")
+    }
+    line := substr(head, 0, line_end)
+    sp := find(line, " ")
+    if sp < 0 {
+        return 0, errors.new("http: malformed CONNECT status line")
+    }
+    version := substr(line, 0, sp)
+    if version != "HTTP/1.0" && version != "HTTP/1.1" {
+        return 0, errors.new("http: malformed CONNECT HTTP version")
+    }
+    rest := substr(line, sp + 1, len(line))
+    sp2 := find(rest, " ")
+    code := rest
+    if sp2 >= 0 {
+        code = substr(rest, 0, sp2)
+    }
+    if len(code) != 3 {
+        return 0, errors.new("http: malformed CONNECT status code")
+    }
+    i := 0
+    for i < 3 {
+        b := byteat(code, i)
+        if b < 48 || b > 57 {
+            return 0, errors.new("http: malformed CONNECT status code")
+        }
+        i = i + 1
+    }
+    [status, se] = strconv.atoi(code)
+    if se != nil || status < 100 || status > 599 {
+        return 0, errors.new("http: malformed CONNECT status code")
+    }
+    pos := line_end + 2
+    for pos < end {
+        eol := find_from(head, "\r\n", pos)
+        if eol < 0 || eol > end {
+            return 0, errors.new("http: malformed CONNECT headers")
+        }
+        if eol == pos {
+            break
+        }
+        field := substr(head, pos, eol)
+        colon := find(field, ":")
+        if colon <= 0 {
+            return 0, errors.new("http: malformed CONNECT header")
+        }
+        name := substr(field, 0, colon)
+        value := substr(field, colon + 1, len(field))
+        lo := 0
+        for lo < len(value) && (byteat(value, lo) == 32 || byteat(value, lo) == 9) {
+            lo = lo + 1
+        }
+        hi := len(value)
+        for hi > lo && (byteat(value, hi - 1) == 32 || byteat(value, hi - 1) == 9) {
+            hi = hi - 1
+        }
+        value = substr(value, lo, hi)
+        name = lwr(name)
+        // RFC 9110: body-framing headers on a 200 CONNECT reply mean
+        // nothing — the tunnel starts at the header terminator.
+        ok2xx := status == 200
+        if name == "transfer-encoding" && len(value) > 0 && !ok2xx {
+            return 0, errors.new("http: invalid CONNECT transfer encoding")
+        }
+        if name == "content-length" && !ok2xx {
+            [length, le] = strconv.atoi(value)
+            if le != nil || length != 0 {
+                return 0, errors.new("http: invalid CONNECT content length")
+            }
+        }
+        pos = eol + 2
+    }
+    // Only 200 establishes the tunnel (upstream requires the literal
+    // "HTTP/1.x 200" status line); other informational statuses are
+    // preludes the caller skips — 101 and everything >= 300 fail.
+    if status == 200 {
+        return status, nil
+    }
+    if status >= 100 && status < 200 && status != 101 {
+        return status, nil
+    }
+    return status, errors.new("http: proxy CONNECT returned status " + itoa(status))
+}
+
+// find_from is find() with a start offset — byte-wise scan (-1 absent).
+fn find_from(s: str, needle: str, from: int) -> int {
+    last := len(s) - len(needle)
+    i := from
+    for i <= last {
+        j := 0
+        for j < len(needle) && byteat(s, i + j) == byteat(needle, j) {
+            j = j + 1
+        }
+        if j == len(needle) {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
 }

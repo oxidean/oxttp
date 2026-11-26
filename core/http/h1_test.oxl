@@ -13,7 +13,7 @@ import "std/encoding/base64"
 import "github.com/oxidean/oxttp/core/model"
 
 fn rq(method: str, u: str) -> own model.Req {
-    return new(model.Req{method: method, url: u, headers: nil, body: model.Body.Empty, timeout_ms: 0, follow: false, max_redirects: 10, httpver: "", synth: nil, verify: ""})
+    return new(model.Req{method: method, url: u, headers: nil, body: model.Body.Empty, timeout_ms: 0, follow: false, max_redirects: 10, httpver: "", synth: nil, verify: "", h2: "", ssl_min: 0, ssl_max: 0, cert_pem: "", key_pem: "", proxies: nil, proxy_env: nil, no_proxy: ""})
 }
 
 fn hs1(n: str, v: str) -> []model.Header {
@@ -421,6 +421,18 @@ fn test_bad_and_https_urls() {
     if e == nil {
         testing.expect_eq(resp.status, 200, "https 200")
         testing.expect(len(resp.body) > 0, "https body")
+        // WI-0013 P2: negotiated version exposed (ADR-0032 default
+        // range is [V12,V13]; example.com negotiates 1.3 = 772)
+        testing.expect(resp.tls_ver == 771 || resp.tls_ver == 772, "tls_ver set")
+    }
+    // --ssl pin: tls1.3-only still connects
+    rp := rq("GET", "https://example.com/")
+    rp.ssl_min = 772
+    rp.ssl_max = 772
+    [respp, ep] = request(rp)
+    testing.expect(ep == nil, "tls1.3 pin")
+    if ep == nil {
+        testing.expect_eq(respp.tls_ver, 772, "pinned 1.3 negotiated")
     }
     // --verify=no still connects (accept-all Verifier)
     r0 := rq("GET", "https://example.com/")
@@ -511,4 +523,319 @@ fn test_host_last() {
     b := resp.body as str
     tail := "Host: 127.0.0.1:" + itoa(f.port) + "\r\n\r\n"
     testing.expect(len(b) >= len(tail) && substr(b, len(b) - len(tail), len(b)) == tail, "host is last header: " + b)
+}
+
+// --- WI-0013 P3: h2/h2c over the owned transport (ADR-0030) --------
+fn test_h2c_prior_knowledge() {
+    f := h2_start(one("<H2ECHO>"))
+    defer f.stop()
+    r := rq("GET", f.url() + "/p?q=1")
+    r.h2 = "prior"
+    [resp, e] = request(r)
+    testing.expect(e == nil, "h2c send")
+    if e != nil {
+        return
+    }
+    testing.expect_eq(resp.status, 200, "h2 200")
+    testing.expect_streq(resp.version, "2.0", "h2 version token")
+    b := resp.body as str
+    testing.expect(find(b, ":method: GET") >= 0, "h2 :method: " + b)
+    testing.expect(find(b, ":scheme: http") >= 0, "h2 :scheme")
+    testing.expect(find(b, ":path: /p?q=1") >= 0, "h2 :path")
+    testing.expect(find(b, ":authority: 127.0.0.1:") >= 0, "h2 :authority")
+    // connection-specific headers must not cross into h2 frames
+    testing.expect(find(b, "connection:") < 0, "no connection header")
+    testing.expect_eq(sget(f.hits), 1, "one exchange")
+}
+
+fn test_h2c_post_body() {
+    f := h2_start(one("<H2ECHO>"))
+    defer f.stop()
+    r := rq("POST", f.url() + "/up")
+    r.h2 = "prior"
+    r.body = model.Body.Raw{ctype: "text/plain", text: "h2body!"}
+    r.headers = hs1("Content-Type", "text/plain")
+    [resp, e] = request(r)
+    testing.expect(e == nil, "h2 post")
+    if e != nil {
+        return
+    }
+    b := resp.body as str
+    testing.expect(find(b, "content-length: 7") >= 0, "h2 CL sent: " + b)
+    testing.expect(strings_ends(b, "h2body!"), "h2 body bytes: " + b)
+}
+
+fn test_h2c_scripted_body() {
+    f := h2_start(one("scripted-h2"))
+    defer f.stop()
+    r := rq("GET", f.url() + "/")
+    r.h2 = "prior"
+    [resp, e] = request(r)
+    testing.expect(e == nil, "send")
+    if e == nil {
+        testing.expect_streq(resp.body as str, "scripted-h2", "script body")
+        testing.expect_eq(resp.status, 200, "status")
+        testing.expect_streq(hdr_get(resp.headers, "content-type"), "text/plain", "resp hdrs decoded")
+    }
+}
+
+fn test_h2c_req_head_synth() {
+    // h2 has no wire head — the captured head is the synthesized
+    // HTTP/2.0 approximation (spec D1).
+    f := h2_start(one("<H2ECHO>"))
+    defer f.stop()
+    r := rq("GET", f.url() + "/x")
+    r.h2 = "prior"
+    [resp, e] = request(r)
+    testing.expect(e == nil, "send")
+    if e == nil {
+        testing.expect_eq(find(resp.req_head, "GET /x HTTP/2.0"), 0, "synth head: " + resp.req_head)
+    }
+}
+
+// --- WI-0013 P4: proxies (spec sem-S5) -----------------------------
+// Fixture is the proxy: for http targets it captures the forwarded
+// request (<ECHO> body = wire bytes); for https it captures CONNECT.
+fn test_proxy_http_absolute_form() {
+    f := fx_start(one("<ECHO>"))
+    defer f.stop()
+    r := rq("GET", "http://example.org/x?q=1")
+    r.proxies = one("http:" + f.url())
+    [resp, e] = request(r)
+    testing.expect(e == nil, "proxied http send")
+    if e != nil {
+        return
+    }
+    b := resp.body as str
+    testing.expect_eq(find(b, "GET http://example.org/x?q=1 HTTP/1.1"), 0, "absolute-form: " + b)
+    testing.expect(find(b, "Host: example.org") >= 0, "origin host hdr")
+    testing.expect_eq(sget(f.hits), 1, "proxy hit once")
+}
+
+fn test_proxy_http_auth_header() {
+    f := fx_start(one("<ECHO>"))
+    defer f.stop()
+    r := rq("GET", "http://example.org/")
+    r.proxies = one("http:http://user:pw@127.0.0.1:" + itoa(f.port))
+    [resp, e] = request(r)
+    testing.expect(e == nil, "proxied send")
+    if e != nil {
+        return
+    }
+    // base64("user:pw") = dXNlcjpwdw==
+    bb := resp.body as str
+    testing.expect(find(bb, "Proxy-Authorization: Basic dXNlcjpwdw==") >= 0, "proxy-auth hdr: " + bb)
+}
+
+fn test_proxy_all_and_scheme_match() {
+    f := fx_start(one("<ECHO>"))
+    defer f.stop()
+    // all: applies to http too; a https: entry must not
+    r := rq("GET", "http://example.org/")
+    r.proxies = one("all:" + f.url())
+    [resp, e] = request(r)
+    testing.expect(e == nil, "all: send")
+    if e == nil {
+        testing.expect_eq(find(resp.body as str, "GET http://example.org/ HTTP/1.1"), 0, "all: absolute-form")
+    }
+    // scheme mismatch → direct to a second loopback origin (never
+    // public DNS): it must see an origin-form request, proxy untouched.
+    o2 := fx_start(one("<ECHO>"))
+    defer o2.stop()
+    r2 := rq("GET", "http://127.0.0.1:" + itoa(o2.port) + "/y")
+    r2.proxies = one("https:" + f.url())
+    [resp2, e2] = request(r2)
+    testing.expect(e2 == nil, "direct send after scheme mismatch")
+    if e2 == nil {
+        testing.expect_eq(find(resp2.body as str, "GET /y HTTP/1.1"), 0, "origin-form at real origin: " + resp2.body as str)
+    }
+    testing.expect_eq(sget(f.hits), 1, "no second proxy hit (https: skipped for http)")
+}
+
+fn test_proxy_env_selection() {
+    f := fx_start(one("<ECHO>"))
+    defer f.stop()
+    r := rq("GET", "http://example.org/")
+    r.proxy_env = one("HTTP_PROXY=" + f.url())
+    [resp, e] = request(r)
+    testing.expect(e == nil, "env proxy send")
+    if e == nil {
+        testing.expect_eq(find(resp.body as str, "GET http://example.org/ HTTP/1.1"), 0, "env absolute-form")
+    }
+}
+
+fn test_proxy_no_proxy_and_loopback() {
+    f := fx_start(one("<ECHO>"))
+    defer f.stop()
+    // NO_PROXY match → direct dial of an unresolvable host errors,
+    // fixture stays untouched
+    r := rq("GET", "http://nx.invalid/")
+    r.proxy_env = one("HTTP_PROXY=" + f.url())
+    r.no_proxy = "nx.invalid"
+    [_r1, e1] = request(r)
+    testing.expect(e1 != nil, "no_proxy bypasses (direct dial fails)")
+    testing.expect_eq(sget(f.hits), 0, "proxy untouched under NO_PROXY")
+    // upstream parity: reqwest applies env proxies to loopback too —
+    // 127.0.0.1 rides the env proxy (absolute-form) unlike Go's
+    // loopback carve-out.
+    r2 := rq("GET", "http://127.0.0.1:1/")
+    r2.proxy_env = one("HTTP_PROXY=" + f.url())
+    [_r2, e2] = request(r2)
+    testing.expect(e2 == nil, "loopback proxied like upstream")
+    testing.expect_eq(sget(f.hits), 1, "env proxy sees the loopback hop")
+}
+
+fn test_proxy_last_match_wins() {
+    // upstream reqwest intercepts run last-CLI-entry-first — an all:
+    // placed after a scheme entry shadows it for that scheme, and a
+    // later same-proto duplicate beats the earlier one.
+    f1 := fx_start(one("<ECHO>"))
+    defer f1.stop()
+    f2 := fx_start(one("<ECHO>"))
+    defer f2.stop()
+    r := rq("GET", "http://example.org/")
+    r.proxies = push(r.proxies, "http:" + f1.url())
+    r.proxies = push(r.proxies, "all:" + f2.url())
+    [_resp, e] = request(r)
+    testing.expect(e == nil, "send ok")
+    testing.expect_eq(sget(f2.hits), 1, "later all: shadows http:")
+    testing.expect_eq(sget(f1.hits), 0, "earlier http: unused")
+    f3 := fx_start(one("<ECHO>"))
+    defer f3.stop()
+    f4 := fx_start(one("<ECHO>"))
+    defer f4.stop()
+    r2 := rq("GET", "http://example.org/")
+    r2.proxies = push(r2.proxies, "http:" + f3.url())
+    r2.proxies = push(r2.proxies, "http:" + f4.url())
+    [_r2, e2] = request(r2)
+    testing.expect(e2 == nil, "send2 ok")
+    testing.expect_eq(sget(f4.hits), 1, "later http: wins over earlier")
+    testing.expect_eq(sget(f3.hits), 0, "earlier http: still unused")
+}
+
+fn test_proxy_scheme_degrades() {
+    // non-http proxy URLs degrade explicitly (spec sem-S5)
+    r := rq("GET", "https://example.org/")
+    r.proxies = one("https:https://proxy.invalid:1")
+    [_r1, e1] = request(r)
+    testing.expect(e1 != nil, "https proxy URL errors")
+    if e1 != nil {
+        testing.expect(find(errors.msg(e1), "proxy URL scheme \"https\" is unsupported") >= 0, "https-scheme degrade: " + errors.msg(e1))
+    }
+    r2 := rq("GET", "http://example.org/")
+    r2.proxies = one("all:socks5://proxy.invalid:1")
+    [_r2, e2] = request(r2)
+    testing.expect(e2 != nil, "socks5 errors")
+    if e2 != nil {
+        testing.expect(find(errors.msg(e2), "proxy URL scheme \"socks5\" is unsupported") >= 0, "socks5 degrade: " + errors.msg(e2))
+    }
+}
+
+fn test_proxy_h2c_rejected() {
+    f := fx_start(one("<ECHO>"))
+    defer f.stop()
+    r := rq("GET", "http://example.org/")
+    r.h2 = "prior"
+    r.proxies = one("http:" + f.url())
+    [_r1, e1] = request(r)
+    testing.expect(e1 != nil, "h2c+proxy errors")
+    if e1 != nil {
+        testing.expect(find(errors.msg(e1), "h2c through a proxy is not supported") >= 0, "h2c+proxy text: " + errors.msg(e1))
+    }
+    testing.expect_eq(sget(f.hits), 0, "no dial attempted")
+}
+
+fn test_proxy_connect_https() {
+    f := capfx_start()
+    defer f.l.close()
+    r := rq("GET", "https://example.org/secure")
+    r.proxies = one("all:http://user:pw@127.0.0.1:" + itoa(f.port))
+    [_resp, e] = request(r)
+    // the 200'd tunnel then fails TLS (fixture can't handshake) —
+    // the assertion is the CONNECT wire shape
+    testing.expect(e != nil, "post-CONNECT TLS fails on fake server")
+    cap := f.cap[0]
+    testing.expect_eq(find(cap, "CONNECT example.org:443 HTTP/1.1"), 0, "CONNECT line: " + cap)
+    testing.expect(find(cap, "Host: example.org:443") >= 0, "CONNECT host: " + cap)
+    testing.expect(find(cap, "Proxy-Authorization: Basic dXNlcjpwdw==") >= 0, "CONNECT auth: " + cap)
+    testing.expect(find(cap, "User-Agent: oxttp/") >= 0, "CONNECT UA: " + cap)
+    testing.expect(find(cap, "proxy-connection") < 0, "no proxy-connection: " + cap)
+}
+
+fn test_proxy_connect_requires_200() {
+    // upstream reqwest tunnel() accepts only the literal 200 status —
+    // a 204 must fail the CONNECT check even though it is 2xx.
+    f := capfx_start_reply("HTTP/1.1 204 No Content\r\n\r\n")
+    defer f.l.close()
+    r := rq("GET", "https://example.org/")
+    r.proxies = one("all:http://127.0.0.1:" + itoa(f.port))
+    [_resp, e] = request(r)
+    testing.expect(e != nil, "204 errors")
+    if e != nil {
+        testing.expect(find(errors.msg(e), "returned status 204") >= 0, "204 rejected: " + errors.msg(e))
+    }
+    testing.expect(find(f.cap[0], "CONNECT example.org:443") >= 0, "CONNECT sent: " + f.cap[0])
+}
+
+fn test_proxy_connect_framing_ignored() {
+    // body-framing headers on a 2xx CONNECT reply are ignored — the
+    // tunnel starts at the header terminator (review F12).
+    f := capfx_start_reply("HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\n")
+    defer f.l.close()
+    r := rq("GET", "https://example.org/")
+    r.proxies = one("all:http://127.0.0.1:" + itoa(f.port))
+    [_resp, e] = request(r)
+    testing.expect(e != nil, "post-tunnel TLS fails on fake server")
+    if e != nil {
+        testing.expect(find(errors.msg(e), "content length") < 0, "CL not rejected: " + errors.msg(e))
+        testing.expect(find(errors.msg(e), "returned status") < 0, "200 accepted: " + errors.msg(e))
+    }
+    testing.expect(find(f.cap[0], "CONNECT example.org:443") >= 0, "CONNECT sent: " + f.cap[0])
+}
+
+fn test_proxy_connect_caller_auth() {
+    // upstream: CONNECT auth derives from the proxy URL's userinfo
+    // only — a caller Proxy-Authorization passes through the tunnel
+    // to the origin untouched (review R10).
+    f := capfx_start()
+    defer f.l.close()
+    r := rq("GET", "https://example.org/")
+    r.proxies = one("all:http://user:pw@127.0.0.1:" + itoa(f.port))
+    r.headers = hs1("Proxy-Authorization", "Bearer caller-token")
+    [_resp, e] = request(r)
+    testing.expect(e != nil, "post-tunnel TLS fails on fake server")
+    cap := f.cap[0]
+    urlcreds := "Basic " + base64.encode("user:pw" as []byte)
+    testing.expect(find(cap, "Proxy-Authorization: " + urlcreds) >= 0, "url creds on CONNECT: " + cap)
+    testing.expect(find(cap, "caller-token") < 0, "caller header not on CONNECT: " + cap)
+}
+
+fn test_h2_authority_from_host_header() {
+    // caller Host: becomes :authority — never a separate host field
+    // (RFC 9113 §8.3.1, review F10).
+    f := h2_start(one("<H2ECHO>"))
+    defer f.stop()
+    r := rq("GET", f.url() + "/")
+    r.h2 = "prior"
+    r.headers = hs1("Host", "vhost.example")
+    [resp, e] = request(r)
+    testing.expect(e == nil, "h2 send")
+    if e != nil {
+        return
+    }
+    b := resp.body as str
+    testing.expect(find(b, ":authority: vhost.example") >= 0, ":authority override: " + b)
+    testing.expect(find(b, "host:") < 0, "no host field on h2: " + b)
+}
+
+fn test_proxy_error_hides_password() {
+    // proxy URL validation errors must not echo the raw URL — it can
+    // carry a userinfo password (review F8).
+    r := rq("GET", "http://example.org/")
+    r.proxies = one("all:http://user:sekretpw@127.0.0.1:0/")
+    [_resp, e] = request(r)
+    testing.expect(e != nil, "bad proxy port errors")
+    if e != nil {
+        testing.expect(find(errors.msg(e), "sekretpw") < 0, "no password in error: " + errors.msg(e))
+    }
 }

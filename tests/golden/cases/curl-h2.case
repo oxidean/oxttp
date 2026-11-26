@@ -1,0 +1,2 @@
+# --curl pin (WI-0013 sem-S6): --http-version 2 -> --http2.
+argv: --curl --http-version 2 GET https://example.org/x

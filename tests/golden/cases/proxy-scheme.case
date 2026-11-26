@@ -1,0 +1,2 @@
+# spec sem-S5.3 degrade: https proxy URL scheme errors before any dial.
+argv: --proxy all:https://p:443 GET {URL}/x
