@@ -151,7 +151,9 @@ fn theme_dir(s: ref Settings) -> str {
     if len(s.theme_directory) > 0 {
         return s.theme_directory
     }
-    return config_dir() + "/themes"
+    // Upstream paths.ThemeDir: user themes live under the DATA dir,
+    // not the config dir.
+    return data_dir() + "/themes"
 }
 
 fn history_dir() -> str { return data_dir() + "/history" }
