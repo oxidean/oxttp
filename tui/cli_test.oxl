@@ -1,0 +1,141 @@
+package main
+
+// tui/cli_test — subcommand surface: parse/exit-code/output
+// contracts, run_exec over the fake transport.
+
+import "std/testing"
+import "std/os"
+
+fn test_cli_version() {
+    r := cli_version()
+    testing.expect(r.code == 0, "code")
+    testing.expect(find(r.stdout, "Posting ") == 0, "banner")
+}
+
+fn test_cli_locate() {
+    let a: []str = nil
+    a = push(a, "locate")
+    a = push(a, "config")
+    r := cli_locate_args(a)
+    testing.expect(r.code == 0, "code")
+    testing.expect(find(r.stdout, "Config file:") == 0, "label")
+    a = push(a, "extra")
+    r = cli_locate_args(a)
+    testing.expect(r.code == 2, "too many args")
+    let b: []str = nil
+    b = push(b, "locate")
+    b = push(b, "bogus")
+    r = cli_locate_args(b)
+    testing.expect(r.code == 2, "unknown target")
+    testing.expect(find(r.stderr, "Unknown thing to locate") >= 0, "err text")
+}
+
+fn test_cli_remote() {
+    let a: []str = nil
+    a = push(a, "remote")
+    a = push(a, "list")
+    r := cli_remote_args(a)
+    testing.expect(r.code == 0, "list code")
+    testing.expect(find(r.stdout, "no running Posting") >= 0, "list text")
+    a[1] = "skill"
+    r = cli_remote_args(a)
+    testing.expect(r.code == 0, "skill code")
+    testing.expect(find(r.stdout, "posting-remote") >= 0, "skill emits md")
+    a[1] = "send"
+    r = cli_remote_args(a)
+    testing.expect(r.code == 1, "send degrade")
+    testing.expect(find(r.stderr, "unix sockets") >= 0, "send err")
+    a[1] = "--help"
+    r = cli_remote_args(a)
+    testing.expect(r.code == 0, "help")
+}
+
+fn test_cli_import() {
+    let a: []str = nil
+    a = push(a, "import")
+    a = push(a, "-t")
+    a = push(a, "postman")
+    a = push(a, "file.json")
+    r := cli_import_args(a)
+    testing.expect(r.code == 1, "degrade code")
+    testing.expect(find(r.stderr, "postman import lands M4") >= 0, "text")
+    a[2] = "bogus"
+    r = cli_import_args(a)
+    testing.expect(r.code == 2, "bad type")
+}
+
+fn test_run_parse() {
+    let a: []str = nil
+    a = push(a, "run")
+    a = push(a, "-c")
+    a = push(a, "/coll")
+    a = push(a, "-e")
+    a = push(a, "dev")
+    a = push(a, "--fail-fast")
+    a = push(a, "--json")
+    a = push(a, "requests/")
+    rp := run_parse_args(a)
+    testing.expect(rp.code == 0, "code")
+    testing.expect_streq(rp.o.coll, "/coll", "coll")
+    testing.expect(len(rp.o.envs) == 1, "envs")
+    testing.expect_streq(rp.o.target, "requests/", "target")
+    testing.expect(rp.o.fail_fast, "ff")
+    testing.expect(rp.o.json, "json")
+    // --x=v form + flag after positional
+    a = nil
+    a = push(a, "run")
+    a = push(a, "req.yaml")
+    a = push(a, "--collection=/c")
+    a = push(a, "--env=prod")
+    rp = run_parse_args(a)
+    testing.expect(rp.code == 0, "code2")
+    testing.expect_streq(rp.o.coll, "/c", "coll2")
+    testing.expect_streq(rp.o.envs[0], "prod", "env2")
+    // two positionals → usage
+    a = push(a, "extra")
+    rp = run_parse_args(a)
+    testing.expect(rp.code == 2, "two positional")
+    // help
+    a = nil
+    a = push(a, "run")
+    a = push(a, "-h")
+    rp = run_parse_args(a)
+    testing.expect(rp.code == -1, "help sentinel")
+    // missing value
+    a = nil
+    a = push(a, "run")
+    a = push(a, "-c")
+    rp = run_parse_args(a)
+    testing.expect(rp.code == 2, "missing val")
+}
+
+// stage_run builds a scratch collection with one good + one
+// script-carrying request and runs run_exec over a fake transport.
+fn test_run_exec() {
+    dir := "/tmp/oxttp-run-test"
+    os.mkdir_all(dir)
+    os.writefile_(dir + "/ok.posting.yaml", "name: ok\nmethod: GET\nurl: http://x.test/a\n")
+    os.writefile_(dir + "/scripted.posting.yaml", "name: sc\nmethod: GET\nurl: http://x.test/b\nscripts:\n  setup: print(1)\n")
+    o := new(RunOpts)
+    o.coll = dir
+    o.target = dir
+    fx := FakeSend{resp: fake_resp(200, "text/plain", "hi", nil), fail: ""}
+    rep := run_exec(o, fx)
+    testing.expect(len(rep.err) == 0, "err: " + rep.err)
+    testing.expect(rep.code == 1, "code (script fails)")
+    testing.expect(len(rep.lines) == 3, "2 req + summary")
+    testing.expect(find(rep.lines[0], "PASSED") >= 0 || find(rep.lines[1], "PASSED") >= 0, "one pass")
+    testing.expect(find(rep.lines[2], "1 passed") >= 0, "summary")
+    // fail-fast + json
+    o.fail_fast = true
+    o.json = true
+    rep = run_exec(o, fx)
+    testing.expect(find(rep.lines[0], "\"results\"") >= 0, "json head")
+    testing.expect(find(rep.lines[0], "\"failed\":1") >= 0, "json failed")
+    // single-file non-.posting.yaml rejects
+    os.writefile_(dir + "/not.txt", "x")
+    o.target = dir + "/not.txt"
+    rep = run_exec(o, fx)
+    testing.expect(rep.code == 1, "non yaml")
+    testing.expect(find(rep.err, ".posting.yaml") >= 0, "err")
+}

@@ -1,0 +1,614 @@
+package main
+
+// tui/cli — the posting CLI surface (ADR-0036): subcommand
+// dispatch for `import|locate|remote|run|version`, each returning
+// an Out{code,stdout,stderr} the caller prints (the Run contract
+// mirrors cli/exec.oxl so tests assert on fields, not fds).
+
+import "std/os"
+import "std/errors"
+import "std/encoding/json"
+import "std/encoding/base64"
+import "github.com/oxidean/oxttp/core/collection"
+import "github.com/oxidean/oxttp/core/config"
+import "github.com/oxidean/oxttp/core/env"
+import "github.com/oxidean/oxttp/core/http"
+import "github.com/oxidean/oxttp/core/model"
+import "github.com/oxidean/oxttp/shared/version"
+
+struct Out { code: int, stdout: str, stderr: str }
+
+fn cli_is_sub(a0: str) -> bool {
+    return a0 == "import" || a0 == "locate" || a0 == "remote" || a0 == "run" || a0 == "version" || a0 == "-v" || a0 == "--version"
+}
+
+// cli_main runs the subcommand named by argv[1].
+fn cli_args() -> []str {
+    let a: []str = nil
+    i := 1
+    for i < os.nargs() {
+        a = push(a, os.args(i))
+        i = i + 1
+    }
+    return a
+}
+
+fn cli_main() -> Out {
+    a0 := os.args(1)
+    if a0 == "version" || a0 == "-v" || a0 == "--version" {
+        return cli_version()
+    }
+    if a0 == "locate" {
+        return cli_locate()
+    }
+    if a0 == "remote" {
+        return cli_remote()
+    }
+    if a0 == "import" {
+        return cli_import()
+    }
+    return cli_run()
+}
+
+fn cli_version() -> Out {
+    return Out{code: 0, stdout: "Posting " + version.get() + "\n", stderr: ""}
+}
+
+fn cli_locate() -> Out {
+    return cli_locate_args(cli_args())
+}
+
+fn cli_locate_args(args: []str) -> Out {
+    if len(args) != 2 {
+        return Out{code: 2, stdout: "", stderr: "posting locate: usage: posting locate config|collection|themes\n"}
+    }
+    what := args[1]
+    if what == "config" {
+        return Out{code: 0, stdout: "Config file:\n" + config.config_file() + "\n", stderr: ""}
+    }
+    if what == "collection" {
+        return Out{code: 0, stdout: "Default collection directory:\n" + config.default_coll_dir() + "\n", stderr: ""}
+    }
+    if what == "themes" {
+        return Out{code: 0, stdout: "Themes directory:\n" + config.config_dir() + "/themes\n", stderr: ""}
+    }
+    return Out{code: 2, stdout: "", stderr: "Unknown thing to locate: \"" + what + "\"\n"}
+}
+
+let SKILL_MD = "---\nname: posting-remote\ndescription: Drive a running Posting instance over its control socket.\n---\n\n# posting remote\n\nposting remote list            - list running instances\nposting remote send <file>     - send a request in the TUI\nposting remote new <file>      - open a request in a new tab\nposting remote env <name>      - switch environment\nposting remote focus <target>  - focus a widget\n"
+
+fn cli_remote() -> Out {
+    return cli_remote_args(cli_args())
+}
+
+fn cli_remote_args(args: []str) -> Out {
+    i := 1
+    cmd := ""
+    for i < len(args) {
+        a := args[i]
+        if a == "--help" || a == "-h" {
+            return Out{code: 0, stdout: "usage: posting remote [--instance NAME] <command>\n  list  send  new  env  focus  skill\n", stderr: ""}
+        }
+        if len(cmd) == 0 && len(a) > 0 && byteat(a, 0) != 45 {
+            cmd = a
+        }
+        i = i + 1
+    }
+    if cmd == "list" {
+        return Out{code: 0, stdout: "PID\tVERSION\tCOLLECTION\tCWD\tSOCKET\nno running Posting found\n", stderr: ""}
+    }
+    if cmd == "skill" {
+        return Out{code: 0, stdout: SKILL_MD, stderr: ""}
+    }
+    if len(cmd) == 0 {
+        return Out{code: 2, stdout: "", stderr: "posting remote: a command is required\n"}
+    }
+    return Out{code: 1, stdout: "", stderr: "no running Posting found (unix sockets unsupported in this build)\n"}
+}
+
+fn cli_import() -> Out {
+    return cli_import_args(cli_args())
+}
+
+fn cli_import_args(args: []str) -> Out {
+    i := 1
+    typ := "openapi"
+    for i < len(args) {
+        a := args[i]
+        if a == "-t" || a == "--type" {
+            if i + 1 >= len(args) {
+                return Out{code: 2, stdout: "", stderr: "posting import: --type needs a value\n"}
+            }
+            typ = args[i + 1]
+            i = i + 1
+        } else if a == "-o" || a == "--output" {
+            if i + 1 >= len(args) {
+                return Out{code: 2, stdout: "", stderr: "posting import: --output needs a value\n"}
+            }
+            i = i + 1
+        } else if a == "-h" || a == "--help" {
+            return Out{code: 0, stdout: "usage: posting import [-t openapi|postman|bruno] [-o DIR] SOURCE...\n", stderr: ""}
+        } else if len(a) > 0 && byteat(a, 0) == 45 {
+            return Out{code: 2, stdout: "", stderr: "posting import: unknown flag " + a + "\n"}
+        }
+        i = i + 1
+    }
+    if typ != "openapi" && typ != "postman" && typ != "bruno" {
+        return Out{code: 2, stdout: "", stderr: "posting import: unknown type " + typ + "\n"}
+    }
+    return Out{code: 1, stdout: "", stderr: "posting import: " + typ + " import lands M4 in this build\n"}
+}
+
+// ---------- run ----------
+
+struct RunOpts {
+    coll: str,
+    target: str,
+    envs: []str,
+    fail_fast: bool,
+    json: bool,
+}
+
+struct RunRep {
+    code: int,
+    lines: []str,   // per-request PASS/FAIL/SKIP + summary (or json)
+    err: str,       // run-level error text
+}
+
+fn run_usage() -> str {
+    return "usage: posting run [flags] TARGET\n  -c, --collection DIR   collection root\n  -e, --env NAME|FILE    environment (repeatable)\n      --fail-fast        stop on first failure\n      --json             emit JSON report\n  -h, --help             this help\n"
+}
+
+// run_parse — run.go flag surface: values via next arg or --x=v,
+// flags-after-positional ok, `--` ends flags.
+struct RunParse { o: own RunOpts, code: int }
+
+fn run_parse() -> own RunParse {
+    return run_parse_args(cli_args())
+}
+
+fn run_parse_args(args: []str) -> own RunParse {
+    rp := new(RunParse)
+    rp.o = new(RunOpts)
+    i := 1
+    end := false
+    for i < len(args) {
+        a := args[i]
+        i = i + 1
+        if a == "--" && !end {
+            end = true
+            continue
+        }
+        if !end && len(a) > 0 && byteat(a, 0) == 45 {
+            v := ""
+            has_v := false
+            eq := find(a, "=")
+            if eq >= 0 {
+                v = substr(a, eq + 1, len(a))
+                a = substr(a, 0, eq)
+                has_v = true
+            }
+            if a == "-c" || a == "--collection" {
+                if !has_v {
+                    if i >= len(args) {
+                        rp.code = 2
+                        return rp
+                    }
+                    v = args[i]
+                    i = i + 1
+                }
+                rp.o.coll = v
+            } else if a == "-e" || a == "--env" {
+                if !has_v {
+                    if i >= len(args) {
+                        rp.code = 2
+                        return rp
+                    }
+                    v = args[i]
+                    i = i + 1
+                }
+                rp.o.envs = push(rp.o.envs, v)
+            } else if a == "--fail-fast" {
+                rp.o.fail_fast = true
+            } else if a == "--json" {
+                rp.o.json = true
+            } else if a == "-h" || a == "--help" {
+                rp.code = -1
+                return rp
+            } else {
+                rp.code = 2
+                return rp
+            }
+        } else {
+            if len(rp.o.target) > 0 {
+                rp.code = 2
+                return rp
+            }
+            rp.o.target = a
+        }
+    }
+    rp.code = 0
+    return rp
+}
+
+fn cli_run() -> Out {
+    rp := run_parse()
+    if rp.code == -1 {
+        return Out{code: 0, stdout: run_usage(), stderr: ""}
+    }
+    if rp.code != 0 || len(rp.o.target) == 0 {
+        return Out{code: 2, stdout: "", stderr: "posting run: bad arguments\nRun posting run --help for usage.\n"}
+    }
+    rep := run_exec(rp.o, http.H1{})
+    if len(rep.err) > 0 {
+        return Out{code: rep.code, stdout: join(rep.lines), stderr: "posting run: " + rep.err + "\n"}
+    }
+    return Out{code: rep.code, stdout: join(rep.lines), stderr: ""}
+}
+
+fn join(lines: []str) -> str {
+    let out = ""
+    i := 0
+    for i < len(lines) {
+        out = out + lines[i]
+        i = i + 1
+    }
+    return out
+}
+
+// run_env resolves -e names/files into an EnvSet — names load
+// <root>/<name>.env (+ .local.env) via build_set; file paths load
+// verbatim via parse_dotenv into a session-shaped last layer.
+struct RunEnv { es: own env.EnvSet, err: str }
+
+fn run_env(root: str, envs: []str) -> own RunEnv {
+    re := new(RunEnv)
+    es := new(env.EnvSet)
+    let active: []str = nil
+    i := 0
+    for i < len(envs) {
+        e := envs[i]
+        i = i + 1
+        is_file := find(e, "/") >= 0 || find(e, "\\") >= 0 || (len(e) > 4 && substr(e, len(e) - 4, len(e)) == ".env")
+        if is_file {
+            if !os.exists(e) || os.isdir(e) {
+                re.err = "environment file not found: " + e
+                return re
+            }
+            [p, pe] = env.parse_dotenv(os.readfile_(e), es)
+            if pe != nil {
+                re.err = e + ": " + errors.msg(pe)
+                return re
+            }
+            es.layers = push(es.layers, env.EnvLayer{name: e, source: "file", vars: p.vars})
+        } else {
+            if !os.exists(root + "/" + e + ".env") {
+                re.err = "environment not found in collection: " + e
+                return re
+            }
+            active = push(active, e)
+        }
+    }
+    es = env.build_set(root, active, nil)
+    re.es = es
+    return re
+}
+
+// run_collect gathers runnable requests under target — dir → scan
+// (any malformed node aborts the run before sending, upstream
+// run.go), file → single .posting.yaml. Returns rel-path-sorted
+// node indexes via an owned copy list (CollNodes can't be copied
+// out of the scan struct, so callers re-derive per node).
+fn run_exec(o: ref RunOpts, t: http.Transport) -> own RunRep {
+    rep := new(RunRep)
+    rep.code = 0
+    rep.lines = nil
+    root := o.coll
+    if len(root) == 0 {
+        root = os.fullpath(".")
+    }
+    target := o.target
+    if !is_abs2(target) {
+        target = root + "/" + target
+    }
+    if !os.exists(target) {
+        rep.err = "no such file or directory: " + o.target
+        rep.code = 1
+        return rep
+    }
+    // settings: warnings are fatal unattended (upstream run.go).
+    cr := config.load("", config.posting_env_pairs())
+    if len(cr.warns) > 0 {
+        rep.err = join(cr.warns)
+        rep.code = 1
+        return rep
+    }
+    re := run_env(root, o.envs)
+    if len(re.err) > 0 {
+        rep.err = re.err
+        rep.code = 1
+        return rep
+    }
+    es := re.es
+    // select
+    sc := new(collection.CollScan)
+    single := !os.isdir(target)
+    if single {
+        if len(target) < 13 || substr(target, len(target) - 13, len(target)) != ".posting.yaml" {
+            rep.err = "not a .posting.yaml file: " + o.target
+            rep.code = 1
+            return rep
+        }
+        [preq, perr] = collection.load_file(target)
+        if perr != nil {
+            rep.err = errors.msg(perr)
+            rep.code = 1
+            return rep
+        }
+        sc.nodes = push(sc.nodes, collection.CollNode{path: target, rel: base_name(target), depth: 0, is_dir: false, req: preq, err: ""})
+    } else {
+        sc = collection.scan(target)
+    }
+    // malformed abort — upstream refuses to run any file when one
+    // fails to load.
+    i := 0
+    for i < len(sc.nodes) {
+        n := sc.nodes[i]
+        i = i + 1
+        if len(n.err) > 0 {
+            rep.err = n.rel + ": " + n.err
+            rep.code = 1
+            return rep
+        }
+        if n.is_dir {
+            continue
+        }
+    }
+    // count runnable
+    total := 0
+    i = 0
+    for i < len(sc.nodes) {
+        if !sc.nodes[i].is_dir {
+            total = total + 1
+        }
+        i = i + 1
+    }
+    if total == 0 {
+        rep.err = "no request files found in " + o.target
+        rep.code = 1
+        return rep
+    }
+    // loop
+    let jar: []JarEnt = nil
+    passed := 0
+    failed := 0
+    skipped := 0
+    let jresults = ""
+    first_j := true
+    i = 0
+    stop := false
+    for i < len(sc.nodes) {
+        n := sc.nodes[i]
+        i = i + 1
+        if n.is_dir {
+            continue
+        }
+        if stop {
+            skipped = skipped + 1
+            rep.lines = push(rep.lines, "SKIPPED " + n.rel + "\n")
+            jresults = jappend(jresults, first_j, "{\"file\":" + jesc(n.rel) + ",\"name\":" + jesc(n.req.name) + ",\"outcome\":\"skipped\"}")
+            first_j = false
+            continue
+        }
+        if len(n.req.url) == 0 {
+            rep.lines = push(rep.lines, "FAILED " + n.rel + ": empty url\n")
+            failed = failed + 1
+            if o.fail_fast { stop = true }
+            jresults = jappend(jresults, first_j, "{\"file\":" + jesc(n.rel) + ",\"outcome\":\"failed\",\"error\":\"empty url\"}")
+            first_j = false
+            continue
+        }
+        if n.req.scripts != nil && (len(n.req.scripts.setup) > 0 || len(n.req.scripts.on_request) > 0 || len(n.req.scripts.on_response) > 0) {
+            rep.lines = push(rep.lines, "FAILED " + n.rel + ": Posting 3 doesn't run Python scripts; remove or replace its scripts before running headlessly\n")
+            failed = failed + 1
+            if o.fail_fast { stop = true }
+            jresults = jappend(jresults, first_j, "{\"file\":" + jesc(n.rel) + ",\"outcome\":\"failed\",\"error\":\"scripts unsupported\"}")
+            first_j = false
+            continue
+        }
+        if len(n.req.captures) > 0 {
+            rep.lines = push(rep.lines, "FAILED " + n.rel + ": captures unsupported in this build — lands M4\n")
+            failed = failed + 1
+            if o.fail_fast { stop = true }
+            jresults = jappend(jresults, first_j, "{\"file\":" + jesc(n.rel) + ",\"outcome\":\"failed\",\"error\":\"captures unsupported in this build\"}")
+            first_j = false
+            continue
+        }
+        [u0, ue0] = collection.subst_url(n.req.url, es)
+        let jlist: []str = nil
+        if ue0 == nil {
+            u0 = scheme_norm(u0)
+            jlist = jar_for_list(jar, url_origin(u0))
+        }
+        sp := collection.plan_req(n.req, es, jlist, root)
+        if len(sp.err) > 0 {
+            rep.lines = push(rep.lines, "FAILED " + n.rel + ": " + sp.err + "\n")
+            failed = failed + 1
+            if o.fail_fast { stop = true }
+            jresults = jappend(jresults, first_j, "{\"file\":" + jesc(n.rel) + ",\"outcome\":\"failed\",\"error\":" + jesc(sp.err) + "}")
+            first_j = false
+            continue
+        }
+        if len(cr.s.ssl_ca_bundle) > 0 && sp.req.verify == "yes" {
+            sp.req.verify = cr.s.ssl_ca_bundle
+        }
+        [resp, se] = t.send(sp.req)
+        if se != nil {
+            msg := errors.msg(se)
+            rep.lines = push(rep.lines, "FAILED " + n.rel + ": " + msg + "\n")
+            failed = failed + 1
+            if o.fail_fast { stop = true }
+            jresults = jappend(jresults, first_j, "{\"file\":" + jesc(n.rel) + ",\"outcome\":\"failed\",\"error\":" + jesc(msg) + "}")
+            first_j = false
+            continue
+        }
+        // carry cookies for this run only (upstream run.go).
+        jar = jar_collect(jar, url_origin(sp.req.url), resp)
+        if model.status_class(resp.status) == 2 {
+            rep.lines = push(rep.lines, "FAILED " + n.rel + ": " + itoa(resp.status) + " " + resp.reason + "\n")
+            failed = failed + 1
+            if o.fail_fast { stop = true }
+            jresults = jappend(jresults, first_j, "{\"file\":" + jesc(n.rel) + ",\"outcome\":\"failed\",\"response\":" + resp_json(sp.req, resp) + "}")
+            first_j = false
+            continue
+        }
+        rep.lines = push(rep.lines, "PASSED " + n.rel + ": " + itoa(resp.status) + " " + resp.reason + " (" + ftoa(resp.elapsed_ms) + " ms)\n")
+        passed = passed + 1
+        jresults = jappend(jresults, first_j, "{\"file\":" + jesc(n.rel) + ",\"name\":" + jesc(n.req.name) + ",\"outcome\":\"passed\",\"response\":" + resp_json(sp.req, resp) + "}")
+        first_j = false
+    }
+    if o.json {
+        rep.lines = nil
+        rep.lines = push(rep.lines, "{\"results\":[" + jresults + "],\"passed\":" + itoa(passed) + ",\"failed\":" + itoa(failed) + ",\"skipped\":" + itoa(skipped) + "}\n")
+    } else {
+        rep.lines = push(rep.lines, itoa(passed) + " passed, " + itoa(failed) + " failed, " + itoa(skipped) + " skipped\n")
+    }
+    if failed > 0 {
+        rep.code = 1
+    }
+    return rep
+}
+
+// ---------- run helpers ----------
+
+fn is_abs2(p: str) -> bool {
+    return len(p) > 0 && byteat(p, 0) == 47
+}
+
+fn base_name(p: str) -> str {
+    i := len(p) - 1
+    for i > 0 && byteat(p, i) != 47 {
+        i = i - 1
+    }
+    if byteat(p, i) == 47 {
+        i = i + 1
+    }
+    return substr(p, i, len(p))
+}
+
+fn scheme_norm(u: str) -> str {
+    if find(u, "://") < 0 {
+        if len(u) > 1 && substr(u, 0, 2) == "//" {
+            return "http:" + u
+        }
+        return "http://" + u
+    }
+    return u
+}
+
+fn jesc(s: str) -> str {
+    return json.tojson(json.jstr(s))
+}
+
+fn jappend(acc: str, first: bool, item: str) -> str {
+    if first {
+        return acc + item
+    }
+    return acc + "," + item
+}
+
+fn resp_json(req: ref model.Req, resp: model.Resp) -> str {
+    let h = ""
+    i := 0
+    for i < len(resp.headers) {
+        if i > 0 {
+            h = h + ","
+        }
+        h = h + "{\"name\":" + jesc(resp.headers[i].name) + ",\"value\":" + jesc(resp.headers[i].value) + "}"
+        i = i + 1
+    }
+    body := resp.body as str
+    if !is_utf8(resp.body) {
+        body = "\"bodyBase64\":" + jesc(base64.encode(resp.body)) + ","
+        return "{\"method\":" + jesc(req.method) + ",\"url\":" + jesc(req.url) + ",\"status\":" + jesc(itoa(resp.status) + " " + resp.reason) + ",\"statusCode\":" + itoa(resp.status) + ",\"headers\":[" + h + "]," + body + "\"size\":" + itoa(len(resp.body)) + ",\"elapsedMs\":" + ftoa(resp.elapsed_ms) + "}"
+    }
+    return "{\"method\":" + jesc(req.method) + ",\"url\":" + jesc(req.url) + ",\"status\":" + jesc(itoa(resp.status) + " " + resp.reason) + ",\"statusCode\":" + itoa(resp.status) + ",\"headers\":[" + h + "],\"body\":" + jesc(body) + ",\"size\":" + itoa(len(resp.body)) + ",\"elapsedMs\":" + ftoa(resp.elapsed_ms) + "}"
+}
+
+fn is_utf8(b: []byte) -> bool {
+    // cheap check: JSON must be valid UTF-8; reject NUL/controls
+    // via jesc which still escapes — upstream checks utf8.Valid.
+    // We approximate: any byte >= 0x80 unpaired → base64. For S11
+    // scope bodies are text; treat as utf8 unless NUL present.
+    i := 0
+    for i < len(b) {
+        if b[i] == 0 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn jar_for_list(jar: []JarEnt, origin: str) -> []str {
+    let out: []str = nil
+    i := 0
+    for i < len(jar) {
+        if jar[i].origin == origin {
+            out = push(out, jar[i].nv)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// jar_collect stores Set-Cookie name=value pairs under the
+// response origin — the run-scoped jar (upstream carries cookies
+// through the run only).
+fn jar_collect(jar: []JarEnt, origin: str, resp: model.Resp) -> []JarEnt {
+    i := 0
+    for i < len(resp.headers) {
+        h := resp.headers[i]
+        i = i + 1
+        if lower_ascii(h.name) != "set-cookie" {
+            continue
+        }
+        nv := h.value
+        sc := find(nv, ";")
+        if sc >= 0 {
+            nv = substr(nv, 0, sc)
+        }
+        ts := 0
+        for ts < len(nv) && (byteat(nv, ts) == 32 || byteat(nv, ts) == 9) {
+            ts = ts + 1
+        }
+        nv = substr(nv, ts, len(nv))
+        if len(nv) == 0 {
+            continue
+        }
+        nm := nv
+        eq := find(nv, "=")
+        if eq > 0 {
+            nm = substr(nv, 0, eq)
+        }
+        j := 0
+        replaced := false
+        for j < len(jar) {
+            e2 := jar[j].nv
+            eq2 := find(e2, "=")
+            cn := e2
+            if eq2 > 0 {
+                cn = substr(e2, 0, eq2)
+            }
+            if jar[j].origin == origin && cn == nm {
+                jar[j].nv = nv
+                replaced = true
+            }
+            j = j + 1
+        }
+        if !replaced {
+            jar = push(jar, JarEnt{origin: origin, nv: nv})
+        }
+    }
+    return jar
+}

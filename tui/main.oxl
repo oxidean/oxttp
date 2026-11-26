@@ -19,8 +19,33 @@ import "github.com/oxidean/oxttp/core/term"
 
 import "github.com/oxidean/oxttp/shared/version"
 
+fn emit_file(f: os.File, s: str) {
+    b := mkslice(byte, len(s))
+    i := 0
+    for i < len(s) {
+        b[i] = byteat(s, i)
+        i = i + 1
+    }
+    [n, we] = f.write(b)
+    if we != nil || n < len(b) {
+        os.quit(1)
+    }
+}
+
 fn main() {
     ver := version.get()
+    // Subcommands run headless — dispatch before any session open
+    // (corpus §1.1: import|locate|remote|run|version).
+    if os.nargs() > 1 && cli_is_sub(os.args(1)) {
+        r := cli_main()
+        if len(r.stdout) > 0 {
+            emit_file(os.stdout(), r.stdout)
+        }
+        if len(r.stderr) > 0 {
+            emit_file(os.stderr(), r.stderr)
+        }
+        os.quit(r.code)
+    }
     [sess, e] = term.open_session()
     if e != nil {
         // Non-tty (CI / pipes): keep the one-line banner.
