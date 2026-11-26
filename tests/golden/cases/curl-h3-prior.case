@@ -1,0 +1,5 @@
+# --curl pin (WI-0013 sem-S6 + subagent-review F1): 3-prior-knowledge
+# emits --http3-only under --curl even though the http3 feature-gate
+# defer would fire on a real send — upstream's to_curl short-circuit
+# runs before client build, so the emit is reachable and must not error.
+argv: --curl --http-version 3-prior-knowledge GET https://example.org/

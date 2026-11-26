@@ -21,6 +21,8 @@ import "std/crypto/md5"
 
 import "std/net/url"
 
+import "std/net/tls"
+
 import "github.com/oxidean/oxttp/core/model"
 
 import "github.com/oxidean/oxttp/core/item"
@@ -723,7 +725,11 @@ fn plan(i: ref Intent, env: []str, stdin: str, stdin_tty: int) -> own ReqPlan {
     // --- stdin body decision (ADR 0022)
     stdin_body := ""
     use_stdin := 0
-    if stdin_tty == 0 && i.ignore_stdin == 0 {
+    // corpus fixture pinning: an EXPLICIT method + empty stdin carries
+    // no body (xh emits a bare GET for `xh GET url </dev/null`), while
+    // redirected stdin with no explicit method still counts — it forces
+    // the default POST and sends CL:0 + json accept/ct.
+    if stdin_tty == 0 && i.ignore_stdin == 0 && (len(stdin) > 0 || len(i.method) == 0) {
         body_items := 0
         j := 0
         for j < len(i.ikinds[:]) {
@@ -1172,11 +1178,78 @@ fn plan(i: ref Intent, env: []str, stdin: str, stdin_tty: int) -> own ReqPlan {
     p.req.follow = (i.follow != 0)
     p.req.max_redirects = i.eff_redirects
     p.req.verify = i.verify
+    // WI-0013 sem-S2: --ssl pins the negotiated version range; unset,
+    // auto and ssl2.3 all leave 0/0 = build default [V12,V13]
+    // (ADR-0032). tls1/1.1 warn+fallback (corpus W-shape, adapted D2).
+    if i.ssl == "tls1.2" {
+        p.req.ssl_min = tls.V12
+        p.req.ssl_max = tls.V12
+    } else if i.ssl == "tls1.3" {
+        p.req.ssl_min = tls.V13
+        p.req.ssl_max = tls.V13
+    } else if i.ssl == "tls1" || i.ssl == "tls1.1" {
+        p.warn = push(p.warn, "rustls does not support older TLS versions. This build's TLS stack requires TLS >= 1.2 — falling back to TLS 1.2+.")
+    }
+    // WI-0013 sem-S4: --native-tls warning-degrades on https (single
+    // TLS stack — ADR-0031); inert on cleartext.
+    if i.native_tls != 0 && url_scheme(i.url) == "https" {
+        p.warn = push(p.warn, "--native-tls selects an alternate TLS backend; this build ships one TLS stack (oxl std/net/tls) — using it")
+    }
+    // WI-0013 sem-S3: --cert/--cert-key read eagerly — upstream loads
+    // them at client build, so a missing file errors even on http://
+    // or --offline. --curl bypasses client build upstream entirely,
+    // so it emits -E verbatim and never touches the files.
+    if i.curl == 0 && len(i.cert) > 0 {
+        if !os.exists(i.cert) {
+            p.err = "cert file not found: " + i.cert
+            return p
+        }
+        p.req.cert_pem = os.readfile_(i.cert)
+        if len(i.cert_key) > 0 {
+            if !os.exists(i.cert_key) {
+                p.err = "cert-key file not found: " + i.cert_key
+                return p
+            }
+            p.req.key_pem = os.readfile_(i.cert_key)
+            // an explicitly supplied key file must carry a key —
+            // empty content errors rather than silently falling back
+            // to the cert PEM (review F1).
+            if len(p.req.key_pem) == 0 {
+                p.err = "cert-key file is empty: " + i.cert_key
+                return p
+            }
+        }
+        // Upstream builds the client (and its identity) eagerly, so a
+        // bad PEM errors even on http:// or --offline — same load the
+        // transport runs, with the cert-file key fallback.
+        kp := p.req.key_pem
+        if len(kp) == 0 {
+            kp = p.req.cert_pem
+        }
+        [_, cce] = tls.load_cert_pem(p.req.cert_pem, kp)
+        if cce != nil {
+            p.err = "couldn't load client certificate: " + errors.msg(cce)
+            return p
+        }
+    }
     if i.http_version == "1.0" {
         p.req.httpver = "HTTP/1.0"
     } else {
         p.req.httpver = "HTTP/1.1"
     }
+    // WI-0013 sem-S1: --http-version 2 is an ALPN hint; 2-prior-
+    // knowledge forces h2c on http / requires negotiated h2 on https.
+    if i.http_version == "2" {
+        p.req.h2 = "hint"
+    } else if i.http_version == "2-prior-knowledge" {
+        p.req.h2 = "prior"
+    }
+    // WI-0013 sem-S5: --proxy entries + captured env proxies carry to
+    // the transport — per-hop resolution (last scheme/all: match
+    // wins), NO_PROXY domain match in pick_proxy.
+    p.req.proxies = i.proxies[:]
+    p.req.proxy_env = i.proxy_env[:]
+    p.req.no_proxy = i.no_proxy
     if i.compress_n > 0 {
         p.warn = push(p.warn, "--compress is unsupported in this build; request body sent uncompressed.")
     }
@@ -1196,6 +1269,12 @@ fn plan(i: ref Intent, env: []str, stdin: str, stdin_tty: int) -> own ReqPlan {
                 p.resume_off = n
             }
         }
+    }
+    // --curl bypasses client build upstream, so transport-side
+    // warnings (rustls fallback, native-tls, compress…) never print —
+    // only the "Warning: Ignored" lines from curl_ignored land.
+    if i.curl != 0 {
+        p.warn = nil
     }
     return p
 }
@@ -1351,16 +1430,20 @@ fn reason_of(code: int, wire: str) -> str {
 // req_head_render draws the request head exactly as xh prints it:
 // status line + title-cased headers + blank line.
 fn req_head_render(i: ref Intent, p: ref ReqPlan) -> str {
-    ver := "HTTP/1.1"
-    if i.http_version == "1.0" {
-        ver = "HTTP/1.0"
-    }
     [u, _e] = url.parse(p.req.url)
     uri := "/"
     uhost := ""
+    scheme := ""
     if _e == nil {
         uri = u.request_uri()
         uhost = u.host
+        scheme = u.scheme
+    }
+    ver := "HTTP/1.1"
+    if i.http_version == "1.0" {
+        ver = "HTTP/1.0"
+    } else if p.req.h2 == "prior" || (p.req.h2 == "hint" && scheme == "https") {
+        ver = "HTTP/2.0" // spec D1: h2 modes render the 2.0 token — cleartext hint can't reach h2, keep 1.1
     }
     hs := p.req.headers
     // display synthesis mirrors wire: Accept* / Cookie / CL / Host
@@ -1556,11 +1639,17 @@ fn curl_ignored(i: ref Intent) -> str {
     if i.download != 0 {
         out = out + "Warning: Ignored --download\n"
     }
-    if len(i.proxies[:]) > 0 || len(i.proxy_env[:]) > 0 {
-        out = out + "Warning: Ignored --proxy\n"
-    }
     if len(i.resolves[:]) > 0 {
         out = out + "Warning: Ignored --resolve\n"
+    }
+    if i.compress_n != 0 {
+        out = out + "Warning: Ignored --compress\n"
+    }
+    // WI-0013 P5 (spec sem-S4/S6): --proxy now emits (-x / env
+    // prefixes) so its Ignored line is gone; --native-tls joins the
+    // corpus §5 ignored list instead.
+    if i.native_tls != 0 {
+        out = out + "Warning: Ignored --native-tls\n"
     }
     return out
 }
@@ -1575,6 +1664,7 @@ fn curl_emit(i: ref Intent, p: ref ReqPlan) -> str {
     fl_d := "-d"
     fl_c := "-C"
     fl_o := "-o"
+    fl_e := "-E"
     if long != 0 {
         fl_loc = "--location"
         fl_x = "--request"
@@ -1582,13 +1672,100 @@ fn curl_emit(i: ref Intent, p: ref ReqPlan) -> str {
         fl_d = "--data"
         fl_c = "--continue-at"
         fl_o = "--output"
+        fl_e = "--cert"
     }
-    cmd := "curl"
+    // WI-0013 P5 (spec sem-S6): --proxy entries become env prefixes
+    // prepended to the line — EVERY occurrence emits in CLI order
+    // (upstream to_curl does the same; shell-last-wins then matches
+    // pick_proxy's last-match selection); all: rides all_proxy
+    // (curl's -x would override the scheme-specific envs). When any
+    // explicit entries exist, unspecified ambient proxy envs are
+    // cleared so the emitted command can't silently inherit a proxy
+    // the request bypassed.
+    pre := ""
+    seen_http := 0
+    seen_https := 0
+    seen_all := 0
+    pxi := 0
+    for pxi < len(i.proxies[:]) {
+        pent := i.proxies[pxi]
+        pxi = pxi + 1
+        ci := find(pent, ":")
+        if ci < 0 {
+            continue
+        }
+        proto := elwr(substr(pent, 0, ci))
+        purl := substr(pent, ci + 1, len(pent))
+        if proto == "all" {
+            seen_all = 1
+            pre = pre + "all_proxy=" + shquote(purl) + " "
+        } else if proto == "http" {
+            seen_http = 1
+            pre = pre + "http_proxy=" + shquote(purl) + " "
+        } else if proto == "https" {
+            seen_https = 1
+            pre = pre + "https_proxy=" + shquote(purl) + " "
+        }
+    }
+    if seen_http + seen_https + seen_all > 0 {
+        if seen_http == 0 {
+            pre = pre + "http_proxy= HTTP_PROXY= "
+        }
+        if seen_https == 0 {
+            pre = pre + "https_proxy= HTTPS_PROXY= "
+        }
+        if seen_all == 0 {
+            pre = pre + "all_proxy= ALL_PROXY= "
+        }
+        // explicit --proxy bypasses env consultation entirely — an
+        // ambient NO_PROXY would let the emitted curl skip a proxy
+        // oxttp itself would have used.
+        pre = pre + "no_proxy= NO_PROXY= "
+    }
+    cmd := pre + "curl"
     if i.follow != 0 {
         cmd = cmd + " " + fl_loc
     }
     if i.http_version == "1.0" {
         cmd = cmd + " --http1.0"
+    }
+    if i.http_version == "1.1" {
+        cmd = cmd + " --http1.1"
+    }
+    if i.http_version == "2" {
+        cmd = cmd + " --http2"
+    }
+    if i.http_version == "2-prior-knowledge" {
+        cmd = cmd + " --http2-prior-knowledge"
+    }
+    // 3-prior-knowledge maps to --http3-only and IS reachable under
+    // --curl: upstream's to_curl short-circuit runs before client
+    // build, so the h3 feature-gate defer never sees it (spec sem-S6).
+    if i.http_version == "3-prior-knowledge" {
+        cmd = cmd + " --http3-only"
+    }
+    if len(i.cert) > 0 {
+        cmd = cmd + " " + fl_e + " " + shquote(i.cert)
+    }
+    if len(i.cert_key) > 0 {
+        cmd = cmd + " --key " + shquote(i.cert_key)
+    }
+    // --ssl tlsX.Y -> --tlsvX.Y --tls-max X.Y; auto/ssl2.3 silent.
+    sslv := ""
+    if i.ssl == "tls1" {
+        sslv = "1.0"
+    }
+    if i.ssl == "tls1.1" {
+        sslv = "1.1"
+    }
+    if i.ssl == "tls1.2" {
+        sslv = "1.2"
+    }
+    if i.ssl == "tls1.3" {
+        sslv = "1.3"
+    }
+    if len(sslv) > 0 {
+        cmd = cmd + " --tlsv" + sslv + " --tls-max " + sslv
     }
     if p.resume_off > 0 {
         cmd = cmd + " " + fl_c + " -"
@@ -1781,6 +1958,12 @@ fn execute(i: ref Intent, envpairs: []str, stdin: str, stdin_tty: int) -> own Ru
             }
             resp = resp2
         }
+    }
+    // W2 (spec sem-S3): a configured client cert that negotiated
+    // TLS 1.2 was not presented — upstream's std caveat is silent;
+    // ADR-0006 says say so.
+    if len(p.req.cert_pem) > 0 && resp.tls_ver == tls.V12 && i.quiet < 2 {
+        warn = warn + prog + ": warning: --cert client certificate was not presented: TLS 1.2 sends an empty certificate list in this build\n"
     }
     // --all / --history-print intermediate hops
     if i.all != 0 {

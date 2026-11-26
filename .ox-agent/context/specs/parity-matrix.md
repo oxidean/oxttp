@@ -19,12 +19,12 @@ Updated: 2026-11-25 · pin oxl 0.26.0
 | §4.5 Auth basic/bearer/digest | `done` | digest §D3 retry landed |
 | §4.5 `https://` / `--https` / `--verify=yes\|pem` | `done` | ADR-0026; PEM path + system roots |
 | §4.5 `--verify=no` | `done` | AcceptAll Verifier (IN-0005=B) |
-| §4.5 `--cert` / `--cert-key` | `next` | oxl 0.26.0 `tls.Config.client_cert` → WI-0013; cert is TLS 1.3-only — a negotiated 1.2 session sends empty certificate_list |
-| §4.5 `--ssl tls1.2` / `--native-tls` | `next` | oxl 0.26.0 `Config.min_ver/max_ver` (V12) → WI-0013 |
+| §4.5 `--cert` / `--cert-key` | `done` | oxl 0.26.0 `tls.Config.client_cert` → WI-0013; cert is TLS 1.3-only — a negotiated 1.2 session sends empty certificate_list |
+| §4.5 `--ssl tls1.2` / `--native-tls` | `done` | oxl 0.26.0 `Config.min_ver/max_ver` (V12) → WI-0013 |
 | §4.5 `--ssl tls1` / `tls1.1` | `oxl-blocked` | oxl rejects <V12 (deprecated versions); degrade = warn + auto-fallback per corpus §4.5 |
-| §4.5 HTTPS + `--proxy` CONNECT | `next` | oxl 0.26.0 `Request.proxy`/`connect_proxy` → WI-0013 |
+| §4.5 HTTPS + `--proxy` CONNECT | `done` | oxl 0.26.0 `Request.proxy`/`connect_proxy` → WI-0013 |
 | §4.6 `--http-version` 1.0/1.1 | `done` | H1 emits 1.0/1.1 |
-| §4.6 `--http-version` 2* | `next` | oxl 0.26.0 `http_version` "2"/"2-prior-knowledge" → WI-0013 |
+| §4.6 `--http-version` 2* | `done` | oxl 0.26.0 `http_version` "2"/"2-prior-knowledge" → WI-0013 |
 | §4.6 `--http-version` 3* | `oxl-blocked` | [#219](https://github.com/oxidean/oxl/issues/219) closed w/o consumable pkg — ADR-0029 |
 | §4.7 offline/curl/generate/check-status | `next`/`post` | check-status+curl done; generate `post` |
 | §5 `--curl` map | `next` | emit + Ignored warnings; map incomplete vs corpus |

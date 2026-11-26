@@ -43,7 +43,7 @@ fn fake_resp(status: int, ct: str, body: str, hops: own []model.Hop) -> model.Re
     tr.closed_ms = 0.1
     return model.Resp{status: status, reason: "OK", headers: hs,
         body: body as []byte, elapsed_ms: 14.0, remote: "127.0.0.1:9",
-        version: "1.1", req_head: "", hops: hops, trace: tr}
+        version: "1.1", req_head: "", hops: hops, trace: tr, tls_ver: 0}
 }
 
 // stage_send arms a.pending/a.pending_preq the way begin_send leaves

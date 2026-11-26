@@ -223,7 +223,7 @@ Short/long controlled by `--curl-long`. Order roughly: env-prefixes, flags, head
 | `--verify=<path>` | `--cacert <path>` |
 | `--cert/--cert-key` | `-E/--cert`, `--key` |
 | `--ssl=tlsX.Y` | `--tlsvX.Y --tls-max X.Y` |
-| `--proxy all:URL` | `-x/--proxy URL` |
+| `--proxy all:URL` | `-x/--proxy URL` — **oxttp deviation:** emits `all_proxy=URL` env prefix instead (a literal `-x` would shadow scheme-specific `*_proxy` entries emitted for combined sets) |
 | `--proxy http:URL` / `https:URL` | env prefix `http_proxy=URL` / `https_proxy=URL` |
 | `--timeout S` | `--max-time S` |
 | `--http-version` | `--http1.0` / `--http1.1` / `--http2` / `--http2-prior-knowledge` / `--http3-only` |

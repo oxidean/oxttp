@@ -58,6 +58,15 @@ struct Req {
     // jar_off disables the transport's in-chain cookie jar (posting's
     // attach_cookies=false); false keeps xh's always-on in-memory jar.
     jar_off: bool,
+    // WI-0013 protocol surfaces (spec sem-S1..S5, ADR-0030/0032):
+    h2: str, // "" none · "hint" = ALPN h2+http/1.1 · "prior" = h2c on http, ALPN-required h2 on https
+    ssl_min: int, // tls version floor (tls.V12/V13); 0 = build default range
+    ssl_max: int, // tls version ceiling; 0 = build default range
+    cert_pem: str, // client certificate PEM text; "" = none (plan reads files eagerly)
+    key_pem: str, // client key PEM text; "" = cert_pem is a combined PEM
+    proxies: []str, // verbatim --proxy "PROTO:URL" entries ("" list = use env)
+    proxy_env: []str, // captured "NAME=value" env proxy vars (empty when --proxy given)
+    no_proxy: str, // NO_PROXY/no_proxy comma list text
 }
 
 // ReqHead is what the wire emitted for one request — kept verbatim
@@ -101,10 +110,11 @@ struct Resp {
     body: []byte,
     elapsed_ms: float,
     remote: str,
-    version: str, // wire version token, e.g. "1.1" from "HTTP/1.1"
+    version: str, // wire version token, e.g. "1.1" from "HTTP/1.1"; "2.0" under h2
     req_head: str, // wire request head that produced this response (CRLF text)
     hops: own []Hop, // redirect-chain exchanges before this response
     trace: own Trace,
+    tls_ver: int, // negotiated TLS version (tls.V12/V13); 0 = cleartext
 }
 
 // status_class: <300 success(0), <400 redirect(1), else error(2) —

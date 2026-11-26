@@ -1255,11 +1255,19 @@ fn resolve(m: own args.Matches, envpairs: []str) -> own Out {
         }
         j = j + 1
     }
-    // proxy env capture (only when --proxy absent) + no_proxy
+    // proxy env capture (only when --proxy absent) + no_proxy.
+    // CGI guard (curl convention, spec sem-S5): under REQUEST_METHOD
+    // the uppercase HTTP_PROXY carries attacker-supplied "Proxy:"
+    // header text — skip it (lowercase http_proxy still applies).
     if len(o.intent.proxies) == 0 {
+        [_rm, rme] = env_lookup(envpairs, "REQUEST_METHOD")
         names := "HTTP_PROXY,HTTPS_PROXY,ALL_PROXY,http_proxy,https_proxy,all_proxy"
         cur := strings.split(names, ",")
         for cur != nil {
+            if rme == nil && cur.v == "HTTP_PROXY" {
+                cur = cur.next
+                continue
+            }
             [pv, pe] = env_lookup(envpairs, cur.v)
             if pe == nil {
                 o.intent.proxy_env = new(push(o.intent.proxy_env[:], cur.v + "=" + pv))
@@ -1317,10 +1325,6 @@ fn resolve(m: own args.Matches, envpairs: []str) -> own Out {
         defer_out(o, prog, "This binary was built without message signature support. Enable the `http-message-signatures` feature.")
         return o
     }
-    if o.intent.http_version == "3-prior-knowledge" {
-        defer_out(o, prog, "This binary was built without support for HTTP/3. Enable the `http3` feature.")
-        return o
-    }
     scheme := url_scheme(o.intent.url)
     if scheme != "http" && scheme != "https" {
         // ADR-0015 TLS deferral retained for non-http(s); https execs via
@@ -1328,29 +1332,26 @@ fn resolve(m: own args.Matches, envpairs: []str) -> own Out {
         defer_out(o, prog, scheme + " URLs are unsupported in this build (TLS is not available)")
         return o
     }
-    // --native-tls is inert on cleartext (ADR-0024); on https it would
-    // select a different stack, so degrade rather than silent oxl TLS.
-    if o.intent.native_tls != 0 && scheme == "https" {
-        defer_out(o, prog, "--native-tls is unsupported in this build (oxidean/oxl#221)")
-        return o
-    }
+    // --native-tls warning-degrades at plan on https (ADR-0031 —
+    // single TLS stack); inert on cleartext.
     // --curl never sends: skip connection-affecting degrades so the
-    // emit path can warn about ignored flags instead of exit 1.
+    // emit path can warn about ignored flags instead of exit 1. The
+    // h3 feature gate sits below this — upstream runs to_curl before
+    // the cfg check, so --curl emits --http3-only rather than error.
     if o.intent.curl != 0 {
         o.exec = 1
+        return o
+    }
+    if o.intent.http_version == "3-prior-knowledge" {
+        defer_out(o, prog, "This binary was built without support for HTTP/3. Enable the `http3` feature.")
         return o
     }
     // Degrade routing (ADR 0024): connection-affecting flags error
     // out; --debug degrades to a warning inside execute. S7 landed
     // --continue / --curl / --pretty (format-options still deferred).
-    if o.intent.http_version == "2" || o.intent.http_version == "2-prior-knowledge" {
-        defer_out(o, prog, "HTTP/2 requests are unsupported in this build")
-        return o
-    }
-    if len(o.intent.proxies[:]) > 0 || len(o.intent.proxy_env[:]) > 0 {
-        defer_out(o, prog, "proxies are unsupported in this build")
-        return o
-    }
+    // WI-0013 executes --http-version 2* (ADR-0030) and --proxy +
+    // env proxies (spec sem-S5); non-http proxy URL schemes degrade
+    // inside the transport per-hop.
     if len(o.intent.resolves[:]) > 0 {
         defer_out(o, prog, "--resolve is unsupported in this build")
         return o

@@ -235,3 +235,104 @@ fn test_exec_curl_ignored_warn() {
     testing.expect(find(r.stderr, "Warning: Ignored --pretty") >= 0, "ignored pretty: " + r.stderr)
     testing.expect(find(r.stderr, "Warning: Ignored --print") >= 0, "ignored print: " + r.stderr)
 }
+
+// WI-0013 P5 (spec sem-S4/S6): --native-tls joins the Ignored list
+// under --curl; --proxy left it (emits -x / env prefixes instead).
+fn test_exec_curl_native_tls_ignored() {
+    r := xrun("--curl\n--native-tls\nhttps://example.org/x", "", 1)
+    testing.expect_eq(r.code, 0, "curl exit")
+    testing.expect(find(r.stderr, "Warning: Ignored --native-tls") >= 0, "ignored native-tls: " + r.stderr)
+    r2 := xrun("--curl\n--proxy\nall:http://p:1\nhttps://example.org/x", "", 1)
+    testing.expect_eq(r2.code, 0, "curl exit")
+    testing.expect(find(r2.stderr, "Ignored --proxy") < 0, "proxy emits now: " + r2.stderr)
+    // all: rides all_proxy env — curl's -x would override scheme envs (F4)
+    testing.expect(find(r2.stdout, "all_proxy='http://p:1'") >= 0, "all_proxy emitted: " + r2.stdout)
+    testing.expect(find(r2.stdout, "-x ") < 0, "no -x flag: " + r2.stdout)
+    r3 := xrun("--curl-long\n--proxy\nall:http://p:1\n--cert\ntests/golden/fixtures/dev-cert.pem\n--cert-key\ntests/golden/fixtures/dev-key.pem\nhttps://example.org/x", "", 1)
+    testing.expect(find(r3.stdout, "all_proxy='http://p:1'") >= 0, "long all_proxy: " + r3.stdout)
+    testing.expect(find(r3.stdout, "--cert 'tests/golden/fixtures/dev-cert.pem'") >= 0, "long --cert: " + r3.stdout)
+    testing.expect(find(r3.stdout, "--key 'tests/golden/fixtures/dev-key.pem'") >= 0, "long --key: " + r3.stdout)
+}
+
+// WI-0013 P2 — ADR-0031: --native-tls on https is a warning-degrade
+// (single TLS stack), inert on cleartext; exit-1 defer retired.
+fn test_exec_native_tls_warns() {
+    r := xrun("--native-tls\n--offline\nhttps://example.org/x", "", 1)
+    testing.expect_eq(r.code, 0, "native-tls https execs: " + r.stderr)
+    testing.expect(find(r.stderr, "warning: --native-tls selects an alternate TLS backend") >= 0, "W3 warn: " + r.stderr)
+    r2 := xrun("--native-tls\n--offline\nhttp://example.org/x", "", 1)
+    testing.expect_eq(r2.code, 0, "native-tls http execs: " + r2.stderr)
+    testing.expect(find(r2.stderr, "native-tls") < 0, "cleartext inert: " + r2.stderr)
+}
+
+// WI-0013 P2 — --ssl map (spec sem-S2): tls1/1.1 warn+fallback;
+// tls1.2/1.3 silent; auto silent.
+fn test_exec_ssl_warns_and_map() {
+    r := xrun("--ssl\ntls1\n--offline\nhttps://example.org", "", 1)
+    testing.expect_eq(r.code, 0, "tls1 execs: " + r.stderr)
+    testing.expect(find(r.stderr, "rustls does not support older TLS versions") >= 0, "W1 warn: " + r.stderr)
+    r2 := xrun("--ssl\ntls1.1\n--offline\nhttps://example.org", "", 1)
+    testing.expect(find(r2.stderr, "rustls does not support older TLS versions") >= 0, "W1 tls1.1: " + r2.stderr)
+    r3 := xrun("--ssl\ntls1.2\n--offline\nhttps://example.org", "", 1)
+    testing.expect(find(r3.stderr, "older TLS") < 0, "tls1.2 silent: " + r3.stderr)
+    r4 := xrun("--ssl\nauto\n--offline\nhttps://example.org", "", 1)
+    testing.expect(find(r4.stderr, "older TLS") < 0, "auto silent: " + r4.stderr)
+}
+
+// WI-0013 P2 — --cert/--cert-key read eagerly at plan (xh validates
+// at client build, scheme-blind): missing file errors exit 1;
+// a present file is inert on cleartext+offline.
+fn test_exec_cert_files() {
+    r := xrun("--cert\n/no/such/cert.pem\n--offline\nexample.org", "", 1)
+    testing.expect_eq(r.code, 1, "missing cert exit 1")
+    testing.expect(find(r.stderr, "cert file not found") >= 0, "names cert: " + r.stderr)
+    os.writefile_("/tmp/oxttp-ctest.pem", "not a real pem")
+    r2 := xrun("--cert\n/tmp/oxttp-ctest.pem\n--cert-key\n/no/such/key.pem\n--offline\nexample.org", "", 1)
+    testing.expect_eq(r2.code, 1, "missing cert-key exit 1")
+    testing.expect(find(r2.stderr, "cert-key file not found") >= 0, "names key: " + r2.stderr)
+    // bad PEM errors eagerly (upstream validates at client build) —
+    // even --offline. spec AC6.
+    r3 := xrun("--cert\n/tmp/oxttp-ctest.pem\n--offline\nexample.org", "", 1)
+    testing.expect_eq(r3.code, 1, "bad pem exit 1: " + r3.stderr)
+    testing.expect(find(r3.stderr, "couldn't load client certificate") >= 0, "pem err text: " + r3.stderr)
+    // a valid identity parses eagerly and offline still passes
+    r4 := xrun("--cert\ntests/golden/fixtures/dev-cert.pem\n--cert-key\ntests/golden/fixtures/dev-key.pem\n--offline\nexample.org", "", 1)
+    testing.expect_eq(r4.code, 0, "valid pem offline passes: " + r4.stderr)
+    // --cert-key alone (no --cert) is ignored, matching upstream
+    r5 := xrun("--cert-key\n/no/such/key.pem\n--offline\nexample.org", "", 1)
+    testing.expect_eq(r5.code, 0, "lone cert-key ignored: " + r5.stderr)
+    os.remove("/tmp/oxttp-ctest.pem")
+}
+
+// --curl proxy emit: EVERY entry emits in order (upstream to_curl;
+// shell-last-wins then matches pick_proxy's last-match), all: ->
+// all_proxy env, and explicit entries clear unspecified ambient
+// proxy envs (invented but documented — spec D7).
+fn test_exec_curl_proxy_emit() {
+    r := xrun("--curl\n--offline\n--proxy\nall:http://pa:1\n--proxy\nhttp:http://ph:2\n--proxy\nhttp:http://second:3\n--proxy\nhttps:http://ps:4\nhttp://example.org/", "", 1)
+    testing.expect_eq(r.code, 0, "curl exit: " + r.stderr)
+    o := r.stdout
+    testing.expect(find(o, "all_proxy='http://pa:1'") >= 0, "all_proxy env: " + o)
+    testing.expect(find(o, " -x ") < 0, "no -x flag: " + o)
+    testing.expect(find(o, "http_proxy='http://ph:2'") >= 0, "first http proxy: " + o)
+    testing.expect(find(o, "http_proxy='http://second:3'") >= 0, "second http entry emitted (last wins): " + o)
+    testing.expect(find(o, "https_proxy='http://ps:4'") >= 0, "https proxy: " + o)
+    // all protos covered -> no ambient clearing emitted
+    testing.expect(find(o, "HTTP_PROXY=") < 0, "no clearing needed: " + o)
+    // only http: set -> https/all ambient envs cleared in the emit
+    r2 := xrun("--curl\n--offline\n--proxy\nhttp:http://ph:2\nhttp://example.org/", "", 1)
+    o2 := r2.stdout
+    testing.expect(find(o2, "https_proxy= HTTPS_PROXY=") >= 0, "https ambient cleared: " + o2)
+    testing.expect(find(o2, "all_proxy= ALL_PROXY=") >= 0, "all ambient cleared: " + o2)
+    testing.expect(find(o2, "http_proxy='http://ph:2'") >= 0, "explicit http kept: " + o2)
+}
+
+// CodeRabbit review F1 — an explicitly supplied but empty --cert-key
+// file errors instead of falling back to the cert PEM.
+fn test_exec_cert_key_empty() {
+    os.writefile_("/tmp/oxttp-ckey-empty.pem", "")
+    r := xrun("--cert\ntests/golden/fixtures/dev-cert.pem\n--cert-key\n/tmp/oxttp-ckey-empty.pem\n--offline\nexample.org", "", 1)
+    testing.expect_eq(r.code, 1, "empty key exit 1")
+    testing.expect(find(r.stderr, "cert-key file is empty") >= 0, "empty key err: " + r.stderr)
+    os.remove("/tmp/oxttp-ckey-empty.pem")
+}

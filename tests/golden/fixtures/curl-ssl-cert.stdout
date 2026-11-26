@@ -1,0 +1,1 @@
+curl -E 'tests/golden/fixtures/dev-cert.pem' --key 'tests/golden/fixtures/dev-key.pem' --tlsv1.2 --tls-max 1.2 -H 'Accept-Encoding: <AE>' -H 'User-Agent: <V>' -H 'Connection: <CONN>' -H 'Accept: */*' 'https://example.org/'

@@ -1,0 +1,2 @@
+# --curl pin (WI-0013 sem-S6): 2-prior-knowledge -> --http2-prior-knowledge.
+argv: --curl --http-version 2-prior-knowledge GET https://example.org/

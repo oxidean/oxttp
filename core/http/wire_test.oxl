@@ -351,3 +351,44 @@ fn hexv(c: int) -> int {
     }
     return -1
 }
+
+fn test_h2_check_length() {
+    let rh: []model.Header = nil
+    rh = push(rh, model.Header{name: "Content-Length", value: "5"})
+    testing.expect(h2_check_length("GET", 200, rh, 5) == nil, "declared == received ok")
+    testing.expect(h2_check_length("GET", 200, rh, 4) != nil, "short body rejected")
+    testing.expect(h2_check_length("GET", 200, rh, 6) != nil, "long body rejected")
+    testing.expect(h2_check_length("HEAD", 200, rh, 0) == nil, "HEAD exempt")
+    testing.expect(h2_check_length("GET", 204, rh, 0) == nil, "204 exempt")
+    testing.expect(h2_check_length("GET", 304, rh, 0) == nil, "304 exempt")
+
+    let none: []model.Header = nil
+    testing.expect(h2_check_length("GET", 200, none, 9) == nil, "absent tolerated")
+
+    let dup: []model.Header = nil
+    dup = push(dup, model.Header{name: "content-length", value: "5"})
+    dup = push(dup, model.Header{name: "Content-Length", value: "5"})
+    testing.expect(h2_check_length("GET", 200, dup, 5) == nil, "agreeing dup ok")
+
+    let bad: []model.Header = nil
+    bad = push(bad, model.Header{name: "content-length", value: "5"})
+    bad = push(bad, model.Header{name: "content-length", value: "7"})
+    testing.expect(h2_check_length("GET", 200, bad, 5) != nil, "conflicting dup rejected")
+
+    let junk: []model.Header = nil
+    junk = push(junk, model.Header{name: "content-length", value: "x"})
+    testing.expect(h2_check_length("GET", 200, junk, 0) != nil, "non-numeric rejected")
+}
+
+fn test_h2_te_canonical() {
+    let hs: []model.Header = nil
+    hs = push(hs, model.Header{name: "TE", value: "Trailers"})
+    hs = push(hs, model.Header{name: "te", value: "deflate"})
+    hs = push(hs, model.Header{name: "x-a", value: "1"})
+    hh := h2_push(nil, hs)
+    testing.expect_eq(len(hh), 2, "only trailers te + x-a forwarded")
+    testing.expect_streq(hh[0].value, "trailers", "te value canonicalized")
+    safe := h2_safe(hs)
+    testing.expect_eq(len(safe), 2, "h2_safe same drop set")
+    testing.expect_streq(safe[0].value, "trailers", "h2_safe te canonicalized")
+}
