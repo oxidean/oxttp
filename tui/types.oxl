@@ -75,9 +75,28 @@ struct Toast {
     msg: str,
 }
 
+// RDraft is one open request editor's full snapshot — corpus §4.5/§8.6:
+// every open tab is an INDEPENDENT request draft (url, method/kind,
+// headers/query/path tables, body, and its response buffer).
+struct RDraft {
+    url: LineEdit,
+    method: str,
+    kind: int,
+    req_tab: int,
+    resp_tab: int,
+    body_ct: int,
+    headers: KVTable,
+    query_kv: KVTable,
+    path_kv: KVTable,
+    body: TextView,
+    resp_view: TextView,
+    resp_rows: ListCur,
+}
+
 struct RTab {
     title: str,
     preview: bool,
+    draft: RDraft,
 }
 
 struct PItem {

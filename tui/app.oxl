@@ -19,7 +19,7 @@ fn new_app() -> own App {
     a.req_tab = 0
     a.resp_tab = 0
     a.tabs = mkslice(RTab, 0)
-    a.tabs = push(a.tabs, RTab{title: "Untitled request", preview: true})
+    a.tabs = push(a.tabs, RTab{title: "Untitled request", preview: true, draft: new_draft()})
     a.cur_tab = 0
     a.sidebar_on = true  // collection_browser.show_on_startup
     a.sidebar_pos = 0
@@ -73,6 +73,100 @@ fn demo_tree() -> Tree {
     t.nodes = push(t.nodes, TreeNode{name: "create-user", depth: 1, is_dir: false, open: false, stub: false})
     t.nodes = push(t.nodes, TreeNode{name: "health", depth: 0, is_dir: false, open: false, stub: false})
     return t
+}
+
+// --- per-tab request drafts (corpus §4.5/§8.6) ---
+// Each RTab owns an RDraft; every tab-selection path captures the
+// live editor into the outgoing tab's draft and restores the incoming
+// tab's — no two tabs ever share url/method/headers/body state.
+
+fn new_draft() -> RDraft {
+    return RDraft{url: new_line_edit(""), method: "GET", kind: KHttp,
+        req_tab: 0, resp_tab: 0, body_ct: 0,
+        headers: new_kv(), query_kv: new_kv(), path_kv: new_kv(),
+        body: new_text_view(""),
+        resp_view: new_text_view("No response yet — send lands in S10."),
+        resp_rows: new_list(0)}
+}
+
+fn copy_kv_rows(rows: []KVRow) -> []KVRow {
+    out := mkslice(KVRow, len(rows))
+    i := 0
+    for i < len(rows) {
+        out[i] = rows[i]
+        i = i + 1
+    }
+    return out
+}
+
+fn copy_strs(xs: []str) -> []str {
+    out := mkslice(str, len(xs))
+    i := 0
+    for i < len(xs) {
+        out[i] = xs[i]
+        i = i + 1
+    }
+    return out
+}
+
+fn copy_ints(xs: []int) -> []int {
+    out := mkslice(int, len(xs))
+    i := 0
+    for i < len(xs) {
+        out[i] = xs[i]
+        i = i + 1
+    }
+    return out
+}
+
+fn copy_kv(t: KVTable) -> KVTable {
+    c := t
+    c.rows = copy_kv_rows(t.rows)
+    return c
+}
+
+fn copy_tv(v: TextView) -> TextView {
+    c := v
+    c.lines = copy_strs(v.lines)
+    c.search_hits = copy_ints(v.search_hits)
+    return c
+}
+
+// draft_capture snapshots the live editor; draft_restore installs a
+// stored one. Both deep-copy the slice fields so the live tables can
+// never alias a saved draft's rows/lines.
+fn draft_capture(a: ref App) -> RDraft {
+    return RDraft{url: a.url, method: a.method, kind: a.kind,
+        req_tab: a.req_tab, resp_tab: a.resp_tab, body_ct: a.body_ct,
+        headers: copy_kv(a.headers), query_kv: copy_kv(a.query_kv),
+        path_kv: copy_kv(a.path_kv), body: copy_tv(a.body),
+        resp_view: copy_tv(a.resp_view), resp_rows: a.resp_rows}
+}
+
+fn draft_restore(a: mut App, d: RDraft) {
+    a.url = d.url
+    a.method = d.method
+    a.kind = d.kind
+    a.req_tab = d.req_tab
+    a.resp_tab = d.resp_tab
+    a.body_ct = d.body_ct
+    a.headers = copy_kv(d.headers)
+    a.query_kv = copy_kv(d.query_kv)
+    a.path_kv = copy_kv(d.path_kv)
+    a.body = copy_tv(d.body)
+    a.resp_view = copy_tv(d.resp_view)
+    a.resp_rows = d.resp_rows
+}
+
+// tab_select switches request tabs: capture the live editor into the
+// outgoing tab's draft, then restore the incoming tab's.
+fn tab_select(a: mut App, i: int) {
+    if i < 0 || i >= len(a.tabs) || i == a.cur_tab {
+        return
+    }
+    a.tabs[a.cur_tab].draft = draft_capture(a)
+    a.cur_tab = i
+    draft_restore(a, a.tabs[i].draft)
 }
 
 fn (a mut App) toast(level: int, msg: str) {
@@ -659,8 +753,10 @@ fn global_action(a: mut App, act: str) -> int {
     } else if act == "save-request" {
         push_modal(a, MSaveReq)
     } else if act == "new-request" {
-        a.tabs = push(a.tabs, RTab{title: "Untitled request", preview: true})
-        a.cur_tab = len(a.tabs) - 1
+        // new tab = a fresh blank draft; the outgoing tab's live
+        // state is captured by tab_select.
+        a.tabs = push(a.tabs, RTab{title: "Untitled request", preview: true, draft: new_draft()})
+        tab_select(a, len(a.tabs) - 1)
     } else if act == "close-tab" {
         if len(a.tabs) > 1 {
             out := mkslice(RTab, 0)
@@ -675,6 +771,8 @@ fn global_action(a: mut App, act: str) -> int {
             if a.cur_tab >= len(a.tabs) {
                 a.cur_tab = len(a.tabs) - 1
             }
+            // the surviving tab's draft replaces the closed tab's
+            draft_restore(a, a.tabs[a.cur_tab].draft)
         }
     } else if act == "keep-tab" {
         i := a.cur_tab
@@ -683,14 +781,15 @@ fn global_action(a: mut App, act: str) -> int {
         }
     } else if act == "next-tab" {
         if len(a.tabs) > 0 {
-            a.cur_tab = (a.cur_tab + 1) - ((a.cur_tab + 1) / len(a.tabs)) * len(a.tabs)
+            tab_select(a, (a.cur_tab + 1) - ((a.cur_tab + 1) / len(a.tabs)) * len(a.tabs))
         }
     } else if act == "previous-tab" {
         if len(a.tabs) > 0 {
-            a.cur_tab = a.cur_tab - 1
-            if a.cur_tab < 0 {
-                a.cur_tab = len(a.tabs) - 1
+            i := a.cur_tab - 1
+            if i < 0 {
+                i = len(a.tabs) - 1
             }
+            tab_select(a, i)
         }
     } else if act == "search-tabs" {
         push_modal(a, MSearchTabs)
@@ -1574,7 +1673,7 @@ fn modal_action(a: mut App, m: int, act: str, ev: term.KeyEvent) -> int {
             a.tabsearch.move(1, false)
         } else if act == "tabsearch-pick" {
             if a.tabsearch.sel < len(a.tabs) {
-                a.cur_tab = a.tabsearch.sel
+                tab_select(a, a.tabsearch.sel)
             }
             pop_modal(a)
         }

@@ -531,6 +531,51 @@ fn test_sidebar_hit_test_uses_y() {
     testing.expect_eq(a.focus, FSidebar, "inside rect → sidebar")
 }
 
+fn test_per_tab_drafts() {
+    // each request tab owns an independent draft — switching saves +
+    // restores url/method/headers/body (corpus §4.5/§8.6).
+    a := new_app()
+    a.focus = FUrl
+    feed_text(a, "http://one.test")
+    dispatch(a, kev("n", true, false, false)) // new-request
+    testing.expect_eq(len(a.tabs), 2, "two tabs")
+    testing.expect_eq(a.cur_tab, 1, "moved to new tab")
+    testing.expect_streq(a.url.text, "", "new tab starts blank")
+    feed_text(a, "http://two.test")
+    a.focus = FReqPane
+    feed_text(a, "xh") // headers cell on tab 1
+    testing.expect_streq(a.headers.rows[0].name, "xh", "tab1 header")
+    dispatch(a, knamed_mod(term.KeyLeft, false, true, false)) // prev
+    testing.expect_eq(a.cur_tab, 0, "back to tab0")
+    testing.expect_streq(a.url.text, "http://one.test", "tab0 url restored")
+    a.focus = FReqPane
+    testing.expect_streq(a.headers.rows[0].name, "", "tab0 headers blank")
+    dispatch(a, knamed_mod(term.KeyRight, false, true, false)) // next
+    testing.expect_streq(a.url.text, "http://two.test", "tab1 url restored")
+    a.focus = FReqPane
+    testing.expect_streq(a.headers.rows[0].name, "xh", "tab1 headers restored")
+    // editing tab1 must not leak into the saved draft until capture
+    a.headers.rows[0].name = "xh2"
+    dispatch(a, knamed_mod(term.KeyLeft, false, true, false))
+    dispatch(a, knamed_mod(term.KeyRight, false, true, false))
+    a.focus = FReqPane
+    testing.expect_streq(a.headers.rows[0].name, "xh2", "edits persist across round-trip")
+    // closing the current tab lands on the survivor's draft
+    dispatch(a, kev("w", false, true, false)) // close-tab on tab1
+    testing.expect_eq(len(a.tabs), 1, "closed")
+    testing.expect_streq(a.url.text, "http://one.test", "survivor's draft live")
+    // tab picker path also restores drafts
+    a2 := new_app()
+    feed_text(a2, "http://first.test")
+    dispatch(a2, kev("n", true, false, false))
+    feed_text(a2, "http://second.test")
+    dispatch(a2, knamed_mod(term.KeyDown, false, true, false)) // search-tabs
+    a2.tabsearch.sel = 0
+    dispatch(a2, knamed(term.KeyEnter)) // pick tab0
+    testing.expect_eq(a2.cur_tab, 0, "picked tab0")
+    testing.expect_streq(a2.url.text, "http://first.test", "picker restores draft")
+}
+
 fn test_method_menu_kind_first() {
     // GraphQL stores method="POST" — reopening the menu must highlight
     // GraphQL, not HTTP POST (else Enter silently reverts the kind).
