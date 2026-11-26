@@ -2,10 +2,11 @@
   "schema_version": 1,
   "id": "WI-0014",
   "title": "S10 TUI collections and send path",
-  "state": "implementing",
+  "state": "blocked",
   "profile": "normal",
-  "current_stage": "implementation",
+  "current_stage": "shipping",
+  "blocked_from": "shipping",
   "created_at": "2026-11-26T01:31:36Z",
-  "updated_at": "2026-11-26T02:24:10Z",
+  "updated_at": "2026-11-26T05:28:20Z",
   "git_baseline": "00eb9bd1257c7df7897f92e31e33855a1e9abd14"
 }

@@ -1,0 +1,9 @@
+schema_version: 1
+request_id: IN-0011
+work_item_id: WI-0014
+run_id: run_1795670881948_641180
+kind: clarification
+question: 'Ship gate: WI-0014 S10 TUI collections + envs + send path is verified and ready to push/PR — needs human approval to proceed (branch feat/wi-0014-s10-tui-send, PR title ''feat(tui): S10 collections and send path'').'
+status: pending
+created_by: ox-agent
+created_at: "2026-11-26T05:28:20Z"
