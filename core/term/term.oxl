@@ -80,3 +80,11 @@ interface Screen {
     present() -> err
     cursor(x: int, y: int, show: bool)
 }
+
+// DecRes is one decode step (oxl multi-return is [v,err] only).
+struct DecRes {
+    used: int,
+    ev: KeyEvent,
+    ok: bool,
+    more: bool,
+}

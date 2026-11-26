@@ -88,3 +88,42 @@ fn test_ansi_grid() {
 fn test_sgr_attr_plain() {
     testing.expect_streq(sgr_attr(0), "0", "plain")
 }
+
+fn test_wide_overwrite_drops_mate() {
+    // overwriting EITHER half of a wide pair must drop the mate —
+    // a stale "" continuation prints the next cell one column
+    // early, a stale lead overprints the new cell.
+    a := new_ansi(10, 2)
+    a.set_cell(0, 0, "界", 7, -1, 0)
+    a.set_wide_cont(1, 0)
+    a.set_cell(2, 0, "b", 7, -1, 0)
+    // replace the lead
+    a.set_cell(0, 0, "A", 7, -1, 0)
+    testing.expect_streq(a.chs[0], "A", "lead replaced")
+    testing.expect_streq(a.chs[1], " ", "stale cont blanked")
+    testing.expect_streq(a.chs[2], "b", "next cell unmoved")
+    // replace the continuation
+    b := new_ansi(10, 2)
+    b.set_cell(0, 0, "界", 7, -1, 0)
+    b.set_wide_cont(1, 0)
+    b.set_cell(1, 0, "B", 7, -1, 0)
+    testing.expect_streq(b.chs[0], " ", "stale lead blanked")
+    testing.expect_streq(b.chs[1], "B", "cont replaced")
+    // untouched pairs survive unrelated writes
+    c := new_ansi(10, 2)
+    c.set_cell(0, 0, "界", 7, -1, 0)
+    c.set_wide_cont(1, 0)
+    c.set_cell(3, 0, "z", 7, -1, 0)
+    testing.expect_streq(c.chs[0], "界", "lead intact")
+    testing.expect_streq(c.chs[1], "", "cont intact")
+    testing.expect_streq(c.chs[3], "z", "far cell")
+    // and a cont-over-write keeps column accounting for present()
+    d := new_ansi(10, 2)
+    d.set_cell(0, 0, "界", 7, -1, 0)
+    d.set_wide_cont(1, 0)
+    d.set_cell(0, 0, "界", 7, -1, 0)   // rewrite same lead
+    d.set_wide_cont(1, 0)              // re-mark cont — still paired
+    testing.expect_streq(d.chs[0], "界", "lead rewritten")
+    testing.expect_streq(d.chs[1], "", "cont remarked")
+    testing.expect_streq(d.chs[2], " ", "no orphan")
+}

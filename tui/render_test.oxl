@@ -1,0 +1,339 @@
+package main
+
+// Render tests — MockScreen is core/term's own AnsiScreen
+// (headless: cells land in chs/attrs, no tty writes until present).
+
+import "std/testing"
+
+import "std/os"
+
+import "github.com/oxidean/oxttp/core/term"
+
+fn cell_at(s: ref term.AnsiScreen, x: int, y: int) -> str {
+    return s.chs[y * s.cols + x]
+}
+
+fn row_str(s: ref term.AnsiScreen, y: int) -> str {
+    out := ""
+    x := 0
+    for x < s.cols {
+        out = out + s.chs[y * s.cols + x]
+        x = x + 1
+    }
+    return out
+}
+
+fn has_text(s: ref term.AnsiScreen, y: int, sub: str) -> bool {
+    row := row_str(s, y)
+    i := 0
+    for i + len(sub) <= len(row) {
+        if substr(row, i, i + len(sub)) == sub {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn test_render_header_url_footer() {
+    scr := term.new_ansi(80, 24)
+    a := new_app()
+    a.url.text = "https://example.com"
+    render(a, scr, "0.0.0-test")
+    testing.expect(has_text(scr, 0, "oxttp-tui 0.0.0-test"), "header")
+    testing.expect(has_text(scr, 0, "env (none)"), "env in header")
+    testing.expect(has_text(scr, 1, "[GET]"), "method cell")
+    testing.expect(has_text(scr, 1, "https://example.com"), "url text")
+    testing.expect(has_text(scr, 23, "quit"), "footer hints")
+}
+
+fn test_render_sidebar_positions() {
+    scr := term.new_ansi(80, 24)
+    a := new_app()
+    render(a, scr, "v")
+    // sidebar on by default, left → "|" at col 0 in body region
+    testing.expect_streq(cell_at(scr, 0, 10), "|", "left sidebar border")
+    testing.expect_eq(a.r_sidebar_x, 0, "sidebar rect x")
+    testing.expect(a.r_sidebar_w > 0, "sidebar w")
+    // right position
+    a.sidebar_pos = 1
+    scr2 := term.new_ansi(80, 24)
+    render(a, scr2, "v")
+    testing.expect_streq(cell_at(scr2, 79, 10), "|", "right sidebar border")
+    testing.expect_eq(a.r_sidebar_x, 80 - a.r_sidebar_w, "right x")
+    // hidden
+    a.sidebar_on = false
+    scr3 := term.new_ansi(80, 24)
+    render(a, scr3, "v")
+    testing.expect_eq(a.r_sidebar_w, 0, "hidden w=0")
+    testing.expect_eq(a.r_main_x, 0, "main takes full")
+}
+
+fn test_render_splits() {
+    a := new_app()
+    // vertical: request pane above response
+    scr := term.new_ansi(80, 24)
+    render(a, scr, "v")
+    testing.expect(a.r_req_y < a.r_resp_y, "vertical req over resp")
+    testing.expect(a.r_req_h + a.r_resp_h == 18, "stacked fills body")
+    // horizontal: side by side
+    a.layout = 1
+    scr2 := term.new_ansi(80, 24)
+    render(a, scr2, "v")
+    testing.expect_eq(a.r_req_y, a.r_resp_y, "horizontal same row")
+    // expanded: request maximized
+    a.layout = 0
+    a.expanded = 1
+    scr3 := term.new_ansi(80, 24)
+    render(a, scr3, "v")
+    testing.expect_eq(a.r_resp_h, 0, "resp hidden when req expanded")
+    a.expanded = 2
+    scr4 := term.new_ansi(80, 24)
+    render(a, scr4, "v")
+    testing.expect_eq(a.r_req_h, 0, "req hidden when resp expanded")
+}
+
+fn test_render_per_kind_tabs() {
+    a := new_app()
+    a.kind = KWs
+    scr := term.new_ansi(80, 24)
+    render(a, scr, "v")
+    testing.expect(has_text(scr, 5, "Message"), "ws tab set")
+    a.kind = KGrpc
+    scr2 := term.new_ansi(80, 24)
+    render(a, scr2, "v")
+    testing.expect(has_text(scr2, 5, "Proto"), "grpc tab set")
+}
+
+fn test_render_focused_border() {
+    a := new_app()
+    a.focus = FReqPane
+    scr := term.new_ansi(80, 24)
+    render(a, scr, "v")
+    // focused pane title bold: find "request" title attr on req top row
+    x := a.r_sidebar_w + 3
+    i := a.r_req_y * scr.cols + x
+    testing.expect(scr.attrs[i] >= term.AttrBold, "focused title bold")
+    // unfocused pane title dim
+    j := a.r_resp_y * scr.cols + x
+    testing.expect(scr.attrs[j] >= term.AttrDim, "unfocused title dim")
+}
+
+fn test_render_toast_and_modal() {
+    a := new_app()
+    a.toast(2, "oops happened")
+    scr := term.new_ansi(80, 24)
+    render(a, scr, "v")
+    testing.expect(has_text(scr, 22, "oops happened"), "toast row")
+    // palette overlay paints over the body
+    push_modal(a, MPalette)
+    scr2 := term.new_ansi(80, 24)
+    render(a, scr2, "v")
+    testing.expect(has_text(scr2, 4, "palette"), "modal title")
+}
+
+fn test_modal_rect_contents_positioned() {
+    // draw_modal's rect must be the real x/y/w/h — contents go to the
+    // centered box, not 0,0.
+    a := new_app()
+    push_modal(a, MConfirm)
+    a.confirm_msg = "Really delete?"
+    scr := term.new_ansi(80, 24)
+    render(a, scr, "v")
+    // centered 50x7 box: x=(80-50)/2=15, y=(24-7)/2=8 — message lands
+    // inside it, row 0 keeps the header text.
+    testing.expect(has_text(scr, 10, "Really delete?"), "confirm text inside modal")
+    testing.expect(has_text(scr, 0, "oxttp-tui"), "header still top row")
+    found := false
+    y := 0
+    for y < 24 {
+        if has_text(scr, y, "enter = yes") {
+            found = true
+        }
+        y = y + 1
+    }
+    testing.expect(found, "confirm hint rendered")
+}
+
+fn test_palette_scrolls_to_selection() {
+    // with more items than the modal's visible rows, the window must
+    // scroll so pal_sel stays on screen (Enter uses absolute index).
+    a := new_app()
+    push_modal(a, MPalette)
+    a.pal_sel = 20 // past the first window
+    scr := term.new_ansi(80, 24)
+    render(a, scr, "v")
+    items := palette_filtered(a)
+    want := items[a.pal_sel].name
+    y := 0
+    found := false
+    for y < 24 {
+        if has_text(scr, y, want) {
+            found = true
+        }
+        y = y + 1
+    }
+    testing.expect(found, "selected palette row rendered onscreen")
+}
+
+fn test_render_frame_clears_stale_cells() {
+    // rendering twice into the same screen must leave no stale cells:
+    // deleted chars and closed modals disappear.
+    a := new_app()
+    scr := term.new_ansi(80, 24)
+    a.url.text = "https://very-long-hostname.example/path"
+    render(a, scr, "v")
+    a.url.text = "x"
+    render(a, scr, "v")
+    testing.expect(!has_text(scr, 1, "hostname"), "old url tail cleared")
+    // closed modal leaves no overlay behind
+    push_modal(a, MHelp)
+    render(a, scr, "v")
+    pop_modal(a)
+    render(a, scr, "v")
+    y := 0
+    for y < 24 {
+        testing.expect(!has_text(scr, y, "global keys:"), "help modal cleared")
+        y = y + 1
+    }
+}
+
+fn test_render_utf8_glyphs_whole() {
+    // multibyte glyphs land as complete cell contents — never split
+    // into byte fragments (sidebar ▸, vars mask •).
+    scr := term.new_ansi(80, 24)
+    a := new_app()
+    a.coll = demo_tree()
+    a.coll.nodes[0].open = false // ▸ closed folder glyph
+    render(a, scr, "v")
+    y := 0
+    found := false
+    for y < 24 {
+        x := 0
+        for x < 80 {
+            c := cell_at(scr, x, y)
+            if c == "▸" {
+                found = true
+            }
+            if len(c) == 1 && byteat(c, 0) >= 128 {
+                testing.expect(false, "byte fragment in cell")
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    testing.expect(found, "▸ glyph stored whole")
+    // clipping is by display columns, not bytes
+    scr2 := term.new_ansi(80, 24)
+    put_str_max(scr2, 0, 0, "abécd", 4, 7, 0)
+    testing.expect_streq(cell_at(scr2, 0, 0), "a", "col0")
+    testing.expect_streq(cell_at(scr2, 2, 0), "é", "whole é at col2")
+    testing.expect_streq(cell_at(scr2, 3, 0), "c", "clipped at 4 cols")
+    testing.expect_streq(cell_at(scr2, 4, 0), " ", "d clipped")
+    // a wide glyph that doesn't fit is dropped, not half-drawn
+    put_str_max(scr2, 0, 1, "x中", 2, 7, 0)
+    testing.expect_streq(cell_at(scr2, 0, 1), "x", "x fits")
+    testing.expect_streq(cell_at(scr2, 1, 1), " ", "2-col glyph dropped at edge")
+    // and when it does fit, its continuation cell stays empty
+    put_str_max(scr2, 0, 2, "中z", 3, 7, 0)
+    testing.expect_streq(cell_at(scr2, 0, 2), "中", "wide glyph")
+    testing.expect_streq(cell_at(scr2, 1, 2), "", "wide continuation empty")
+    testing.expect_streq(cell_at(scr2, 2, 2), "z", "z lands after 2 cols")
+}
+
+fn test_screenshot_text_write() {
+    a := new_app()
+    a.url.text = "https://shot.test"
+    scr := term.new_ansi(60, 10)
+    render(a, scr, "v1")
+    p := "/tmp/oxttp-shot-test.txt"
+    we := write_screenshot(scr, p)
+    testing.expect(we == nil, "write ok")
+    data := os.readfile_(p)
+    testing.expect(str_contains(data, "oxttp-tui v1"), "header in shot")
+    testing.expect(str_contains(data, "https://shot.test"), "url in shot")
+    // bad path → err so the loop can toast honestly
+    we2 := write_screenshot(scr, "/nonexistent-dir-xyz/shot.txt")
+    testing.expect(we2 != nil, "bad path errors")
+    os.remove(p)
+}
+
+
+fn test_render_url_hscrolls_to_cursor() {
+    // a URL wider than the field h-scrolls so the insertion point
+    // stays visible — the tail (and cursor) land inside the bar.
+    a := new_app()
+    u := "http://x/"
+    i := 0
+    for i < 80 {
+        u = u + "a"
+        i = i + 1
+    }
+    u = u + "END"
+    a.url.text = u
+    a.url.cur = len(u)
+    a.focus = FUrl
+    scr := term.new_ansi(80, 24)
+    render(a, scr, "v")
+    testing.expect(has_text(scr, 1, "END"), "url tail visible")
+    testing.expect_eq(scr.cx, 78, "cursor at field edge")
+    // short url: no scroll, cursor right after the text
+    a2 := new_app()
+    a2.url.text = "http://x"
+    a2.url.cur = 8
+    a2.focus = FUrl
+    scr2 := term.new_ansi(80, 24)
+    render(a2, scr2, "v")
+    testing.expect(has_text(scr2, 1, "http://x"), "short url from col 0")
+    testing.expect_eq(scr2.cx, 20, "cursor after text")
+}
+
+fn test_render_kv_scrolls_to_selection() {
+    // selection past the visible window scrolls the table so the
+    // selected row is drawn (and highlight-able).
+    a := new_app()
+    i := 0
+    for i < 12 {
+        a.headers.rows = push(a.headers.rows, KVRow{name: "h" + itoa(i), value: "v", enabled: true})
+        i = i + 1
+    }
+    a.headers.cur = 10
+    a.focus = FReqPane
+    scr := term.new_ansi(80, 24)
+    render(a, scr, "v")
+    want := a.headers.rows[a.headers.cur].name
+    y := 0
+    found := false
+    for y < 24 {
+        if has_text(scr, y, want) {
+            found = true
+        }
+        y = y + 1
+    }
+    testing.expect(found, "selected row inside window")
+}
+
+fn test_render_body_cursor_past_lineno() {
+    // body rows paint "N <text>" — the cursor sits past the same
+    // prefix, not over the number (single- and multi-digit).
+    a := new_app()
+    a.focus = FReqPane
+    a.req_tab = 1 // Body
+    a.body_edit = true
+    a.body = new_text_view("abc")
+    a.body.cx = 1
+    scr := term.new_ansi(80, 24)
+    render(a, scr, "v")
+    testing.expect_eq(scr.cx, a.r_req_x + 4, "1-digit prefix + 1 char")
+    a2 := new_app()
+    a2.focus = FReqPane
+    a2.req_tab = 1
+    a2.body_edit = true
+    a2.body = new_text_view("l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10")
+    a2.body.top = 8
+    a2.body.cy = 9
+    a2.body.cx = 1
+    scr2 := term.new_ansi(80, 24)
+    render(a2, scr2, "v")
+    testing.expect_eq(scr2.cx, a2.r_req_x + 5, "2-digit prefix + 1 char")
+}
