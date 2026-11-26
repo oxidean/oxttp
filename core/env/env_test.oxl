@@ -1,0 +1,201 @@
+package env
+
+// dotenv parsing + EnvSet layering + substitution — corpus §6.
+import "std/errors"
+import "std/testing"
+import "github.com/oxidean/oxttp/core/model"
+
+fn kv(n: str, v: str) -> model.KV {
+    return model.KV{name: n, value: v, enabled: true}
+}
+
+fn strs1(a: str) -> []str {
+    let s: []str = nil
+    return push(s, a)
+}
+
+fn strs2(a: str, b: str) -> []str {
+    let s: []str = nil
+    s = push(s, a)
+    return push(s, b)
+}
+
+fn set_with(names: []str, vals: []str) -> own EnvSet {
+    s := new(EnvSet)
+    l := EnvLayer{name: "test", source: "session", vars: nil}
+    i := 0
+    for i < len(names) {
+        l.vars = push(l.vars, kv(names[i], vals[i]))
+        i = i + 1
+    }
+    s.layers = push(s.layers, l)
+    return s
+}
+
+fn test_dotenv_basics() {
+    src := "# comment\nA=1\nexport B= two\nC='it works'\nD=\"x${A}\"\nBARE\n"
+    prior := new(EnvSet)
+    [p, e] = parse_dotenv(src, prior)
+    testing.expect(e == nil, "parses")
+    testing.expect_eq(len(p.vars), 5, "5 vars")
+    testing.expect_streq(p.vars[0].name, "A", "name A")
+    testing.expect_streq(p.vars[1].value, "two", "unquoted trimmed")
+    testing.expect_streq(p.vars[2].value, "it works", "single quotes literal")
+    testing.expect_streq(p.vars[3].value, "x1", "dq expands same-file")
+    testing.expect_streq(p.vars[4].value, "", "bare name empty")
+}
+
+fn test_dotenv_trim_and_comment_rules() {
+    src := "A=  pad  \nB=v # tail\nc=low\n"
+    prior := new(EnvSet)
+    [p, e] = parse_dotenv(src, prior)
+    testing.expect(e == nil, "parses")
+    testing.expect_streq(p.vars[0].value, "pad", "unquoted trimmed")
+    testing.expect_streq(p.vars[1].value, "v", "inline comment cut")
+    testing.expect_streq(p.vars[2].name, "c", "lowercase name")
+}
+
+fn test_dotenv_refs_prior_layer() {
+    prior := set_with(strs1("P"), strs1("9"))
+    [p, e] = parse_dotenv("A=${P}\nB=${A}x\nC=${NOPE}\n", prior)
+    testing.expect(e == nil, "parses")
+    testing.expect_streq(p.vars[0].value, "9", "prior layer ref")
+    testing.expect_streq(p.vars[1].value, "9x", "same-file chain")
+    testing.expect_streq(p.vars[2].value, "${NOPE}", "unresolved literal")
+}
+
+fn test_dotenv_posting_warns() {
+    prior := new(EnvSet)
+    [p, e] = parse_dotenv("POSTING_A=1\nOK=2\n", prior)
+    testing.expect(e == nil, "parses")
+    testing.expect_eq(len(p.warns), 1, "one warn")
+    testing.expect(find(p.warns[0], "POSTING_A") >= 0, "warn names var")
+    testing.expect_eq(len(p.vars), 2, "var still kept")
+}
+
+fn test_envset_lookup_precedence() {
+    s := new(EnvSet)
+    l1 := EnvLayer{name: "posting.env", source: "file", vars: nil}
+    l1.vars = push(l1.vars, kv("X", "base"))
+    l1.vars = push(l1.vars, kv("Y", "base"))
+    s.layers = push(s.layers, l1)
+    l2 := EnvLayer{name: "dev.env", source: "file", vars: nil}
+    l2.vars = push(l2.vars, kv("X", "dev"))
+    s.layers = push(s.layers, l2)
+    l3 := EnvLayer{name: "session", source: "session", vars: nil}
+    l3.vars = push(l3.vars, kv("Y", "sess"))
+    s.layers = push(s.layers, l3)
+    r := s.lookup("X")
+    testing.expect(r.ok, "X found")
+    testing.expect_streq(r.value, "dev", "last layer wins")
+    r2 := s.lookup("Y")
+    testing.expect_streq(r2.value, "sess", "session wins")
+    r3 := s.lookup("ZZZ")
+    testing.expect(!r3.ok, "miss")
+}
+
+fn test_substitute_forms() {
+    s := set_with(strs2("NAME", "B"), strs2("world", "b"))
+    [r, e] = substitute("hello $NAME and ${B}", s, false)
+    testing.expect(e == nil, "ok")
+    testing.expect_streq(r, "hello world and b", "forms")
+    [r2, e2] = substitute("a $$ b", s, false)
+    testing.expect(e2 == nil, "ok")
+    testing.expect_streq(r2, "a $ b", "dollar escape")
+    [r3, e3] = substitute("$NAME-x${B}y", s, false)
+    testing.expect(e3 == nil, "ok")
+    testing.expect_streq(r3, "world-xby", "adjacent")
+}
+
+fn test_substitute_unresolved() {
+    s := set_with(strs1("A"), strs1("1"))
+    [r, e] = substitute("x$MISSING y", s, false)
+    testing.expect(e == nil, "passthrough no err")
+    testing.expect_streq(r, "x$MISSING y", "passthrough literal")
+    [_r2, e2] = substitute("u/$MISSING", s, true)
+    testing.expect(e2 != nil, "in_url errors")
+    if e2 != nil {
+        testing.expect(find(errors.msg(e2), "$MISSING") >= 0, "names var")
+    }
+}
+
+fn test_substitute_generated() {
+    s := new(EnvSet)
+    [r, e] = substitute("${$uuid}", s, false)
+    testing.expect(e == nil, "uuid ok")
+    testing.expect_eq(len(r), 36, "uuid shape")
+    testing.expect_eq(byteat(r, 8), 45, "uuid dash")
+    testing.expect_eq(byteat(r, 14), 52, "v4 nibble")
+    [r2, e2] = substitute("${$timestamp}", s, false)
+    testing.expect(e2 == nil, "ts ok")
+    testing.expect(len(r2) >= 9 && len(r2) <= 11, "ts digits")
+    [r3, e3] = substitute("${$timestampMs}", s, false)
+    testing.expect(e3 == nil, "ms ok")
+    testing.expect(len(r3) >= 12, "ms digits longer")
+    [r4, e4] = substitute("${$isoTimestamp}", s, false)
+    testing.expect(e4 == nil, "iso ok")
+    testing.expect_eq(len(r4), 20, "iso shape")
+    testing.expect_eq(byteat(r4, 4), 45, "iso dash")
+    testing.expect_eq(byteat(r4, 10), 84, "iso T")
+    testing.expect_eq(byteat(r4, 19), 90, "iso Z")
+    [r5, e5] = substitute("${$randomInt}", s, false)
+    testing.expect(e5 == nil, "rint ok")
+    testing.expect(len(r5) >= 1 && len(r5) <= 10, "rint digits")
+    i := 0
+    for i < len(r5) {
+        c := byteat(r5, i)
+        testing.expect(c >= 48 && c <= 57, "rint all digits")
+        i = i + 1
+    }
+}
+
+fn test_substitute_limits() {
+    s := set_with(strs1("A"), strs1("x"))
+    big := ""
+    i := 0
+    for i < 10001 {
+        big = big + "$A"
+        i = i + 1
+    }
+    [_r, e] = substitute(big, s, false)
+    testing.expect(e != nil, "over ref cap errors")
+}
+
+fn test_substitute_edge_chars() {
+    s := set_with(strs1("A"), strs1("v"))
+    [r, e] = substitute("end$ and $9x and ${A", s, false)
+    testing.expect(e == nil, "no err")
+    testing.expect(find(r, "end$") >= 0, "trailing $ literal")
+    testing.expect(find(r, "$9x") >= 0, "digit-start literal")
+    testing.expect(find(r, "${A") >= 0, "unclosed literal")
+}
+
+fn test_scan_envs() {
+    sc := scan_envs("tests/tui-fixtures/small-app")
+    testing.expect_eq(len(sc.base), 2, "base pair present")
+    testing.expect_streq(sc.base[0], "posting.env", "base[0]")
+    testing.expect_streq(sc.base[1], "posting.local.env", "base[1]")
+    testing.expect_eq(len(sc.named), 2, "dev + prod")
+    testing.expect_streq(sc.named[0], "dev", "dev once")
+    testing.expect_streq(sc.named[1], "prod", "prod")
+}
+
+fn test_build_set_layers() {
+    let sess: []model.KV = nil
+    sess = push(sess, kv("SHARED", "sess"))
+    s := build_set("tests/tui-fixtures/small-app", strs1("dev"), sess)
+    r := s.lookup("BASE")
+    testing.expect(r.ok, "base file loaded")
+    testing.expect_streq(r.value, "http://example.test", "base val")
+    r2 := s.lookup("SHARED")
+    testing.expect_streq(r2.value, "sess", "session wins over all")
+    r3 := s.lookup("WHO")
+    testing.expect_streq(r3.value, "devlocal", "local.env wins")
+    r4 := s.lookup("DEVONLY")
+    testing.expect_streq(r4.value, "1", "named loaded")
+    s2 := build_set("tests/tui-fixtures/small-app", strs2("dev", "ghost"), sess)
+    testing.expect(s2.lookup("WHO").ok, "missing file skipped")
+    s3 := build_set("tests/tui-fixtures/small-app", nil, nil)
+    testing.expect(!s3.lookup("WHO").ok, "inactive named skipped")
+    testing.expect_streq(s3.lookup("SHARED").value, "localwin", "posting.local beats posting.env")
+}
