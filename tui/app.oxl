@@ -1071,12 +1071,14 @@ fn widget_action(a: mut App, act: str, ev: term.KeyEvent) -> int {
             if a.resp_tab < 0 {
                 a.resp_tab = len(resp_tabs()) - 1
             }
+            a.resp_rows = new_list(resp_row_count(a))
         }
     } else if act == "tab-next" {
         if a.focus == FReqTabs {
             a.req_tab = (a.req_tab + 1) - ((a.req_tab + 1) / req_tab_count(a)) * req_tab_count(a)
         } else if a.focus == FRespTabs {
             a.resp_tab = (a.resp_tab + 1) - ((a.resp_tab + 1) / len(resp_tabs())) * len(resp_tabs())
+            a.resp_rows = new_list(resp_row_count(a))
         }
     } else if act == "tab-enter" {
         if a.focus == FReqTabs {
@@ -1941,6 +1943,7 @@ fn jump_action(a: mut App, act: str) -> int {
     if act == "jump-resp-body" {
         a.focus = FRespPane
         a.resp_tab = 0
+        a.resp_rows = new_list(resp_row_count(a))
         return ENone
     }
     if act == "jump-history" {
