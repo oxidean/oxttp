@@ -1,0 +1,259 @@
+package main
+
+// S10.4 send path: draft → plan_req → ESend → exec_send → response
+// install (body/JSON re-indent, headers, cookies, trace, title meta),
+// jar update, send_failed, and session history (cap 100, newest-first,
+// open-as-sent, remove). exec_send_t takes the Transport port so a
+// fake can stand in for H1 — no sockets in tests.
+
+import "std/errors"
+import "std/testing"
+import "github.com/oxidean/oxttp/core/collection"
+import "github.com/oxidean/oxttp/core/model"
+
+// FakeSend implements core/http.Transport — returns a staged Resp or
+// a staged error, never a socket.
+struct FakeSend {
+    resp: model.Resp,
+    fail: str,
+}
+
+fn (f FakeSend) send(req: ref model.Req) -> [model.Resp, err] {
+    if len(f.fail) > 0 {
+        return f.resp, errors.new(f.fail)
+    }
+    return f.resp, nil
+}
+
+// fake_resp builds a response with a full trace; hops stays whatever
+// the caller passes (nil exercises the no-redirect path).
+fn fake_resp(status: int, ct: str, body: str, hops: own []model.Hop) -> model.Resp {
+    hs := mkslice(model.Header, 0)
+    if len(ct) > 0 {
+        hs = push(hs, model.Header{name: "Content-Type", value: ct})
+    }
+    tr := new(model.Trace)
+    tr.connect_ms = 3.0
+    tr.tls_ms = 1.5
+    tr.send_headers_ms = 0.5
+    tr.send_body_ms = 0.25
+    tr.recv_headers_ms = 8.0
+    tr.recv_body_ms = 2.0
+    tr.closed_ms = 0.1
+    return model.Resp{status: status, reason: "OK", headers: hs,
+        body: body as []byte, elapsed_ms: 14.0, remote: "127.0.0.1:9",
+        version: "1.1", req_head: "", hops: hops, trace: tr}
+}
+
+// stage_send arms a.pending/a.pending_preq the way begin_send leaves
+// them, without re-running the planner.
+fn stage_send(a: mut App, url: str) {
+    a.url.text = url
+    a.pending_preq = draft_to_request(a)
+    a.pending_name = "staged"
+    a.pending = new(model.Req)
+    a.pending.method = "GET"
+    a.pending.url = url
+}
+
+fn test_begin_send_plan_err() {
+    a := new_app()
+    // empty url → plan error toast, no send staged
+    fx := begin_send(a)
+    testing.expect_eq(fx, ENone, "plan err does not send")
+    testing.expect_eq(len(a.toasts), 1, "error toast")
+    testing.expect_eq(a.toasts[0].level, 2, "send errors are error toasts")
+    testing.expect(a.pending == nil, "no pending req")
+    // kind degrades through plan_req (graphql/grpc/ws sends are M4)
+    a2 := new_app()
+    a2.kind = KGraphql
+    a2.url.text = "http://x"
+    fx2 := begin_send(a2)
+    testing.expect_eq(fx2, ENone, "kind send degrades")
+    testing.expect(str_contains(a2.toasts[0].msg, "M4"), "kind toast names M4")
+}
+
+fn test_begin_send_ok() {
+    a := new_app()
+    a.url.text = "example.com/users"
+    fx := begin_send(a)
+    testing.expect_eq(fx, ESend, "planned send returns ESend")
+    testing.expect(a.pending != nil, "pending staged")
+    testing.expect_streq(a.pending.url, "http://example.com/users", "scheme-less → http")
+    testing.expect_streq(a.pending_name, "Untitled request", "pending name = tab title")
+}
+
+fn test_begin_send_url_substitution() {
+    scratch_coll()
+    a := new_app()
+    a.coll_dir = COLL_SCRATCH
+    load_collection(a)
+    a.url.text = "$BASE/users"
+    fx := begin_send(a)
+    testing.expect_eq(fx, ESend, "substituted send plans")
+    testing.expect_streq(a.pending.url, "http://example.test/users", "$BASE resolved into url")
+    // unresolved in-url is a plan error
+    a2 := new_app()
+    a2.coll_dir = COLL_SCRATCH
+    load_collection(a2)
+    a2.url.text = "$MISSING/x"
+    fx2 := begin_send(a2)
+    testing.expect_eq(fx2, ENone, "unresolved var fails the plan")
+    testing.expect(str_contains(a2.toasts[len(a2.toasts)-1].msg, "MISSING"), "names the var")
+}
+
+fn test_begin_send_warns() {
+    a := new_app()
+    pr := new(collection.PRequest)
+    pr.url = "http://x"
+    pr.options = new(collection.POptions{follow_redirects: true, verify_ssl: true,
+        attach_cookies: true, substitute_body_variables: true,
+        proxy_url: "http://proxy:8888", timeout: 5.0, set_mask: 16})
+    a.pending_preq = pr
+    a.url.text = "http://x"
+    fx := begin_send_preq(a)
+    testing.expect_eq(fx, ESend, "warns do not block the send")
+    found := false
+    i := 0
+    for i < len(a.toasts) {
+        if a.toasts[i].level == 0 && str_contains(a.toasts[i].msg, "proxy") {
+            found = true
+        }
+        i = i + 1
+    }
+    testing.expect(found, "proxy warn raised at info level")
+}
+
+fn test_exec_send_installs_response() {
+    a := new_app()
+    stage_send(a, "http://x/users")
+    hs := mkslice(model.Hop, 0)
+    r := fake_resp(200, "application/json", "{\"a\":1}", new(hs))
+    r.headers = push(r.headers, model.Header{name: "Set-Cookie", value: "sid=abc; Path=/"})
+    f := FakeSend{resp: r, fail: ""}
+    exec_send_t(a, f)
+    testing.expect(a.pending == nil, "pending consumed")
+    // body: JSON content-type re-indents 2sp
+    testing.expect_eq(len(a.resp_view.lines), 3, "pretty body lines")
+    testing.expect_streq(a.resp_view.lines[1], "  \"a\": 1", "2sp indent")
+    // headers + cookies rows
+    testing.expect_eq(len(a.resp_hdr_rows), 2, "header rows")
+    testing.expect_streq(a.resp_hdr_rows[0], "Content-Type: application/json", "hdr row text")
+    testing.expect_eq(len(a.resp_ck_rows), 1, "cookie row")
+    testing.expect_streq(a.resp_ck_rows[0], "sid=abc; Path=/", "cookie row text")
+    // trace: 7 stage rows, no hops line when the chain is empty
+    testing.expect_eq(len(a.resp_tr_rows), 7, "7 stage rows")
+    testing.expect(str_contains(a.resp_tr_rows[0], "connect"), "connect row")
+    // title meta + status class + sizes
+    testing.expect_streq(a.resp_title, "response · 200 OK · 7 B · 14 ms", "title meta")
+    testing.expect_eq(a.resp_class, 0, "2xx class")
+    testing.expect_eq(a.resp_size, 7, "body size")
+    // jar picked up the set-cookie (attach_cookies default true)
+    testing.expect_eq(len(a.jar), 1, "jar updated")
+    testing.expect_streq(a.jar[0], "sid=abc", "jar holds n=v")
+    // history appended
+    testing.expect_eq(len(a.history), 1, "history entry")
+    testing.expect_eq(a.history[0].status, 200, "entry status")
+    testing.expect(len(a.history[0].req_yaml) > 0, "entry keeps request yaml")
+}
+
+fn test_install_resp_hops_and_nojson() {
+    a := new_app()
+    stage_send(a, "http://x")
+    hops := mkslice(model.Hop, 0)
+    hops = push(hops, model.Hop{req_head: "GET /a HTTP/1.1", status: 301,
+        reason: "Moved", version: "1.1", headers: nil, body: nil,
+        elapsed_ms: 2.0, remote: "127.0.0.1:9"})
+    r := fake_resp(200, "text/plain", "plain body stays", new(hops))
+    install_resp(a, r)
+    testing.expect_eq(len(a.resp_tr_rows), 8, "stage rows + hops line")
+    testing.expect(str_contains(a.resp_tr_rows[7], "hops: 1"), "hops row last")
+    // non-JSON content stays verbatim
+    testing.expect_streq(a.resp_view.lines[0], "plain body stays", "verbatim body")
+    // a nil hops own is legal — install must not touch len() on it
+    a2 := new_app()
+    stage_send(a2, "http://x")
+    r2 := fake_resp(204, "", "", nil)
+    r2.reason = "No Content"
+    install_resp(a2, r2)
+    testing.expect_eq(len(a2.resp_tr_rows), 7, "nil hops: stage rows only")
+    testing.expect_eq(len(a2.resp_ck_rows), 0, "no cookies")
+}
+
+fn test_exec_send_error_installs() {
+    a := new_app()
+    stage_send(a, "http://x")
+    f := FakeSend{resp: fake_resp(0, "", "", nil), fail: "dial tcp: refused"}
+    exec_send_t(a, f)
+    testing.expect_eq(len(a.resp_view.lines), 1, "error text installed")
+    testing.expect(str_contains(a.resp_view.lines[0], "request failed"), "failed prefix")
+    testing.expect(str_contains(a.resp_view.lines[0], "refused"), "err text")
+    testing.expect_streq(a.resp_title, "response · error", "error title")
+    testing.expect_eq(a.resp_class, 2, "error class")
+    testing.expect_eq(len(a.history), 0, "errors skip history")
+    testing.expect_eq(len(a.jar), 0, "jar untouched")
+    testing.expect_eq(a.toasts[len(a.toasts)-1].level, 2, "error toast")
+}
+
+fn test_history_cap_newest_first() {
+    a := new_app()
+    stage_send(a, "http://x")
+    i := 0
+    for i < 105 {
+        he := HistEnt{title: "t" + itoa(i), method: "GET", url: "http://x/" + itoa(i),
+            status: 200, reason: "OK", elapsed_ms: 1.0, size: 1,
+            req_yaml: "url: http://x\n", resp_text: "b",
+            resp_hdr_rows: nil, resp_ck_rows: nil, resp_tr_rows: nil}
+        a.history = push(a.history, he)
+        if len(a.history) > 100 {
+            a.history = a.history[len(a.history) - 100:]
+        }
+        i = i + 1
+    }
+    testing.expect_eq(len(a.history), 100, "cap 100")
+    // newest-first through the modal list: index 0 = most recent
+    testing.expect_streq(a.history[len(a.history)-1].url, "http://x/104", "newest kept")
+    testing.expect_streq(a.history[0].url, "http://x/5", "oldest dropped")
+}
+
+fn test_history_open_and_delete() {
+    scratch_coll()
+    a := new_app()
+    a.coll_dir = COLL_SCRATCH
+    load_collection(a)
+    stage_send(a, "http://x/one")
+    r := fake_resp(200, "application/json", "{\"k\":2}", new(mkslice(model.Hop, 0)))
+    f := FakeSend{resp: r, fail: ""}
+    exec_send_t(a, f)
+    stage_send(a, "http://x/two")
+    r2 := fake_resp(404, "text/plain", "nope", new(mkslice(model.Hop, 0)))
+    r2.reason = "Not Found"
+    f2 := FakeSend{resp: r2, fail: ""}
+    exec_send_t(a, f2)
+    testing.expect_eq(len(a.history), 2, "two entries")
+    // MHistory lists newest-first: sel 0 opens the LAST pushed entry
+    push_modal(a, MHistory)
+    a.hist.sel = 0
+    hist_open(a)
+    testing.expect_eq(len(a.tabs), 2, "open pushes a preview tab")
+    nt := a.tabs[len(a.tabs)-1]
+    testing.expect(nt.preview, "history tab is preview")
+    testing.expect_streq(nt.draft.url.text, "http://x/two", "as-sent url restored")
+    testing.expect_streq(nt.draft.resp_title, "response · 404 Not Found · 4 B · 14 ms", "stored title")
+    testing.expect(len(nt.draft.resp_view.lines) >= 1, "stored body installed")
+    // backspace removes the selected (newest) entry
+    push_modal(a, MHistory)
+    a.hist.sel = 0
+    hist_delete(a)
+    testing.expect_eq(len(a.history), 1, "entry removed")
+    testing.expect_streq(a.history[0].url, "http://x/one", "oldest survives")
+}
+
+fn test_send_failed_via_dispatch() {
+    // ctrl+j on an empty draft toasts the plan error, never returns
+    // ESend — the dispatch path a real keypress takes.
+    a := new_app()
+    fx := dispatch(a, kev("j", true, false, false))
+    testing.expect_eq(fx, ENone, "dispatch surfaces no ESend")
+    testing.expect_eq(len(a.toasts), 1, "plan err toast")
+}

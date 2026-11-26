@@ -5,6 +5,10 @@ package main
 // must be declared before embedders (App embeds every widget type).
 // Order here is the dependency order.
 
+import "github.com/oxidean/oxttp/core/collection"
+import "github.com/oxidean/oxttp/core/env"
+import "github.com/oxidean/oxttp/core/model"
+
 struct LineEdit {
     text: str,
     cur: int,
@@ -49,6 +53,9 @@ struct TreeNode {
     is_dir: bool,
     open: bool,
     stub: bool, // placeholder rows render dimmed
+    path: str,  // fs path — collection file/folder, "" for stub rows
+    kind: str,  // request kind (graphql/grpc/websocket) for badges
+    err: str,   // malformed-file error text (corpus placeholder rows)
 }
 
 struct Tree {
@@ -78,6 +85,9 @@ struct Toast {
 // RDraft is one open request editor's full snapshot — corpus §4.5/§8.6:
 // every open tab is an INDEPENDENT request draft (url, method/kind,
 // headers/query/path tables, body, and its response buffer).
+// S10 adds the backing file path, the decoded request (read-only
+// auth/options panes render it; sends merge live fields over it), and
+// per-response-tab row sets.
 struct RDraft {
     url: LineEdit,
     method: str,
@@ -91,6 +101,35 @@ struct RDraft {
     body: TextView,
     resp_view: TextView,
     resp_rows: ListCur,
+    resp_hdr_rows: []str,
+    resp_ck_rows: []str,
+    resp_tr_rows: []str,
+    resp_title: str,
+    resp_class: int, // status_class for title color; -1 = no response
+    path: str,       // backing .posting.yaml — "" = unsaved
+    auth_text: str,  // read-only Auth pane render
+    opts_text: str,  // read-only Options pane render
+    info_text: str,  // Info pane render (description et al.)
+    preq: own collection.PRequest,
+    resp_size: int,
+    elapsed_ms: float,
+}
+
+// HistEnt is one in-memory history record (corpus §5.3 — S10 keeps
+// history session-only, cap 100, deviation listed in spec).
+struct HistEnt {
+    title: str,
+    method: str,
+    url: str,
+    status: int,
+    reason: str,
+    elapsed_ms: float,
+    size: int,
+    req_yaml: str,      // marshaled request-as-drafted — re-decodes on open
+    resp_text: str,
+    resp_hdr_rows: []str,
+    resp_ck_rows: []str,
+    resp_tr_rows: []str,
 }
 
 struct RTab {
@@ -129,7 +168,19 @@ struct App {
     coll: Tree,
     coll_search: LineEdit,
     coll_searching: bool,
+    coll_dir: str,
     env_name: str,
+    env_active: []str,
+    env_names: []str,
+    env: own env.EnvSet,
+    session_vars: []model.KV,
+    jar: []str,
+    history: []HistEnt,
+    pending: own model.Req,
+    pending_preq: own collection.PRequest,
+    pending_name: str,
+    sending: bool,
+    var_rows: []str,
     vars: ListCur,
     vars_filter: LineEdit,
     vars_filtering: bool,
@@ -144,6 +195,19 @@ struct App {
     body_ct: int,        // 0 json 1 text 2 xml 3 html
     resp_view: TextView,
     resp_rows: ListCur,
+    resp_hdr_rows: []str,
+    resp_ck_rows: []str,
+    resp_tr_rows: []str,
+    resp_title: str,
+    resp_class: int,
+    path: str,           // live draft backing file (mirrors RDraft.path)
+    auth_text: str,
+    opts_text: str,
+    info_text: str,
+    preq: own collection.PRequest,
+    resp_size: int,
+    elapsed_ms: float,
+    confirm_arg: str,
     pal_query: LineEdit,
     pal_sel: int,
     tabsearch: ListCur,
@@ -198,6 +262,7 @@ let MEnvSwitch = 10
 // dispatch effects returned to the loop.
 let ENone = 0
 let EQuit = 1
+let ESend = 2
 
 
 // RTab is one open request-editor tab (new-request/close-tab/next-tab).

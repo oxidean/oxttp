@@ -1,0 +1,429 @@
+package main
+
+// S10.4 collection glue: load_collection (scan → tree + env set),
+// open/dup/delete/save file ops, preview-tab rules, env switching,
+// variables masking, URL substitution preview, tree filter.
+// File ops run against a scratch copy under /tmp — the committed
+// fixture tree is read-only for tests.
+
+import "std/testing"
+import "std/os"
+import "github.com/oxidean/oxttp/core/collection"
+import "github.com/oxidean/oxttp/core/term"
+import "github.com/oxidean/oxttp/core/yaml"
+
+let COLL_FIXTURE = "tests/tui-fixtures/small-app"
+let COLL_SCRATCH = "/tmp/oxttp-tui-coll-test"
+
+// scratch_coll (re)builds a tiny collection tree: a folder with a
+// nested folder, one env file pair, and a malformed file.
+fn scratch_coll() {
+    os.mkdir_all(COLL_SCRATCH + "/requests/nested")
+    os.writefile_(COLL_SCRATCH + "/requests/get-users.posting.yaml",
+        "name: Get users\ndescription: list\nmethod: GET\nurl: http://localhost:9/users\nheaders:\n  - name: Accept\n    value: application/json\n  - name: X-Off\n    value: skip\n    enabled: false\nparams:\n  - name: limit\n    value: \"10\"\n")
+    os.writefile_(COLL_SCRATCH + "/requests/nested/create-user.posting.yaml",
+        "name: Create user\nmethod: post\nurl: $BASE/users\nheaders:\n  - name: Content-Type\n    value: application/json\nbody:\n  content: |\n    {\"name\": \"ada\"}\noptions:\n  follow_redirects: false\n  timeout: 2.5\n")
+    os.writefile_(COLL_SCRATCH + "/requests/aaa-first.posting.yaml",
+        "name: First req\nmethod: GET\nurl: http://localhost:9/first\n")
+    os.writefile_(COLL_SCRATCH + "/requests/zzz-bad.posting.yaml", "name: [broken\n")
+    os.writefile_(COLL_SCRATCH + "/posting.env", "BASE=http://example.test\nAPI_SECRET=tok123\n")
+    os.writefile_(COLL_SCRATCH + "/dev.env", "WHO=dev\n")
+    os.writefile_(COLL_SCRATCH + "/dev.local.env", "WHO=devlocal\n")
+    // stale artifacts from earlier runs must not leak into assertions
+    rm_quiet(COLL_SCRATCH + "/requests/get-users (copy).posting.yaml")
+    rm_quiet(COLL_SCRATCH + "/requests/get-users (copy 2).posting.yaml")
+    rm_quiet(COLL_SCRATCH + "/requests/aaa-first (copy).posting.yaml")
+    rm_quiet(COLL_SCRATCH + "/requests/nested/create-user (copy).posting.yaml")
+    rm_quiet(COLL_SCRATCH + "/my-new-req.posting.yaml")
+    rm_quiet(COLL_SCRATCH + "/sub/deep.posting.yaml")
+    rm_quiet(COLL_SCRATCH + "/sub")
+}
+
+fn rm_quiet(p: str) {
+    if os.exists(p) {
+        os.remove(p)
+    }
+}
+
+fn app_in(dir: str) -> own App {
+    a := new_app()
+    a.coll_dir = dir
+    load_collection(a)
+    a.toasts = mkslice(Toast, 0) // scan warns are not under test here
+    return a
+}
+
+// node_idx finds the flat index of a node by name ("" = not found → -1).
+fn node_idx(a: ref App, name: str) -> int {
+    i := 0
+    for i < len(a.coll.nodes) {
+        if a.coll.nodes[i].name == name {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn test_load_collection_builds_tree() {
+    scratch_coll()
+    a := app_in(COLL_SCRATCH)
+    // folders-first pre-order: requests/ then its children
+    testing.expect(len(a.coll.nodes) >= 5, "tree rows built")
+    testing.expect_streq(a.coll.nodes[0].name, "requests/", "dir first")
+    testing.expect(a.coll.nodes[0].is_dir, "row0 is dir")
+    testing.expect(a.coll.nodes[0].open, "folders open on first load")
+    testing.expect_streq(a.coll.nodes[1].name, "nested/", "nested dir next (folders-first)")
+    testing.expect_streq(a.coll.nodes[2].name, "Create user", "req uses name: field")
+    testing.expect(len(a.coll.nodes[2].path) > 0, "req row carries fs path")
+    i := node_idx(a, "zzz-bad")
+    testing.expect(i > 0, "malformed row present")
+    testing.expect(a.coll.nodes[i].stub, "malformed row is stub")
+    testing.expect(len(a.coll.nodes[i].err) > 0, "malformed row carries err")
+    // env discovery + resolved set: posting.env + dev/dev.local names
+    testing.expect_eq(len(a.env_names), 1, "one named env")
+    testing.expect_streq(a.env_names[0], "dev", "dev env discovered")
+    testing.expect_streq(a.env_name, "(none)", "no env active yet")
+    testing.expect(a.env != nil, "env set built at load")
+    lr := a.env.lookup("BASE")
+    testing.expect(lr.ok, "BASE resolves")
+    testing.expect_streq(lr.value, "http://example.test", "BASE value")
+}
+
+fn test_open_into_draft() {
+    scratch_coll()
+    a := app_in(COLL_SCRATCH)
+    a.focus = FSidebar
+    a.coll.cur = node_idx(a, "Get users")
+    tree_open(a)
+    testing.expect_eq(a.focus, FUrl, "open focuses url")
+    testing.expect_streq(a.tabs[a.cur_tab].title, "Get users", "tab title = name")
+    testing.expect_streq(a.url.text, "http://localhost:9/users", "url fills")
+    testing.expect_streq(a.method, "GET", "method fills")
+    testing.expect_eq(len(a.headers.rows), 3, "2 headers + sentinel")
+    testing.expect_streq(a.headers.rows[0].name, "Accept", "header row")
+    testing.expect(!a.headers.rows[1].enabled, "disabled row honored")
+    testing.expect_eq(len(a.query_kv.rows), 2, "1 param + sentinel")
+    testing.expect_streq(a.query_kv.rows[0].name, "limit", "param row")
+    testing.expect_streq(a.path, COLL_SCRATCH+"/requests/get-users.posting.yaml", "draft path set")
+    testing.expect(a.preq != nil, "decoded request kept on draft")
+    testing.expect(len(a.info_text) > 0, "info pane text rendered")
+    // open a second request: the preview tab is replaced in place
+    a.coll.cur = node_idx(a, "Create user")
+    tree_open(a)
+    testing.expect_eq(len(a.tabs), 1, "preview tab reused")
+    testing.expect_streq(a.url.text, "$BASE/users", "second file's url")
+    testing.expect_streq(a.method, "POST", "method uppercased at decode")
+    testing.expect(len(a.body.lines) > 0, "body content loaded")
+    testing.expect(len(a.opts_text) > 0, "options pane rendered")
+    testing.expect(str_contains(a.opts_text, "follow_redirects: false"), "option value shown")
+}
+
+fn test_open_malformed_toasts() {
+    scratch_coll()
+    a := app_in(COLL_SCRATCH)
+    a.focus = FSidebar
+    n := len(a.tabs)
+    a.coll.cur = node_idx(a, "zzz-bad")
+    tree_open(a)
+    testing.expect_eq(len(a.tabs), n, "no tab for malformed file")
+    testing.expect_eq(len(a.toasts), 1, "error toast raised")
+    testing.expect_eq(a.toasts[0].level, 2, "malformed open is error toast")
+}
+
+fn test_preview_pin_on_edit() {
+    scratch_coll()
+    a := app_in(COLL_SCRATCH)
+    a.focus = FSidebar
+    a.coll.cur = node_idx(a, "Get users")
+    tree_open(a)
+    testing.expect(a.tabs[0].preview, "opened tab is preview")
+    // any draft edit pins it; the next open pushes a new tab
+    a.focus = FUrl
+    feed_text(a, "!")
+    testing.expect(!a.tabs[0].preview, "edit pins preview tab")
+    a.focus = FSidebar
+    a.coll.cur = node_idx(a, "Create user")
+    tree_open(a)
+    testing.expect_eq(len(a.tabs), 2, "pinned tab: next open pushes")
+    testing.expect(a.tabs[1].preview, "new tab is the preview")
+}
+
+fn test_open_multi_select() {
+    scratch_coll()
+    a := app_in(COLL_SCRATCH)
+    a.focus = FSidebar
+    // create-user .. get-users spans three clean files (aaa-first
+    // sits between them) — first reuses the preview tab, the rest
+    // push new non-preview tabs (corpus §4.9).
+    lo := node_idx(a, "Create user")
+    hi := node_idx(a, "Get users")
+    a.coll.cur = hi
+    a.coll.anchor = lo
+    tree_open(a)
+    testing.expect_eq(len(a.tabs), 3, "three files opened across the range")
+    testing.expect_eq(a.coll.anchor, -1, "selection consumed")
+    testing.expect_streq(a.tabs[0].title, "Create user", "first file in preview tab")
+    testing.expect_streq(a.tabs[1].title, "First req", "second file own tab")
+    testing.expect(!a.tabs[1].preview, "later opens are pinned")
+    testing.expect_streq(a.tabs[2].title, "Get users", "third file own tab")
+    testing.expect(!a.tabs[2].preview, "pinned")
+}
+
+fn test_draft_roundtrip() {
+    scratch_coll()
+    a := app_in(COLL_SCRATCH)
+    a.focus = FSidebar
+    a.coll.cur = node_idx(a, "Get users")
+    tree_open(a)
+    r := draft_to_request(a)
+    testing.expect_streq(r.method, "GET", "method carries")
+    testing.expect_streq(r.url, "http://localhost:9/users", "url carries")
+    testing.expect_eq(len(r.headers), 2, "empty sentinel dropped")
+    testing.expect_eq(len(r.params), 1, "param carried")
+    // marshal → parse → decode roundtrip keeps the file's fields
+    y := collection.marshal(r)
+    [n, pe] = yaml.parse(y)
+    testing.expect(pe == nil, "marshal parses")
+    [r2, de] = collection.decode(n)
+    testing.expect(de == nil, "re-decodes")
+    testing.expect_streq(r2.name, "Get users", "name survives")
+    testing.expect_eq(len(r2.headers), 2, "headers survive")
+    testing.expect(!r2.headers[1].enabled, "enabled flag survives")
+}
+
+fn test_tree_dup() {
+    scratch_coll()
+    a := app_in(COLL_SCRATCH)
+    a.focus = FSidebar
+    a.coll.cur = node_idx(a, "Get users")
+    tree_dup(a)
+    cp := COLL_SCRATCH + "/requests/get-users (copy).posting.yaml"
+    testing.expect(os.exists(cp), "(copy) file written")
+    [r, e] = collection.load_file(cp)
+    testing.expect(e == nil, "copy decodes")
+    testing.expect_streq(r.name, "Get users (copy)", "name renamed")
+    i := node_idx(a, "Get users (copy)")
+    testing.expect(i > 0, "tree reloaded with the copy")
+    // second dup takes the free-name suffix
+    a.coll.cur = node_idx(a, "Get users")
+    tree_dup(a)
+    testing.expect(os.exists(COLL_SCRATCH+"/requests/get-users (copy 2).posting.yaml"), "copy 2")
+    // multi-select dups every request in the range
+    a.coll.anchor = node_idx(a, "Create user")
+    a.coll.cur = node_idx(a, "First req")
+    tree_dup(a)
+    testing.expect(os.exists(COLL_SCRATCH+"/requests/nested/create-user (copy).posting.yaml"), "sel dup 1")
+    testing.expect(os.exists(COLL_SCRATCH+"/requests/aaa-first (copy).posting.yaml"), "sel dup 2")
+    testing.expect_eq(a.coll.anchor, -1, "selection consumed")
+    // folder row degrades instead
+    a.coll.cur = 0
+    n := len(a.toasts)
+    tree_dup(a)
+    testing.expect_eq(len(a.toasts), n + 1, "folder dup degrades")
+    testing.expect_eq(a.toasts[n].level, 2, "degrade toast")
+}
+
+fn test_tree_delete() {
+    scratch_coll()
+    a := app_in(COLL_SCRATCH)
+    a.focus = FSidebar
+    a.coll.cur = node_idx(a, "zzz-bad")
+    tree_delete(a)
+    testing.expect_eq(top_modal(a), MConfirm, "delete asks first")
+    confirm_yes(a)
+    pop_modal(a)
+    testing.expect(!os.exists(COLL_SCRATCH+"/requests/zzz-bad.posting.yaml"), "file removed")
+    testing.expect(node_idx(a, "zzz-bad") < 0, "row gone after reload")
+    // folder delete degrades — no modal
+    a.coll.cur = 0
+    n := len(a.toasts)
+    tree_delete(a)
+    testing.expect_eq(len(a.modals), 0, "no confirm for folders")
+    testing.expect_eq(len(a.toasts), n + 1, "folder delete degrades")
+}
+
+fn test_save_request() {
+    scratch_coll()
+    a := app_in(COLL_SCRATCH)
+    a.url.text = "http://x/new"
+    a.method = "POST"
+    push_modal(a, MSaveReq)
+    a.save_name = new_line_edit("My New Req!")
+    a.save_file = new_line_edit("")
+    a.save_folder = new_line_edit("")
+    save_do(a)
+    p := COLL_SCRATCH + "/my-new-req.posting.yaml"
+    testing.expect(os.exists(p), "slug path written")
+    testing.expect_streq(a.path, p, "tab gained backing path")
+    testing.expect_streq(a.tabs[a.cur_tab].title, "My New Req!", "tab title = save name")
+    testing.expect(!a.tabs[a.cur_tab].preview, "saved tab pinned")
+    [r, e] = collection.load_file(p)
+    testing.expect(e == nil, "saved file decodes")
+    testing.expect_streq(r.method, "POST", "method saved")
+    testing.expect_streq(r.url, "http://x/new", "url saved")
+    // folder field mkdirs under the collection
+    a2 := app_in(COLL_SCRATCH)
+    a2.url.text = "http://x/sub"
+    a2.save_name = new_line_edit("Deep")
+    a2.save_folder = new_line_edit("sub")
+    a2.save_file = new_line_edit("")
+    save_do(a2)
+    testing.expect(os.exists(COLL_SCRATCH+"/sub/deep.posting.yaml"), "folder path mkdir'd")
+    // name is required
+    a3 := app_in(COLL_SCRATCH)
+    a3.save_name = new_line_edit("")
+    n := len(a3.toasts)
+    save_do(a3)
+    testing.expect_eq(len(a3.toasts), n + 1, "empty name toasts")
+    // folder must stay inside the collection
+    a4 := app_in(COLL_SCRATCH)
+    a4.save_name = new_line_edit("Esc")
+    a4.save_folder = new_line_edit("../escape")
+    n4 := len(a4.toasts)
+    save_do(a4)
+    testing.expect_eq(len(a4.toasts), n4 + 1, ".. folder refused")
+    testing.expect(!os.exists(COLL_SCRATCH+"/../escape"), "nothing outside the tree")
+    a5 := app_in(COLL_SCRATCH)
+    a5.save_name = new_line_edit("Esc2")
+    a5.save_file = new_line_edit("../evil.posting.yaml")
+    n5 := len(a5.toasts)
+    save_do(a5)
+    testing.expect_eq(len(a5.toasts), n5 + 1, ".. filename refused")
+}
+
+fn test_save_overwrite_confirms() {
+    scratch_coll()
+    a := app_in(COLL_SCRATCH)
+    a.focus = FSidebar
+    a.coll.cur = node_idx(a, "Get users")
+    tree_open(a)
+    // save onto an existing path other than the tab's own → MConfirm
+    a.save_name = new_line_edit("Get users")
+    a.save_file = new_line_edit("zzz-bad.posting.yaml")
+    a.save_folder = new_line_edit("requests")
+    save_do(a)
+    testing.expect_eq(top_modal(a), MConfirm, "overwrite asks")
+    testing.expect_streq(a.confirm_action, "save-overwrite", "stashed action")
+    confirm_yes(a)
+    pop_modal(a)
+    // the malformed file is now a valid save of the draft
+    [r, e] = collection.load_file(COLL_SCRATCH + "/requests/zzz-bad.posting.yaml")
+    testing.expect(e == nil, "overwritten file decodes")
+    testing.expect_streq(r.name, "Get users", "new content landed")
+}
+
+fn test_env_switch() {
+    scratch_coll()
+    a := app_in(COLL_SCRATCH)
+    push_modal(a, MEnvSwitch)
+    testing.expect_eq(a.vars.count, 2, "(none) + dev rows")
+    a.vars.sel = 1
+    env_pick(a)
+    testing.expect_eq(len(a.env_active), 1, "one active env")
+    testing.expect_streq(a.env_name, "dev", "env row shows dev")
+    // dev.local.env wins over dev.env inside the set
+    lr := a.env.lookup("WHO")
+    testing.expect(lr.ok, "WHO resolves")
+    testing.expect_streq(lr.value, "devlocal", "local layer wins")
+    lr2 := a.env.lookup("BASE")
+    testing.expect(lr2.ok, "base env still applies")
+    // (none) clears
+    push_modal(a, MEnvSwitch)
+    a.vars.sel = 0
+    env_pick(a)
+    testing.expect_eq(len(a.env_active), 0, "env cleared")
+    testing.expect_streq(a.env_name, "(none)", "label resets")
+    lr3 := a.env.lookup("WHO")
+    testing.expect(!lr3.ok, "dev vars gone")
+}
+
+fn test_variables_rows_masking() {
+    scratch_coll()
+    a := app_in(COLL_SCRATCH)
+    var_rows_build(a)
+    saw_base := false
+    saw_secret := false
+    i := 0
+    for i < len(a.var_rows) {
+        if str_contains(a.var_rows[i], "BASE = http://example.test") {
+            saw_base = true
+        }
+        if str_contains(a.var_rows[i], "API_SECRET") {
+            saw_secret = true
+            testing.expect(str_contains(a.var_rows[i], "••••"), "secret masked")
+            testing.expect(!str_contains(a.var_rows[i], "tok123"), "value hidden")
+        }
+        i = i + 1
+    }
+    testing.expect(saw_base, "plain var row shown")
+    testing.expect(saw_secret, "secret var row present")
+    a.vars_reveal = true
+    var_rows_build(a)
+    i = 0
+    revealed := false
+    for i < len(a.var_rows) {
+        if str_contains(a.var_rows[i], "API_SECRET = tok123") {
+            revealed = true
+        }
+        i = i + 1
+    }
+    testing.expect(revealed, "ctrl+r reveal shows value")
+}
+
+fn test_url_preview() {
+    scratch_coll()
+    a := app_in(COLL_SCRATCH)
+    a.url.text = "$BASE/users"
+    testing.expect_streq(url_preview(a), "http://example.test/users", "substituted preview")
+    a.url.text = "$NOPE/x"
+    p := url_preview(a)
+    testing.expect(str_contains(p, "unresolved"), "unresolved marker")
+    testing.expect(str_contains(p, "$NOPE"), "names the missing var")
+    // secret-named values mask inside the resolved preview
+    a.url.text = "http://x/$API_SECRET"
+    p2 := url_preview(a)
+    testing.expect(str_contains(p2, "••••"), "secret value masked")
+    testing.expect(!str_contains(p2, "tok123"), "secret hidden")
+    // no env at all → the text previews verbatim
+    a.env = nil
+    a.url.text = "$BASE/y"
+    testing.expect_streq(url_preview(a), "$BASE/y", "no env: verbatim")
+}
+
+fn test_tree_filter() {
+    scratch_coll()
+    a := app_in(COLL_SCRATCH)
+    a.focus = FSidebar
+    dispatch(a, kev("/", false, false, false))
+    testing.expect(a.coll_searching, "search input opens")
+    feed_text(a, "create")
+    vis := a.coll.visible()
+    names := ""
+    i := 0
+    for i < len(vis) {
+        names = names + "|" + a.coll.nodes[vis[i]].name
+        i = i + 1
+    }
+    testing.expect(str_contains(names, "Create user"), "match kept")
+    testing.expect(str_contains(names, "nested/"), "ancestor kept")
+    testing.expect(str_contains(names, "requests/"), "root kept")
+    testing.expect(!str_contains(names, "Get users"), "non-match hidden")
+    testing.expect(!str_contains(names, "zzz-bad"), "malformed hidden")
+    // backspace edits the query
+    dispatch(a, knamed(term.KeyBackspace))
+    testing.expect_streq(a.coll.filter, "creat", "backspace edits query")
+    // enter commits — the committed filter stays applied …
+    dispatch(a, knamed(term.KeyEnter))
+    testing.expect(!a.coll_searching, "enter closes input")
+    testing.expect_eq(len(a.coll.visible()), 3, "committed filter still applies")
+    // … until escape clears it (corpus: escape clears selection then search)
+    dispatch(a, knamed(term.KeyEscape))
+    testing.expect_eq(len(a.coll.visible()), len(a.coll.nodes), "escape clears filter")
+    // 'd' while searching must not reach tree-dup
+    dispatch(a, kev("/", false, false, false))
+    n := len(a.toasts)
+    feed_text(a, "d")
+    testing.expect_eq(len(a.toasts), n, "typed d filtered, not duped")
+    testing.expect_streq(a.coll.filter, "d", "query took the letter")
+}

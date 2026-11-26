@@ -29,6 +29,13 @@ fn main() {
     }
     defer sess.close()
     a := new_app()
+    parse_argv(a)
+    if a.quit {
+        // -h/--help/-v/--version — the banner is the whole output.
+        println("oxttp-tui " + ver)
+        return
+    }
+    load_collection(a)
     dec := term.new_decoder()
     stdin := os.stdin()
     buf := mkslice(byte, 256)
@@ -56,6 +63,17 @@ fn main() {
                 fx := dispatch(a, evs[i])
                 if fx == EQuit {
                     a.quit = true
+                }
+                if fx == ESend {
+                    // paint a "Sending…" frame before the send blocks —
+                    // exec_send installs the response or the error text.
+                    a.sending = true
+                    render(a, sess.scr, ver)
+                    spe := sess.scr.present()
+                    if spe == nil {
+                        exec_send(a)
+                    }
+                    a.sending = false
                 }
                 i = i + 1
             }
