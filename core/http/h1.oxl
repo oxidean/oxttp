@@ -114,7 +114,7 @@ fn (t mut TmoTlsReader) asreader() -> io.Reader {
 // req.follow) through roundtrip; the final Resp is returned.
 fn (t H1) send(req: ref model.Req) -> [model.Resp, err] {
     rt_sigpipe_ignore()
-    cur := new(model.Req{method: req.method, url: req.url, headers: req.headers, body: req.body, timeout_ms: req.timeout_ms, follow: req.follow, max_redirects: req.max_redirects, httpver: req.httpver, synth: req.synth, verify: req.verify})
+    cur := new(model.Req{method: req.method, url: req.url, headers: req.headers, body: req.body, timeout_ms: req.timeout_ms, follow: req.follow, max_redirects: req.max_redirects, httpver: req.httpver, synth: req.synth, verify: req.verify, h2: req.h2, ssl_min: req.ssl_min, ssl_max: req.ssl_max, cert_pem: req.cert_pem, key_pem: req.key_pem, proxies: req.proxies, proxy_env: req.proxy_env, no_proxy: req.no_proxy})
     hops := 0
     jar := "" // jar-lite: "n=v; n=v" accumulated across hops (ADR 0023)
     let hs: []model.Hop = nil
@@ -204,7 +204,7 @@ fn (t H1) send(req: ref model.Req) -> [model.Resp, err] {
         }
         cur.url = nu.string()
     }
-    return model.Resp{status: 0, reason: "", headers: nil, body: nil, elapsed_ms: 0.0, remote: "", version: "", hops: nil, req_head: "", trace: nil}, nil
+    return model.Resp{status: 0, reason: "", headers: nil, body: nil, elapsed_ms: 0.0, remote: "", version: "", hops: nil, req_head: "", trace: nil, tls_ver: 0}, nil
 }
 
 // request is the package-level convenience on a shared zero-value
@@ -271,7 +271,7 @@ fn dial_h1(host: str, port: int, tmo_ms: int) -> [net.Conn, err] {
 // roundtrip performs one request/response exchange on a fresh
 // connection and fills the stage timings on the way out.
 fn (t H1) roundtrip(req: ref model.Req, cap: mut model.Hop) -> [model.Resp, err] {
-    bad := model.Resp{status: 0, reason: "", headers: nil, body: nil, elapsed_ms: 0.0, remote: "", version: "", hops: nil, req_head: "", trace: nil}
+    bad := model.Resp{status: 0, reason: "", headers: nil, body: nil, elapsed_ms: 0.0, remote: "", version: "", hops: nil, req_head: "", trace: nil, tls_ver: 0}
     t0 := now_ms()
     tr := new(model.Trace)
     [u, ue] = check_url(req.url)
@@ -479,7 +479,7 @@ fn finish_roundtrip(req: ref model.Req, br: own bufio.Reader, cap: mut model.Hop
     }
     tr.closed_ms = itof(now_ms() - c0)
     let bodyb: []byte = db
-    return model.Resp{status: h.status, reason: h.reason, headers: h.headers, body: bodyb, elapsed_ms: itof(now_ms() - t0), remote: host + ":" + itoa(port), version: h.version, hops: nil, req_head: "", trace: tr}, nil
+    return model.Resp{status: h.status, reason: h.reason, headers: h.headers, body: bodyb, elapsed_ms: itof(now_ms() - t0), remote: host + ":" + itoa(port), version: h.version, hops: nil, req_head: "", trace: tr, tls_ver: 0}, nil
 }
 
 // check_url gates the scheme surface: http and https. Other schemes
