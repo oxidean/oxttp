@@ -1,0 +1,1 @@
+http_proxy='http://hprox:3128' https_proxy='http://sprox:3129' curl -x 'http://anyp:8080' -H 'Accept-Encoding: <AE>' -H 'User-Agent: <V>' -H 'Connection: <CONN>' -H 'Accept: */*' 'https://example.org/'

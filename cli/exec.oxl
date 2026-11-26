@@ -1221,6 +1221,12 @@ fn plan(i: ref Intent, env: []str, stdin: str, stdin_tty: int) -> own ReqPlan {
     } else if i.http_version == "2-prior-knowledge" {
         p.req.h2 = "prior"
     }
+    // WI-0013 sem-S5: --proxy entries + captured env proxies carry to
+    // the transport — per-hop resolution (scheme match else all:),
+    // NO_PROXY + loopback carve-outs live in pick_proxy.
+    p.req.proxies = i.proxies[:]
+    p.req.proxy_env = i.proxy_env[:]
+    p.req.no_proxy = i.no_proxy
     if i.compress_n > 0 {
         p.warn = push(p.warn, "--compress is unsupported in this build; request body sent uncompressed.")
     }
@@ -1602,11 +1608,14 @@ fn curl_ignored(i: ref Intent) -> str {
     if i.download != 0 {
         out = out + "Warning: Ignored --download\n"
     }
-    if len(i.proxies[:]) > 0 || len(i.proxy_env[:]) > 0 {
-        out = out + "Warning: Ignored --proxy\n"
-    }
     if len(i.resolves[:]) > 0 {
         out = out + "Warning: Ignored --resolve\n"
+    }
+    // WI-0013 P5 (spec sem-S4/S6): --proxy now emits (-x / env
+    // prefixes) so its Ignored line is gone; --native-tls joins the
+    // corpus §5 ignored list instead.
+    if i.native_tls != 0 {
+        out = out + "Warning: Ignored --native-tls\n"
     }
     return out
 }
@@ -1621,6 +1630,8 @@ fn curl_emit(i: ref Intent, p: ref ReqPlan) -> str {
     fl_d := "-d"
     fl_c := "-C"
     fl_o := "-o"
+    fl_e := "-E"
+    fl_px := "-x"
     if long != 0 {
         fl_loc = "--location"
         fl_x = "--request"
@@ -1628,13 +1639,76 @@ fn curl_emit(i: ref Intent, p: ref ReqPlan) -> str {
         fl_d = "--data"
         fl_c = "--continue-at"
         fl_o = "--output"
+        fl_e = "--cert"
+        fl_px = "--proxy"
     }
-    cmd := "curl"
+    // WI-0013 P5 (spec sem-S6): --proxy http:/https: entries become
+    // env prefixes prepended to the line; all: becomes -x (last
+    // wins, matching curl's own last-flag semantics). Env-captured
+    // proxies stay silent — curl inherits the same environment.
+    pre := ""
+    allp := ""
+    pxi := 0
+    for pxi < len(i.proxies[:]) {
+        pent := i.proxies[pxi]
+        pxi = pxi + 1
+        ci := find(pent, ":")
+        if ci < 0 {
+            continue
+        }
+        proto := elwr(substr(pent, 0, ci))
+        purl := substr(pent, ci + 1, len(pent))
+        if proto == "all" {
+            allp = purl
+        } else if proto == "http" {
+            pre = pre + "http_proxy=" + shquote(purl) + " "
+        } else if proto == "https" {
+            pre = pre + "https_proxy=" + shquote(purl) + " "
+        }
+    }
+    cmd := pre + "curl"
     if i.follow != 0 {
         cmd = cmd + " " + fl_loc
     }
     if i.http_version == "1.0" {
         cmd = cmd + " --http1.0"
+    }
+    if i.http_version == "2" {
+        cmd = cmd + " --http2"
+    }
+    if i.http_version == "2-prior-knowledge" {
+        cmd = cmd + " --http2-prior-knowledge"
+    }
+    // 3-prior-knowledge maps to --http3-only but is unreachable: the
+    // h3 feature-gate defer fires ahead of the curl short-circuit.
+    if i.http_version == "3-prior-knowledge" {
+        cmd = cmd + " --http3-only"
+    }
+    if len(i.cert) > 0 {
+        cmd = cmd + " " + fl_e + " " + shquote(i.cert)
+    }
+    if len(i.cert_key) > 0 {
+        cmd = cmd + " --key " + shquote(i.cert_key)
+    }
+    // --ssl tlsX.Y -> --tlsvX.Y --tls-max X.Y; auto/ssl2.3 silent.
+    sslv := ""
+    if i.ssl == "tls1" {
+        sslv = "1.0"
+    }
+    if i.ssl == "tls1.1" {
+        sslv = "1.1"
+    }
+    if i.ssl == "tls1.2" {
+        sslv = "1.2"
+    }
+    if i.ssl == "tls1.3" {
+        sslv = "1.3"
+    }
+    if len(sslv) > 0 {
+        cmd = cmd + " --tlsv" + sslv + " --tls-max " + sslv
+    }
+    if len(allp) > 0 {
+        cmd = cmd + " " + fl_px + " " + shquote(allp)
     }
     if p.resume_off > 0 {
         cmd = cmd + " " + fl_c + " -"

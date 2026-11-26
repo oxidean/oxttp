@@ -1,0 +1,2 @@
+# --curl pin (WI-0013 sem-S6): --proxy all: -> -x; http:/https: -> env prefixes.
+argv: --curl --proxy all:http://anyp:8080 --proxy http:http://hprox:3128 --proxy https:http://sprox:3129 GET https://example.org/
