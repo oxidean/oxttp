@@ -154,6 +154,11 @@ fn (t H1) send(req: ref model.Req) -> [model.Resp, err] {
         }
         loc := hdr_get(resp.headers, "location")
         if len(loc) == 0 {
+            // redirect status without a target ends the chain — keep
+            // the Resp contract uniform: hops non-nil (len() on a nil
+            // own handle traps) and req_head installed.
+            resp.hops = new(hs)
+            resp.req_head = cap.req_head
             return resp, nil
         }
         eff := cur.max_redirects
