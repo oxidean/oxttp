@@ -1,0 +1,12 @@
+name: Upload form
+method: POST
+url: example.com/form
+body:
+  form_data:
+    - name: a
+      value: "1"
+auth:
+  type: basic
+  basic:
+    username: u
+    password: p

@@ -16,6 +16,10 @@ import "std/errors"
 import "std/strconv"
 
 // YNode kinds: 0 scalar, 1 map, 2 list.
+// plain marks scalars that emit bare even when they look like a
+// YAML bool/null/number — the collection encoder sets it on real
+// bools/numbers (enabled: false, timeout: 5.0) so output stays
+// canonical instead of quoting everything typed-looking.
 struct YNode {
     kind: int,
     s: str,
@@ -23,6 +27,7 @@ struct YNode {
     items: []own YNode,
     line: int,
     force_quote: bool,
+    plain: bool,
 }
 
 struct YPair { key: str, val: own YNode }
@@ -613,6 +618,9 @@ fn ind_str(indent: int) -> str {
 }
 
 fn esc_or_plain(n: ref YNode) -> str {
+    if n.plain {
+        return n.s
+    }
     if n.force_quote || !plain_safe(n.s) {
         return esc_dq(n.s)
     }

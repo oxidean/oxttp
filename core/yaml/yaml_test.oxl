@@ -137,18 +137,18 @@ fn test_parse_key_only_map_inside_seq_scalars() {
 fn test_emit_roundtrip() {
     root := new(YNode)
     root.kind = 1
-    root.pairs = push(root.pairs, YPair{key: "name", val: new(YNode{kind: 0, s: "get users", pairs: nil, items: nil, line: 0, force_quote: false})})
+    root.pairs = push(root.pairs, YPair{key: "name", val: new(YNode{kind: 0, s: "get users", pairs: nil, items: nil, line: 0, force_quote: false, plain: false})})
     hs := new(YNode)
     hs.kind = 2
     it := new(YNode)
     it.kind = 1
-    it.pairs = push(it.pairs, YPair{key: "name", val: new(YNode{kind: 0, s: "A", pairs: nil, items: nil, line: 0, force_quote: false})})
-    it.pairs = push(it.pairs, YPair{key: "value", val: new(YNode{kind: 0, s: "1", pairs: nil, items: nil, line: 0, force_quote: true})})
+    it.pairs = push(it.pairs, YPair{key: "name", val: new(YNode{kind: 0, s: "A", pairs: nil, items: nil, line: 0, force_quote: false, plain: false})})
+    it.pairs = push(it.pairs, YPair{key: "value", val: new(YNode{kind: 0, s: "1", pairs: nil, items: nil, line: 0, force_quote: true, plain: false})})
     hs.items = push(hs.items, it)
     root.pairs = push(root.pairs, YPair{key: "headers", val: hs})
     b := new(YNode)
     b.kind = 1
-    b.pairs = push(b.pairs, YPair{key: "content", val: new(YNode{kind: 0, s: "l1\nl2\n", pairs: nil, items: nil, line: 0, force_quote: false})})
+    b.pairs = push(b.pairs, YPair{key: "content", val: new(YNode{kind: 0, s: "l1\nl2\n", pairs: nil, items: nil, line: 0, force_quote: false, plain: false})})
     root.pairs = push(root.pairs, YPair{key: "body", val: b})
     out := emit(root)
     [n2, e2] = parse(out)
@@ -166,9 +166,9 @@ fn test_emit_scalar_safety() {
     root := new(YNode)
     root.kind = 1
     // bool/num-looking strings must quote so YAML readers keep str
-    root.pairs = push(root.pairs, YPair{key: "s", val: new(YNode{kind: 0, s: "true", pairs: nil, items: nil, line: 0, force_quote: true})})
-    root.pairs = push(root.pairs, YPair{key: "n", val: new(YNode{kind: 0, s: "42", pairs: nil, items: nil, line: 0, force_quote: true})})
-    root.pairs = push(root.pairs, YPair{key: "plain", val: new(YNode{kind: 0, s: "abc", pairs: nil, items: nil, line: 0, force_quote: false})})
+    root.pairs = push(root.pairs, YPair{key: "s", val: new(YNode{kind: 0, s: "true", pairs: nil, items: nil, line: 0, force_quote: true, plain: false})})
+    root.pairs = push(root.pairs, YPair{key: "n", val: new(YNode{kind: 0, s: "42", pairs: nil, items: nil, line: 0, force_quote: true, plain: false})})
+    root.pairs = push(root.pairs, YPair{key: "plain", val: new(YNode{kind: 0, s: "abc", pairs: nil, items: nil, line: 0, force_quote: false, plain: false})})
     out := emit(root)
     testing.expect(find(out, "\"true\"") >= 0, "bool-lookalike quoted")
     testing.expect(find(out, "\"42\"") >= 0, "num-lookalike quoted")
