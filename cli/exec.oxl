@@ -21,6 +21,8 @@ import "std/crypto/md5"
 
 import "std/net/url"
 
+import "std/net/tls"
+
 import "github.com/oxidean/oxttp/core/model"
 
 import "github.com/oxidean/oxttp/core/item"
@@ -1172,6 +1174,41 @@ fn plan(i: ref Intent, env: []str, stdin: str, stdin_tty: int) -> own ReqPlan {
     p.req.follow = (i.follow != 0)
     p.req.max_redirects = i.eff_redirects
     p.req.verify = i.verify
+    // WI-0013 sem-S2: --ssl pins the negotiated version range; unset,
+    // auto and ssl2.3 all leave 0/0 = build default [V12,V13]
+    // (ADR-0032). tls1/1.1 warn+fallback (corpus W-shape, adapted D2).
+    if i.ssl == "tls1.2" {
+        p.req.ssl_min = tls.V12
+        p.req.ssl_max = tls.V12
+    } else if i.ssl == "tls1.3" {
+        p.req.ssl_min = tls.V13
+        p.req.ssl_max = tls.V13
+    } else if i.ssl == "tls1" || i.ssl == "tls1.1" {
+        p.warn = push(p.warn, "rustls does not support older TLS versions. This build's TLS stack requires TLS >= 1.2 — falling back to TLS 1.2+.")
+    }
+    // WI-0013 sem-S4: --native-tls warning-degrades on https (single
+    // TLS stack — ADR-0031); inert on cleartext.
+    if i.native_tls != 0 && url_scheme(i.url) == "https" {
+        p.warn = push(p.warn, "--native-tls selects an alternate TLS backend; this build ships one TLS stack (oxl std/net/tls) — using it")
+    }
+    // WI-0013 sem-S3: --cert/--cert-key read eagerly — upstream loads
+    // them at client build, so a missing file errors even on http://
+    // or --offline. The key file appends onto the cert PEM (corpus:
+    // "Private key file appended to cert PEM").
+    if len(i.cert) > 0 {
+        if !os.exists(i.cert) {
+            p.err = "cert file not found: " + i.cert
+            return p
+        }
+        p.req.cert_pem = os.readfile_(i.cert)
+        if len(i.cert_key) > 0 {
+            if !os.exists(i.cert_key) {
+                p.err = "cert-key file not found: " + i.cert_key
+                return p
+            }
+            p.req.key_pem = os.readfile_(i.cert_key)
+        }
+    }
     if i.http_version == "1.0" {
         p.req.httpver = "HTTP/1.0"
     } else {
@@ -1781,6 +1818,12 @@ fn execute(i: ref Intent, envpairs: []str, stdin: str, stdin_tty: int) -> own Ru
             }
             resp = resp2
         }
+    }
+    // W2 (spec sem-S3): a configured client cert that negotiated
+    // TLS 1.2 was not presented — upstream's std caveat is silent;
+    // ADR-0006 says say so.
+    if len(p.req.cert_pem) > 0 && resp.tls_ver == tls.V12 && i.quiet < 2 {
+        warn = warn + prog + ": warning: --cert client certificate was not presented: TLS 1.2 sends an empty certificate list in this build\n"
     }
     // --all / --history-print intermediate hops
     if i.all != 0 {

@@ -235,3 +235,47 @@ fn test_exec_curl_ignored_warn() {
     testing.expect(find(r.stderr, "Warning: Ignored --pretty") >= 0, "ignored pretty: " + r.stderr)
     testing.expect(find(r.stderr, "Warning: Ignored --print") >= 0, "ignored print: " + r.stderr)
 }
+
+// WI-0013 P2 — ADR-0031: --native-tls on https is a warning-degrade
+// (single TLS stack), inert on cleartext; exit-1 defer retired.
+fn test_exec_native_tls_warns() {
+    r := xrun("--native-tls\n--offline\nhttps://example.org/x", "", 1)
+    testing.expect_eq(r.code, 0, "native-tls https execs: " + r.stderr)
+    testing.expect(find(r.stderr, "warning: --native-tls selects an alternate TLS backend") >= 0, "W3 warn: " + r.stderr)
+    r2 := xrun("--native-tls\n--offline\nhttp://example.org/x", "", 1)
+    testing.expect_eq(r2.code, 0, "native-tls http execs: " + r2.stderr)
+    testing.expect(find(r2.stderr, "native-tls") < 0, "cleartext inert: " + r2.stderr)
+}
+
+// WI-0013 P2 — --ssl map (spec sem-S2): tls1/1.1 warn+fallback;
+// tls1.2/1.3 silent; auto silent.
+fn test_exec_ssl_warns_and_map() {
+    r := xrun("--ssl\ntls1\n--offline\nhttps://example.org", "", 1)
+    testing.expect_eq(r.code, 0, "tls1 execs: " + r.stderr)
+    testing.expect(find(r.stderr, "rustls does not support older TLS versions") >= 0, "W1 warn: " + r.stderr)
+    r2 := xrun("--ssl\ntls1.1\n--offline\nhttps://example.org", "", 1)
+    testing.expect(find(r2.stderr, "rustls does not support older TLS versions") >= 0, "W1 tls1.1: " + r2.stderr)
+    r3 := xrun("--ssl\ntls1.2\n--offline\nhttps://example.org", "", 1)
+    testing.expect(find(r3.stderr, "older TLS") < 0, "tls1.2 silent: " + r3.stderr)
+    r4 := xrun("--ssl\nauto\n--offline\nhttps://example.org", "", 1)
+    testing.expect(find(r4.stderr, "older TLS") < 0, "auto silent: " + r4.stderr)
+}
+
+// WI-0013 P2 — --cert/--cert-key read eagerly at plan (xh validates
+// at client build, scheme-blind): missing file errors exit 1;
+// a present file is inert on cleartext+offline.
+fn test_exec_cert_files() {
+    r := xrun("--cert\n/no/such/cert.pem\n--offline\nexample.org", "", 1)
+    testing.expect_eq(r.code, 1, "missing cert exit 1")
+    testing.expect(find(r.stderr, "cert file not found") >= 0, "names cert: " + r.stderr)
+    os.writefile_("/tmp/oxttp-ctest.pem", "not a real pem")
+    r2 := xrun("--cert\n/tmp/oxttp-ctest.pem\n--cert-key\n/no/such/key.pem\n--offline\nexample.org", "", 1)
+    testing.expect_eq(r2.code, 1, "missing cert-key exit 1")
+    testing.expect(find(r2.stderr, "cert-key file not found") >= 0, "names key: " + r2.stderr)
+    r3 := xrun("--cert\n/tmp/oxttp-ctest.pem\n--offline\nexample.org", "", 1)
+    testing.expect_eq(r3.code, 0, "offline cert passes (no TLS): " + r3.stderr)
+    // --cert-key alone (no --cert) is ignored, matching upstream
+    r4 := xrun("--cert-key\n/no/such/key.pem\n--offline\nexample.org", "", 1)
+    testing.expect_eq(r4.code, 0, "lone cert-key ignored: " + r4.stderr)
+    os.remove("/tmp/oxttp-ctest.pem")
+}

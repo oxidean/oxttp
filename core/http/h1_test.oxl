@@ -421,6 +421,18 @@ fn test_bad_and_https_urls() {
     if e == nil {
         testing.expect_eq(resp.status, 200, "https 200")
         testing.expect(len(resp.body) > 0, "https body")
+        // WI-0013 P2: negotiated version exposed (ADR-0032 default
+        // range is [V12,V13]; example.com negotiates 1.3 = 772)
+        testing.expect(resp.tls_ver == 771 || resp.tls_ver == 772, "tls_ver set")
+    }
+    // --ssl pin: tls1.3-only still connects
+    rp := rq("GET", "https://example.com/")
+    rp.ssl_min = 772
+    rp.ssl_max = 772
+    [respp, ep] = request(rp)
+    testing.expect(ep == nil, "tls1.3 pin")
+    if ep == nil {
+        testing.expect_eq(respp.tls_ver, 772, "pinned 1.3 negotiated")
     }
     // --verify=no still connects (accept-all Verifier)
     r0 := rq("GET", "https://example.com/")

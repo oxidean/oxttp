@@ -352,7 +352,7 @@ fn (t H1) roundtrip(req: ref model.Req, cap: mut model.Hop) -> [model.Resp, err]
                 htmo = 1
             }
         }
-        [tc, te] = tls_wrap(raw, host, req.verify, htmo)
+        [tc, te] = tls_wrap(raw, host, req, htmo)
         if te != nil {
             return bad, te
         }
@@ -376,7 +376,7 @@ fn (t H1) roundtrip(req: ref model.Req, cap: mut model.Hop) -> [model.Resp, err]
         tr.send_body_ms = itof(now_ms() - c0)
         trr := TmoTlsReader{c: tc, deadline: deadline, tmo: req.timeout_ms}
         br := new(bufio.newreadersize(trr.asreader(), 16384))
-        [resp, re] = finish_roundtrip(req, br, cap, host, port, t0, c0, tr, bad)
+        [resp, re] = finish_roundtrip(req, br, cap, host, port, t0, c0, tr, bad, tc.s.ver)
         tc.close()
         return resp, re
     }
@@ -399,14 +399,14 @@ fn (t H1) roundtrip(req: ref model.Req, cap: mut model.Hop) -> [model.Resp, err]
     tr.send_body_ms = itof(now_ms() - c0)
     trr := TmoReader{c: raw, deadline: deadline, tmo: req.timeout_ms}
     br := new(bufio.newreadersize(trr.asreader(), 16384))
-    [resp, re] = finish_roundtrip(req, br, cap, host, port, t0, c0, tr, bad)
+    [resp, re] = finish_roundtrip(req, br, cap, host, port, t0, c0, tr, bad, 0)
     raw.close()
     return resp, re
 }
 
 // finish_roundtrip reads the HTTP response from br, fills hop cap, and
 // builds Resp (shared by cleartext and TLS paths).
-fn finish_roundtrip(req: ref model.Req, br: own bufio.Reader, cap: mut model.Hop, host: str, port: int, t0: int, c0: int, tr: own model.Trace, bad: model.Resp) -> [model.Resp, err] {
+fn finish_roundtrip(req: ref model.Req, br: own bufio.Reader, cap: mut model.Hop, host: str, port: int, t0: int, c0: int, tr: own model.Trace, bad: model.Resp, tls_ver: int) -> [model.Resp, err] {
     h := Head{status: 0, reason: "", headers: nil, version: ""}
     for true {
         [raw, rhe] = read_head(br)
@@ -479,7 +479,7 @@ fn finish_roundtrip(req: ref model.Req, br: own bufio.Reader, cap: mut model.Hop
     }
     tr.closed_ms = itof(now_ms() - c0)
     let bodyb: []byte = db
-    return model.Resp{status: h.status, reason: h.reason, headers: h.headers, body: bodyb, elapsed_ms: itof(now_ms() - t0), remote: host + ":" + itoa(port), version: h.version, hops: nil, req_head: "", trace: tr, tls_ver: 0}, nil
+    return model.Resp{status: h.status, reason: h.reason, headers: h.headers, body: bodyb, elapsed_ms: itof(now_ms() - t0), remote: host + ":" + itoa(port), version: h.version, hops: nil, req_head: "", trace: tr, tls_ver: tls_ver}, nil
 }
 
 // check_url gates the scheme surface: http and https. Other schemes
@@ -501,23 +501,26 @@ fn check_url(raw: str) -> [own url.URL, err] {
 
 // tls_wrap handshakes over an already-connected TCP socket. verify:
 // ""/"yes" → system roots; "no" → AcceptAll; else PEM path.
-fn tls_wrap(c: net.Conn, host: str, verify: str, tmo_ms: int) -> [tls.Conn, err] {
+// ssl_min/ssl_max pin the negotiated range (0 = build default
+// [V12,V13], ADR-0032); h2 modes set ALPN; cert_pem (combined PEM,
+// corpus convention) becomes Config.client_cert.
+fn tls_wrap(c: net.Conn, host: str, req: ref model.Req, tmo_ms: int) -> [tls.Conn, err] {
     if tmo_ms < 0 {
         tmo_ms = 0
     }
     cfg := tls.default_cfg()
     cfg.server_name = host
-    v := lwr(verify)
+    v := lwr(req.verify)
     if v == "no" {
         let a: tls.Verifier = AcceptAll{}
         cfg.verify = a
     } else if len(v) > 0 && v != "yes" {
-        if !os.exists(verify) {
+        if !os.exists(req.verify) {
             c.close()
             let z: tls.Conn
-            return z, errors.new("http: verify CA file not found: " + verify)
+            return z, errors.new("http: verify CA file not found: " + req.verify)
         }
-        text := os.readfile_(verify)
+        text := os.readfile_(req.verify)
         roots := x509.Roots{cas: new(mkslice(x509.Cert, 0))}
         [_, le] = roots.load_pem(text)
         if le != nil {
@@ -526,6 +529,37 @@ fn tls_wrap(c: net.Conn, host: str, verify: str, tmo_ms: int) -> [tls.Conn, err]
             return z, le
         }
         cfg.roots = roots
+    }
+    cfg.min_ver = req.ssl_min
+    cfg.max_ver = req.ssl_max
+    if cfg.min_ver == 0 {
+        cfg.min_ver = tls.V12
+    }
+    if cfg.max_ver == 0 {
+        cfg.max_ver = tls.V13
+    }
+    if req.h2 == "hint" {
+        al := mkslice(str, 2)
+        al[0] = "h2"
+        al[1] = "http/1.1"
+        cfg.alpn = al
+    } else if req.h2 == "prior" {
+        al2 := mkslice(str, 1)
+        al2[0] = "h2"
+        cfg.alpn = al2
+    }
+    if len(req.cert_pem) > 0 {
+        kp := req.key_pem
+        if len(kp) == 0 {
+            kp = req.cert_pem
+        }
+        [cc, cce] = tls.load_cert_pem(req.cert_pem, kp)
+        if cce != nil {
+            c.close()
+            let z: tls.Conn
+            return z, cce
+        }
+        cfg.client_cert = cc
     }
     if tmo_ms <= 0 {
         tmo_ms = 30000

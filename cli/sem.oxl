@@ -1328,12 +1328,8 @@ fn resolve(m: own args.Matches, envpairs: []str) -> own Out {
         defer_out(o, prog, scheme + " URLs are unsupported in this build (TLS is not available)")
         return o
     }
-    // --native-tls is inert on cleartext (ADR-0024); on https it would
-    // select a different stack, so degrade rather than silent oxl TLS.
-    if o.intent.native_tls != 0 && scheme == "https" {
-        defer_out(o, prog, "--native-tls is unsupported in this build (oxidean/oxl#221)")
-        return o
-    }
+    // --native-tls warning-degrades at plan on https (ADR-0031 —
+    // single TLS stack); inert on cleartext.
     // --curl never sends: skip connection-affecting degrades so the
     // emit path can warn about ignored flags instead of exit 1.
     if o.intent.curl != 0 {
