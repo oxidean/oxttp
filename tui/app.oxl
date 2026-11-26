@@ -260,17 +260,23 @@ fn req_pane_bindings(a: ref App) -> []Binding {
     name := ts[a.req_tab]
     if a.kind == KHttp || a.kind == KGraphql {
         if name == "Headers" || name == "Query" || name == "Params" {
-            // KV table bindings (§4.6)
+            // KV table bindings (§4.6). While a cell edit is live the
+            // letters are TEXT — hjkl must type into the cell, not
+            // navigate the table (they re-bind once it commits).
             bs = push(bs, bind("up", "kv-up"))
             bs = push(bs, bind("down", "kv-down"))
-            bs = push(bs, bind("k", "kv-up"))
-            bs = push(bs, bind("j", "kv-down"))
+            if !kv_editing(a) {
+                bs = push(bs, bind("k", "kv-up"))
+                bs = push(bs, bind("j", "kv-down"))
+            }
             bs = push(bs, bind("ctrl+r", "kv-toggle"))
             bs = push(bs, bind("ctrl+x", "kv-delete"))
             bs = push(bs, bind("left", "kv-left"))
             bs = push(bs, bind("right", "kv-right"))
-            bs = push(bs, bind("h", "kv-left"))
-            bs = push(bs, bind("l", "kv-right"))
+            if !kv_editing(a) {
+                bs = push(bs, bind("h", "kv-left"))
+                bs = push(bs, bind("l", "kv-right"))
+            }
             bs = push(bs, bind("enter", "kv-edit"))
             bs = push(bs, bind("backspace", "edit-backspace"))
             bs = push(bs, bind("delete", "edit-del-right"))
@@ -722,12 +728,14 @@ fn global_action(a: mut App, act: str) -> int {
 
 // widget_action — focused-widget binding outcomes.
 fn widget_action(a: mut App, act: str, ev: term.KeyEvent) -> int {
-    // line-edit shared actions
+    // line-edit shared actions — mutation target is resolved by
+    // focus: an active KV cell edit wins, then the focused KV cell
+    // (implicit edit), then the URL field. a.url is never mutated
+    // while another pane owns the press.
     if act == "edit-backspace" {
-        a.url.backspace()
-        kv_commit_or_edit(a)
+        edit_backspace(a)
     } else if act == "edit-del-right" {
-        a.url.del_right()
+        edit_del_right(a)
     } else if act == "edit-left" {
         a.url.move(a.url.cur - 1, false)
     } else if act == "edit-right" {
@@ -752,14 +760,19 @@ fn widget_action(a: mut App, act: str, ev: term.KeyEvent) -> int {
         a.url.select_all()
     } else if act == "edit-undo" {
         a.url.undo()
+        sync_path_kv(a)
     } else if act == "edit-redo" {
         a.url.redo()
+        sync_path_kv(a)
     } else if act == "edit-del-word" {
         a.url.del_word_back()
+        sync_path_kv(a)
     } else if act == "edit-del-start" {
         a.url.del_to_start()
+        sync_path_kv(a)
     } else if act == "edit-del-end" {
         a.url.del_to_end()
+        sync_path_kv(a)
     } else if act == "url-enter" {
         if is_curl_text(a.url.text) {
             a.degrade("curl import lands S10")
@@ -821,7 +834,12 @@ fn widget_action(a: mut App, act: str, ev: term.KeyEvent) -> int {
     } else if act == "kv-delete" {
         kv_del(a)
     } else if act == "kv-edit" {
-        kv_begin_edit(a)
+        // enter opens the cell editor; enter again commits it
+        if kv_editing(a) {
+            kv_commit(a)
+        } else {
+            kv_begin_edit(a)
+        }
     } else if act == "body-pager" {
         a.degrade("f3 pager — no pager handoff this build")
     } else if act == "body-editor" {
@@ -831,13 +849,29 @@ fn widget_action(a: mut App, act: str, ev: term.KeyEvent) -> int {
     } else if act == "body-backspace" {
         body_backspace(a)
     } else if act == "tv-up" {
-        a.resp_view.move(0, -1, false)
+        if wants_body(a) {
+            a.body.move(0, -1, false)
+        } else {
+            a.resp_view.move(0, -1, false)
+        }
     } else if act == "tv-down" {
-        a.resp_view.move(0, 1, false)
+        if wants_body(a) {
+            a.body.move(0, 1, false)
+        } else {
+            a.resp_view.move(0, 1, false)
+        }
     } else if act == "tv-left" {
-        a.resp_view.move(-1, 0, false)
+        if wants_body(a) {
+            a.body.move(-1, 0, false)
+        } else {
+            a.resp_view.move(-1, 0, false)
+        }
     } else if act == "tv-right" {
-        a.resp_view.move(1, 0, false)
+        if wants_body(a) {
+            a.body.move(1, 0, false)
+        } else {
+            a.resp_view.move(1, 0, false)
+        }
     } else if act == "tv-word-fwd" {
         a.resp_view.word_fwd(false)
     } else if act == "tv-word-back" {
@@ -986,6 +1020,9 @@ fn active_kv(a: ref App) -> int {
 }
 
 fn kv_move(a: mut App, d: int) {
+    // commit an in-flight cell edit against the OLD cell before the
+    // selection moves — else the live buffer writes into the new row.
+    kv_commit(a)
     w := active_kv(a)
     if w < 0 {
         return
@@ -1000,6 +1037,7 @@ fn kv_move(a: mut App, d: int) {
 }
 
 fn kv_col(a: mut App, c: int) {
+    kv_commit(a)
     w := active_kv(a)
     if w == 0 {
         a.headers.col = c
@@ -1009,6 +1047,7 @@ fn kv_col(a: mut App, c: int) {
 }
 
 fn kv_toggle(a: mut App) {
+    kv_commit(a)
     w := active_kv(a)
     if w == 0 {
         a.headers.toggle()
@@ -1018,6 +1057,7 @@ fn kv_toggle(a: mut App) {
 }
 
 fn kv_del(a: mut App) {
+    kv_commit(a)
     w := active_kv(a)
     if w == 0 {
         a.headers.del_row()
@@ -1029,49 +1069,115 @@ fn kv_del(a: mut App) {
 fn kv_begin_edit(a: mut App) {
     w := active_kv(a)
     if w == 0 {
-        a.headers.editing = true
-        if a.headers.col == 0 {
-            a.headers.edit = new_line_edit(a.headers.rows[a.headers.cur].name)
-        } else {
-            a.headers.edit = new_line_edit(a.headers.rows[a.headers.cur].value)
-        }
+        a.headers.begin_edit()
     } else if w == 1 {
-        a.query_kv.editing = true
-        if a.query_kv.col == 0 {
-            a.query_kv.edit = new_line_edit(a.query_kv.rows[a.query_kv.cur].name)
-        } else {
-            a.query_kv.edit = new_line_edit(a.query_kv.rows[a.query_kv.cur].value)
-        }
+        a.query_kv.begin_edit()
     } else if w == 2 {
-        a.path_kv.editing = true
+        // Path names derive from ":name" URL placeholders — only the
+        // value column is editable (corpus §4.6); a placeholder-less
+        // table has no row to edit.
+        if a.path_kv.is_sentinel() {
+            return
+        }
         a.path_kv.col = 1
-        a.path_kv.edit = new_line_edit(a.path_kv.rows[a.path_kv.cur].value)
+        a.path_kv.begin_edit()
     }
 }
 
-fn kv_commit_or_edit(a: mut App) {
-    // backspace inside a live kv cell-edit routes to that edit, not url
+// kv_commit commits the live cell edit on the active table (no-op
+// when nothing is being edited).
+fn kv_commit(a: mut App) {
+    w := active_kv(a)
+    if w == 0 {
+        a.headers.commit_edit()
+    } else if w == 1 {
+        a.query_kv.commit_edit()
+    } else if w == 2 {
+        a.path_kv.commit_edit()
+    }
+}
+
+fn kv_editing(a: ref App) -> bool {
+    w := active_kv(a)
+    if w == 0 {
+        return a.headers.editing
+    }
+    if w == 1 {
+        return a.query_kv.editing
+    }
+    if w == 2 {
+        return a.path_kv.editing
+    }
+    return false
+}
+
+// kv_cell_bs backspaces inside the current cell of table w — starting
+// an implicit edit when none is active. Path cells edit the value
+// column only (name derives from the URL).
+fn kv_cell_bs(a: mut App, w: int) {
+    if w == 0 {
+        a.headers.ensure_edit()
+        a.headers.edit.backspace()
+        a.headers.apply_edit()
+    } else if w == 1 {
+        a.query_kv.ensure_edit()
+        a.query_kv.edit.backspace()
+        a.query_kv.apply_edit()
+    } else if w == 2 {
+        if a.path_kv.is_sentinel() {
+            return
+        }
+        a.path_kv.col = 1
+        a.path_kv.ensure_edit()
+        a.path_kv.edit.backspace()
+        a.path_kv.apply_edit()
+    }
+}
+
+fn kv_cell_del(a: mut App, w: int) {
+    if w == 0 {
+        a.headers.ensure_edit()
+        a.headers.edit.del_right()
+        a.headers.apply_edit()
+    } else if w == 1 {
+        a.query_kv.ensure_edit()
+        a.query_kv.edit.del_right()
+        a.query_kv.apply_edit()
+    } else if w == 2 {
+        if a.path_kv.is_sentinel() {
+            return
+        }
+        a.path_kv.col = 1
+        a.path_kv.ensure_edit()
+        a.path_kv.edit.del_right()
+        a.path_kv.apply_edit()
+    }
+}
+
+// edit target resolution for text mutations: a focused KV table owns
+// the press (active or implicit cell edit); otherwise the URL field.
+fn edit_backspace(a: mut App) {
     if a.focus == FReqPane {
         w := active_kv(a)
-        if w == 0 && a.headers.editing {
-            a.headers.edit.backspace()
-            a.headers.commit_edit()
-            a.headers.editing = true
-            return
-        }
-        if w == 1 && a.query_kv.editing {
-            a.query_kv.edit.backspace()
-            a.query_kv.commit_edit()
-            a.query_kv.editing = true
-            return
-        }
-        if w == 2 && a.path_kv.editing {
-            a.path_kv.edit.backspace()
-            a.path_kv.commit_edit()
-            a.path_kv.editing = true
+        if w >= 0 {
+            kv_cell_bs(a, w)
             return
         }
     }
+    a.url.backspace()
+    sync_path_kv(a)
+}
+
+fn edit_del_right(a: mut App) {
+    if a.focus == FReqPane {
+        w := active_kv(a)
+        if w >= 0 {
+            kv_cell_del(a, w)
+            return
+        }
+    }
+    a.url.del_right()
+    sync_path_kv(a)
 }
 
 fn rows_cur(a: mut App) -> int {
@@ -1111,6 +1217,17 @@ fn rows_end(a: mut App, shift: bool) {
         return
     }
     a.resp_rows.end(shift)
+}
+
+// wants_body — is the focused pane the request Body/Message editor?
+// Its cursor nav must move a.body (not a.resp_view) or inserts land
+// at the wrong offset.
+fn wants_body(a: ref App) -> bool {
+    if a.focus != FReqPane {
+        return false
+    }
+    n := active_kv_name(a)
+    return n == "Body" || n == "Message"
 }
 
 // widget_wants_text — does the focused widget eat plain runes?
@@ -1160,13 +1277,16 @@ fn kv_type_char(a: mut App, ch: str) {
     w := active_kv(a)
     if w == 0 {
         a.headers.type_char(ch)
-        a.headers.editing = false
     } else if w == 1 {
         a.query_kv.type_char(ch)
-        a.query_kv.editing = false
     } else if w == 2 {
+        // Path names derive from the URL — route direct typing to the
+        // value column like kv_begin_edit does (corpus §4.6).
+        if a.path_kv.is_sentinel() {
+            return
+        }
+        a.path_kv.col = 1
         a.path_kv.type_char(ch)
-        a.path_kv.editing = false
     }
 }
 
@@ -1505,14 +1625,9 @@ fn jump_action(a: mut App, act: str) -> int {
 }
 
 fn method_menu_idx(method: str, kind: int) -> int {
-    names := method_names()
-    i := 0
-    for i < len(names) {
-        if names[i] == method {
-            return i
-        }
-        i = i + 1
-    }
+    // non-HTTP kinds resolve by KIND first — GraphQL stores
+    // method "POST" for the wire, so resolving by string would land
+    // on HTTP POST and Enter would silently revert the kind.
     if kind == KGraphql {
         return 7
     }
@@ -1521,6 +1636,14 @@ fn method_menu_idx(method: str, kind: int) -> int {
     }
     if kind == KWs {
         return 9
+    }
+    names := method_names()
+    i := 0
+    for i < len(names) {
+        if names[i] == method {
+            return i
+        }
+        i = i + 1
     }
     return 0
 }
@@ -1821,6 +1944,11 @@ fn is_curl_text(s: str) -> bool {
 // --- mouse ---
 
 fn dispatch_mouse(a: mut App, ev: term.KeyEvent) -> int {
+    // a live modal owns the pointer — swallow clicks/scrolls so they
+    // can't hit-test background panes and steal focus.
+    if len(a.modals) > 0 {
+        return ENone
+    }
     m := ev.key as term.Key.Mouse
     if m.kind == term.MouseScrollUp || m.kind == term.MouseScrollDown {
         d := -1
@@ -1828,7 +1956,7 @@ fn dispatch_mouse(a: mut App, ev: term.KeyEvent) -> int {
             d = 1
         }
         // scroll the pane under the cursor
-        if a.sidebar_on && m.x >= a.r_sidebar_x && m.x < a.r_sidebar_x + a.r_sidebar_w {
+        if a.sidebar_on && in_rect(m.x, m.y, a.r_sidebar_x, a.r_sidebar_y, a.r_sidebar_w, a.r_sidebar_h) {
             a.coll.move(d, false)
         } else if a.r_resp_h > 0 && in_rect(m.x, m.y, a.r_resp_x, a.r_resp_y, a.r_resp_w, a.r_resp_h) {
             a.resp_view.move(0, d, false)
@@ -1841,7 +1969,7 @@ fn dispatch_mouse(a: mut App, ev: term.KeyEvent) -> int {
         return ENone
     }
     // click → focus pane under point
-    if a.sidebar_on && m.x >= a.r_sidebar_x && m.x < a.r_sidebar_x + a.r_sidebar_w {
+    if a.sidebar_on && in_rect(m.x, m.y, a.r_sidebar_x, a.r_sidebar_y, a.r_sidebar_w, a.r_sidebar_h) {
         a.focus = FSidebar
         vis := a.coll.visible()
         // tree rows start 2 cells below the pane top (title + env row)
@@ -1870,13 +1998,14 @@ fn in_rect(x: int, y: int, rx: int, ry: int, rw: int, rh: int) -> bool {
     return x >= rx && x < rx + rw && y >= ry && y < ry + rh
 }
 
-// feed_text dispatches each char of s as a plain rune event
-// (search/palette/test helper).
+// feed_text dispatches each GLYPH of s as a plain rune event
+// (search/palette/test helper) — multibyte chars arrive whole.
 fn feed_text(a: mut App, s: str) {
     i := 0
     for i < len(s) {
-        ev := term.KeyEvent{key: term.Key.Rune{ch: substr(s, i, i + 1)}, ctrl: false, alt: false, shift: false, meta: false, sup: false}
+        gl := term.glyph_len(s, i)
+        ev := term.KeyEvent{key: term.Key.Rune{ch: substr(s, i, i + gl)}, ctrl: false, alt: false, shift: false, meta: false, sup: false}
         dispatch(a, ev)
-        i = i + 1
+        i = i + gl
     }
 }

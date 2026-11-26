@@ -66,6 +66,72 @@ fn test_list_cur() {
     testing.expect_eq(l.anchor, -1, "anchor cleared")
 }
 
+fn test_line_edit_sel_delete_undo() {
+    // selection deletes must snap() FIRST so ctrl+z restores them
+    e := new_line_edit("hello")
+    e.select_all()
+    e.backspace()
+    testing.expect_streq(e.text, "", "sel deleted")
+    e.undo()
+    testing.expect_streq(e.text, "hello", "undo restores sel-backspace")
+    e2 := new_line_edit("abc")
+    e2.select_all()
+    e2.del_right()
+    testing.expect_streq(e2.text, "", "del_right sel")
+    e2.undo()
+    testing.expect_streq(e2.text, "abc", "undo del_right sel")
+    e3 := new_line_edit("wipe me")
+    e3.select_all()
+    e3.del_word_back()
+    testing.expect_streq(e3.text, "", "ctrl+w sel")
+    e3.undo()
+    testing.expect_streq(e3.text, "wipe me", "undo ctrl+w sel")
+    // no-op deletions stay out of undo history
+    e4 := new_line_edit("x")
+    e4.move(0, false)
+    e4.backspace()
+    testing.expect(!e4.has_undo, "noop backspace not undoable")
+    e5 := new_line_edit("y")
+    e5.del_right()
+    testing.expect(!e5.has_undo, "noop del_right not undoable")
+}
+
+fn test_line_edit_utf8() {
+    // byte offsets stay, but every op snaps to code-point boundaries
+    e := new_line_edit("")
+    e.insert("hé")
+    testing.expect_eq(len(e.text), 3, "hé is 3 bytes")
+    e.backspace()
+    testing.expect_streq(e.text, "h", "backspace removes whole é")
+    e.insert("é")
+    testing.expect_streq(e.text, "hé", "reinsert")
+    e2 := new_line_edit("é")
+    e2.move(0, false)
+    e2.del_right()
+    testing.expect_streq(e2.text, "", "del_right removes whole é")
+    // move through multibyte: left/right step over the glyph atomically
+    e3 := new_line_edit("aéz")
+    e3.move(0, false)
+    e3.move(e3.cur + 1, false)
+    testing.expect_eq(e3.cur, 1, "cur before é")
+    e3.move(e3.cur + 1, false)
+    testing.expect_eq(e3.cur, 3, "right snapped over é (2 bytes)")
+    e3.move(e3.cur - 1, false)
+    testing.expect_eq(e3.cur, 1, "left snapped back over é")
+    // insert-after-left keeps the string valid
+    e3.insert("X")
+    testing.expect_streq(e3.text, "aXéz", "insert at boundary")
+    // backspace through a multibyte char mid-text
+    e4 := new_line_edit("héllo")
+    e4.backspace()
+    e4.backspace()
+    e4.backspace()
+    e4.backspace()
+    testing.expect_streq(e4.text, "h", "4 backspaces ate llo+é")
+    e4.undo()
+    testing.expect_streq(e4.text, "hé", "undo restored é whole")
+}
+
 fn test_kv_table() {
     t := new_kv()
     testing.expect_eq(len(t.rows), 1, "sentinel")

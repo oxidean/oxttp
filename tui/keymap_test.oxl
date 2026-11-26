@@ -384,3 +384,161 @@ fn test_screenshot() {
     dispatch(a, kev("s", true, false, true))
     testing.expect(a.want_shot, "want_shot set")
 }
+
+fn mev(kind: int, x: int, y: int) -> term.KeyEvent {
+    return term.KeyEvent{key: term.Key.Mouse{kind: kind, x: x, y: y, button: 0}, ctrl: false, alt: false, shift: false, meta: false, sup: false}
+}
+
+fn test_kv_cell_edit_hjkl_types() {
+    // while a cell edit is live, hjkl are text — after enter commits
+    // they navigate again (corpus §4.5/4.6).
+    a := new_app()
+    a.focus = FReqPane // req_tab 0 = Headers
+    dispatch(a, knamed(term.KeyEnter))
+    testing.expect(a.headers.editing, "enter opens cell edit")
+    feed_text(a, "jh")
+    testing.expect_streq(a.headers.rows[0].name, "jh", "jh typed into cell")
+    testing.expect_eq(a.headers.cur, 0, "hjkl did not navigate")
+    dispatch(a, knamed(term.KeyEnter))
+    testing.expect(!a.headers.editing, "enter commits")
+    dispatch(a, kev("j", false, false, false))
+    testing.expect_eq(a.headers.cur, 1, "j navigates after commit")
+    dispatch(a, kev("k", false, false, false))
+    testing.expect_eq(a.headers.cur, 0, "k navigates back")
+}
+
+fn test_kv_backspace_delete_never_touch_url() {
+    // backspace/delete on a focused KV table target the cell — the
+    // URL field must not lose chars (it isn't the edit target).
+    a := new_app()
+    a.url.text = "keepme"
+    a.url.cur = 2
+    a.focus = FReqPane
+    feed_text(a, "ab")
+    testing.expect_streq(a.headers.rows[0].name, "ab", "implicit edit")
+    dispatch(a, knamed(term.KeyBackspace))
+    testing.expect_streq(a.headers.rows[0].name, "a", "cell backspace")
+    testing.expect_streq(a.url.text, "keepme", "url untouched by bs")
+    // delete-at-cursor-0 via a preset cell edit
+    a.headers.edit.cur = 0
+    dispatch(a, knamed(term.KeyDelete))
+    testing.expect_streq(a.headers.rows[0].name, "", "cell delete ate 'a'")
+    testing.expect_streq(a.url.text, "keepme", "url untouched by del")
+}
+
+fn test_kv_edit_commits_before_selection_move() {
+    // column/row changes mid-edit commit the buffer to the OLD cell —
+    // it must not follow the cursor into the new one.
+    a := new_app()
+    a.focus = FReqPane
+    feed_text(a, "ab")
+    dispatch(a, knamed(term.KeyDown)) // commits row 0, selects row 1
+    testing.expect_streq(a.headers.rows[0].name, "ab", "committed to old cell")
+    testing.expect_eq(a.headers.cur, 1, "moved")
+    // backspace on the new row must NOT write the old buffer there
+    dispatch(a, knamed(term.KeyBackspace))
+    testing.expect_streq(a.headers.rows[1].name, "", "row1 name stays empty")
+    feed_text(a, "zz")
+    testing.expect_streq(a.headers.rows[1].name, "zz", "row1 own text")
+    testing.expect_streq(a.headers.rows[0].name, "ab", "row0 untouched")
+}
+
+fn test_url_edits_resync_path() {
+    // Path rows derive from :name segments — they must refresh on
+    // every URL text change, not just rune inserts.
+    a := new_app()
+    a.focus = FUrl
+    feed_text(a, "http://x/:id")
+    testing.expect_eq(len(a.path_kv.rows), 1, "one param row")
+    testing.expect_streq(a.path_kv.rows[0].name, "id", ":id derived")
+    dispatch(a, knamed(term.KeyBackspace)) // eats 'd' → :i
+    testing.expect_streq(a.path_kv.rows[0].name, "i", "backspace resyncs")
+    // undo restores text → row returns (single-level undo buffer)
+    dispatch(a, kev("z", true, false, false))
+    testing.expect_streq(a.path_kv.rows[0].name, "id", "undo resyncs")
+    dispatch(a, knamed(term.KeyBackspace))
+    dispatch(a, knamed(term.KeyBackspace))
+    dispatch(a, knamed(term.KeyBackspace))
+    // url is "http://x/:" → trailing ':' with no name → sentinel row
+    testing.expect_eq(len(a.path_kv.rows), 1, "collapsed")
+    testing.expect_streq(a.path_kv.rows[0].name, "", "param gone")
+}
+
+fn test_path_typing_targets_value() {
+    // Path names are URL-derived — typing + enter-edit land on the
+    // value column only.
+    a := new_app()
+    a.url.text = "http://x/:id"
+    sync_path_kv(a)
+    a.focus = FReqPane
+    a.req_tab = 2 // Path
+    feed_text(a, "42")
+    testing.expect_streq(a.path_kv.rows[0].name, "id", "name still derived")
+    testing.expect_streq(a.path_kv.rows[0].value, "42", "typed into value")
+    // param-less path table: nothing to edit
+    a2 := new_app()
+    a2.focus = FReqPane
+    a2.req_tab = 2
+    feed_text(a2, "x")
+    testing.expect_eq(len(a2.path_kv.rows), 1, "no phantom row")
+    testing.expect_streq(a2.path_kv.rows[0].name, "", "sentinel stays")
+}
+
+fn test_body_editor_cursor_nav() {
+    // left/right inside the Body editor move a.body's insert cursor,
+    // not the response view's.
+    a := new_app()
+    a.focus = FReqPane
+    a.req_tab = 1 // Body
+    feed_text(a, "abc")
+    testing.expect_eq(a.body.cx, 3, "body cursor after inserts")
+    dispatch(a, knamed(term.KeyLeft))
+    testing.expect_eq(a.body.cx, 2, "left moved body cursor")
+    testing.expect_eq(a.resp_view.cx, 0, "resp cursor untouched")
+    dispatch(a, knamed(term.KeyRight))
+    testing.expect_eq(a.body.cx, 3, "right moved body cursor")
+    // the inserted text lands where the cursor says
+    dispatch(a, knamed(term.KeyLeft))
+    dispatch(a, knamed(term.KeyLeft))
+    feed_text(a, "X")
+    testing.expect_streq(a.body.lines[0], "aXbc", "insert at moved cursor")
+}
+
+fn test_modal_swallows_mouse() {
+    a := new_app()
+    scr := term.new_ansi(80, 24)
+    render(a, scr, "v")
+    // sanity: without a modal a sidebar click focuses the sidebar
+    dispatch(a, mev(term.MousePress, a.r_sidebar_x + 1, a.r_sidebar_y + 3))
+    testing.expect_eq(a.focus, FSidebar, "plain click hits sidebar")
+    a.focus = FUrl
+    push_modal(a, MPalette)
+    dispatch(a, mev(term.MousePress, a.r_sidebar_x + 1, a.r_sidebar_y + 3))
+    testing.expect_eq(a.focus, FUrl, "modal swallows background click")
+    dispatch(a, mev(term.MouseScrollUp, a.r_resp_x + 1, a.r_resp_y + 1))
+    testing.expect_eq(a.resp_view.cy, 0, "modal swallows scroll")
+}
+
+fn test_sidebar_hit_test_uses_y() {
+    // the sidebar rect is 2D — a click above it (url row) is not a
+    // sidebar press even when x is inside its columns.
+    a := new_app()
+    scr := term.new_ansi(80, 24)
+    render(a, scr, "v")
+    dispatch(a, mev(term.MousePress, a.r_sidebar_x + 2, 1))
+    testing.expect_eq(a.focus, FUrl, "row-1 click hits url not sidebar")
+    dispatch(a, mev(term.MousePress, a.r_sidebar_x + 2, a.r_sidebar_y + 2))
+    testing.expect_eq(a.focus, FSidebar, "inside rect → sidebar")
+}
+
+fn test_method_menu_kind_first() {
+    // GraphQL stores method="POST" — reopening the menu must highlight
+    // GraphQL, not HTTP POST (else Enter silently reverts the kind).
+    a := new_app()
+    a.kind = KGraphql
+    a.method = "POST"
+    push_modal(a, MMethodMenu)
+    testing.expect_eq(a.method_sel, 7, "graphql row selected")
+    dispatch(a, knamed(term.KeyEnter))
+    testing.expect_eq(a.kind, KGraphql, "enter keeps graphql kind")
+}

@@ -141,7 +141,7 @@ struct App {
 
     // hit-test rects cached from last render (mouse dispatch)
     r_sidebar_x: int, r_sidebar_w: int,
-    r_sidebar_y: int,
+    r_sidebar_y: int, r_sidebar_h: int,
     r_url_y: int, r_url_h: int,
     r_req_x: int, r_req_y: int, r_req_w: int, r_req_h: int,
     r_resp_x: int, r_resp_y: int, r_resp_w: int, r_resp_h: int,

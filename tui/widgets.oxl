@@ -46,6 +46,22 @@ fn (e mut LineEdit) del_sel() -> bool {
     return true
 }
 
+// is_cont_byte: UTF-8 continuation byte (0x80..0xBF).
+fn is_cont_byte(c: byte) -> bool {
+    return c >= 128 && c < 192
+}
+
+// glyph_start backs a byte offset off continuation bytes onto the
+// lead byte of the glyph containing it (i itself when already on a
+// boundary) — cursor/deletion snapping keeps text valid UTF-8 while
+// cur stays a byte offset.
+fn glyph_start(s: str, i: int) -> int {
+    for i > 0 && is_cont_byte(byteat(s, i)) {
+        i = i - 1
+    }
+    return i
+}
+
 fn (e mut LineEdit) insert(ch: str) {
     e.snap()
     if e.del_sel() {
@@ -55,27 +71,39 @@ fn (e mut LineEdit) insert(ch: str) {
 }
 
 fn (e mut LineEdit) backspace() {
-    if e.del_sel() {
-        e.undo_text = e.text
+    // snap BEFORE deleting a selection so ctrl+z restores it —
+    // a deletion that actually ran must land in undo history.
+    if e.has_sel() {
+        e.snap()
+        e.del_sel()
         return
     }
     if e.cur <= 0 {
         return
     }
     e.snap()
-    e.text = substr(e.text, 0, e.cur - 1) + substr(e.text, e.cur, len(e.text))
-    e.cur = e.cur - 1
+    lo := glyph_start(e.text, e.cur - 1)
+    e.text = substr(e.text, 0, lo) + substr(e.text, e.cur, len(e.text))
+    e.cur = lo
 }
 
 fn (e mut LineEdit) del_right() {
-    if e.del_sel() {
+    if e.has_sel() {
+        e.snap()
+        e.del_sel()
         return
     }
     if e.cur >= len(e.text) {
         return
     }
     e.snap()
-    e.text = substr(e.text, 0, e.cur) + substr(e.text, e.cur + 1, len(e.text))
+    // delete the whole glyph at cur — walking past its continuation
+    // bytes keeps a multibyte char atomic.
+    hi := e.cur + 1
+    for hi < len(e.text) && is_cont_byte(byteat(e.text, hi)) {
+        hi = hi + 1
+    }
+    e.text = substr(e.text, 0, e.cur) + substr(e.text, hi, len(e.text))
 }
 
 fn (e mut LineEdit) home() {
@@ -135,7 +163,9 @@ fn (e mut LineEdit) snap_nopos() {
 }
 
 fn (e mut LineEdit) del_word_back() {
-    if e.del_sel() {
+    if e.has_sel() {
+        e.snap()
+        e.del_sel()
         return
     }
     i := e.cur
@@ -191,6 +221,17 @@ fn (e mut LineEdit) move(to: int, shift: bool) {
     }
     if to > len(e.text) {
         to = len(e.text)
+    }
+    // snap to a code-point boundary in the direction of travel so a
+    // multibyte glyph is stepped over atomically, never split.
+    if to > e.cur {
+        for to < len(e.text) && is_cont_byte(byteat(e.text, to)) {
+            to = to + 1
+        }
+    } else if to < e.cur {
+        for to > 0 && is_cont_byte(byteat(e.text, to)) {
+            to = to - 1
+        }
     }
     e.cur = to
 }
@@ -365,35 +406,33 @@ fn (t mut KVTable) del_row() {
     }
 }
 
-// type_char pushes a rune into the current cell (sentinel appends a
-// real row then edits). Returns true when it consumed the char.
-fn (t mut KVTable) type_char(ch: str) -> bool {
-    if t.is_sentinel() {
-        // grow: sentinel becomes a real row, new sentinel appended
-        if t.col == 0 {
-            t.rows[t.cur].name = ch
-        } else {
-            t.rows[t.cur].value = ch
-        }
+// begin_edit opens the cell editor on the current cell. Editing the
+// sentinel materializes the row: a fresh sentinel is appended behind
+// it (corpus §4.6 — "type in last empty row → new row").
+fn (t mut KVTable) begin_edit() {
+    grow := t.is_sentinel()
+    t.editing = true
+    if t.col == 0 {
+        t.edit = new_line_edit(t.rows[t.cur].name)
+    } else {
+        t.edit = new_line_edit(t.rows[t.cur].value)
+    }
+    if grow {
         t.rows = push(t.rows, KVRow{name: "", value: "", enabled: true})
-        t.editing = true
-        t.edit = new_line_edit(ch)
-        return true
     }
-    if !t.editing {
-        t.editing = true
-        if t.col == 0 {
-            t.edit = new_line_edit(t.rows[t.cur].name)
-        } else {
-            t.edit = new_line_edit(t.rows[t.cur].value)
-        }
-    }
-    t.edit.insert(ch)
-    t.commit_edit()
-    return true
 }
 
-fn (t mut KVTable) commit_edit() {
+// ensure_edit enters the cell editor only if not already editing —
+// implicit edit on first typed/deleted char.
+fn (t mut KVTable) ensure_edit() {
+    if !t.editing {
+        t.begin_edit()
+    }
+}
+
+// apply_edit writes the live edit buffer back to the current cell
+// WITHOUT leaving edit mode — the row tracks keystrokes as they land.
+fn (t mut KVTable) apply_edit() {
     if !t.editing {
         return
     }
@@ -402,6 +441,23 @@ fn (t mut KVTable) commit_edit() {
     } else {
         t.rows[t.cur].value = t.edit.text
     }
+}
+
+// type_char pushes a rune into the current cell (implicit edit on a
+// fresh cell; sentinel rows grow via begin_edit). Edit mode persists
+// until commit_edit — nav keys must not fire mid-edit.
+fn (t mut KVTable) type_char(ch: str) -> bool {
+    t.ensure_edit()
+    t.edit.insert(ch)
+    t.apply_edit()
+    return true
+}
+
+// commit_edit writes the buffer to the cell and exits edit mode —
+// callers run it before selection moves so an in-flight edit can't
+// leak into the wrong cell.
+fn (t mut KVTable) commit_edit() {
+    t.apply_edit()
     t.editing = false
 }
 

@@ -468,6 +468,7 @@ fn render(a: mut App, scr: mut term.AnsiScreen, ver: str) {
     a.r_sidebar_x = sx
     a.r_sidebar_w = sw
     a.r_sidebar_y = by
+    a.r_sidebar_h = bh
     a.r_main_x = sw
     a.r_main_w = cols - sw
     if a.sidebar_pos == 1 {
