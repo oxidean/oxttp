@@ -98,6 +98,24 @@ fn (s mut AnsiScreen) set_cell(x: int, y: int, ch: str, fg: int, bg: int, attr: 
     if len(ch) == 0 {
         ch = " "
     }
+    // overwriting half of a wide pair must drop the mate too — a stale
+    // continuation column makes present() emit the next cell one
+    // column early, a stale lead overprints this cell. "" only ever
+    // marks a continuation, so both halves are detectable.
+    if s.chs[i] == "" && x > 0 {
+        // (x,y) was the trailing half of a wide glyph — blank its lead
+        s.chs[i - 1] = " "
+        s.fgs[i - 1] = 0
+        s.bgs[i - 1] = 0
+        s.attrs[i - 1] = 0
+    }
+    if x + 1 < s.cols && s.chs[i + 1] == "" {
+        // (x,y) held a wide lead — blank its trailing continuation
+        s.chs[i + 1] = " "
+        s.fgs[i + 1] = 0
+        s.bgs[i + 1] = 0
+        s.attrs[i + 1] = 0
+    }
     // store the COMPLETE first glyph — a truncated byte run would let
     // present() emit a style escape in the middle of a multibyte
     // character (the terminal then prints mojibake).
@@ -116,6 +134,14 @@ fn (s mut AnsiScreen) set_wide_cont(x: int, y: int) {
         return
     }
     i := y * s.cols + x
+    // overwriting a wide lead orphans its old continuation at (x+1,y)
+    // — a stray "" column would print the next cell a column early.
+    if x + 1 < s.cols && s.chs[i + 1] == "" {
+        s.chs[i + 1] = " "
+        s.fgs[i + 1] = 0
+        s.bgs[i + 1] = 0
+        s.attrs[i + 1] = 0
+    }
     s.chs[i] = ""
     s.fgs[i] = -1
     s.bgs[i] = -1
