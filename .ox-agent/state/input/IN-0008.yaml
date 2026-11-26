@@ -4,6 +4,9 @@ work_item_id: WI-0011
 run_id: run_1795642145253_486363
 kind: clarification
 question: 'Approve merge of the 0.26.0 pin bump (WI-0011): one-line .oxl-version change, all tests green on the new toolchain.'
-status: pending
+status: answered
+answer: 'Approved — PR #12 merged as 35663e7.'
 created_by: ox-agent
+answered_by: JesseKoldewijn
 created_at: "2026-11-25T21:29:15Z"
+answered_at: "2026-11-26T01:30:52Z"
