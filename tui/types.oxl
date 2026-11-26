@@ -1,0 +1,207 @@
+package main
+
+// All struct + const declarations live in types.oxl — the C backend
+// emits value-typed struct fields in file order, so embedding types
+// must be declared before embedders (App embeds every widget type).
+// Order here is the dependency order.
+
+struct LineEdit {
+    text: str,
+    cur: int,
+    sel_anchor: int,
+    undo_text: str,
+    undo_cur: int,
+    has_undo: bool,
+    redo_text: str,
+    redo_cur: int,
+    has_redo: bool,
+}
+
+struct ListCur {
+    sel: int,
+    count: int,
+    anchor: int, // -1 = no extended selection
+    top: int,    // scroll offset
+}
+
+struct TabStrip {
+    sel: int,
+    count: int,
+}
+
+struct KVRow {
+    name: str,
+    value: str,
+    enabled: bool,
+}
+
+struct KVTable {
+    rows: []KVRow,
+    cur: int,
+    col: int,       // 0 name, 1 value
+    editing: bool,
+    edit: LineEdit,
+}
+
+struct TreeNode {
+    name: str,
+    depth: int,
+    is_dir: bool,
+    open: bool,
+    stub: bool, // placeholder rows render dimmed
+}
+
+struct Tree {
+    nodes: []TreeNode,
+    cur: int,
+    anchor: int,
+    filter: str,
+}
+
+struct TextView {
+    lines: []str,
+    cx: int,
+    cy: int,
+    top: int,
+    anchor_x: int, // -1 = no visual selection
+    anchor_y: int,
+    search: str,
+    search_hits: []int, // line indices
+    search_idx: int,
+}
+
+struct Toast {
+    level: int, // 0 info, 1 success, 2 error
+    msg: str,
+}
+
+// RDraft is one open request editor's full snapshot — corpus §4.5/§8.6:
+// every open tab is an INDEPENDENT request draft (url, method/kind,
+// headers/query/path tables, body, and its response buffer).
+struct RDraft {
+    url: LineEdit,
+    method: str,
+    kind: int,
+    req_tab: int,
+    resp_tab: int,
+    body_ct: int,
+    headers: KVTable,
+    query_kv: KVTable,
+    path_kv: KVTable,
+    body: TextView,
+    resp_view: TextView,
+    resp_rows: ListCur,
+}
+
+struct RTab {
+    title: str,
+    preview: bool,
+    draft: RDraft,
+}
+
+struct PItem {
+    name: str,
+    action: str,
+    degrade: str, // non-empty → toast this instead of running action
+}
+
+struct App {
+    focus: int,
+    modals: []int,
+    quit: bool,
+    want_shot: bool,
+
+    url: LineEdit,
+    method: str,
+    kind: int,
+    method_sel: int, // cursor inside method menu
+
+    req_tab: int,
+    resp_tab: int,
+    tabs: []RTab,
+    cur_tab: int,
+
+    sidebar_on: bool,
+    sidebar_pos: int, // 0 left 1 right
+    layout: int,      // 0 vertical 1 horizontal
+    expanded: int,    // 0 none 1 request 2 response
+
+    coll: Tree,
+    coll_search: LineEdit,
+    coll_searching: bool,
+    env_name: str,
+    vars: ListCur,
+    vars_filter: LineEdit,
+    vars_filtering: bool,
+    vars_reveal: bool,
+    hist: ListCur,
+
+    headers: KVTable,
+    query_kv: KVTable,
+    path_kv: KVTable,
+    body: TextView,      // editable-ish area is simplified to view+append
+    body_edit: bool,
+    body_ct: int,        // 0 json 1 text 2 xml 3 html
+    resp_view: TextView,
+    resp_rows: ListCur,
+    pal_query: LineEdit,
+    pal_sel: int,
+    tabsearch: ListCur,
+    save_name: LineEdit,
+    save_file: LineEdit,
+    save_folder: LineEdit,
+    save_desc: LineEdit,
+    save_field: int,
+    confirm_msg: str,
+    confirm_action: str,
+
+    toasts: []Toast,
+    hinted_vars: bool,  // '$' suggestion degrade shown once
+
+    // hit-test rects cached from last render (mouse dispatch)
+    r_sidebar_x: int, r_sidebar_w: int,
+    r_sidebar_y: int, r_sidebar_h: int,
+    r_url_y: int, r_url_h: int,
+    r_req_x: int, r_req_y: int, r_req_w: int, r_req_h: int,
+    r_resp_x: int, r_resp_y: int, r_resp_w: int, r_resp_h: int,
+    r_main_x: int, r_main_w: int,
+}
+
+// Focus targets (corpus focus.* config maps onto these).
+let FSidebar = 0
+let FUrl = 1
+let FMethod = 2
+let FReqTabs = 3
+let FReqPane = 4
+let FRespTabs = 5
+let FRespPane = 6
+
+// Request kinds — tab sets switch per §4.1.
+let KHttp = 0
+let KGraphql = 1
+let KGrpc = 2
+let KWs = 3
+
+// Modal frame kinds (§4.12 overlay stack + jump/method/search states).
+let MNone = 0
+let MPalette = 1
+let MHelp = 2
+let MVariables = 3
+let MConfirm = 4
+let MSaveReq = 5
+let MSearchTabs = 6
+let MHistory = 7
+let MMethodMenu = 8
+let MJump = 9
+let MEnvSwitch = 10
+
+// dispatch effects returned to the loop.
+let ENone = 0
+let EQuit = 1
+
+
+// RTab is one open request-editor tab (new-request/close-tab/next-tab).
+
+// Palette item — §4.13 contents; action runs via global/degrade paths.
+
+

@@ -1,0 +1,524 @@
+package term
+
+// Incremental input decoder — stdin byte chunks → []KeyEvent.
+// Grammar per corpus §3 (ctrl/alt/shift/meta/super + named keys)
+// and §4 (SGR mouse). Alt-vs-escape uses the same-chunk rule
+// (ADR-0028): ESC followed by more bytes in the same feed is an
+// alt/escape sequence; a lone trailing ESC is Escape.
+
+struct Decoder {
+    tail: []byte,
+}
+
+fn new_decoder() -> own Decoder {
+    d := new(Decoder)
+    d.tail = mkslice(byte, 0)
+    return d
+}
+
+fn (d mut Decoder) feed(b: []byte) -> []KeyEvent {
+    // tail + b → work buffer; consume events; keep partial tail.
+    n0 := len(d.tail)
+    n := n0 + len(b)
+    buf := mkslice(byte, n)
+    i := 0
+    for i < n0 {
+        buf[i] = d.tail[i]
+        i = i + 1
+    }
+    i = 0
+    for i < len(b) {
+        buf[n0 + i] = b[i]
+        i = i + 1
+    }
+    d.tail = mkslice(byte, 0)
+    evs := mkslice(KeyEvent, 0)
+    i = 0
+    for i < n {
+        r := decode_one(buf, i, n)
+        if r.more {
+            rest := mkslice(byte, n - i)
+            k := 0
+            for k < n - i {
+                rest[k] = buf[i + k]
+                k = k + 1
+            }
+            d.tail = rest
+            return evs
+        }
+        if r.ok {
+            evs = push(evs, r.ev)
+        }
+        u := r.used
+        if u < 1 {
+            u = 1
+        }
+        i = i + u
+    }
+    return evs
+}
+
+fn nil_ev() -> KeyEvent {
+    return KeyEvent{key: Key.Rune{ch: ""}, ctrl: false, alt: false, shift: false, meta: false, sup: false}
+}
+
+fn res(used: int, ev: KeyEvent, ok: bool, more: bool) -> DecRes {
+    return DecRes{used: used, ev: ev, ok: ok, more: more}
+}
+
+// decode_one decodes one event at buf[pos].
+fn decode_one(buf: []byte, pos: int, n: int) -> DecRes {
+    c := buf[pos]
+    if c == 27 {
+        return decode_esc(buf, pos, n)
+    }
+    if c < 32 {
+        return decode_c0(buf, pos)
+    }
+    if c == 127 {
+        return res(1, named_ev(KeyBackspace), true, false)
+    }
+    if c < 128 {
+        e := KeyEvent{key: Key.Rune{ch: one_byte(c)}, ctrl: false, alt: false, shift: false, meta: false, sup: false}
+        if c >= 65 && c <= 90 {
+            e.shift = true
+        }
+        return res(1, e, true, false)
+    }
+    // UTF-8 multibyte
+    need := 0
+    if c >= 240 {
+        need = 4
+    } else if c >= 224 {
+        need = 3
+    } else if c >= 192 {
+        need = 2
+    } else {
+        return res(1, nil_ev(), false, false)
+    }
+    if pos + need > n {
+        return res(0, nil_ev(), false, true)
+    }
+    b := mkslice(byte, need)
+    k := 0
+    for k < need {
+        cb := buf[pos + k]
+        if k > 0 && (cb < 128 || cb >= 192) {
+            return res(1, nil_ev(), false, false)
+        }
+        b[k] = cb
+        k = k + 1
+    }
+    return res(need, KeyEvent{key: Key.Rune{ch: b as str}, ctrl: false, alt: false, shift: false, meta: false, sup: false}, true, false)
+}
+
+fn one_byte(c: byte) -> str {
+    b := mkslice(byte, 1)
+    b[0] = c
+    return b as str
+}
+
+fn named_ev(code: int) -> KeyEvent {
+    return KeyEvent{key: Key.Named{code: code}, ctrl: false, alt: false, shift: false, meta: false, sup: false}
+}
+
+// C0 control bytes → corpus keys. 0x0d enter, 0x09 tab,
+// 0x08 backspace (ctrl+h collision resolved in the keymap layer),
+// 0x01..0x1a → ctrl+letter, 0x00 → ctrl+space, 0x1c..0x1f →
+// ctrl+\, ], ^, _.
+fn decode_c0(buf: []byte, pos: int) -> DecRes {
+    c := buf[pos]
+    if c == 13 {
+        return res(1, named_ev(KeyEnter), true, false)
+    }
+    if c == 9 {
+        return res(1, named_ev(KeyTab), true, false)
+    }
+    if c == 8 {
+        return res(1, named_ev(KeyBackspace), true, false)
+    }
+    if c >= 1 && c <= 26 {
+        ch := one_byte(c + 96) // 1→a .. 26→z
+        return res(1, KeyEvent{key: Key.Rune{ch: ch}, ctrl: true, alt: false, shift: false, meta: false, sup: false}, true, false)
+    }
+    if c == 0 {
+        return res(1, KeyEvent{key: Key.Rune{ch: " "}, ctrl: true, alt: false, shift: false, meta: false, sup: false}, true, false)
+    }
+    if c >= 28 && c <= 31 {
+        ch := one_byte(c + 64) // 28→\ 29→] 30→^ 31→_
+        return res(1, KeyEvent{key: Key.Rune{ch: ch}, ctrl: true, alt: false, shift: false, meta: false, sup: false}, true, false)
+    }
+    return res(1, nil_ev(), false, false)
+}
+
+// ESC-sequence decode: CSI, SS3, alt-prefix, lone escape.
+fn decode_esc(buf: []byte, pos: int, n: int) -> DecRes {
+    if pos + 1 >= n {
+        // lone trailing ESC → Escape (same-chunk rule)
+        return res(1, named_ev(KeyEscape), true, false)
+    }
+    c2 := buf[pos + 1]
+    if c2 == 91 {
+        return decode_csi(buf, pos, n)
+    }
+    if c2 == 79 {
+        return decode_ss3(buf, pos, n)
+    }
+    if c2 == 27 {
+        // ESC ESC → alt+escape
+        e := named_ev(KeyEscape)
+        e.alt = true
+        return res(2, e, true, false)
+    }
+    // alt + key: decode the key after ESC, mark alt
+    r := decode_one(buf, pos + 1, n)
+    if r.more {
+        return res(0, nil_ev(), false, true)
+    }
+    if r.ok {
+        r.ev.alt = true
+        return res(1 + r.used, r.ev, true, false)
+    }
+    return res(2, nil_ev(), false, false)
+}
+
+// CSI: ESC [ params… final(0x40-0x7e). Params: up to 3 ';'-separated
+// numbers; private markers '<' (SGR mouse), '>', '?' at start.
+fn decode_csi(buf: []byte, pos: int, n: int) -> DecRes {
+    i := pos + 2
+    p0 := -1
+    p1 := -1
+    p2 := -1
+    priv := 0
+    cur := 0
+    have := false
+    idx := 0
+    for i < n {
+        cb := buf[i]
+        if cb >= 48 && cb <= 57 {
+            cur = cur * 10 + (cb - 48)
+            have = true
+            i = i + 1
+        } else if cb == 59 {
+            if idx == 0 {
+                p0 = cur
+                if !have {
+                    p0 = -1
+                }
+            } else if idx == 1 {
+                p1 = cur
+            } else {
+                p2 = cur
+            }
+            idx = idx + 1
+            cur = 0
+            have = false
+            i = i + 1
+        } else if (cb == 60 || cb == 62 || cb == 63) && i == pos + 2 {
+            priv = cb
+            i = i + 1
+        } else {
+            // final byte
+            if have {
+                if idx == 0 {
+                    p0 = cur
+                } else if idx == 1 {
+                    p1 = cur
+                } else {
+                    p2 = cur
+                }
+            }
+            return csi_final(fb_of(buf, i), pos, i, priv, p0, p1, p2)
+        }
+        if i - pos > 32 {
+            return res(i - pos, nil_ev(), false, false)
+        }
+    }
+    return res(0, nil_ev(), false, true)
+}
+
+fn fb_of(buf: []byte, i: int) -> int {
+    return buf[i]
+}
+
+fn csi_final(fb: int, pos: int, i: int, priv: int, p0: int, p1: int, p2: int) -> DecRes {
+    used := i - pos + 1
+    if priv == 60 {
+        // SGR mouse <b;x;yM|m
+        kind := MousePress
+        if fb == 109 {
+            kind = MouseRelease
+        }
+        if fb != 77 && fb != 109 {
+            return res(used, nil_ev(), false, false)
+        }
+        b := p0
+        if b < 0 {
+            b = 0
+        }
+        wheel := false
+        motion := false
+        ctrl := false
+        alt := false
+        shift := false
+        if b >= 64 {
+            b = b - 64
+            wheel = true
+        }
+        if b >= 32 {
+            b = b - 32
+            motion = true
+        }
+        if b >= 16 {
+            b = b - 16
+            ctrl = true
+        }
+        if b >= 8 {
+            b = b - 8
+            alt = true
+        }
+        if b >= 4 {
+            b = b - 4
+            shift = true
+        }
+        if wheel {
+            if b == 0 {
+                kind = MouseScrollUp
+            } else {
+                kind = MouseScrollDown
+            }
+        } else if motion && fb == 77 {
+            kind = MouseDrag
+        }
+        x := p1 - 1
+        y := p2 - 1
+        if x < 0 {
+            x = 0
+        }
+        if y < 0 {
+            y = 0
+        }
+        return res(used, KeyEvent{key: Key.Mouse{kind: kind, x: x, y: y, button: b}, ctrl: ctrl, alt: alt, shift: shift, meta: false, sup: false}, true, false)
+    }
+    if priv != 0 {
+        return res(used, nil_ev(), false, false)
+    }
+    // kitty CSI-u: final 'u', p0 = codepoint, p1 = mods. With
+    // disambiguation on, esc/enter/tab/backspace arrive as CSI-u —
+    // map them to Named keys so the keymap's "escape"/"enter"/"tab"/
+    // "backspace" bindings fire (modal close, cell commit). Other
+    // codepoints stay Runes (printable combos like ctrl+shift+v);
+    // modifiers apply to either result.
+    if fb == 117 {
+        if p0 < 0 {
+            return res(used, nil_ev(), false, false)
+        }
+        code := -1
+        if p0 == 27 {
+            code = KeyEscape
+        } else if p0 == 13 {
+            code = KeyEnter
+        } else if p0 == 9 {
+            code = KeyTab
+        } else if p0 == 127 {
+            code = KeyBackspace
+        }
+        if code >= 0 {
+            e := named_ev(code)
+            e = apply_mods(e, p1)
+            return res(used, e, true, false)
+        }
+        e := KeyEvent{key: Key.Rune{ch: utf8_of(p0)}, ctrl: false, alt: false, shift: false, meta: false, sup: false}
+        e = apply_mods(e, p1)
+        return res(used, e, true, false)
+    }
+    code := -1
+    if fb == 65 {
+        code = KeyUp
+    } else if fb == 66 {
+        code = KeyDown
+    } else if fb == 67 {
+        code = KeyRight
+    } else if fb == 68 {
+        code = KeyLeft
+    } else if fb == 72 {
+        code = KeyHome
+    } else if fb == 70 {
+        code = KeyEnd
+    } else if fb == 90 {
+        e := KeyEvent{key: Key.Named{code: KeyTab}, ctrl: false, alt: false, shift: true, meta: false, sup: false}
+        return res(used, e, true, false)
+    } else if fb == 126 {
+        code = tilde_code(p0)
+        if code == -1 {
+            return res(used, nil_ev(), false, false)
+        }
+        e := KeyEvent{key: Key.Named{code: code}, ctrl: false, alt: false, shift: false, meta: false, sup: false}
+        e = apply_mods(e, p1)
+        return res(used, e, true, false)
+    }
+    if code == -1 {
+        return res(used, nil_ev(), false, false)
+    }
+    e2 := KeyEvent{key: Key.Named{code: code}, ctrl: false, alt: false, shift: false, meta: false, sup: false}
+    e2 = apply_mods(e2, p1)
+    return res(used, e2, true, false)
+}
+
+fn tilde_code(p0: int) -> int {
+    if p0 == 1 || p0 == 7 {
+        return KeyHome
+    }
+    if p0 == 2 {
+        return KeyInsert
+    }
+    if p0 == 3 {
+        return KeyDelete
+    }
+    if p0 == 4 || p0 == 8 {
+        return KeyEnd
+    }
+    if p0 == 5 {
+        return KeyPgUp
+    }
+    if p0 == 6 {
+        return KeyPgDown
+    }
+    if p0 == 11 {
+        return KeyF1
+    }
+    if p0 == 12 {
+        return KeyF1 + 1
+    }
+    if p0 == 13 {
+        return KeyF1 + 2
+    }
+    if p0 == 14 {
+        return KeyF1 + 3
+    }
+    if p0 == 15 {
+        return KeyF1 + 4
+    }
+    if p0 == 17 {
+        return KeyF1 + 5
+    }
+    if p0 == 18 {
+        return KeyF1 + 6
+    }
+    if p0 == 19 {
+        return KeyF1 + 7
+    }
+    if p0 == 20 {
+        return KeyF1 + 8
+    }
+    if p0 == 21 {
+        return KeyF1 + 9
+    }
+    if p0 == 23 {
+        return KeyF1 + 10
+    }
+    if p0 == 24 {
+        return KeyF1 + 11
+    }
+    return -1
+}
+
+// apply_mods sets modifiers from a CSI modifier param
+// (value = 1 + bitmask: shift 1, alt 2, ctrl 4, super 8, hyper 16,
+// meta 32 — kitty layout; caps/num lock ignored).
+fn apply_mods(e: KeyEvent, p: int) -> KeyEvent {
+    if p < 0 {
+        return e
+    }
+    m := p - 1
+    if m >= 128 {
+        m = m - 128
+    }
+    if m >= 64 {
+        m = m - 64
+    }
+    if m >= 32 {
+        e.meta = true
+        m = m - 32
+    }
+    if m >= 16 {
+        m = m - 16
+    }
+    if m >= 8 {
+        e.sup = true
+        m = m - 8
+    }
+    if m >= 4 {
+        e.ctrl = true
+        m = m - 4
+    }
+    if m >= 2 {
+        e.alt = true
+        m = m - 2
+    }
+    if m >= 1 {
+        e.shift = true
+        m = m - 1
+    }
+    return e
+}
+
+// SS3: ESC O <char>
+fn decode_ss3(buf: []byte, pos: int, n: int) -> DecRes {
+    if pos + 2 >= n {
+        return res(0, nil_ev(), false, true)
+    }
+    c := buf[pos + 2]
+    code := -1
+    if c == 80 {
+        code = KeyF1
+    } else if c == 81 {
+        code = KeyF1 + 1
+    } else if c == 82 {
+        code = KeyF1 + 2
+    } else if c == 83 {
+        code = KeyF1 + 3
+    } else if c == 65 {
+        code = KeyUp
+    } else if c == 66 {
+        code = KeyDown
+    } else if c == 67 {
+        code = KeyRight
+    } else if c == 68 {
+        code = KeyLeft
+    } else if c == 72 {
+        code = KeyHome
+    } else if c == 70 {
+        code = KeyEnd
+    }
+    if code == -1 {
+        return res(3, nil_ev(), false, false)
+    }
+    return res(3, named_ev(code), true, false)
+}
+
+// utf8_of encodes a codepoint to a str (kitty CSI-u).
+fn utf8_of(cp: int) -> str {
+    if cp < 128 {
+        return one_byte(cp)
+    }
+    if cp < 2048 {
+        b := mkslice(byte, 2)
+        b[0] = 192 + cp / 64
+        b[1] = 128 + cp - (cp / 64) * 64
+        return b as str
+    }
+    if cp < 65536 {
+        b := mkslice(byte, 3)
+        b[0] = 224 + cp / 4096
+        b[1] = 128 + (cp / 64) - (cp / 4096) * 64
+        b[2] = 128 + cp - (cp / 64) * 64
+        return b as str
+    }
+    b := mkslice(byte, 4)
+    b[0] = 240 + cp / 262144
+    b[1] = 128 + (cp / 4096) - (cp / 262144) * 64
+    b[2] = 128 + (cp / 64) - (cp / 4096) * 64
+    b[3] = 128 + cp - (cp / 64) * 64
+    return b as str
+}

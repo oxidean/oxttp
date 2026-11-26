@@ -38,6 +38,17 @@ fn new_ansi(cols: int, rows: int) -> own AnsiScreen {
     s.fgs = mkslice(int, n)
     s.bgs = mkslice(int, n)
     s.attrs = mkslice(int, n)
+    s.cx = 0
+    s.cy = 0
+    s.show_cur = true
+    s.clear()
+    return s
+}
+
+// clear resets every cell to a blank — render() calls it at frame
+// start so deleted chars / closed overlays leave no stale cells.
+fn (s mut AnsiScreen) clear() {
+    n := s.cols * s.rows
     i := 0
     for i < n {
         s.chs[i] = " "
@@ -46,10 +57,33 @@ fn new_ansi(cols: int, rows: int) -> own AnsiScreen {
         s.attrs[i] = 0
         i = i + 1
     }
-    s.cx = 0
-    s.cy = 0
-    s.show_cur = true
-    return s
+}
+
+// glyph_len returns the byte length of the UTF-8 glyph starting at
+// s[i] — 1 for ASCII and for stray/invalid bytes (continuation
+// bytes, truncated tails), else the validated multibyte length.
+fn glyph_len(s: str, i: int) -> int {
+    c := byteat(s, i)
+    need := 1
+    if c >= 240 {
+        need = 4
+    } else if c >= 224 {
+        need = 3
+    } else if c >= 194 {
+        need = 2
+    }
+    if i + need > len(s) {
+        return 1
+    }
+    k := 1
+    for k < need {
+        cb := byteat(s, i + k)
+        if cb < 128 || cb >= 192 {
+            return 1
+        }
+        k = k + 1
+    }
+    return need
 }
 
 fn (s AnsiScreen) size() -> CellSize {
@@ -64,10 +98,54 @@ fn (s mut AnsiScreen) set_cell(x: int, y: int, ch: str, fg: int, bg: int, attr: 
     if len(ch) == 0 {
         ch = " "
     }
-    s.chs[i] = substr(ch, 0, 1)
+    // overwriting half of a wide pair must drop the mate too — a stale
+    // continuation column makes present() emit the next cell one
+    // column early, a stale lead overprints this cell. "" only ever
+    // marks a continuation, so both halves are detectable.
+    if s.chs[i] == "" && x > 0 {
+        // (x,y) was the trailing half of a wide glyph — blank its lead
+        s.chs[i - 1] = " "
+        s.fgs[i - 1] = 0
+        s.bgs[i - 1] = 0
+        s.attrs[i - 1] = 0
+    }
+    if x + 1 < s.cols && s.chs[i + 1] == "" {
+        // (x,y) held a wide lead — blank its trailing continuation
+        s.chs[i + 1] = " "
+        s.fgs[i + 1] = 0
+        s.bgs[i + 1] = 0
+        s.attrs[i + 1] = 0
+    }
+    // store the COMPLETE first glyph — a truncated byte run would let
+    // present() emit a style escape in the middle of a multibyte
+    // character (the terminal then prints mojibake).
+    s.chs[i] = substr(ch, 0, glyph_len(ch, 0))
     s.fgs[i] = fg
     s.bgs[i] = bg
     s.attrs[i] = attr
+}
+
+// set_wide_cont marks (x, y) as the trailing column a 2-cell glyph
+// already occupies — stores an EMPTY glyph so present() emits
+// nothing for this column (the terminal advanced past it when it
+// drew the wide glyph at x-1).
+fn (s mut AnsiScreen) set_wide_cont(x: int, y: int) {
+    if x < 0 || y < 0 || x >= s.cols || y >= s.rows {
+        return
+    }
+    i := y * s.cols + x
+    // overwriting a wide lead orphans its old continuation at (x+1,y)
+    // — a stray "" column would print the next cell a column early.
+    if x + 1 < s.cols && s.chs[i + 1] == "" {
+        s.chs[i + 1] = " "
+        s.fgs[i + 1] = 0
+        s.bgs[i + 1] = 0
+        s.attrs[i + 1] = 0
+    }
+    s.chs[i] = ""
+    s.fgs[i] = -1
+    s.bgs[i] = -1
+    s.attrs[i] = 0
 }
 
 fn (s mut AnsiScreen) cursor(x: int, y: int, show: bool) {
@@ -143,6 +221,34 @@ struct Session {
     armed: int,
 }
 
+// open_seq enables the input modes S9 needs on top of S8's raw mode:
+// SGR mouse (button-event tracking 1002 + SGR coords 1006) and the
+// kitty keyboard disambiguate flag (`>1u`) so ctrl+shift+{s,v,z} and
+// alt-modified keys arrive as distinguishable CSI-u (corpus §9 notes
+// the kitty dependency). Returned by open_seq() for tests.
+fn open_seq() -> str {
+    return "\x1b[?1002h\x1b[?1006h\x1b[>1u"
+}
+
+// close_seq reverses open_seq before leaving the alternate screen.
+fn close_seq() -> str {
+    return "\x1b[?1002l\x1b[?1006l\x1b[<u"
+}
+
+// enter_seq joins the alternate screen FIRST — the kitty keyboard
+// stack and the mouse modes are per-screen state, so pushing them
+// before `?1049h` lands them on the main screen's stack where the
+// TUI never runs (and where they'd stay active after exit).
+fn enter_seq() -> str {
+    return "\x1b[?1049h" + open_seq()
+}
+
+// leave_seq pops kitty + mouse modes BEFORE leaving the alternate
+// screen — off the same per-screen stack they were pushed onto.
+fn leave_seq() -> str {
+    return close_seq() + "\x1b[?1049l\x1b[?25h\x1b[0m"
+}
+
 // open_session enters raw mode on stdin, arms SIGINT/SIGWINCH, and
 // builds an AnsiScreen sized to the tty. Non-tty → err (caller falls
 // back to plain stdout).
@@ -180,14 +286,21 @@ fn open_session() -> [own Session, err] {
     s.raw = raw
     s.scr = new_ansi(cols, rows)
     s.armed = 1
+    // Enter the alt screen, THEN enable SGR mouse + kitty
+    // disambiguate (ADR-0028) so they land on the right per-screen
+    // stack; failure is non-fatal — keys still decode without them,
+    // degrade paths cover the rest.
+    f := os.stdout()
+    [_, _we] = f.write(enter_seq() as []byte)
     return s, nil
 }
 
 fn (s mut Session) close() -> err {
-    // Always leave the alternate screen first so a disarm/restore
-    // failure cannot trap the parent shell on the hidden buffer.
+    // Pop the per-screen modes before leaving the alternate screen so
+    // a disarm/restore failure cannot trap the parent shell on the
+    // hidden buffer — and no mode stays pushed on the wrong screen.
     f := os.stdout()
-    [nw, we] = f.write("\x1b[?1049l\x1b[?25h\x1b[0m" as []byte)
+    [nw, we] = f.write(leave_seq() as []byte)
     first := we
     if nw < 0 && first == nil {
         // ignore short write on teardown
