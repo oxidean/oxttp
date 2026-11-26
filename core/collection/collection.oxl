@@ -69,6 +69,10 @@ struct PScripts { setup: str, on_request: str, on_response: str }
 // options block — corpus defaults (follow_redirects true, verify_ssl
 // true, attach_cookies true, substitute_body_variables true, timeout
 // 5s) are applied by the parser, not here.
+// set_mask tracks which keys the file explicitly set (bits: 1
+// follow_redirects, 2 verify_ssl, 4 attach_cookies, 8
+// substitute_body_variables, 16 proxy_url, 32 timeout) so encode
+// writes only non-defaults back — additive, not a corpus key.
 struct POptions {
     follow_redirects: bool,
     verify_ssl: bool,
@@ -76,6 +80,7 @@ struct POptions {
     substitute_body_variables: bool,
     proxy_url: str,
     timeout: float,
+    set_mask: int,
 }
 
 // path_params rows are {name,value} only — always enabled (corpus).
@@ -104,4 +109,1997 @@ struct PRequest {
     options: own POptions,
     captures: []model.KV,
     variable_scope: own PVarScope,
+}
+
+
+
+
+// ==================== S10.3: file IO + send planning ====================
+// decode/encode/scan/load_file/save_file implement corpus §5 (strict
+// 17-key top level, exactly-one body, corpus option defaults applied
+// at decode); plan_req implements §7.1 (scheme-less http, :name path
+// params, enabled rows, auth, options, jar cookies, UA synth).
+import "std/encoding/base64"
+import "std/errors"
+import "std/os"
+import "std/strconv"
+import "std/strings"
+import "std/net/url"
+import "github.com/oxidean/oxttp/core/env"
+import "github.com/oxidean/oxttp/core/yaml"
+import "github.com/oxidean/oxttp/shared/version"
+
+struct CollNode {
+    path: str,
+    rel: str,
+    depth: int,
+    is_dir: bool,
+    req: own PRequest,
+    err: str,
+}
+
+struct CollScan {
+    root: str,
+    nodes: []CollNode,
+}
+
+struct SendPlan {
+    req: own model.Req,
+    warns: []str,
+    err: str,
+}
+
+// --- decode helpers ---
+
+fn cerr(msg: str) -> err {
+    return errors.new("collection: " + msg)
+}
+
+// is_empty reports a "key:"-with-no-value node — YAML null. Container
+// decoders treat it as absent (upstream unmarshals null into zero
+// values, never errors).
+fn is_empty(v: ref yaml.YNode) -> bool {
+    return v == nil || (v.kind == 0 && len(v.s) == 0)
+}
+
+// scal reads a scalar node's text; containers error.
+fn scal(v: ref yaml.YNode, what: str) -> [str, err] {
+    if v == nil {
+        return "", cerr(what + " must be a scalar")
+    }
+    if v.kind != 0 {
+        return "", cerr(what + " must be a scalar")
+    }
+    return v.s, nil
+}
+
+// tobool decodes a YAML bool scalar.
+fn tobool(v: ref yaml.YNode, what: str) -> [bool, err] {
+    [s, e] = scal(v, what)
+    if e != nil {
+        return false, e
+    }
+    if s == "true" || s == "True" || s == "TRUE" {
+        return true, nil
+    }
+    if s == "false" || s == "False" || s == "FALSE" {
+        return false, nil
+    }
+    return false, cerr(what + " must be a bool")
+}
+
+// tofloat decodes a YAML number scalar.
+fn tofloat(v: ref yaml.YNode, what: str) -> [float, err] {
+    [s, e] = scal(v, what)
+    if e != nil {
+        return 0.0, e
+    }
+    [f, fe] = strconv.parsefloat(s)
+    if fe != nil {
+        return 0.0, cerr(what + " must be a number")
+    }
+    return f, nil
+}
+
+// ym_idx finds a key in a map node — -1 when absent (ref returns are
+// banned, so callers index pairs themselves).
+fn ym_idx(n: ref yaml.YNode, key: str) -> int {
+    if n == nil || n.kind != 1 {
+        return -1
+    }
+    i := 0
+    for i < len(n.pairs) {
+        if n.pairs[i].key == key {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn ym_has(n: ref yaml.YNode, key: str) -> bool {
+    return ym_idx(n, key) >= 0
+}
+
+// str_list decodes a seq of scalars (proto files/import_paths).
+fn str_list(v: ref yaml.YNode, what: str) -> [[]str, err] {
+    let out: []str = nil
+    if is_empty(v) {
+        return out, nil
+    }
+    if v.kind != 2 {
+        return nil, cerr(what + " must be a list")
+    }
+    i := 0
+    for i < len(v.items) {
+        it := v.items[i]
+        i = i + 1
+        if is_empty(it) {
+            continue
+        }
+        if it == nil || it.kind != 0 {
+            return nil, cerr(what + " entries must be scalars")
+        }
+        out = push(out, it.s)
+    }
+    return out, nil
+}
+
+// kv_rows decodes [{name,value,enabled}] rows — enabled defaults true.
+fn kv_rows(v: ref yaml.YNode, what: str) -> [[]model.KV, err] {
+    let out: []model.KV = nil
+    if is_empty(v) {
+        return out, nil
+    }
+    if v.kind != 2 {
+        return nil, cerr(what + " must be a list")
+    }
+    i := 0
+    for i < len(v.items) {
+        it := v.items[i]
+        i = i + 1
+        if is_empty(it) {
+            continue
+        }
+        if it == nil || it.kind != 1 {
+            return nil, cerr(what + " rows must be maps")
+        }
+        row := model.KV{name: "", value: "", enabled: true}
+        j := 0
+        for j < len(it.pairs) {
+            pk := it.pairs[j].key
+            pv := it.pairs[j].val
+            j = j + 1
+            if pk == "name" {
+                [s, se] = scal(pv, what + ".name")
+                if se != nil {
+                    return nil, se
+                }
+                row.name = s
+            } else if pk == "value" {
+                [s2, se2] = scal(pv, what + ".value")
+                if se2 != nil {
+                    return nil, se2
+                }
+                row.value = s2
+            } else if pk == "enabled" {
+                if is_empty(pv) {
+                    continue
+                }
+                [b, be] = tobool(pv, what + ".enabled")
+                if be != nil {
+                    return nil, be
+                }
+                row.enabled = b
+            }
+        }
+        out = push(out, row)
+    }
+    return out, nil
+}
+
+// pp_rows decodes [{name,value}] path-param rows.
+fn pp_rows(v: ref yaml.YNode) -> [[]PathParam, err] {
+    let out: []PathParam = nil
+    if is_empty(v) {
+        return out, nil
+    }
+    if v.kind != 2 {
+        return nil, cerr("path_params must be a list")
+    }
+    i := 0
+    for i < len(v.items) {
+        it := v.items[i]
+        i = i + 1
+        if is_empty(it) {
+            continue
+        }
+        if it == nil || it.kind != 1 {
+            return nil, cerr("path_params rows must be maps")
+        }
+        row := PathParam{name: "", value: ""}
+        ni := ym_idx(it, "name")
+        if ni >= 0 {
+            [s, se] = scal(it.pairs[ni].val, "path_params.name")
+            if se != nil {
+                return nil, se
+            }
+            row.name = s
+        }
+        vi := ym_idx(it, "value")
+        if vi >= 0 {
+            [s2, se2] = scal(it.pairs[vi].val, "path_params.value")
+            if se2 != nil {
+                return nil, se2
+            }
+            row.value = s2
+        }
+        out = push(out, row)
+    }
+    return out, nil
+}
+
+// str_map decodes a map node into ordered KV rows (captures,
+// variable_scope.variables — posting maps stay ordered here).
+fn str_map(v: ref yaml.YNode, what: str) -> [[]model.KV, err] {
+    let out: []model.KV = nil
+    if is_empty(v) {
+        return out, nil
+    }
+    if v.kind != 1 {
+        return nil, cerr(what + " must be a map")
+    }
+    i := 0
+    for i < len(v.pairs) {
+        k := v.pairs[i].key
+        vv := v.pairs[i].val
+        i = i + 1
+        [s, se] = scal(vv, what + "." + k)
+        if se != nil {
+            return nil, se
+        }
+        out = push(out, model.KV{name: k, value: s, enabled: true})
+    }
+    return out, nil
+}
+
+// part_rows decodes multipart parts — each needs exactly one of
+// value|file (corpus §5.2).
+fn part_rows(v: ref yaml.YNode) -> [[]model.Part, err] {
+    let out: []model.Part = nil
+    if is_empty(v) {
+        return out, nil
+    }
+    if v.kind != 2 {
+        return nil, cerr("multipart must be a list")
+    }
+    i := 0
+    for i < len(v.items) {
+        it := v.items[i]
+        i = i + 1
+        if is_empty(it) {
+            continue
+        }
+        if it == nil || it.kind != 1 {
+            return nil, cerr("multipart parts must be maps")
+        }
+        hasv := ym_has(it, "value")
+        hasf := ym_has(it, "file")
+        if hasv == hasf {
+            return nil, cerr("multipart part needs exactly one of value|file")
+        }
+        p := model.Part{name: "", value: "", file: "", filename: "", content_type: "", enabled: true, is_file: hasf}
+        j := 0
+        for j < len(it.pairs) {
+            pk := it.pairs[j].key
+            pv := it.pairs[j].val
+            j = j + 1
+            if pk == "enabled" {
+                if is_empty(pv) {
+                    continue
+                }
+                [b, be] = tobool(pv, "multipart.enabled")
+                if be != nil {
+                    return nil, be
+                }
+                p.enabled = b
+            } else if pk == "name" || pk == "value" || pk == "file" || pk == "filename" || pk == "content_type" {
+                // non-strict block: unknown keys ignore (corpus pins
+                // strict decode only for graphql/grpc/websocket)
+                [s, se] = scal(pv, "multipart." + pk)
+                if se != nil {
+                    return nil, se
+                }
+                if pk == "name" {
+                    p.name = s
+                } else if pk == "value" {
+                    p.value = s
+                } else if pk == "file" {
+                    p.file = s
+                } else if pk == "filename" {
+                    p.filename = s
+                } else {
+                    p.content_type = s
+                }
+            }
+        }
+        out = push(out, p)
+    }
+    return out, nil
+}
+
+// body_dec decodes the body block; >1 kind present = error.
+fn body_dec(v: ref yaml.YNode) -> [own PBody, err] {
+    b := new(PBody)
+    if is_empty(v) {
+        return b, nil
+    }
+    if v.kind != 1 {
+        return nil, cerr("body must be a map")
+    }
+    kinds := 0
+    i := 0
+    for i < len(v.pairs) {
+        k := v.pairs[i].key
+        pv := v.pairs[i].val
+        i = i + 1
+        if k == "content" {
+            [s, se] = scal(pv, "body.content")
+            if se != nil {
+                return nil, se
+            }
+            b.content = s
+            b.has_content = true
+            kinds = kinds + 1
+        } else if k == "form_data" {
+            [rows, re] = kv_rows(pv, "body.form_data")
+            if re != nil {
+                return nil, re
+            }
+            b.form_data = rows
+            b.has_form_data = true
+            kinds = kinds + 1
+        } else if k == "multipart" {
+            [ps, pe] = part_rows(pv)
+            if pe != nil {
+                return nil, pe
+            }
+            b.multipart = ps
+            b.has_multipart = true
+            kinds = kinds + 1
+        } else if k == "file" {
+            [s2, se2] = scal(pv, "body.file")
+            if se2 != nil {
+                return nil, se2
+            }
+            b.file = s2
+            b.has_file = true
+            kinds = kinds + 1
+        } else if k == "content_type" {
+            [s3, se3] = scal(pv, "body.content_type")
+            if se3 != nil {
+                return nil, se3
+            }
+            b.content_type = s3
+        }
+    }
+    if kinds > 1 {
+        return nil, cerr("body: more than one body kind")
+    }
+    return b, nil
+}
+
+// --- JSON bridge for graphql.variables ---
+
+fn looks_bool(s: str) -> bool {
+    return s == "true" || s == "false" || s == "True" || s == "False" || s == "TRUE" || s == "FALSE"
+}
+
+fn looks_null(s: str) -> bool {
+    return s == "null" || s == "Null" || s == "NULL" || s == "~"
+}
+
+// yjson converts a YNode into a json tree — scalars coerce
+// bool/null/number so posting `variables:` maps arrive typed.
+// Quoted scalars keep string type: `code: "001"` is a string, only
+// plain `code: 001` reads as a number.
+fn yjson(v: ref yaml.YNode) -> own json.Json {
+    if v == nil {
+        return json.jnull()
+    }
+    if v.kind == 1 {
+        o := json.jobj()
+        i := 0
+        for i < len(v.pairs) {
+            k := v.pairs[i].key
+            pv := v.pairs[i].val
+            i = i + 1
+            json.jadd(o, k, yjson(pv))
+        }
+        return o
+    }
+    if v.kind == 2 {
+        b := json.jarrb()
+        i := 0
+        for i < len(v.items) {
+            json.jarrb_add(b, yjson(v.items[i]))
+            i = i + 1
+        }
+        return json.jarrb_arr(b)
+    }
+    s := v.s
+    if !v.plain {
+        return json.jstr(s)
+    }
+    if looks_bool(s) {
+        return json.jbool(s == "true" || s == "True" || s == "TRUE")
+    }
+    if looks_null(s) {
+        return json.jnull()
+    }
+    [iv, ie] = strconv.atoi(s)
+    if ie == nil {
+        return json.jint(iv)
+    }
+    [fv, fe] = strconv.parsefloat(s)
+    if fe == nil {
+        return json.jfloat(fv)
+    }
+    return json.jstr(s)
+}
+
+// gql_dec decodes the graphql block — STRICT (corpus).
+fn gql_dec(v: ref yaml.YNode) -> [own PGraphQL, err] {
+    g := new(PGraphQL)
+    if is_empty(v) {
+        return g, nil
+    }
+    if v.kind != 1 {
+        return nil, cerr("graphql must be a map")
+    }
+    i := 0
+    for i < len(v.pairs) {
+        k := v.pairs[i].key
+        pv := v.pairs[i].val
+        i = i + 1
+        if k == "query" {
+            [s, se] = scal(pv, "graphql.query")
+            if se != nil {
+                return nil, se
+            }
+            g.query = s
+        } else if k == "variables" {
+            g.variables = yjson(pv)
+        } else if k == "operation_name" {
+            [s2, se2] = scal(pv, "graphql.operation_name")
+            if se2 != nil {
+                return nil, se2
+            }
+            g.operation_name = s2
+        } else {
+            return nil, cerr("graphql: unknown key " + k)
+        }
+    }
+    return g, nil
+}
+
+// grpc_dec decodes the grpc block — STRICT (corpus).
+fn grpc_dec(v: ref yaml.YNode) -> [own PGrpc, err] {
+    g := new(PGrpc)
+    if is_empty(v) {
+        return g, nil
+    }
+    if v.kind != 1 {
+        return nil, cerr("grpc must be a map")
+    }
+    i := 0
+    for i < len(v.pairs) {
+        k := v.pairs[i].key
+        pv := v.pairs[i].val
+        i = i + 1
+        if k == "method" || k == "message" || k == "authority" {
+            [s, se] = scal(pv, "grpc." + k)
+            if se != nil {
+                return nil, se
+            }
+            if k == "method" {
+                g.method = s
+            } else if k == "message" {
+                g.message = s
+            } else {
+                g.authority = s
+            }
+        } else if k == "proto" {
+            pr := new(PProto)
+            if pv != nil && pv.kind == 1 {
+                fi := ym_idx(pv, "files")
+                if fi >= 0 {
+                    [fs, fe] = str_list(pv.pairs[fi].val, "grpc.proto.files")
+                    if fe != nil {
+                        return nil, fe
+                    }
+                    pr.files = fs
+                }
+                ii := ym_idx(pv, "import_paths")
+                if ii >= 0 {
+                    [ip, ie] = str_list(pv.pairs[ii].val, "grpc.proto.import_paths")
+                    if ie != nil {
+                        return nil, ie
+                    }
+                    pr.import_paths = ip
+                }
+            }
+            g.proto = pr
+        } else {
+            return nil, cerr("grpc: unknown key " + k)
+        }
+    }
+    return g, nil
+}
+
+// ws_dec decodes the websocket block — STRICT (corpus).
+fn ws_dec(v: ref yaml.YNode) -> [own PWebsocket, err] {
+    w := new(PWebsocket)
+    if is_empty(v) {
+        return w, nil
+    }
+    if v.kind != 1 {
+        return nil, cerr("websocket must be a map")
+    }
+    i := 0
+    for i < len(v.pairs) {
+        k := v.pairs[i].key
+        pv := v.pairs[i].val
+        i = i + 1
+        if k == "message" {
+            [s, se] = scal(pv, "websocket.message")
+            if se != nil {
+                return nil, se
+            }
+            w.message = s
+        } else if k == "binary" {
+            if !is_empty(pv) {
+                [b, be] = tobool(pv, "websocket.binary")
+                if be != nil {
+                    return nil, be
+                }
+                w.binary = b
+            }
+        } else {
+            return nil, cerr("websocket: unknown key " + k)
+        }
+    }
+    return w, nil
+}
+
+// basic_dec decodes a {username,password} auth block.
+fn basic_dec(v: ref yaml.YNode, what: str) -> [own PBasic, err] {
+    b := new(PBasic)
+    if is_empty(v) {
+        return b, nil
+    }
+    if v.kind != 1 {
+        return nil, cerr(what + " must be a map")
+    }
+    ui := ym_idx(v, "username")
+    if ui >= 0 {
+        [s, se] = scal(v.pairs[ui].val, what + ".username")
+        if se != nil {
+            return nil, se
+        }
+        b.username = s
+    }
+    pi := ym_idx(v, "password")
+    if pi >= 0 {
+        [s2, se2] = scal(v.pairs[pi].val, what + ".password")
+        if se2 != nil {
+            return nil, se2
+        }
+        b.password = s2
+    }
+    return b, nil
+}
+
+// bearer_dec decodes {token}.
+fn bearer_dec(v: ref yaml.YNode) -> [own PBearer, err] {
+    b := new(PBearer)
+    if is_empty(v) {
+        return b, nil
+    }
+    if v.kind != 1 {
+        return nil, cerr("bearer_token must be a map")
+    }
+    ti := ym_idx(v, "token")
+    if ti >= 0 {
+        [s, se] = scal(v.pairs[ti].val, "bearer_token.token")
+        if se != nil {
+            return nil, se
+        }
+        b.token = s
+    }
+    return b, nil
+}
+
+// oauth_dec decodes the oauth2 block (corpus field list).
+fn oauth_dec(v: ref yaml.YNode) -> [own POAuth2, err] {
+    o := new(POAuth2)
+    if is_empty(v) {
+        return o, nil
+    }
+    if v.kind != 1 {
+        return nil, cerr("oauth2 must be a map")
+    }
+    i := 0
+    for i < len(v.pairs) {
+        k := v.pairs[i].key
+        pv := v.pairs[i].val
+        i = i + 1
+        // non-strict block: unknown keys ignore
+        if k == "grant_type" || k == "authorization_url" || k == "token_url" || k == "client_id" || k == "client_secret" || k == "scope" || k == "redirect_uri" || k == "client_auth" {
+            [s, se] = scal(pv, "oauth2." + k)
+            if se != nil {
+                return nil, se
+            }
+            if k == "grant_type" {
+                o.grant_type = s
+            } else if k == "authorization_url" {
+                o.authorization_url = s
+            } else if k == "token_url" {
+                o.token_url = s
+            } else if k == "client_id" {
+                o.client_id = s
+            } else if k == "client_secret" {
+                o.client_secret = s
+            } else if k == "scope" {
+                o.scope = s
+            } else if k == "redirect_uri" {
+                o.redirect_uri = s
+            } else {
+                o.client_auth = s
+            }
+        }
+    }
+    return o, nil
+}
+
+// auth_dec decodes the auth block — type ∈ basic|digest|
+// bearer_token|oauth2 (corpus §5.2).
+fn auth_dec(v: ref yaml.YNode) -> [own PAuth, err] {
+    a := new(PAuth)
+    if is_empty(v) {
+        return a, nil
+    }
+    if v.kind != 1 {
+        return nil, cerr("auth must be a map")
+    }
+    ti := ym_idx(v, "type")
+    if ti >= 0 {
+        [t, te] = scal(v.pairs[ti].val, "auth.type")
+        if te != nil {
+            return nil, te
+        }
+        a.type = t
+    }
+    if len(a.type) > 0 && a.type != "basic" && a.type != "digest" && a.type != "bearer_token" && a.type != "oauth2" {
+        return nil, cerr("auth.type must be basic|digest|bearer_token|oauth2")
+    }
+    bi := ym_idx(v, "basic")
+    if bi >= 0 {
+        [b, be] = basic_dec(v.pairs[bi].val, "auth.basic")
+        if be != nil {
+            return nil, be
+        }
+        a.basic = b
+    }
+    di := ym_idx(v, "digest")
+    if di >= 0 {
+        [d2, de] = basic_dec(v.pairs[di].val, "auth.digest")
+        if de != nil {
+            return nil, de
+        }
+        a.digest = d2
+    }
+    ki := ym_idx(v, "bearer_token")
+    if ki >= 0 {
+        [k, ke] = bearer_dec(v.pairs[ki].val)
+        if ke != nil {
+            return nil, ke
+        }
+        a.bearer_token = k
+    }
+    oi := ym_idx(v, "oauth2")
+    if oi >= 0 {
+        [o, oe] = oauth_dec(v.pairs[oi].val)
+        if oe != nil {
+            return nil, oe
+        }
+        a.oauth2 = o
+    }
+    return a, nil
+}
+
+// scripts_dec decodes {setup,on_request,on_response}.
+fn scripts_dec(v: ref yaml.YNode) -> [own PScripts, err] {
+    s := new(PScripts)
+    if is_empty(v) {
+        return s, nil
+    }
+    if v.kind != 1 {
+        return nil, cerr("scripts must be a map")
+    }
+    si := ym_idx(v, "setup")
+    if si >= 0 {
+        [x, xe] = scal(v.pairs[si].val, "scripts.setup")
+        if xe != nil {
+            return nil, xe
+        }
+        s.setup = x
+    }
+    ri := ym_idx(v, "on_request")
+    if ri >= 0 {
+        [x2, xe2] = scal(v.pairs[ri].val, "scripts.on_request")
+        if xe2 != nil {
+            return nil, xe2
+        }
+        s.on_request = x2
+    }
+    xi := ym_idx(v, "on_response")
+    if xi >= 0 {
+        [x3, xe3] = scal(v.pairs[xi].val, "scripts.on_response")
+        if xe3 != nil {
+            return nil, xe3
+        }
+        s.on_response = x3
+    }
+    return s, nil
+}
+
+// opts_dec decodes options with corpus defaults applied; set_mask
+// records which keys the file set so encode writes non-defaults back.
+fn opts_dec(v: ref yaml.YNode) -> [own POptions, err] {
+    o := new(POptions{follow_redirects: true, verify_ssl: true, attach_cookies: true, substitute_body_variables: true, proxy_url: "", timeout: 5.0, set_mask: 0})
+    if is_empty(v) {
+        return o, nil
+    }
+    if v.kind != 1 {
+        return nil, cerr("options must be a map")
+    }
+    i := 0
+    for i < len(v.pairs) {
+        k := v.pairs[i].key
+        pv := v.pairs[i].val
+        i = i + 1
+        if k == "proxy_url" {
+            if is_empty(pv) {
+                continue
+            }
+            [s, se] = scal(pv, "options.proxy_url")
+            if se != nil {
+                return nil, se
+            }
+            o.proxy_url = s
+            o.set_mask = o.set_mask | 16
+        } else if k == "timeout" {
+            if is_empty(pv) {
+                continue
+            }
+            [f, fe] = tofloat(pv, "options.timeout")
+            if fe != nil {
+                return nil, fe
+            }
+            o.timeout = f
+            o.set_mask = o.set_mask | 32
+        } else if k == "follow_redirects" || k == "verify_ssl" || k == "attach_cookies" || k == "substitute_body_variables" {
+            // non-strict block: unknown keys ignore (corpus pins
+            // strict decode only for graphql/grpc/websocket)
+            if is_empty(pv) {
+                continue
+            }
+            [b, be] = tobool(pv, "options." + k)
+            if be != nil {
+                return nil, be
+            }
+            if k == "follow_redirects" {
+                o.follow_redirects = b
+                o.set_mask = o.set_mask | 1
+            } else if k == "verify_ssl" {
+                o.verify_ssl = b
+                o.set_mask = o.set_mask | 2
+            } else if k == "attach_cookies" {
+                o.attach_cookies = b
+                o.set_mask = o.set_mask | 4
+            } else {
+                o.substitute_body_variables = b
+                o.set_mask = o.set_mask | 8
+            }
+        }
+    }
+    return o, nil
+}
+
+// varscope_dec decodes variable_scope{variables:{NAME:template}}.
+fn varscope_dec(v: ref yaml.YNode) -> [own PVarScope, err] {
+    vs := new(PVarScope)
+    if is_empty(v) {
+        return vs, nil
+    }
+    if v.kind != 1 {
+        return nil, cerr("variable_scope must be a map")
+    }
+    vi := ym_idx(v, "variables")
+    if vi >= 0 {
+        [rows, re] = str_map(v.pairs[vi].val, "variable_scope.variables")
+        if re != nil {
+            return nil, re
+        }
+        vs.variables = rows
+    }
+    return vs, nil
+}
+
+fn valid_method(m: str) -> bool {
+    return m == "GET" || m == "POST" || m == "PUT" || m == "PATCH" || m == "DELETE" || m == "HEAD" || m == "OPTIONS"
+}
+
+fn valid_kind(k: str) -> bool {
+    return len(k) == 0 || k == "graphql" || k == "grpc" || k == "websocket"
+}
+
+// decode builds a PRequest from a parsed document — corpus §5.2:
+// 17 top-level keys, unknown = error; method uppercased + validated.
+fn decode(n: ref yaml.YNode) -> [own PRequest, err] {
+    r := new(PRequest)
+    if n == nil {
+        return nil, cerr("empty document")
+    }
+    if n.kind != 1 {
+        return nil, cerr("request file must be a map")
+    }
+    i := 0
+    for i < len(n.pairs) {
+        k := n.pairs[i].key
+        v := n.pairs[i].val
+        i = i + 1
+        if k == "name" {
+            [s, se] = scal(v, "name")
+            if se != nil {
+                return nil, se
+            }
+            r.name = s
+        } else if k == "description" {
+            [s2, se2] = scal(v, "description")
+            if se2 != nil {
+                return nil, se2
+            }
+            r.description = s2
+        } else if k == "kind" {
+            [s3, se3] = scal(v, "kind")
+            if se3 != nil {
+                return nil, se3
+            }
+            if !valid_kind(s3) {
+                return nil, cerr("kind must be graphql|grpc|websocket")
+            }
+            r.kind = s3
+        } else if k == "method" {
+            [s4, se4] = scal(v, "method")
+            if se4 != nil {
+                return nil, se4
+            }
+            m := strings.upper(s4)
+            // "method:" bare is a YAML null — same as omitted (GET
+            // downstream), not a validation failure.
+            if len(m) > 0 && !valid_method(m) {
+                return nil, cerr("method must be GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS")
+            }
+            r.method = m
+        } else if k == "url" {
+            [s5, se5] = scal(v, "url")
+            if se5 != nil {
+                return nil, se5
+            }
+            r.url = s5
+        } else if k == "headers" {
+            [rows, re] = kv_rows(v, "headers")
+            if re != nil {
+                return nil, re
+            }
+            r.headers = rows
+        } else if k == "params" {
+            [rows2, re2] = kv_rows(v, "params")
+            if re2 != nil {
+                return nil, re2
+            }
+            r.params = rows2
+        } else if k == "path_params" {
+            [pps, pe] = pp_rows(v)
+            if pe != nil {
+                return nil, pe
+            }
+            r.path_params = pps
+        } else if k == "body" {
+            [b, be] = body_dec(v)
+            if be != nil {
+                return nil, be
+            }
+            r.body = b
+        } else if k == "graphql" {
+            [g, ge] = gql_dec(v)
+            if ge != nil {
+                return nil, ge
+            }
+            r.graphql = g
+        } else if k == "grpc" {
+            [g2, ge2] = grpc_dec(v)
+            if ge2 != nil {
+                return nil, ge2
+            }
+            r.grpc = g2
+        } else if k == "websocket" {
+            [w, we] = ws_dec(v)
+            if we != nil {
+                return nil, we
+            }
+            r.websocket = w
+        } else if k == "auth" {
+            [a, ae] = auth_dec(v)
+            if ae != nil {
+                return nil, ae
+            }
+            r.auth = a
+        } else if k == "scripts" {
+            [sc, sce] = scripts_dec(v)
+            if sce != nil {
+                return nil, sce
+            }
+            r.scripts = sc
+        } else if k == "options" {
+            [o, oe] = opts_dec(v)
+            if oe != nil {
+                return nil, oe
+            }
+            r.options = o
+        } else if k == "captures" {
+            [rows3, re3] = str_map(v, "captures")
+            if re3 != nil {
+                return nil, re3
+            }
+            r.captures = rows3
+        } else if k == "variable_scope" {
+            [vs, ve] = varscope_dec(v)
+            if ve != nil {
+                return nil, ve
+            }
+            r.variable_scope = vs
+        } else {
+            return nil, cerr("unknown key " + k)
+        }
+    }
+    return r, nil
+}
+
+// --- encode ---
+
+fn ystr_node(s: str) -> own yaml.YNode {
+    n := new(yaml.YNode)
+    n.kind = 0
+    n.s = s
+    return n
+}
+
+fn ybool_node(b: bool) -> own yaml.YNode {
+    n := new(yaml.YNode)
+    n.kind = 0
+    n.plain = true
+    if b {
+        n.s = "true"
+    } else {
+        n.s = "false"
+    }
+    return n
+}
+
+fn yfloat_node(f: float) -> own yaml.YNode {
+    n := new(yaml.YNode)
+    n.kind = 0
+    n.plain = true
+    n.s = ftoa(f)
+    return n
+}
+
+fn yput(m: mut yaml.YNode, key: str, val: own yaml.YNode) {
+    m.pairs = push(m.pairs, yaml.YPair{key: key, val: val})
+}
+
+fn yput_str(m: mut yaml.YNode, key: str, s: str) {
+    yput(m, key, ystr_node(s))
+}
+
+// ykv_list renders [{name,value,enabled}] — enabled written only
+// when false (omitempty: true is the decode default).
+fn ykv_list(rows: []model.KV) -> own yaml.YNode {
+    n := new(yaml.YNode)
+    n.kind = 2
+    i := 0
+    for i < len(rows) {
+        row := rows[i]
+        i = i + 1
+        if len(row.name) == 0 && len(row.value) == 0 && row.enabled {
+            continue
+        }
+        it := new(yaml.YNode)
+        it.kind = 1
+        yput_str(it, "name", row.name)
+        yput_str(it, "value", row.value)
+        if !row.enabled {
+            yput(it, "enabled", ybool_node(false))
+        }
+        n.items = push(n.items, it)
+    }
+    return n
+}
+
+fn ypart_list(rows: []model.Part) -> own yaml.YNode {
+    n := new(yaml.YNode)
+    n.kind = 2
+    i := 0
+    for i < len(rows) {
+        p := rows[i]
+        i = i + 1
+        it := new(yaml.YNode)
+        it.kind = 1
+        yput_str(it, "name", p.name)
+        if p.is_file {
+            yput_str(it, "file", p.file)
+        } else {
+            yput_str(it, "value", p.value)
+        }
+        if len(p.filename) > 0 {
+            yput_str(it, "filename", p.filename)
+        }
+        if len(p.content_type) > 0 {
+            yput_str(it, "content_type", p.content_type)
+        }
+        if !p.enabled {
+            yput(it, "enabled", ybool_node(false))
+        }
+        n.items = push(n.items, it)
+    }
+    return n
+}
+
+fn ystr_list(xs: []str) -> own yaml.YNode {
+    n := new(yaml.YNode)
+    n.kind = 2
+    i := 0
+    for i < len(xs) {
+        n.items = push(n.items, ystr_node(xs[i]))
+        i = i + 1
+    }
+    return n
+}
+
+// jnode converts a json tree back into YNode scalars/containers for
+// graphql.variables round-trips.
+fn jnode(j: ref json.Json) -> own yaml.YNode {
+    n := new(yaml.YNode)
+    if j == nil {
+        n.kind = 0
+        n.s = "null"
+        n.plain = true
+        return n
+    }
+    if j.kind == 4 {
+        n.kind = 1
+        c := j.child
+        for c != nil {
+            yput(n, c.key, jnode(c))
+            c = c.next
+        }
+        return n
+    }
+    if j.kind == 5 {
+        n.kind = 2
+        c := j.child
+        for c != nil {
+            n.items = push(n.items, jnode(c))
+            c = c.next
+        }
+        return n
+    }
+    n.kind = 0
+    if j.kind == 0 {
+        n.s = "null"
+        n.plain = true
+    } else if j.kind == 1 {
+        n.plain = true
+        if j.b {
+            n.s = "true"
+        } else {
+            n.s = "false"
+        }
+    } else if j.kind == 2 {
+        n.s = itoa(j.i)
+        n.plain = true
+    } else if j.kind == 6 {
+        n.s = ftoa(j.f)
+        n.plain = true
+    } else {
+        n.s = j.s
+    }
+    return n
+}
+
+// encode renders a PRequest into a YNode DOM — corpus key order,
+// omitempty throughout (only non-defaults written).
+fn encode(r: ref PRequest) -> own yaml.YNode {
+    root := new(yaml.YNode)
+    root.kind = 1
+    if len(r.name) > 0 {
+        yput_str(root, "name", r.name)
+    }
+    if len(r.description) > 0 {
+        yput_str(root, "description", r.description)
+    }
+    if len(r.kind) > 0 {
+        yput_str(root, "kind", r.kind)
+    }
+    if len(r.method) > 0 {
+        yput_str(root, "method", r.method)
+    }
+    if len(r.url) > 0 {
+        yput_str(root, "url", r.url)
+    }
+    if len(r.headers) > 0 {
+        yput(root, "headers", ykv_list(r.headers))
+    }
+    if len(r.params) > 0 {
+        yput(root, "params", ykv_list(r.params))
+    }
+    if len(r.path_params) > 0 {
+        pp := new(yaml.YNode)
+        pp.kind = 2
+        i := 0
+        for i < len(r.path_params) {
+            row := r.path_params[i]
+            i = i + 1
+            it := new(yaml.YNode)
+            it.kind = 1
+            yput_str(it, "name", row.name)
+            yput_str(it, "value", row.value)
+            pp.items = push(pp.items, it)
+        }
+        yput(root, "path_params", pp)
+    }
+    if r.body != nil {
+        b := r.body
+        bm := new(yaml.YNode)
+        bm.kind = 1
+        if b.has_content {
+            yput_str(bm, "content", b.content)
+        }
+        if b.has_form_data {
+            yput(bm, "form_data", ykv_list(b.form_data))
+        }
+        if b.has_multipart {
+            yput(bm, "multipart", ypart_list(b.multipart))
+        }
+        if b.has_file {
+            yput_str(bm, "file", b.file)
+        }
+        if len(b.content_type) > 0 {
+            yput_str(bm, "content_type", b.content_type)
+        }
+        if len(bm.pairs) > 0 {
+            yput(root, "body", bm)
+        }
+    }
+    if r.graphql != nil {
+        gm := new(yaml.YNode)
+        gm.kind = 1
+        if len(r.graphql.query) > 0 {
+            yput_str(gm, "query", r.graphql.query)
+        }
+        if r.graphql.variables != nil {
+            yput(gm, "variables", jnode(r.graphql.variables))
+        }
+        if len(r.graphql.operation_name) > 0 {
+            yput_str(gm, "operation_name", r.graphql.operation_name)
+        }
+        yput(root, "graphql", gm)
+    }
+    if r.grpc != nil {
+        g2 := new(yaml.YNode)
+        g2.kind = 1
+        if len(r.grpc.method) > 0 {
+            yput_str(g2, "method", r.grpc.method)
+        }
+        if len(r.grpc.message) > 0 {
+            yput_str(g2, "message", r.grpc.message)
+        }
+        if len(r.grpc.authority) > 0 {
+            yput_str(g2, "authority", r.grpc.authority)
+        }
+        if r.grpc.proto != nil {
+            pm := new(yaml.YNode)
+            pm.kind = 1
+            if len(r.grpc.proto.files) > 0 {
+                yput(pm, "files", ystr_list(r.grpc.proto.files))
+            }
+            if len(r.grpc.proto.import_paths) > 0 {
+                yput(pm, "import_paths", ystr_list(r.grpc.proto.import_paths))
+            }
+            yput(g2, "proto", pm)
+        }
+        yput(root, "grpc", g2)
+    }
+    if r.websocket != nil {
+        wm := new(yaml.YNode)
+        wm.kind = 1
+        if len(r.websocket.message) > 0 {
+            yput_str(wm, "message", r.websocket.message)
+        }
+        if r.websocket.binary {
+            yput(wm, "binary", ybool_node(true))
+        }
+        yput(root, "websocket", wm)
+    }
+    if r.auth != nil && len(r.auth.type) > 0 {
+        am := new(yaml.YNode)
+        am.kind = 1
+        yput_str(am, "type", r.auth.type)
+        if r.auth.basic != nil {
+            bm2 := new(yaml.YNode)
+            bm2.kind = 1
+            yput_str(bm2, "username", r.auth.basic.username)
+            yput_str(bm2, "password", r.auth.basic.password)
+            yput(am, "basic", bm2)
+        }
+        if r.auth.digest != nil {
+            dm := new(yaml.YNode)
+            dm.kind = 1
+            yput_str(dm, "username", r.auth.digest.username)
+            yput_str(dm, "password", r.auth.digest.password)
+            yput(am, "digest", dm)
+        }
+        if r.auth.bearer_token != nil {
+            tm := new(yaml.YNode)
+            tm.kind = 1
+            yput_str(tm, "token", r.auth.bearer_token.token)
+            yput(am, "bearer_token", tm)
+        }
+        if r.auth.oauth2 != nil {
+            om := new(yaml.YNode)
+            om.kind = 1
+            o2 := r.auth.oauth2
+            if len(o2.grant_type) > 0 {
+                yput_str(om, "grant_type", o2.grant_type)
+            }
+            if len(o2.authorization_url) > 0 {
+                yput_str(om, "authorization_url", o2.authorization_url)
+            }
+            if len(o2.token_url) > 0 {
+                yput_str(om, "token_url", o2.token_url)
+            }
+            if len(o2.client_id) > 0 {
+                yput_str(om, "client_id", o2.client_id)
+            }
+            if len(o2.client_secret) > 0 {
+                yput_str(om, "client_secret", o2.client_secret)
+            }
+            if len(o2.scope) > 0 {
+                yput_str(om, "scope", o2.scope)
+            }
+            if len(o2.redirect_uri) > 0 {
+                yput_str(om, "redirect_uri", o2.redirect_uri)
+            }
+            if len(o2.client_auth) > 0 {
+                yput_str(om, "client_auth", o2.client_auth)
+            }
+            yput(am, "oauth2", om)
+        }
+        yput(root, "auth", am)
+    }
+    if r.scripts != nil && (len(r.scripts.setup) > 0 || len(r.scripts.on_request) > 0 || len(r.scripts.on_response) > 0) {
+        sm := new(yaml.YNode)
+        sm.kind = 1
+        if len(r.scripts.setup) > 0 {
+            yput_str(sm, "setup", r.scripts.setup)
+        }
+        if len(r.scripts.on_request) > 0 {
+            yput_str(sm, "on_request", r.scripts.on_request)
+        }
+        if len(r.scripts.on_response) > 0 {
+            yput_str(sm, "on_response", r.scripts.on_response)
+        }
+        yput(root, "scripts", sm)
+    }
+    if r.options != nil {
+        o := r.options
+        om2 := new(yaml.YNode)
+        om2.kind = 1
+        if (o.set_mask & 1) != 0 && !o.follow_redirects {
+            yput(om2, "follow_redirects", ybool_node(false))
+        }
+        if (o.set_mask & 2) != 0 && !o.verify_ssl {
+            yput(om2, "verify_ssl", ybool_node(false))
+        }
+        if (o.set_mask & 4) != 0 && !o.attach_cookies {
+            yput(om2, "attach_cookies", ybool_node(false))
+        }
+        if (o.set_mask & 8) != 0 && !o.substitute_body_variables {
+            yput(om2, "substitute_body_variables", ybool_node(false))
+        }
+        if (o.set_mask & 16) != 0 && len(o.proxy_url) > 0 {
+            yput_str(om2, "proxy_url", o.proxy_url)
+        }
+        if (o.set_mask & 32) != 0 && o.timeout != 5.0 {
+            yput(om2, "timeout", yfloat_node(o.timeout))
+        }
+        if len(om2.pairs) > 0 {
+            yput(root, "options", om2)
+        }
+    }
+    if len(r.captures) > 0 {
+        cm := new(yaml.YNode)
+        cm.kind = 1
+        i := 0
+        for i < len(r.captures) {
+            kv := r.captures[i]
+            i = i + 1
+            yput_str(cm, kv.name, kv.value)
+        }
+        yput(root, "captures", cm)
+    }
+    if r.variable_scope != nil && len(r.variable_scope.variables) > 0 {
+        vm := new(yaml.YNode)
+        vm.kind = 1
+        inner := new(yaml.YNode)
+        inner.kind = 1
+        i := 0
+        for i < len(r.variable_scope.variables) {
+            kv2 := r.variable_scope.variables[i]
+            i = i + 1
+            yput_str(inner, kv2.name, kv2.value)
+        }
+        yput(vm, "variables", inner)
+        yput(root, "variable_scope", vm)
+    }
+    return root
+}
+
+// marshal renders a request to .posting.yaml text.
+fn marshal(r: ref PRequest) -> str {
+    return yaml.emit(encode(r))
+}
+
+// --- file IO + tree scan (§5.1) ---
+
+// load_file reads + parses + decodes one .posting.yaml.
+fn load_file(path: str) -> [own PRequest, err] {
+    if !os.exists(path) {
+        return nil, cerr("no such file: " + path)
+    }
+    text := os.readfile_(path)
+    if len(text) == 0 {
+        return nil, cerr("empty file: " + path)
+    }
+    [n, e] = yaml.parse(text)
+    if e != nil {
+        return nil, e
+    }
+    return decode(n)
+}
+
+fn path_dir(p: str) -> str {
+    i := len(p)
+    for i > 0 {
+        if byteat(p, i - 1) == 47 {
+            return substr(p, 0, i - 1)
+        }
+        i = i - 1
+    }
+    return ""
+}
+
+// save_file marshals r to path, creating parent dirs (§5.2 save).
+fn save_file(path: str, r: ref PRequest) -> err {
+    d := path_dir(path)
+    if len(d) > 0 {
+        me := os.mkdir_all(d)
+        if me != nil {
+            return me
+        }
+    }
+    if os.writefile_(path, marshal(r)) < 0 {
+        return cerr("cannot write " + path)
+    }
+    return nil
+}
+
+fn skip_name(nm: str) -> bool {
+    if len(nm) == 0 {
+        return true
+    }
+    if byteat(nm, 0) == 46 {
+        return true
+    }
+    return nm == "__pycache__" || nm == "node_modules"
+}
+
+// scan walks dir for folders + *.posting.yaml files — folders first
+// then alpha at each level (§5.1); malformed files land as nodes
+// carrying err, never aborting the walk.
+fn scan(dir: str) -> own CollScan {
+    sc := new(CollScan)
+    sc.root = dir
+    if os.isdir(dir) {
+        scan_into(dir, "", 0, sc)
+    }
+    return sc
+}
+
+fn scan_into(root: str, rel: str, depth: int, sc: mut CollScan) {
+    base := root
+    if len(rel) > 0 {
+        base = root + "/" + rel
+    }
+    names := os.ls(base)
+    i := 0
+    for i < len(names) {
+        nm := names[i]
+        i = i + 1
+        if skip_name(nm) {
+            continue
+        }
+        p := base + "/" + nm
+        if !os.isdir(p) {
+            continue
+        }
+        r2 := nm
+        if len(rel) > 0 {
+            r2 = rel + "/" + nm
+        }
+        sc.nodes = push(sc.nodes, CollNode{path: p, rel: r2, depth: depth, is_dir: true, req: nil, err: ""})
+        scan_into(root, r2, depth + 1, sc)
+    }
+    i = 0
+    for i < len(names) {
+        nm := names[i]
+        i = i + 1
+        // corpus §5.1 skips dot-DIRECTORIES (plus __pycache__ /
+        // node_modules); a dot-prefixed *.posting.yaml file still
+        // loads like any other request file.
+        if len(nm) < 13 || substr(nm, len(nm) - 13, len(nm)) != ".posting.yaml" {
+            continue
+        }
+        p := base + "/" + nm
+        if os.isdir(p) {
+            continue
+        }
+        r2 := nm
+        if len(rel) > 0 {
+            r2 = rel + "/" + nm
+        }
+        nd := CollNode{path: p, rel: r2, depth: depth, is_dir: false, req: nil, err: ""}
+        [rq, re] = load_file(p)
+        if re != nil {
+            nd.err = errors.msg(re)
+        } else {
+            nd.req = rq
+        }
+        sc.nodes = push(sc.nodes, nd)
+    }
+}
+
+// --- plan_req: PRequest -> wire model.Req (§7.1) ---
+
+fn chr(c: int) -> str {
+    b := mkslice(byte, 1)
+    b[0] = c
+    return b as str
+}
+
+fn ascii_lower(s: str) -> str {
+    out := ""
+    i := 0
+    for i < len(s) {
+        c := byteat(s, i)
+        if c >= 65 && c <= 90 {
+            out = out + chr(c + 32)
+        } else {
+            out = out + chr(c)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// fill_seg replaces a :name path segment with its path_params value
+// (path-escaped); unmatched placeholders stay literal.
+fn fill_seg(seg: str, r: ref PRequest, es: ref env.EnvSet) -> [str, err] {
+    if len(seg) < 2 || byteat(seg, 0) != 58 {
+        return seg, nil
+    }
+    name := substr(seg, 1, len(seg))
+    i := 0
+    for i < len(r.path_params) {
+        pp := r.path_params[i]
+        i = i + 1
+        if pp.name == name {
+            [sv, se] = env.substitute(pp.value, es, true)
+            if se != nil {
+                return "", se
+            }
+            return url.pathescape(sv), nil
+        }
+    }
+    return seg, nil
+}
+
+// fill_path rewrites every :name segment of the url path — query
+// and fragment text is held aside so `:name` matching only ever sees
+// real path segments (a trailing "?q=v" can't glue onto one).
+fn fill_path(u: str, r: ref PRequest, es: ref env.EnvSet) -> [str, err] {
+    if find(u, ":") < 0 {
+        return u, nil
+    }
+    tail := ""
+    fi := find(u, "#")
+    if fi >= 0 {
+        tail = substr(u, fi, len(u))
+        u = substr(u, 0, fi)
+    }
+    qi := find(u, "?")
+    if qi >= 0 {
+        tail = substr(u, qi, len(u)) + tail
+        u = substr(u, 0, qi)
+    }
+    out := ""
+    seg := ""
+    i := 0
+    for i <= len(u) {
+        if i == len(u) || byteat(u, i) == 47 {
+            [fs, fe] = fill_seg(seg, r, es)
+            if fe != nil {
+                return "", fe
+            }
+            out = out + fs
+            if i < len(u) {
+                out = out + "/"
+            }
+            seg = ""
+        } else {
+            seg = seg + chr(byteat(u, i))
+        }
+        i = i + 1
+    }
+    return out + tail, nil
+}
+
+fn hdr_value(rows: []model.Header, name: str) -> str {
+    ln := ascii_lower(name)
+    i := 0
+    for i < len(rows) {
+        if ascii_lower(rows[i].name) == ln {
+            return rows[i].value
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// hdr_named checks the EMITTED headers for `name` (ci) — explicit-
+// wins guards must see post-substitution names: a `$HDR` row that
+// resolves to "Authorization" is still an explicit Authorization.
+fn hdr_named(rows: []model.Header, name: str) -> bool {
+    ln := ascii_lower(name)
+    i := 0
+    for i < len(rows) {
+        if ascii_lower(rows[i].name) == ln {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// resolve_rel anchors a relative file path at the collection dir.
+fn resolve_rel(coll_dir: str, p: str) -> str {
+    if len(p) == 0 || len(coll_dir) == 0 {
+        return p
+    }
+    if byteat(p, 0) == 47 {
+        return p
+    }
+    if len(p) > 1 && byteat(p, 1) == 58 {
+        return p
+    }
+    return coll_dir + "/" + p
+}
+
+// subst_url substitutes $VARS in a URL per corpus §6.2: the address
+// part (scheme/authority/path — everything before the first "?" or
+// "#") errors on an unresolved name; query + fragment text passes
+// unresolved names through literally.
+fn subst_url(u: str, es: ref env.EnvSet) -> [str, err] {
+    cut := len(u)
+    qi := find(u, "?")
+    if qi >= 0 && qi < cut {
+        cut = qi
+    }
+    fi := find(u, "#")
+    if fi >= 0 && fi < cut {
+        cut = fi
+    }
+    [h, he] = env.substitute(substr(u, 0, cut), es, true)
+    if he != nil {
+        return "", he
+    }
+    [t, te] = env.substitute(substr(u, cut, len(u)), es, false)
+    if te != nil {
+        return "", te
+    }
+    return h + t, nil
+}
+
+// scoped_env layers the request's variable_scope.variables into the
+// env set: above env files, below session values (corpus §6.3). Each
+// value is a template expanded against the env + the scope vars
+// resolved so far.
+fn scoped_env(r: ref PRequest, es: ref env.EnvSet) -> own env.EnvSet {
+    out := new(env.EnvSet)
+    work := new(env.EnvSet)
+    let sess: []env.EnvLayer = nil
+    noscope := r.variable_scope == nil || len(r.variable_scope.variables) == 0
+    if es != nil {
+        out.warns = es.warns
+        i := 0
+        for i < len(es.layers) {
+            ly := es.layers[i]
+            if ly.source == "session" && !noscope {
+                sess = push(sess, ly)
+            } else {
+                out.layers = push(out.layers, ly)
+                work.layers = push(work.layers, ly)
+            }
+            i = i + 1
+        }
+    }
+    if noscope {
+        return out
+    }
+    sc := env.EnvLayer{name: "variable_scope", source: "file", vars: nil}
+    work.layers = push(work.layers, sc)
+    si := len(work.layers) - 1
+    i := 0
+    for i < len(sess) {
+        work.layers = push(work.layers, sess[i])
+        i = i + 1
+    }
+    i = 0
+    for i < len(r.variable_scope.variables) {
+        kv := r.variable_scope.variables[i]
+        val := kv.value
+        [v, ve] = env.substitute(kv.value, work, false)
+        if ve == nil {
+            val = v
+        }
+        row := model.KV{name: kv.name, value: val, enabled: kv.enabled}
+        sc.vars = push(sc.vars, row)
+        work.layers[si].vars = sc.vars
+        i = i + 1
+    }
+    out.layers = push(out.layers, sc)
+    i = 0
+    for i < len(sess) {
+        out.layers = push(out.layers, sess[i])
+        i = i + 1
+    }
+    return out
+}
+
+// bad_wire reports CR/LF in a value headed for the wire — a header
+// name/value or request-target containing them would splice extra
+// headers into the head.
+fn bad_wire(s: str) -> bool {
+    return find(s, "\r") >= 0 || find(s, "\n") >= 0
+}
+
+// plan_req maps a decoded request + environment + cookie jar into a
+// wire model.Req — corpus §7.1. err set → caller toasts; warns → info
+// toasts (proxy etc.).
+fn plan_req(r: ref PRequest, envset: ref env.EnvSet, jar: []str, coll_dir: str) -> SendPlan {
+    sp := SendPlan{req: nil, warns: nil, err: ""}
+    if len(r.kind) > 0 {
+        sp.err = "kind " + r.kind + " sends land M4 — unsupported in this build"
+        return sp
+    }
+    es := scoped_env(r, envset)
+    [u, ue] = subst_url(r.url, es)
+    if ue != nil {
+        sp.err = errors.msg(ue)
+        return sp
+    }
+    if len(u) == 0 {
+        sp.err = "empty url"
+        return sp
+    }
+    if find(u, "://") < 0 {
+        if len(u) > 1 && substr(u, 0, 2) == "//" {
+            // scheme-relative "//host/path" → "http://host/path"
+            // (prefixing http:// would mangle to http:////host/path)
+            u = "http:" + u
+        } else {
+            u = "http://" + u
+        }
+    }
+    [u2, ue2] = fill_path(u, r, es)
+    if ue2 != nil {
+        sp.err = errors.msg(ue2)
+        return sp
+    }
+    u = u2
+    // query params — enabled rows, query-escaped halves; a fragment
+    // always stays last (params insert ahead of "#...").
+    frag := ""
+    fi := find(u, "#")
+    if fi >= 0 {
+        frag = substr(u, fi, len(u))
+        u = substr(u, 0, fi)
+    }
+    sep := "?"
+    if find(u, "?") >= 0 {
+        sep = "&"
+    }
+    i := 0
+    for i < len(r.params) {
+        p := r.params[i]
+        i = i + 1
+        if !p.enabled || len(p.name) == 0 {
+            continue
+        }
+        [pn, pe] = env.substitute(p.name, es, false)
+        if pe != nil {
+            sp.err = errors.msg(pe)
+            return sp
+        }
+        [pv, pe2] = env.substitute(p.value, es, false)
+        if pe2 != nil {
+            sp.err = errors.msg(pe2)
+            return sp
+        }
+        u = u + sep + url.queryescape(pn) + "=" + url.queryescape(pv)
+        sep = "&"
+    }
+    u = u + frag
+    // headers — enabled rows, name/value substituted
+    let hdrs: []model.Header = nil
+    i = 0
+    for i < len(r.headers) {
+        h := r.headers[i]
+        i = i + 1
+        if !h.enabled || len(h.name) == 0 {
+            continue
+        }
+        [hn, he] = env.substitute(h.name, es, false)
+        if he != nil {
+            sp.err = errors.msg(he)
+            return sp
+        }
+        [hv, he2] = env.substitute(h.value, es, false)
+        if he2 != nil {
+            sp.err = errors.msg(he2)
+            return sp
+        }
+        hdrs = push(hdrs, model.Header{name: hn, value: hv})
+    }
+    // options — corpus defaults when the block is absent
+    follow := true
+    verify := true
+    cookies := true
+    subbody := true
+    timeout := 5.0
+    proxy := ""
+    if r.options != nil {
+        o := r.options
+        follow = o.follow_redirects
+        verify = o.verify_ssl
+        cookies = o.attach_cookies
+        subbody = o.substitute_body_variables
+        timeout = o.timeout
+        proxy = o.proxy_url
+    }
+    // body
+    b := model.Body.Empty
+    if r.body != nil {
+        if r.body.has_content {
+            text := r.body.content
+            if subbody {
+                [t2, te2] = env.substitute(text, es, false)
+                if te2 != nil {
+                    sp.err = errors.msg(te2)
+                    return sp
+                }
+                text = t2
+            }
+            ct := r.body.content_type
+            if len(ct) == 0 {
+                ct = hdr_value(hdrs, "Content-Type")
+            }
+            b = model.Body.Raw{ctype: ct, text: text}
+        } else if r.body.has_form_data {
+            let fs: []model.KV = nil
+            j := 0
+            for j < len(r.body.form_data) {
+                f := r.body.form_data[j]
+                j = j + 1
+                if !f.enabled || len(f.name) == 0 {
+                    continue
+                }
+                nv := f.name
+                vv := f.value
+                if subbody {
+                    [n2, ne2] = env.substitute(nv, es, false)
+                    if ne2 != nil {
+                        sp.err = errors.msg(ne2)
+                        return sp
+                    }
+                    [v2, ve2] = env.substitute(vv, es, false)
+                    if ve2 != nil {
+                        sp.err = errors.msg(ve2)
+                        return sp
+                    }
+                    nv = n2
+                    vv = v2
+                }
+                fs = push(fs, model.KV{name: nv, value: vv, enabled: true})
+            }
+            b = model.Body.Form{fields: new(fs[:])}
+        } else if r.body.has_multipart {
+            let ps: []model.Part = nil
+            j := 0
+            for j < len(r.body.multipart) {
+                mp := r.body.multipart[j]
+                j = j + 1
+                if !mp.enabled {
+                    continue
+                }
+                pv2 := mp.value
+                pf := mp.file
+                if subbody {
+                    [v3, ve3] = env.substitute(pv2, es, false)
+                    if ve3 != nil {
+                        sp.err = errors.msg(ve3)
+                        return sp
+                    }
+                    [f3, fe3] = env.substitute(pf, es, false)
+                    if fe3 != nil {
+                        sp.err = errors.msg(fe3)
+                        return sp
+                    }
+                    pv2 = v3
+                    pf = f3
+                }
+                np := model.Part{name: mp.name, value: pv2, file: resolve_rel(coll_dir, pf), filename: mp.filename, content_type: mp.content_type, enabled: true, is_file: mp.is_file}
+                ps = push(ps, np)
+            }
+            b = model.Body.Multipart{parts: new(ps[:])}
+        } else if r.body.has_file {
+            fp := r.body.file
+            if subbody {
+                [f4, fe4] = env.substitute(fp, es, false)
+                if fe4 != nil {
+                    sp.err = errors.msg(fe4)
+                    return sp
+                }
+                fp = f4
+            }
+            fp = resolve_rel(coll_dir, fp)
+            ct2 := r.body.content_type
+            if len(ct2) == 0 {
+                ct2 = hdr_value(hdrs, "Content-Type")
+            }
+            b = model.Body.FileBody{path: fp, ctype: ct2, filename: ""}
+        }
+    }
+    // auth — an explicit enabled Authorization row wins over the block
+    if r.auth != nil && len(r.auth.type) > 0 && !hdr_named(hdrs, "Authorization") {
+        if r.auth.type == "basic" && r.auth.basic != nil {
+            [usr, uer] = env.substitute(r.auth.basic.username, es, false)
+            if uer != nil {
+                sp.err = errors.msg(uer)
+                return sp
+            }
+            [pw, per] = env.substitute(r.auth.basic.password, es, false)
+            if per != nil {
+                sp.err = errors.msg(per)
+                return sp
+            }
+            cred := usr + ":" + pw
+            hdrs = push(hdrs, model.Header{name: "Authorization", value: "Basic " + base64.encode(cred as []byte)})
+        } else if r.auth.type == "bearer_token" && r.auth.bearer_token != nil {
+            [tk, tke] = env.substitute(r.auth.bearer_token.token, es, false)
+            if tke != nil {
+                sp.err = errors.msg(tke)
+                return sp
+            }
+            hdrs = push(hdrs, model.Header{name: "Authorization", value: "Bearer " + tk})
+        } else if r.auth.type == "digest" {
+            sp.err = "digest auth needs challenge retry — unsupported in this build"
+            return sp
+        } else if r.auth.type == "oauth2" {
+            sp.err = "oauth2 auth lands M4 — unsupported in this build"
+            return sp
+        }
+    }
+    // jar cookies — an explicit enabled Cookie row wins
+    if cookies && len(jar) > 0 && !hdr_named(hdrs, "Cookie") {
+        cv := ""
+        ci := 0
+        for ci < len(jar) {
+            if ci > 0 {
+                cv = cv + "; "
+            }
+            cv = cv + jar[ci]
+            ci = ci + 1
+        }
+        hdrs = push(hdrs, model.Header{name: "Cookie", value: cv})
+    }
+    // wire hygiene: CR/LF inside a header or the request-target
+    // splices into the head — refuse before it reaches a socket.
+    if bad_wire(u) {
+        sp.err = "url contains CR/LF characters"
+        return sp
+    }
+    i = 0
+    for i < len(hdrs) {
+        if bad_wire(hdrs[i].name) || bad_wire(hdrs[i].value) {
+            sp.err = "header " + hdrs[i].name + " contains CR/LF characters"
+            return sp
+        }
+        i = i + 1
+    }
+    rq := new(model.Req)
+    m := r.method
+    if len(m) == 0 {
+        m = "GET"
+    }
+    rq.method = m
+    rq.url = u
+    rq.headers = hdrs
+    rq.body = b
+    rq.jar_off = !cookies
+    rq.follow = follow
+    if follow {
+        rq.max_redirects = 10
+    } else {
+        rq.max_redirects = 0
+    }
+    // timeout <= 0 (incl. an explicit `timeout: 0`) behaves as the
+    // corpus default, never "unbounded" — a synchronous send with no
+    // deadline would freeze the TUI permanently. Sub-ms values clamp
+    // to 1ms so ftoi can't produce 0 either.
+    if timeout <= 0.0 {
+        timeout = 5.0
+    }
+    t_ms := ftoi(timeout * 1000.0)
+    if t_ms <= 0 {
+        t_ms = 1
+    }
+    rq.timeout_ms = t_ms
+    if verify {
+        rq.verify = ""
+    } else {
+        rq.verify = "no"
+    }
+    if len(proxy) > 0 {
+        sp.warns = push(sp.warns, "proxy unsupported in this build — sending direct")
+    }
+    // User-Agent synth tail — corpus §7.1: posting/<ver> unless set
+    if !hdr_named(hdrs, "User-Agent") {
+        rq.synth = push(rq.synth, model.Header{name: "User-Agent", value: "posting/" + version.get()})
+    }
+    sp.req = rq
+    return sp
 }

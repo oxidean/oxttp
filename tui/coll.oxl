@@ -1,0 +1,1381 @@
+package main
+
+// S10.4: collection glue — argv/env resolution, load_collection
+// (scan → tree + resolved env set), open/dup/delete/save file ops,
+// env switching, URL substitution preview, send planning + response
+// install, session history (cap 100, newest-first).
+
+import "std/errors"
+import "std/os"
+import "std/encoding/json"
+import "github.com/oxidean/oxttp/core/collection"
+import "github.com/oxidean/oxttp/core/env"
+import "github.com/oxidean/oxttp/core/http"
+import "github.com/oxidean/oxttp/core/model"
+import "github.com/oxidean/oxttp/core/yaml"
+
+// ---------- argv / startup ----------
+
+// parse_argv resolves corpus §1.1: positional dir or -c/--collection
+// seeds coll_dir; -e/--env NAME|FILE seeds env_active (named envs) or
+// session_vars (file paths load directly); other "-" flags toast.
+fn parse_argv(a: mut App) {
+    i := 1
+    for i < os.nargs() {
+        arg := os.args(i)
+        if arg == "-c" || arg == "--collection" {
+            if i + 1 < os.nargs() {
+                a.coll_dir = os.args(i + 1)
+                i = i + 1
+            }
+        } else if arg == "-e" || arg == "--env" {
+            if i + 1 < os.nargs() {
+                v := os.args(i + 1)
+                i = i + 1
+                // a value that looks like a file path (has a separator
+                // or a .env suffix) must exist — otherwise upstream
+                // reports a missing env file rather than silently
+                // treating the path as an env NAME.
+                looks_file := str_contains(v, "/") || str_contains(v, "\\") || (len(v) > 4 && substr(v, len(v) - 4, len(v)) == ".env")
+                if looks_file && (!os.exists(v) || os.isdir(v)) {
+                    a.toast(2, "env file not found: " + v)
+                } else if len(v) > 0 && os.exists(v) && !os.isdir(v) {
+                    // FILE: parse directly into the session layer
+                    // (§6.1 — --env file paths resolve from CWD).
+                    es0 := new(env.EnvSet)
+                    [p, pe] = env.parse_dotenv(os.readfile_(v), es0)
+                    if pe != nil {
+                        a.toast(2, "env " + v + ": " + errors.msg(pe))
+                    } else {
+                        k := 0
+                        for k < len(p.vars) {
+                            a.session_vars = push(a.session_vars, p.vars[k])
+                            k = k + 1
+                        }
+                    }
+                } else {
+                    a.env_active = push(a.env_active, v)
+                }
+            }
+        } else if arg == "-h" || arg == "--help" || arg == "-v" || arg == "--version" {
+            a.quit = true
+        } else if len(arg) > 0 && byteat(arg, 0) == 45 {
+            a.degrade("flag surface lands S11 — ignored: " + arg)
+        } else if len(arg) > 0 {
+            a.coll_dir = arg
+        }
+        i = i + 1
+    }
+    if len(a.coll_dir) == 0 {
+        a.coll_dir = default_coll_dir()
+    }
+}
+
+// default_coll_dir — corpus §1.1 default <data>/default
+// ($XDG_DATA_HOME/posting or ~/.local/share/posting).
+fn default_coll_dir() -> str {
+    base := os.getenv("XDG_DATA_HOME")
+    if len(base) == 0 {
+        base = os.getenv("HOME") + "/.local/share"
+    }
+    d := base + "/posting/default"
+    if !os.isdir(d) {
+        e := os.mkdir_all(d)
+        if e != nil {
+            return "."
+        }
+    }
+    return d
+}
+
+// ---------- path helpers ----------
+
+fn basename(rel: str) -> str {
+    i := len(rel) - 1
+    for i >= 0 {
+        if byteat(rel, i) == 47 {
+            return substr(rel, i + 1, len(rel))
+        }
+        i = i - 1
+    }
+    return rel
+}
+
+fn file_stem(rel: str) -> str {
+    b := basename(rel)
+    if len(b) > 13 && substr(b, len(b) - 13, len(b)) == ".posting.yaml" {
+        return substr(b, 0, len(b) - 13)
+    }
+    return b
+}
+
+fn env_label(active: []str) -> str {
+    if len(active) == 0 {
+        return "(none)"
+    }
+    s := active[0]
+    i := 1
+    for i < len(active) {
+        s = s + "," + active[i]
+        i = i + 1
+    }
+    return s
+}
+
+fn byte_str(c: int) -> str {
+    b := mkslice(byte, 1)
+    b[0] = c
+    return b as str
+}
+
+fn bstr(b: bool) -> str {
+    if b {
+        return "true"
+    }
+    return "false"
+}
+
+fn ascii_eq(s: str, ci: str) -> bool {
+    if len(s) != len(ci) {
+        return false
+    }
+    i := 0
+    for i < len(s) {
+        ca := byteat(s, i)
+        cb := byteat(ci, i)
+        if ca >= 65 && ca <= 90 {
+            ca = ca + 32
+        }
+        if cb >= 65 && cb <= 90 {
+            cb = cb + 32
+        }
+        if ca != cb {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn str_replace(s: str, from: str, to: str) -> str {
+    if len(from) == 0 {
+        return s
+    }
+    out := ""
+    i := 0
+    for i < len(s) {
+        if i + len(from) <= len(s) && substr(s, i, i + len(from)) == from {
+            out = out + to
+            i = i + len(from)
+        } else {
+            out = out + substr(s, i, i + 1)
+            i = i + 1
+        }
+    }
+    return out
+}
+
+// ---------- load ----------
+
+// load_collection (re)scans coll_dir into the tree and rebuilds the
+// resolved env set — open-folder state survives reloads by path.
+fn load_collection(a: mut App) {
+    open_paths := mkslice(str, 0)
+    i := 0
+    for i < len(a.coll.nodes) {
+        if a.coll.nodes[i].is_dir && a.coll.nodes[i].open {
+            open_paths = push(open_paths, a.coll.nodes[i].path)
+        }
+        i = i + 1
+    }
+    // first load: the stub placeholder row has no path — treat as
+    // "nothing was open yet" and expand every folder (corpus §5.1
+    // default). Later reloads preserve by path.
+    first := len(a.coll.nodes) == 0 || (len(a.coll.nodes) == 1 && a.coll.nodes[0].stub && len(a.coll.nodes[0].path) == 0)
+    sc := collection.scan(a.coll_dir)
+    nodes := mkslice(TreeNode, 0)
+    i = 0
+    for i < len(sc.nodes) {
+        cn := sc.nodes[i]
+        nm := ""
+        knd := ""
+        if cn.is_dir {
+            nm = basename(cn.rel) + "/"
+        } else if len(cn.err) > 0 {
+            nm = file_stem(cn.rel)
+        } else {
+            nm = cn.req.name
+            if len(nm) == 0 {
+                nm = file_stem(cn.rel)
+            }
+            knd = cn.req.kind
+        }
+        is_open := false
+        if cn.is_dir {
+            if first {
+                is_open = true
+            } else {
+                j := 0
+                for j < len(open_paths) {
+                    if open_paths[j] == cn.path {
+                        is_open = true
+                    }
+                    j = j + 1
+                }
+            }
+        }
+        nodes = push(nodes, TreeNode{name: nm, depth: cn.depth, is_dir: cn.is_dir,
+            open: is_open, stub: len(cn.err) > 0, path: cn.path, kind: knd, err: cn.err})
+        i = i + 1
+    }
+    if len(nodes) == 0 {
+        nodes = push(nodes, TreeNode{name: "(empty collection)", depth: 0,
+            is_dir: false, open: false, stub: true, path: "", kind: "", err: ""})
+    }
+    a.coll.nodes = nodes
+    a.coll.cur = 0
+    a.coll.anchor = -1
+    // env: discover names + build the resolved set (active + session)
+    es := env.scan_envs(a.coll_dir)
+    a.env_names = es.named
+    a.env = env.build_set(a.coll_dir, a.env_active, a.session_vars)
+    a.env_name = env_label(a.env_active)
+    wi := 0
+    for wi < len(a.env.warns) {
+        a.toast(0, a.env.warns[wi])
+        wi = wi + 1
+    }
+}
+
+// ---------- open ----------
+
+// tree_open — enter on a folder toggles; on a request file opens it
+// into a tab; multi-selection opens the range (first reuses the
+// preview tab, rest push pinned tabs).
+fn tree_open(a: mut App) {
+    if len(a.coll.nodes) == 0 {
+        return
+    }
+    lo := a.coll.cur
+    hi := a.coll.cur
+    if a.coll.anchor >= 0 && a.coll.anchor != a.coll.cur {
+        lo = a.coll.anchor
+        hi = a.coll.cur
+        if lo > hi {
+            t := lo
+            lo = hi
+            hi = t
+        }
+    }
+    first_file := true
+    i := lo
+    for i <= hi && i < len(a.coll.nodes) {
+        n := a.coll.nodes[i]
+        if n.is_dir {
+            if i == a.coll.cur {
+                a.coll.toggle_folder()
+            }
+        } else if len(n.err) > 0 {
+            a.toast(2, n.name + ": " + n.err)
+        } else if len(n.path) > 0 {
+            open_into_draft(a, n.path, first_file)
+            first_file = false
+        }
+        i = i + 1
+    }
+    a.coll.anchor = -1
+}
+
+// open_into_draft loads path, builds a draft, and either replaces the
+// current preview tab or pushes a new one.
+fn open_into_draft(a: mut App, path: str, preview: bool) {
+    [r, e] = collection.load_file(path)
+    if e != nil {
+        a.toast(2, basename(path) + ": " + errors.msg(e))
+        return
+    }
+    t := r.name
+    if len(t) == 0 {
+        t = file_stem(path)
+    }
+    d := draft_from_request(r, path)
+    // preview-tab rule: a preview open replaces a preview tab in
+    // place; anything else pushes (multi-select's later files always
+    // land new non-preview tabs, corpus §4.9).
+    if preview && a.tabs[a.cur_tab].preview {
+        a.tabs[a.cur_tab].draft = d
+        a.tabs[a.cur_tab].title = t
+        draft_restore(a, a.tabs[a.cur_tab].draft)
+    } else {
+        a.tabs = push(a.tabs, RTab{title: t, preview: preview, draft: d})
+        tab_select(a, len(a.tabs) - 1)
+    }
+    a.focus = FUrl
+}
+
+// ---------- draft <-> request ----------
+
+fn kind_idx(k: str) -> int {
+    if k == "graphql" {
+        return KGraphql
+    }
+    if k == "grpc" {
+        return KGrpc
+    }
+    if k == "websocket" {
+        return KWs
+    }
+    return KHttp
+}
+
+fn kind_str(k: int) -> str {
+    if k == KGraphql {
+        return "graphql"
+    }
+    if k == KGrpc {
+        return "grpc"
+    }
+    if k == KWs {
+        return "websocket"
+    }
+    // corpus §5: `kind` exists only for non-http requests — HTTP is
+    // the absence of the key (plan_req degrades on any non-empty).
+    return ""
+}
+
+fn ct_idx(ct: str) -> int {
+    l := lower_ascii(ct)
+    if str_contains(l, "xml") {
+        return 2
+    }
+    if str_contains(l, "html") {
+        return 3
+    }
+    if str_contains(l, "json") || len(l) == 0 {
+        return 0
+    }
+    return 1
+}
+
+fn ct_str(i: int) -> str {
+    if i == 1 {
+        return "text/plain"
+    }
+    if i == 2 {
+        return "application/xml"
+    }
+    if i == 3 {
+        return "text/html"
+    }
+    return "application/json"
+}
+
+fn kv_from(rows: []model.KV) -> KVTable {
+    t := new_kv()
+    out := mkslice(KVRow, 0)
+    i := 0
+    for i < len(rows) {
+        out = push(out, KVRow{name: rows[i].name, value: rows[i].value, enabled: rows[i].enabled})
+        i = i + 1
+    }
+    out = push(out, KVRow{name: "", value: "", enabled: true})
+    t.rows = out
+    return t
+}
+
+// draft_from_request builds the editor draft for a decoded request —
+// editable fields fill the widgets; auth/options/info render into the
+// read-only panes; the decoded request itself stays on the draft so
+// sends and saves can carry the non-widget fields through.
+fn draft_from_request(r: own collection.PRequest, path: str) -> RDraft {
+    d := new_draft()
+    d.url = new_line_edit(r.url)
+    d.method = r.method
+    if len(d.method) == 0 {
+        d.method = "GET"
+    }
+    d.kind = kind_idx(r.kind)
+    d.path = path
+    d.info_text = info_render(r)
+    d.auth_text = auth_render(r)
+    d.opts_text = opts_render(r)
+    d.headers = kv_from(r.headers)
+    d.query_kv = kv_from(r.params)
+    d.path_kv = new_kv()
+    rows := mkslice(KVRow, 0)
+    i := 0
+    for i < len(r.path_params) {
+        rows = push(rows, KVRow{name: r.path_params[i].name, value: r.path_params[i].value, enabled: true})
+        i = i + 1
+    }
+    rows = push(rows, KVRow{name: "", value: "", enabled: true})
+    d.path_kv.rows = rows
+    if r.body != nil && r.body.has_content {
+        d.body = new_text_view(r.body.content)
+        d.body_ct = ct_idx(r.body.content_type)
+    } else if r.body != nil && r.body.has_form_data {
+        d.body = new_text_view("(form_data body — edit in the request file)")
+    } else if r.body != nil && r.body.has_multipart {
+        d.body = new_text_view("(multipart body — edit in the request file)")
+    } else if r.body != nil && r.body.has_file {
+        d.body = new_text_view("(file body: " + r.body.file + ")")
+    }
+    d.preq = r
+    return d
+}
+
+fn info_render(r: ref collection.PRequest) -> str {
+    s := ""
+    if len(r.description) > 0 {
+        s = r.description + "\n"
+    }
+    if len(r.kind) > 0 && r.kind != "http" {
+        s = s + "kind: " + r.kind + "\n"
+    }
+    return s
+}
+
+fn mask_secret(v: str) -> str {
+    if len(v) == 0 {
+        return ""
+    }
+    return "••••"
+}
+
+fn auth_render(r: ref collection.PRequest) -> str {
+    au := r.auth
+    if au == nil {
+        return ""
+    }
+    s := "type: " + au.type + "\n"
+    if au.type == "basic" && au.basic != nil {
+        s = s + "username: " + au.basic.username + "\n"
+        s = s + "password: " + mask_secret(au.basic.password) + "\n"
+    } else if au.type == "digest" && au.digest != nil {
+        s = s + "username: " + au.digest.username + "\n"
+        s = s + "password: " + mask_secret(au.digest.password) + "\n"
+    } else if au.type == "bearer_token" && au.bearer_token != nil {
+        s = s + "token: " + mask_secret(au.bearer_token.token) + "\n"
+    } else if au.type == "oauth2" && au.oauth2 != nil {
+        o := au.oauth2
+        s = s + "grant_type: " + o.grant_type + "\n"
+        s = s + "client_id: " + o.client_id + "\n"
+        s = s + "client_secret: " + mask_secret(o.client_secret) + "\n"
+        if len(o.scope) > 0 {
+            s = s + "scope: " + o.scope + "\n"
+        }
+    }
+    return s
+}
+
+fn opts_render(r: ref collection.PRequest) -> str {
+    s := "follow_redirects: true\nverify_ssl: true\nattach_cookies: true\nsubstitute_body_variables: true\ntimeout: 5.0\n"
+    if r.options == nil {
+        return s
+    }
+    o := r.options
+    s = "follow_redirects: " + bstr(o.follow_redirects) + "\n"
+    s = s + "verify_ssl: " + bstr(o.verify_ssl) + "\n"
+    s = s + "attach_cookies: " + bstr(o.attach_cookies) + "\n"
+    s = s + "substitute_body_variables: " + bstr(o.substitute_body_variables) + "\n"
+    if len(o.proxy_url) > 0 {
+        s = s + "proxy_url: " + o.proxy_url + "\n"
+    }
+    s = s + "timeout: " + ftoa(o.timeout) + "\n"
+    return s
+}
+
+// draft_to_request rebuilds a PRequest from the live widget state —
+// editable fields come from the widgets; non-widget fields (auth,
+// options, scripts, captures, kind blocks) carry over from the file's
+// decoded request when there is one.
+fn draft_to_request(a: ref App) -> own collection.PRequest {
+    r := new(collection.PRequest)
+    r.method = a.method
+    r.url = a.url.text
+    r.kind = kind_str(a.kind)
+    i := 0
+    for i < len(a.headers.rows) {
+        row := a.headers.rows[i]
+        if len(row.name) > 0 || len(row.value) > 0 {
+            r.headers = push(r.headers, model.KV{name: row.name, value: row.value, enabled: row.enabled})
+        }
+        i = i + 1
+    }
+    i = 0
+    for i < len(a.query_kv.rows) {
+        row := a.query_kv.rows[i]
+        if len(row.name) > 0 || len(row.value) > 0 {
+            r.params = push(r.params, model.KV{name: row.name, value: row.value, enabled: row.enabled})
+        }
+        i = i + 1
+    }
+    i = 0
+    for i < len(a.path_kv.rows) {
+        row := a.path_kv.rows[i]
+        if len(row.name) > 0 {
+            r.path_params = push(r.path_params, collection.PathParam{name: row.name, value: row.value})
+        }
+        i = i + 1
+    }
+    // non-editable body kinds (form_data/multipart/file): the pane
+    // shows a placeholder, never the body — keep the file's block
+    // verbatim instead of writing the placeholder out as content.
+    locked := a.preq != nil && a.preq.body != nil && !a.preq.body.has_content
+    if (a.kind == KHttp || a.kind == KWs) && !locked {
+        text := join_lines(a.body.lines)
+        if len(text) > 0 {
+            b := new(collection.PBody)
+            b.content = text
+            b.has_content = true
+            b.content_type = ct_str(a.body_ct)
+            // a loaded content_type survives verbatim while the
+            // selector still sits on the bucket it decoded to —
+            // ct_str's 4 slots can't name a custom type.
+            if a.preq != nil && a.preq.body != nil && a.preq.body.has_content {
+                if ct_idx(a.preq.body.content_type) == a.body_ct {
+                    b.content_type = a.preq.body.content_type
+                }
+            }
+            r.body = b
+        }
+    }
+    if a.preq != nil {
+        r.name = a.preq.name
+        r.description = a.preq.description
+        r.auth = a.preq.auth
+        r.options = a.preq.options
+        r.scripts = a.preq.scripts
+        r.captures = a.preq.captures
+        r.variable_scope = a.preq.variable_scope
+        r.graphql = a.preq.graphql
+        r.grpc = a.preq.grpc
+        r.websocket = a.preq.websocket
+        if r.body == nil && locked {
+            r.body = a.preq.body
+        }
+    }
+    return r
+}
+
+// bcat appends s to a byte accumulator — amortized O(1) per byte so
+// body joins and JSON re-indents stay linear on large texts (str +=
+// is O(n²) there).
+fn bcat(b: []byte, s: str) -> []byte {
+    sb := s as []byte
+    i := 0
+    for i < len(sb) {
+        b = push(b, sb[i])
+        i = i + 1
+    }
+    return b
+}
+
+fn join_lines(ls: []str) -> str {
+    s := mkslice(byte, 0)
+    i := 0
+    for i < len(ls) {
+        if i > 0 {
+            s = push(s, 10)
+        }
+        s = bcat(s, ls[i])
+        i = i + 1
+    }
+    return s as str
+}
+
+// ---------- dup / delete / save ----------
+
+// tree_dup copies every request file in the cursor's selection range
+// (anchor..cur) beside its original as "<base> (copy)[ N]" with a
+// renamed name: field — folders/malformed rows skip; nothing duped
+// degrades (corpus §4.9 "duplicate request (or all selected)").
+fn tree_dup(a: mut App) {
+    if len(a.coll.nodes) == 0 {
+        return
+    }
+    lo := a.coll.cur
+    hi := a.coll.cur
+    if a.coll.anchor >= 0 && a.coll.anchor != a.coll.cur {
+        lo = a.coll.anchor
+        hi = a.coll.cur
+        if lo > hi {
+            t := lo
+            lo = hi
+            hi = t
+        }
+    }
+    did := false
+    i := lo
+    for i <= hi && i < len(a.coll.nodes) {
+        n := a.coll.nodes[i]
+        if !n.is_dir && len(n.err) == 0 && len(n.path) > 0 {
+            dup_one(a, n.path)
+            did = true
+        }
+        i = i + 1
+    }
+    a.coll.anchor = -1
+    if !did {
+        a.degrade("duplicate needs a request file")
+        return
+    }
+    load_collection(a)
+}
+
+fn dup_one(a: mut App, path: str) {
+    [r, e] = collection.load_file(path)
+    if e != nil {
+        a.toast(2, "duplicate: " + errors.msg(e))
+        return
+    }
+    if len(r.name) > 0 {
+        r.name = r.name + " (copy)"
+    } else {
+        r.name = file_stem(path) + " (copy)"
+    }
+    dir := collection.path_dir(path)
+    stem := file_stem(path)
+    tgt := dir + "/" + stem + " (copy).posting.yaml"
+    i := 2
+    for os.exists(tgt) {
+        tgt = dir + "/" + stem + " (copy " + itoa(i) + ").posting.yaml"
+        i = i + 1
+    }
+    se := collection.save_file(tgt, r)
+    if se != nil {
+        a.toast(2, "duplicate: " + errors.msg(se))
+        return
+    }
+    a.toast(1, "duplicated → " + basename(tgt))
+}
+
+fn tree_delete(a: mut App) {
+    if len(a.coll.nodes) == 0 {
+        return
+    }
+    n := a.coll.nodes[a.coll.cur]
+    if n.is_dir {
+        a.degrade("folder delete — recursive remove lands S11")
+        return
+    }
+    // only no-path placeholder rows are exempt — a malformed file is
+    // still a real file and can be removed.
+    if len(n.path) == 0 {
+        a.degrade("nothing to delete")
+        return
+    }
+    a.confirm_msg = "Delete " + n.name + "?"
+    a.confirm_action = "tree-delete"
+    a.confirm_arg = n.path
+    push_modal(a, MConfirm)
+}
+
+// confirm_yes runs the stashed action when the confirm modal accepts.
+fn confirm_yes(a: mut App) {
+    act := a.confirm_action
+    arg := a.confirm_arg
+    a.confirm_action = ""
+    if act == "tree-delete" {
+        re := os.remove(arg)
+        if re != nil {
+            a.toast(2, "delete: " + errors.msg(re))
+            return
+        }
+        a.toast(1, "deleted " + basename(arg))
+        load_collection(a)
+    } else if act == "save-overwrite" {
+        save_write(a, arg)
+    }
+}
+
+fn slugify(s: str) -> str {
+    out := ""
+    prev_dash := true
+    i := 0
+    for i < len(s) {
+        c := byteat(s, i)
+        if c >= 65 && c <= 90 {
+            c = c + 32
+        }
+        if (c >= 97 && c <= 122) || (c >= 48 && c <= 57) {
+            out = out + byte_str(c)
+            prev_dash = false
+        } else if !prev_dash {
+            out = out + "-"
+            prev_dash = true
+        }
+        i = i + 1
+    }
+    for len(out) > 0 && byteat(out, len(out) - 1) == 45 {
+        out = substr(out, 0, len(out) - 1)
+    }
+    if len(out) == 0 {
+        return "request"
+    }
+    return out
+}
+
+// save_do runs the save modal's confirm: name required; file field
+// else <slug>.posting.yaml; folder field makes subdirs; existing
+// paths confirm before overwrite.
+fn save_do(a: mut App) {
+    name := a.save_name.text
+    if len(name) == 0 {
+        a.toast(2, "save: name is required")
+        return
+    }
+    fname := a.save_file.text
+    if len(fname) == 0 {
+        fname = slugify(name) + ".posting.yaml"
+    } else if len(fname) < 13 || substr(fname, len(fname) - 13, len(fname)) != ".posting.yaml" {
+        fname = fname + ".posting.yaml"
+    }
+    // file is a bare filename inside the chosen folder — no path parts.
+    if str_contains(fname, "/") || str_contains(fname, "..") {
+        a.toast(2, "save: file must be a plain filename")
+        return
+    }
+    dir := a.coll_dir
+    folder := a.save_folder.text
+    if len(folder) > 0 {
+        // the corpus folder field picks a collection-relative dir —
+        // refuse absolute paths and `..` segments rather than writing
+        // outside the collection tree.
+        bad := len(folder) > 0 && byteat(folder, 0) == 47
+        seg := folder
+        for len(seg) > 0 && !bad {
+            slash := find(seg, "/")
+            part := seg
+            if slash >= 0 {
+                part = substr(seg, 0, slash)
+                seg = substr(seg, slash + 1, len(seg))
+            } else {
+                seg = ""
+            }
+            if part == ".." {
+                bad = true
+            }
+        }
+        if bad {
+            a.toast(2, "save: folder must stay inside the collection")
+            return
+        }
+        dir = dir + "/" + folder
+        if !os.isdir(dir) {
+            me := os.mkdir_all(dir)
+            if me != nil {
+                a.toast(2, "save: " + errors.msg(me))
+                return
+            }
+        }
+    }
+    path := dir + "/" + fname
+    if os.exists(path) && path != a.path {
+        a.confirm_msg = "Overwrite " + basename(path) + "?"
+        a.confirm_action = "save-overwrite"
+        a.confirm_arg = path
+        push_modal(a, MConfirm)
+        return
+    }
+    save_write(a, path)
+}
+
+fn save_write(a: mut App, path: str) {
+    r := draft_to_request(a)
+    r.name = a.save_name.text
+    if len(r.name) == 0 {
+        r.name = file_stem(path)
+    }
+    r.description = a.save_desc.text
+    e := collection.save_file(path, r)
+    if e != nil {
+        a.toast(2, "save: " + errors.msg(e))
+        return
+    }
+    a.toast(1, "saved → " + path)
+    a.path = path
+    nm := r.name
+    a.preq = r
+    a.tabs[a.cur_tab].title = nm
+    a.tabs[a.cur_tab].preview = false
+    a.tabs[a.cur_tab].draft.path = path
+    load_collection(a)
+}
+
+// ---------- env ----------
+
+// env_pick applies the MEnvSwitch selection — row 0 is (none), rows
+// 1.. are a.env_names — then rebuilds the resolved set.
+fn env_pick(a: mut App) {
+    sel := a.vars.sel
+    if sel <= 0 {
+        a.env_active = nil
+    } else if sel - 1 < len(a.env_names) {
+        xs := mkslice(str, 0)
+        xs = push(xs, a.env_names[sel - 1])
+        a.env_active = xs
+    }
+    a.env = env.build_set(a.coll_dir, a.env_active, a.session_vars)
+    a.env_name = env_label(a.env_active)
+    nv := 0
+    i := 0
+    for i < len(a.env.layers) {
+        nv = nv + len(a.env.layers[i].vars)
+        i = i + 1
+    }
+    a.toast(1, "environment: " + a.env_name + " (" + itoa(nv) + " vars)")
+    pop_modal(a)
+}
+
+fn is_secret(n: str) -> bool {
+    l := lower_ascii(n)
+    return str_contains(l, "secret") || str_contains(l, "token") || str_contains(l, "pass") || str_contains(l, "key")
+}
+
+// var_rows_build flattens the resolved env into display rows
+// "NAME = value [layer]" — secret-named values mask unless revealed.
+fn var_rows_build(a: mut App) {
+    rows := mkslice(str, 0)
+    if a.env != nil {
+        i := 0
+        for i < len(a.env.layers) {
+            ly := a.env.layers[i]
+            j := 0
+            for j < len(ly.vars) {
+                v := ly.vars[j]
+                val := v.value
+                if is_secret(v.name) && !a.vars_reveal {
+                    val = "••••"
+                }
+                rows = push(rows, v.name + " = " + val + " [" + ly.name + "]")
+                j = j + 1
+            }
+            i = i + 1
+        }
+    }
+    a.var_rows = rows
+    a.vars = new_list(len(rows))
+}
+
+// url_preview renders the substituted URL for the preview row —
+// $VARS resolve through the active env; unresolved names annotate;
+// secret-named values mask (§4.4 + §6 hide_secrets_in_value_preview).
+fn url_preview(a: ref App) -> str {
+    t := a.url.text
+    if len(t) == 0 {
+        return "(empty url)"
+    }
+    es := a.env
+    if es == nil {
+        return t
+    }
+    [s, e] = env.substitute(t, es, true)
+    if e != nil {
+        msg := errors.msg(e)
+        di := -1
+        i := 0
+        for i < len(msg) {
+            if byteat(msg, i) == 36 {
+                di = i
+            }
+            i = i + 1
+        }
+        if di >= 0 {
+            return t + " (unresolved " + substr(msg, di, len(msg)) + ")"
+        }
+        return t + " (" + msg + ")"
+    }
+    i := 0
+    for i < len(es.layers) {
+        j := 0
+        for j < len(es.layers[i].vars) {
+            v := es.layers[i].vars[j]
+            if is_secret(v.name) && len(v.value) > 0 {
+                s = str_replace(s, v.value, "••••")
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return s
+}
+
+// ---------- send ----------
+
+// begin_send builds a plan for the current draft — plan err toasts,
+// warns toast at info level, and a staged SendPlan returns ESend so
+// the loop can paint "Sending…" before exec_send blocks.
+fn begin_send(a: mut App) -> int {
+    a.pending_preq = draft_to_request(a)
+    a.pending_name = a.tabs[a.cur_tab].title
+    return begin_send_preq(a)
+}
+
+// begin_send_preq plans whatever a.pending_preq currently holds —
+// split out so tests can stage a custom PRequest.
+fn begin_send_preq(a: mut App) -> int {
+    if a.pending_preq == nil {
+        a.pending_preq = draft_to_request(a)
+    }
+    es := a.env
+    if es == nil {
+        es = new(env.EnvSet)
+    }
+    // jar cookies are origin-scoped: resolve the outgoing URL the
+    // same way plan_req will (query vars pass through, only the
+    // address part errors unresolved), then send matching entries.
+    let jar: []str = nil
+    [u0, ue0] = collection.subst_url(a.pending_preq.url, es)
+    if ue0 == nil {
+        if find(u0, "://") < 0 {
+            if len(u0) > 1 && substr(u0, 0, 2) == "//" {
+                u0 = "http:" + u0
+            } else {
+                u0 = "http://" + u0
+            }
+        }
+        jar = jar_for(a, url_origin(u0))
+    }
+    sp := collection.plan_req(a.pending_preq, es, jar, a.coll_dir)
+    wi := 0
+    for wi < len(sp.warns) {
+        a.toast(0, sp.warns[wi])
+        wi = wi + 1
+    }
+    if len(sp.err) > 0 {
+        a.toast(2, "send: " + sp.err)
+        return ENone
+    }
+    a.pending = sp.req
+    if len(a.pending_name) == 0 {
+        a.pending_name = a.tabs[a.cur_tab].title
+    }
+    return ESend
+}
+
+// exec_send runs the staged request through H1 — called by the event
+// loop after it paints a "Sending…" frame (the send blocks).
+fn exec_send(a: mut App) {
+    exec_send_t(a, http.H1{})
+}
+
+// exec_send_t is the transport seam — tests drive it with a fake
+// Transport (the port is an interface) so install/fail paths are
+// exercised without a socket.
+fn exec_send_t(a: mut App, t: http.Transport) {
+    if a.pending == nil {
+        return
+    }
+    send_url := a.pending.url
+    [resp, e] = t.send(a.pending)
+    a.pending = nil
+    if e != nil {
+        send_failed(a, errors.msg(e))
+        return
+    }
+    install_resp(a, resp, send_url)
+}
+
+// send_failed installs the transport error as the response view —
+// errors do not append history.
+fn send_failed(a: mut App, msg: str) {
+    a.resp_view = new_text_view("request failed: " + msg)
+    a.resp_hdr_rows = nil
+    a.resp_ck_rows = nil
+    a.resp_tr_rows = nil
+    a.resp_title = "response · error"
+    a.resp_class = 2
+    a.resp_rows = new_list(resp_row_count(a))
+    a.pending_preq = nil
+    a.toast(2, "request failed: " + msg)
+}
+
+// install_resp renders a response into the pane: body (JSON re-
+// indented), header/cookie/trace rows, meta title, jar update, and a
+// history entry (cap 100, drop-oldest). req_url is the wire URL the
+// response answered — jar entries scope to its origin.
+fn install_resp(a: mut App, resp: model.Resp, req_url: str) {
+    text := resp.body as str
+    ct := ""
+    i := 0
+    for i < len(resp.headers) {
+        if ascii_eq(resp.headers[i].name, "content-type") {
+            ct = resp.headers[i].value
+        }
+        i = i + 1
+    }
+    if str_contains(lower_ascii(ct), "json") {
+        pj := json_pretty(text)
+        if len(pj) > 0 {
+            text = pj
+        }
+    }
+    a.resp_view = new_text_view(text)
+    hs := mkslice(str, 0)
+    i = 0
+    for i < len(resp.headers) {
+        hs = push(hs, resp.headers[i].name + ": " + resp.headers[i].value)
+        i = i + 1
+    }
+    a.resp_hdr_rows = hs
+    attach := true
+    if a.pending_preq != nil && a.pending_preq.options != nil {
+        attach = a.pending_preq.options.attach_cookies
+    }
+    cks := mkslice(str, 0)
+    i = 0
+    for i < len(resp.headers) {
+        if ascii_eq(resp.headers[i].name, "set-cookie") {
+            cks = push(cks, resp.headers[i].value)
+            if attach {
+                jar_set(a, url_origin(req_url), cookie_nv(resp.headers[i].value))
+            }
+        }
+        i = i + 1
+    }
+    // redirect hops set cookies too — jar them under the origin each
+    // hop actually hit (upstream jars every hop's Set-Cookie).
+    if attach && resp.hops != nil {
+        i = 0
+        for i < len(resp.hops) {
+            hp := resp.hops[i]
+            i = i + 1
+            if len(hp.url) == 0 {
+                continue
+            }
+            org := url_origin(hp.url)
+            j := 0
+            for j < len(hp.headers) {
+                if ascii_eq(hp.headers[j].name, "set-cookie") {
+                    jar_set(a, org, cookie_nv(hp.headers[j].value))
+                }
+                j = j + 1
+            }
+        }
+    }
+    a.resp_ck_rows = cks
+    trs := mkslice(str, 0)
+    if resp.trace != nil {
+        tr := resp.trace
+        trs = push(trs, "connect           " + ms_str(tr.connect_ms))
+        trs = push(trs, "tls handshake     " + ms_str(tr.tls_ms))
+        trs = push(trs, "send headers      " + ms_str(tr.send_headers_ms))
+        trs = push(trs, "send body         " + ms_str(tr.send_body_ms))
+        trs = push(trs, "receive headers   " + ms_str(tr.recv_headers_ms))
+        trs = push(trs, "receive body      " + ms_str(tr.recv_body_ms))
+        trs = push(trs, "response closed   " + ms_str(tr.closed_ms))
+    }
+    // hops is `own []Hop` — len() auto-derefs the handle, so a nil
+    // own traps; transports may leave it nil (h1 does on a redirect
+    // with no Location). The trace tab shows the count row only when
+    // the chain actually recorded hops.
+    if resp.hops != nil && len(resp.hops) > 0 {
+        trs = push(trs, "hops: " + itoa(len(resp.hops)))
+    }
+    a.resp_tr_rows = trs
+    a.resp_size = len(resp.body)
+    a.elapsed_ms = resp.elapsed_ms
+    a.resp_class = model.status_class(resp.status)
+    a.resp_title = "response · " + itoa(resp.status) + " " + resp.reason + " · " + size_str(a.resp_size) + " · " + ms_str(resp.elapsed_ms)
+    a.resp_rows = new_list(resp_row_count(a))
+    if a.pending_preq != nil {
+        m := a.method
+        u := a.url.text
+        if a.pending != nil {
+            m = a.pending.method
+            u = a.pending.url
+        }
+        he := HistEnt{title: a.pending_name, method: m, url: u,
+            status: resp.status, reason: resp.reason, elapsed_ms: resp.elapsed_ms,
+            size: a.resp_size, req_yaml: collection.marshal(a.pending_preq),
+            resp_text: text, resp_hdr_rows: hs, resp_ck_rows: cks, resp_tr_rows: trs}
+        a.history = push(a.history, he)
+        if len(a.history) > 100 {
+            a.history = a.history[len(a.history) - 100:]
+        }
+    }
+    a.pending_preq = nil
+}
+
+// resp_row_count — the active resp tab's row count for its ListCur.
+fn resp_row_count(a: ref App) -> int {
+    ts := resp_tabs()
+    if a.resp_tab >= len(ts) {
+        return 0
+    }
+    n := ts[a.resp_tab]
+    if n == "Headers" {
+        return len(a.resp_hdr_rows)
+    }
+    if n == "Cookies" {
+        return len(a.resp_ck_rows)
+    }
+    if n == "Trace" {
+        return len(a.resp_tr_rows)
+    }
+    return len(a.resp_view.lines)
+}
+
+fn resp_rows_active(a: ref App) -> []str {
+    ts := resp_tabs()
+    if a.resp_tab >= len(ts) {
+        return nil
+    }
+    n := ts[a.resp_tab]
+    if n == "Headers" {
+        return a.resp_hdr_rows
+    }
+    if n == "Cookies" {
+        return a.resp_ck_rows
+    }
+    if n == "Trace" {
+        return a.resp_tr_rows
+    }
+    return nil
+}
+
+// cookie_nv — "name=value; Attr=.." → "name=value" for the jar.
+fn cookie_nv(v: str) -> str {
+    i := 0
+    for i < len(v) && byteat(v, i) != 59 {
+        i = i + 1
+    }
+    return substr(v, 0, i)
+}
+
+// url_origin — "scheme://authority" lowercased, path/query/fragment
+// stripped. Jar entries key on this so a response's cookies only
+// return to the origin that set them.
+fn url_origin(u: str) -> str {
+    rest := u
+    scheme := ""
+    si := find(rest, "://")
+    if si >= 0 {
+        scheme = substr(rest, 0, si)
+        rest = substr(rest, si + 3, len(rest))
+    }
+    i := 0
+    for i < len(rest) {
+        c := byteat(rest, i)
+        if c == 47 || c == 63 || c == 35 {
+            break
+        }
+        i = i + 1
+    }
+    return lower_ascii(scheme) + "://" + lower_ascii(substr(rest, 0, i))
+}
+
+// jar_for — the "name=value" strings scoped to origin (plan_req's
+// jar form). Other origins' cookies never ride along.
+fn jar_for(a: ref App, origin: str) -> []str {
+    let out: []str = nil
+    i := 0
+    for i < len(a.jar) {
+        if a.jar[i].origin == origin {
+            out = push(out, a.jar[i].nv)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// jar_set replaces a same-named cookie at the same origin else
+// appends — jar entries are {origin, "name=value"}.
+fn jar_set(a: mut App, origin: str, nv: str) {
+    if len(nv) == 0 {
+        return
+    }
+    nm := nv
+    i := 0
+    for i < len(nv) && byteat(nv, i) != 61 {
+        i = i + 1
+    }
+    if i < len(nv) {
+        nm = substr(nv, 0, i)
+    }
+    j := 0
+    for j < len(a.jar) {
+        e := 0
+        for e < len(a.jar[j].nv) && byteat(a.jar[j].nv, e) != 61 {
+            e = e + 1
+        }
+        cn := a.jar[j].nv
+        if e < len(a.jar[j].nv) {
+            cn = substr(a.jar[j].nv, 0, e)
+        }
+        if a.jar[j].origin == origin && cn == nm {
+            a.jar[j].nv = nv
+            return
+        }
+        j = j + 1
+    }
+    a.jar = push(a.jar, JarEnt{origin: origin, nv: nv})
+}
+
+// ---------- formatting ----------
+
+fn ms_str(f: float) -> str {
+    if f < 1.0 {
+        return "<1 ms"
+    }
+    if f < 1000.0 {
+        return itoa(ftoi(f)) + " ms"
+    }
+    return ftoa(f / 1000.0) + " s"
+}
+
+fn size_str(n: int) -> str {
+    if n < 1024 {
+        return itoa(n) + " B"
+    }
+    if n < 1048576 {
+        t := n * 10 / 1024
+        return itoa(t / 10) + "." + itoa(t - (t / 10) * 10) + " KB"
+    }
+    t := n * 10 / 1048576
+    return itoa(t / 10) + "." + itoa(t - (t / 10) * 10) + " MB"
+}
+
+// json_pretty re-indents a JSON body 2sp — returns "" when the body
+// isn't JSON so callers keep the verbatim text.
+fn json_pretty(text: str) -> str {
+    if len(text) == 0 {
+        return ""
+    }
+    j := json.jparse(text)
+    if j == nil || j.kind == 0 {
+        return ""
+    }
+    return jpretty(j, 0)
+}
+
+fn indent_str(d: int) -> str {
+    s := ""
+    i := 0
+    for i < d * 2 {
+        s = s + " "
+        i = i + 1
+    }
+    return s
+}
+
+fn jpretty(j: ref json.Json, depth: int) -> str {
+    return jpretty_at(j, 0) as str
+}
+
+// jpretty_at re-indents into a byte accumulator — body-sized JSON
+// would make string-concat recursion quadratic.
+fn jpretty_at(j: ref json.Json, depth: int) -> []byte {
+    if j == nil || j.kind == 0 {
+        return "null" as []byte
+    }
+    if j.kind == 1 || j.kind == 2 || j.kind == 3 || j.kind == 6 {
+        return json.tojson(j) as []byte
+    }
+    if j.child == nil {
+        if j.kind == 4 {
+            return "{}" as []byte
+        }
+        return "[]" as []byte
+    }
+    s := mkslice(byte, 0)
+    close := "]"
+    if j.kind == 4 {
+        s = push(s, 123)
+        close = "}"
+    } else {
+        s = push(s, 91)
+    }
+    s = push(s, 10)
+    m := j.child
+    first := true
+    for m != nil {
+        if !first {
+            s = bcat(s, ",\n")
+        }
+        first = false
+        s = bcat(s, indent_str(depth + 1))
+        if j.kind == 4 {
+            s = bcat(s, json.tojson(json.jstr(m.key)))
+            s = bcat(s, ": ")
+        }
+        sb := jpretty_at(m, depth + 1)
+        i := 0
+        for i < len(sb) {
+            s = push(s, sb[i])
+            i = i + 1
+        }
+        m = m.next
+    }
+    s = push(s, 10)
+    s = bcat(s, indent_str(depth))
+    s = bcat(s, close)
+    return s
+}
+
+// ---------- history ----------
+
+// hist_open turns the selected history row (newest-first) into a
+// preview tab with the as-drafted request + stored response.
+fn hist_open(a: mut App) {
+    if a.hist.sel >= len(a.history) {
+        return
+    }
+    ent := a.history[len(a.history) - 1 - a.hist.sel]
+    pop_modal(a)
+    if len(ent.req_yaml) == 0 {
+        a.toast(0, "history entry has no request")
+        return
+    }
+    [n, pe] = yaml.parse(ent.req_yaml)
+    if pe != nil {
+        a.toast(2, "history: " + errors.msg(pe))
+        return
+    }
+    [r, de] = collection.decode(n)
+    if de != nil {
+        a.toast(2, "history: " + errors.msg(de))
+        return
+    }
+    t := r.name
+    if len(t) == 0 {
+        t = ent.title
+    }
+    if len(t) == 0 {
+        t = ent.method + " " + ent.url
+    }
+    d := draft_from_request(r, "")
+    d.resp_view = new_text_view(ent.resp_text)
+    d.resp_hdr_rows = copy_strs(ent.resp_hdr_rows)
+    d.resp_ck_rows = copy_strs(ent.resp_ck_rows)
+    d.resp_tr_rows = copy_strs(ent.resp_tr_rows)
+    d.resp_title = "response · " + itoa(ent.status) + " " + ent.reason + " · " + size_str(ent.size) + " · " + ms_str(ent.elapsed_ms)
+    d.resp_class = model.status_class(ent.status)
+    d.resp_size = ent.size
+    d.elapsed_ms = ent.elapsed_ms
+    a.tabs = push(a.tabs, RTab{title: t, preview: true, draft: d})
+    tab_select(a, len(a.tabs) - 1)
+    a.resp_rows = new_list(resp_row_count(a))
+}
+
+// hist_delete removes the selected history row (newest-first).
+fn hist_delete(a: mut App) {
+    if a.hist.sel >= len(a.history) {
+        return
+    }
+    idx := len(a.history) - 1 - a.hist.sel
+    out := mkslice(HistEnt, 0)
+    i := 0
+    for i < len(a.history) {
+        if i != idx {
+            out = push(out, a.history[i])
+        }
+        i = i + 1
+    }
+    a.history = out
+    a.hist = new_list(len(a.history))
+    if a.hist.sel >= len(a.history) && len(a.history) > 0 {
+        a.hist.sel = len(a.history) - 1
+    }
+}

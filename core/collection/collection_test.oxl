@@ -18,6 +18,6 @@ fn test_schema_surface() {
     pp := PathParam{name: "id", value: "7"}
     testing.expect_streq(pp.name, "id", "path param")
 
-    o := POptions{follow_redirects: true, verify_ssl: true, attach_cookies: true, substitute_body_variables: true, proxy_url: "", timeout: 5.0}
+    o := POptions{follow_redirects: true, verify_ssl: true, attach_cookies: true, substitute_body_variables: true, proxy_url: "", timeout: 5.0, set_mask: 0}
     testing.expect(o.follow_redirects, "options flags")
 }

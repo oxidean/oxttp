@@ -472,9 +472,41 @@ fn (t mut KVTable) cancel_edit() {
 // selection anchor, flat visible-row projection.
 
 
-// visible returns indices of nodes shown under fold state.
+// visible returns indices of nodes shown under fold state. A live
+// filter (sidebar "/" search text) instead keeps only rows whose
+// name matches — case-insensitive substring — plus the ancestor
+// folders needed to reach them (fold state ignored while filtering).
 fn (t Tree) visible() -> []int {
     out := mkslice(int, 0)
+    if len(t.filter) > 0 {
+        q := lower_ascii(t.filter)
+        keep := mkslice(bool, len(t.nodes))
+        i := 0
+        for i < len(t.nodes) {
+            if str_contains(lower_ascii(t.nodes[i].name), q) {
+                keep[i] = true
+                // mark the ancestor chain so the match stays reachable
+                d := t.nodes[i].depth
+                j := i - 1
+                for j >= 0 && d > 0 {
+                    if t.nodes[j].depth < d {
+                        keep[j] = true
+                        d = t.nodes[j].depth
+                    }
+                    j = j - 1
+                }
+            }
+            i = i + 1
+        }
+        i = 0
+        for i < len(t.nodes) {
+            if keep[i] {
+                out = push(out, i)
+            }
+            i = i + 1
+        }
+        return out
+    }
     hide_depth := -1
     i := 0
     for i < len(t.nodes) {

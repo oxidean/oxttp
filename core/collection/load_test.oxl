@@ -1,0 +1,452 @@
+package collection
+
+// .posting.yaml decode/encode/scan/plan_req — corpus §5, §7.1.
+import "std/errors"
+import "std/testing"
+import "github.com/oxidean/oxttp/core/model"
+import "github.com/oxidean/oxttp/core/env"
+import "github.com/oxidean/oxttp/core/yaml"
+
+fn ymap_idx(n: ref yaml.YNode, key: str) -> int {
+    i := 0
+    for i < len(n.pairs) {
+        if n.pairs[i].key == key {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn decode_src(src: str) -> [own PRequest, err] {
+    [n, e] = yaml.parse(src)
+    if e != nil {
+        return nil, e
+    }
+    return decode(n)
+}
+
+fn test_decode_full_request() {
+    src := "name: Get users\ndescription: list\nmethod: get\nurl: http://x/u\nheaders:\n  - name: A\n    value: '1'\n    enabled: false\n  - name: B\n    value: '2'\nparams:\n  - name: p\n    value: v\npath_params:\n  - name: id\n    value: '7'\nbody:\n  content: hi\n  content_type: text/plain\nscripts:\n  setup: s\n  on_request: r\n  on_response: x\noptions:\n  follow_redirects: false\n  timeout: 2.5\ncaptures:\n  TOK: $.token\nvariable_scope:\n  variables:\n    A: '1'\n"
+    [r, e] = decode_src(src)
+    testing.expect(e == nil, "decodes")
+    testing.expect_streq(r.name, "Get users", "name")
+    testing.expect_streq(r.method, "GET", "method uppercased")
+    testing.expect_eq(len(r.headers), 2, "two headers")
+    testing.expect(!r.headers[0].enabled, "enabled false honored")
+    testing.expect(r.headers[1].enabled, "enabled default true")
+    testing.expect(r.body != nil, "body present")
+    testing.expect(r.body.has_content, "has_content")
+    testing.expect_streq(r.body.content_type, "text/plain", "body ct")
+    testing.expect(r.options != nil, "options")
+    testing.expect(!r.options.follow_redirects, "follow false")
+    testing.expect(r.options.verify_ssl, "verify default true")
+    testing.expect(r.options.timeout > 2.4 && r.options.timeout < 2.6, "timeout")
+    testing.expect_eq(len(r.captures), 1, "captures")
+    testing.expect_streq(r.captures[0].value, "$.token", "capture expr")
+    testing.expect(r.variable_scope != nil, "varscope")
+    testing.expect(r.scripts != nil, "scripts")
+}
+
+fn test_decode_strict_and_kind() {
+    [_r, e] = decode_src("bogus_key: 1\n")
+    testing.expect(e != nil, "unknown top key err")
+    [_r2, e2] = decode_src("method: FOO\n")
+    testing.expect(e2 != nil, "bad method err")
+    [_r3, e3] = decode_src("kind: socks\n")
+    testing.expect(e3 != nil, "bad kind err")
+    [r4, e4] = decode_src("kind: graphql\ngraphql:\n  query: '{ q }'\n  variables:\n    a: 1\n")
+    testing.expect(e4 == nil, "graphql ok")
+    testing.expect_streq(r4.kind, "graphql", "kind kept")
+    testing.expect(r4.graphql != nil && r4.graphql.variables != nil, "vars json")
+    [_r5, e5] = decode_src("graphql:\n  query: q\n  bogus: 1\n")
+    testing.expect(e5 != nil, "graphql strict")
+    [_r6, e6] = decode_src("websocket:\n  message: hi\n  bogus: 1\n")
+    testing.expect(e6 != nil, "websocket strict")
+    [_r7, e7] = decode_src("grpc:\n  method: m\n  bogus: 1\n")
+    testing.expect(e7 != nil, "grpc strict")
+}
+
+fn test_decode_body_exactly_one() {
+    [_r, e] = decode_src("body:\n  content: x\n  file: f.txt\n")
+    testing.expect(e != nil, "two body kinds err")
+    if e != nil {
+        testing.expect(find(errors.msg(e), "body") >= 0, "mentions body")
+    }
+    [_r2, e2] = decode_src("body:\n  multipart:\n    - name: a\n")
+    testing.expect(e2 != nil, "part needs value|file")
+    [_r3, e3] = decode_src("body:\n  multipart:\n    - name: a\n      value: v\n      file: f\n")
+    testing.expect(e3 != nil, "part exactly-one")
+    [r4, e4] = decode_src("body:\n  multipart:\n    - name: f1\n      file: ./x.bin\n      enabled: false\n")
+    testing.expect(e4 == nil, "file part ok")
+    testing.expect(r4.body.has_multipart, "multipart")
+    testing.expect(!r4.body.multipart[0].enabled, "part enabled false")
+    testing.expect(r4.body.multipart[0].is_file, "is_file")
+    [r5, e5] = decode_src("body:\n  form_data:\n    - name: a\n      value: v\n")
+    testing.expect(e5 == nil, "form ok")
+    testing.expect(r5.body.has_form_data, "form")
+}
+
+fn test_decode_auth() {
+    src := "auth:\n  type: bearer_token\n  bearer_token:\n    token: $TOK\n"
+    [r, e] = decode_src(src)
+    testing.expect(e == nil, "auth decodes")
+    testing.expect_streq(r.auth.type, "bearer_token", "auth type")
+    testing.expect_streq(r.auth.bearer_token.token, "$TOK", "token")
+    [_r2, e2] = decode_src("auth:\n  type: bogus\n")
+    testing.expect(e2 != nil, "bad auth type")
+    [r3, e3] = decode_src("auth:\n  type: oauth2\n  oauth2:\n    grant_type: code\n    client_id: c\n")
+    testing.expect(e3 == nil, "oauth2 ok")
+    testing.expect_streq(r3.auth.oauth2.client_id, "c", "oauth2 field")
+}
+
+fn test_decode_options_setmask() {
+    [r, e] = decode_src("options:\n  verify_ssl: false\n")
+    testing.expect(e == nil, "ok")
+    testing.expect(!r.options.verify_ssl, "verify off")
+    testing.expect(r.options.follow_redirects, "follow default")
+    testing.expect(r.options.attach_cookies, "cookies default")
+    testing.expect(r.options.substitute_body_variables, "sub default")
+    m := r.options.set_mask
+    testing.expect((m & 2) != 0, "verify bit set")
+    testing.expect((m & 1) == 0, "follow bit unset")
+    [_r2, e2] = decode_src("options:\n  timeout: nope\n")
+    testing.expect(e2 != nil, "bad timeout")
+}
+
+fn test_encode_omitempty() {
+    r := new(PRequest{name: "N", description: "", kind: "", method: "GET", url: "http://x", headers: nil, params: nil, path_params: nil, body: nil, graphql: nil, grpc: nil, websocket: nil, auth: nil, scripts: nil, options: nil, captures: nil, variable_scope: nil})
+    out := marshal(r)
+    testing.expect(find(out, "name: N") >= 0, "name emitted")
+    testing.expect(find(out, "method: GET") >= 0, "method emitted")
+    testing.expect(find(out, "description") < 0, "empty desc omitted")
+    testing.expect(find(out, "options") < 0, "nil options omitted")
+    testing.expect(find(out, "body") < 0, "nil body omitted")
+}
+
+fn test_encode_key_order_and_safety() {
+    r := new(PRequest{name: "true", description: "d", kind: "", method: "POST", url: "u", headers: nil, params: nil, path_params: nil, body: nil, graphql: nil, grpc: nil, websocket: nil, auth: nil, scripts: nil, options: nil, captures: nil, variable_scope: nil})
+    hs := push(r.headers, model.KV{name: "X", value: "42", enabled: false})
+    r.headers = hs
+    out := marshal(r)
+    in := find(out, "name:")
+    id := find(out, "method:")
+    testing.expect(in >= 0 && id > in, "name before method")
+    testing.expect(find(out, "\"true\"") >= 0, "string 'true' quoted")
+    testing.expect(find(out, "value: \"42\"") >= 0, "num string quoted")
+    testing.expect(find(out, "enabled: false") >= 0, "bool bare")
+    [r2, e2] = decode_src(out)
+    testing.expect(e2 == nil, "re-decodes")
+    testing.expect_streq(r2.name, "true", "string preserved")
+    testing.expect(!r2.headers[0].enabled, "bool preserved")
+}
+
+fn test_marshal_roundtrip() {
+    src := "name: Round\nmethod: POST\nurl: http://x\nbody:\n  content: |\n    line\n  content_type: text/plain\noptions:\n  follow_redirects: false\n  timeout: 3.5\nauth:\n  type: basic\n  basic:\n    username: u\n    password: p\n"
+    [r, e] = decode_src(src)
+    testing.expect(e == nil, "decode")
+    out := marshal(r)
+    [r2, e2] = decode_src(out)
+    testing.expect(e2 == nil, "re-decode")
+    testing.expect_streq(r2.body.content, "line\n", "block scalar rt")
+    testing.expect(!r2.options.follow_redirects, "opt rt")
+    testing.expect_streq(r2.auth.basic.username, "u", "auth rt")
+}
+
+fn test_scan_fixture() {
+    sc := scan("tests/tui-fixtures/small-app")
+    testing.expect(len(sc.nodes) > 0, "nodes found")
+    // folders first, then files, alpha at each level
+    testing.expect(sc.nodes[0].is_dir, "folder first")
+    testing.expect_streq(sc.nodes[0].rel, "requests", "requests dir")
+    reqs := 0
+    errs := 0
+    i := 0
+    for i < len(sc.nodes) {
+        n := sc.nodes[i]
+        if n.is_dir {
+            testing.expect(len(n.path) > 0, "dir path")
+        } else if len(n.path) >= 13 && substr(n.path, len(n.path) - 13, len(n.path)) == ".posting.yaml" {
+            reqs = reqs + 1
+            if len(n.err) > 0 {
+                errs = errs + 1
+            }
+        }
+        i = i + 1
+    }
+    testing.expect_eq(reqs, 4, "four request files")
+    testing.expect_eq(errs, 1, "one malformed -> err row")
+}
+
+fn test_load_file() {
+    [r, e] = load_file("tests/tui-fixtures/small-app/requests/get-users.posting.yaml")
+    testing.expect(e == nil, "loads")
+    testing.expect_streq(r.name, "Get users", "req name")
+    testing.expect_streq(r.method, "GET", "method")
+    testing.expect_eq(len(r.params), 1, "param row")
+    [_r2, e2] = load_file("tests/tui-fixtures/small-app/requests/malformed.posting.yaml")
+    testing.expect(e2 != nil, "malformed errors")
+    [_r3, e3] = load_file("tests/tui-fixtures/small-app/requests/nope.posting.yaml")
+    testing.expect(e3 != nil, "missing errors")
+}
+
+fn plan_env() -> own env.EnvSet {
+    s := new(env.EnvSet)
+    l := env.EnvLayer{name: "s", source: "session", vars: nil}
+    l.vars = push(l.vars, model.KV{name: "BASE", value: "http://b.test", enabled: true})
+    l.vars = push(l.vars, model.KV{name: "TOK", value: "t1", enabled: true})
+    s.layers = push(s.layers, l)
+    return s
+}
+
+fn test_plan_req_basic() {
+    src := "method: get\nurl: $BASE/users/:id\npath_params:\n  - name: id\n    value: a b\nparams:\n  - name: q\n    value: x&y\n  - name: off\n    value: no\n    enabled: false\nheaders:\n  - name: A\n    value: v $TOK\n  - name: Dead\n    value: x\n    enabled: false\n"
+    [r, e] = decode_src(src)
+    testing.expect(e == nil, "decode")
+    es := plan_env()
+    sp := plan_req(r, es, nil, "d")
+    testing.expect(len(sp.err) == 0, "no err")
+    testing.expect(sp.req != nil, "req built")
+    testing.expect_streq(sp.req.method, "GET", "method up")
+    testing.expect_streq(sp.req.url, "http://b.test/users/a%20b?q=x%26y", "url built")
+    testing.expect_eq(len(sp.req.headers), 1, "enabled only")
+    testing.expect_streq(sp.req.headers[0].value, "v t1", "header sub")
+}
+
+fn test_plan_req_schemeless_and_auth() {
+    [r, e] = decode_src("url: example.com/x\nauth:\n  type: bearer_token\n  bearer_token:\n    token: $TOK\n")
+    es := plan_env()
+    sp := plan_req(r, es, nil, "d")
+    testing.expect(len(sp.err) == 0, "ok")
+    testing.expect_streq(sp.req.url, "http://example.com/x", "scheme added")
+    found := false
+    i := 0
+    for i < len(sp.req.headers) {
+        if sp.req.headers[i].name == "Authorization" {
+            found = true
+            testing.expect_streq(sp.req.headers[i].value, "Bearer t1", "bearer sub")
+        }
+        i = i + 1
+    }
+    testing.expect(found, "auth header")
+    // explicit Authorization row wins
+    [r2, e2] = decode_src("url: x.com\nheaders:\n  - name: Authorization\n    value: Custom z\nauth:\n  type: basic\n  basic:\n    username: u\n    password: p\n")
+    sp2 := plan_req(r2, es, nil, "d")
+    testing.expect(len(sp2.err) == 0, "ok2")
+    auths := 0
+    i = 0
+    for i < len(sp2.req.headers) {
+        if sp2.req.headers[i].name == "Authorization" {
+            auths = auths + 1
+            testing.expect_streq(sp2.req.headers[i].value, "Custom z", "explicit wins")
+        }
+        i = i + 1
+    }
+    testing.expect_eq(auths, 1, "one auth header")
+    [r3, e3] = decode_src("url: x.com\nauth:\n  type: digest\n")
+    sp3 := plan_req(r3, es, nil, "d")
+    testing.expect(len(sp3.err) > 0, "digest degrades")
+}
+
+fn test_plan_req_bodies() {
+    es := plan_env()
+    [r, e] = decode_src("method: POST\nurl: x.com\nbody:\n  content: hi $TOK\n  content_type: text/plain\n")
+    sp := plan_req(r, es, nil, "d")
+    testing.expect(len(sp.err) == 0, "ok")
+    // Raw body substituted (substitute_body_variables default true)
+    br := sp.req.body as model.Body.Raw
+    testing.expect_streq(br.text, "hi t1", "raw sub")
+    testing.expect_streq(br.ctype, "text/plain", "ctype")
+    [r2, e2] = decode_src("method: POST\nurl: x.com\nbody:\n  content: hi $TOK\noptions:\n  substitute_body_variables: false\n")
+    sp2 := plan_req(r2, es, nil, "d")
+    br2 := sp2.req.body as model.Body.Raw
+    testing.expect_streq(br2.text, "hi $TOK", "gate off keeps literal")
+    [r3, e3] = decode_src("method: POST\nurl: x.com\nbody:\n  form_data:\n    - name: a\n      value: $TOK\n")
+    sp3 := plan_req(r3, es, nil, "d")
+    fb := sp3.req.body as model.Body.Form
+    testing.expect_streq(fb.fields[0].value, "t1", "form sub")
+    [r4, e4] = decode_src("kind: graphql\nurl: x.com\n")
+    sp4 := plan_req(r4, es, nil, "d")
+    testing.expect(len(sp4.err) > 0, "kind degrades")
+}
+
+fn test_plan_req_options() {
+    es := plan_env()
+    [r, e] = decode_src("url: x.com\noptions:\n  follow_redirects: false\n  verify_ssl: false\n  timeout: 2.5\n  proxy_url: http://p\n")
+    sp := plan_req(r, es, nil, "d")
+    testing.expect(!sp.req.follow, "follow off")
+    testing.expect_eq(sp.req.max_redirects, 0, "no redirects")
+    testing.expect_streq(sp.req.verify, "no", "verify no")
+    testing.expect_eq(sp.req.timeout_ms, 2500, "timeout ms")
+    testing.expect_eq(len(sp.warns), 1, "proxy warn")
+    [r2, e2] = decode_src("url: x.com\n")
+    sp2 := plan_req(r2, es, nil, "d")
+    testing.expect(sp2.req.follow, "follow default")
+    testing.expect_eq(sp2.req.max_redirects, 10, "max redir default")
+    testing.expect_eq(sp2.req.timeout_ms, 5000, "timeout default 5s")
+    // timeout <= 0 must never reach the transport as "unbounded" —
+    // a synchronous send with no deadline freezes the TUI; it reads
+    // as the corpus default instead. Sub-ms values clamp to 1ms.
+    [r3, e3] = decode_src("url: x.com\noptions:\n  timeout: 0\n")
+    sp3 := plan_req(r3, es, nil, "d")
+    testing.expect_eq(sp3.req.timeout_ms, 5000, "timeout 0 -> default")
+    [r4, e4] = decode_src("url: x.com\noptions:\n  timeout: -2\n")
+    sp4 := plan_req(r4, es, nil, "d")
+    testing.expect_eq(sp4.req.timeout_ms, 5000, "timeout -2 -> default")
+    [r5, e5] = decode_src("url: x.com\noptions:\n  timeout: 0.0004\n")
+    sp5 := plan_req(r5, es, nil, "d")
+    testing.expect_eq(sp5.req.timeout_ms, 1, "timeout sub-ms -> 1ms")
+}
+
+fn test_plan_req_cookies_and_unresolved() {
+    es := plan_env()
+    let jar: []str = nil
+    jar = push(jar, "s1=abc")
+    jar = push(jar, "s2=def")
+    [r, e] = decode_src("url: x.com\n")
+    sp := plan_req(r, es, jar, "d")
+    found := false
+    i := 0
+    for i < len(sp.req.headers) {
+        if sp.req.headers[i].name == "Cookie" {
+            found = true
+            testing.expect_streq(sp.req.headers[i].value, "s1=abc; s2=def", "jar joined")
+        }
+        i = i + 1
+    }
+    testing.expect(found, "cookie header")
+    [r2, e2] = decode_src("url: x.com\nheaders:\n  - name: Cookie\n    value: mine=1\n")
+    sp2 := plan_req(r2, es, jar, "d")
+    cookies := 0
+    i = 0
+    for i < len(sp2.req.headers) {
+        if sp2.req.headers[i].name == "Cookie" {
+            cookies = cookies + 1
+            testing.expect_streq(sp2.req.headers[i].value, "mine=1", "explicit cookie wins")
+        }
+        i = i + 1
+    }
+    testing.expect_eq(cookies, 1, "one cookie")
+    [r3, e3] = decode_src("url: $NOPE/x\n")
+    sp3 := plan_req(r3, es, nil, "d")
+    testing.expect(len(sp3.err) > 0, "unresolved url err")
+}
+
+fn test_yjson_quoted_provenance() {
+    // quoted scalars keep string type in graphql.variables — only
+    // plain scalars coerce. `code: "001"` must not become int 1.
+    [r, e] = decode_src("kind: graphql\ngraphql:\n  query: '{ q }'\n  variables:\n    code: \"001\"\n    num: 7\n")
+    testing.expect(e == nil, "decode")
+    vs := r.graphql.variables
+    testing.expect(vs != nil, "vars json")
+    csaw := false
+    nsaw := false
+    c := vs.child
+    for c != nil {
+        if c.key == "code" {
+            csaw = true
+            testing.expect_eq(c.kind, 3, "quoted stays string")
+            testing.expect_streq(c.s, "001", "leading zeros kept")
+        }
+        if c.key == "num" {
+            nsaw = true
+            testing.expect_eq(c.kind, 2, "plain coerces int")
+        }
+        c = c.next
+    }
+    testing.expect(csaw && nsaw, "both keys seen")
+    // save → reload keeps the string form
+    out := marshal(r)
+    testing.expect(find(out, "\"001\"") >= 0, "string emits quoted")
+    [r2, e2] = decode_src(out)
+    testing.expect(e2 == nil, "re-decode")
+    c2 := r2.graphql.variables.child
+    ok := false
+    for c2 != nil {
+        if c2.key == "code" {
+            ok = c2.kind == 3 && c2.s == "001"
+        }
+        c2 = c2.next
+    }
+    testing.expect(ok, "round-trip keeps string")
+}
+
+fn test_plan_req_path_param_with_query_and_frag() {
+    // :name fills only real path segments — query + fragment text
+    // is held aside, not glued onto the last segment.
+    es := plan_env()
+    [r, e] = decode_src("url: http://x/users/:id?active=1\npath_params:\n  - name: id\n    value: '7'\n")
+    testing.expect(e == nil, "decode")
+    sp := plan_req(r, es, nil, "d")
+    testing.expect(len(sp.err) == 0, "no err")
+    testing.expect_streq(sp.req.url, "http://x/users/7?active=1", ":id fills ahead of query")
+    [r2, e2] = decode_src("url: http://x/users/:id#details\npath_params:\n  - name: id\n    value: '7'\n")
+    testing.expect(e2 == nil, "decode2")
+    sp2 := plan_req(r2, es, nil, "d")
+    testing.expect_streq(sp2.req.url, "http://x/users/7#details", ":id fills ahead of fragment")
+    // a :name in the query itself is not a path segment
+    [r3, e3] = decode_src("url: http://x/users?q=:id\npath_params:\n  - name: id\n    value: '7'\n")
+    testing.expect(e3 == nil, "decode3")
+    sp3 := plan_req(r3, es, nil, "d")
+    testing.expect_streq(sp3.req.url, "http://x/users?q=:id", "query colon untouched")
+}
+
+fn test_plan_req_params_before_fragment() {
+    // params must insert ahead of "#frag" — the fragment is always
+    // the last thing on the wire URL.
+    es := plan_env()
+    [r, e] = decode_src("url: http://x/users#details\nparams:\n  - name: q\n    value: v\n")
+    testing.expect(e == nil, "decode")
+    sp := plan_req(r, es, nil, "d")
+    testing.expect(len(sp.err) == 0, "no err")
+    testing.expect_streq(sp.req.url, "http://x/users?q=v#details", "param ahead of frag")
+    [r2b, e2b] = decode_src("url: http://x/users?a=1#frag\nparams:\n  - name: q\n    value: v\n")
+    testing.expect(e2b == nil, "decode2")
+    sp2 := plan_req(r2b, es, nil, "d")
+    testing.expect_streq(sp2.req.url, "http://x/users?a=1&q=v#frag", "param appends into query, frag last")
+}
+
+fn test_plan_req_substituted_header_guards() {
+    // explicit-wins guards see POST-substitution names: a $HN row
+    // resolving to "Authorization" still blocks the auth block, and
+    // a $HC row resolving to "Cookie" suppresses the jar.
+    es := new(env.EnvSet)
+    l := env.EnvLayer{name: "s", source: "session", vars: nil}
+    l.vars = push(l.vars, model.KV{name: "HN", value: "Authorization", enabled: true})
+    l.vars = push(l.vars, model.KV{name: "TOK", value: "t1", enabled: true})
+    es.layers = push(es.layers, l)
+    [r, e] = decode_src("url: x.com\nheaders:\n  - name: $HN\n    value: Custom z\nauth:\n  type: bearer_token\n  bearer_token:\n    token: $TOK\n")
+    testing.expect(e == nil, "decode")
+    sp := plan_req(r, es, nil, "d")
+    testing.expect(len(sp.err) == 0, "no err")
+    auths := 0
+    i := 0
+    for i < len(sp.req.headers) {
+        if sp.req.headers[i].name == "Authorization" {
+            auths = auths + 1
+            testing.expect_streq(sp.req.headers[i].value, "Custom z", "substituted explicit wins")
+        }
+        i = i + 1
+    }
+    testing.expect_eq(auths, 1, "exactly one Authorization")
+    // same for Cookie vs the jar
+    es2 := new(env.EnvSet)
+    l2 := env.EnvLayer{name: "s", source: "session", vars: nil}
+    l2.vars = push(l2.vars, model.KV{name: "HC", value: "Cookie", enabled: true})
+    es2.layers = push(es2.layers, l2)
+    let jar: []str = nil
+    jar = push(jar, "s=1")
+    [r2, e2] = decode_src("url: x.com\nheaders:\n  - name: $HC\n    value: mine=1\n")
+    testing.expect(e2 == nil, "decode2")
+    sp2 := plan_req(r2, es2, jar, "d")
+    cookies := 0
+    i = 0
+    for i < len(sp2.req.headers) {
+        if sp2.req.headers[i].name == "Cookie" {
+            cookies = cookies + 1
+            testing.expect_streq(sp2.req.headers[i].value, "mine=1", "substituted cookie row wins")
+        }
+        i = i + 1
+    }
+    testing.expect_eq(cookies, 1, "jar suppressed by substituted row")
+}

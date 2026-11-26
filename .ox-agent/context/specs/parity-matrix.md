@@ -42,9 +42,9 @@ Updated: 2026-11-25 · pin oxl 0.26.0
 | §2 Config 40 keys | `next` | S11 |
 | §3 Keymap ~114 | `done` | S9: 164 bound actions / 277 rows, layered dispatch; degrades toasted |
 | §4 Screens / panels | `next`/`partial` | S9 shell+panes+modals render; widget depths land S10 |
-| §5 `.posting.yaml` collections | `next` | S10 (types in WI-0003) |
-| §6 Environments / captures | `next`/`post` | Env S10/S11; captures M4 |
-| §7.1 HTTP(+TLS) send | `next` | S10 + HTTPS WI |
+| §5 `.posting.yaml` collections | `done` | S10: yaml subset + decode/encode/scan; TUI browse/open/dup/delete/save |
+| §6 Environments / captures | `done`/`partial` | S10: env files+layers+switching+substitution; environments.json S11; captures M4 |
+| §7.1 HTTP(+TLS) send | `done` | S10 TUI send via existing H1+TLS path (HTTPS included); proxy warns |
 | §7.1 client certs | `next` | oxl 0.26.0 `client_cert` → WI-0013 cli + M4 tui; TLS 1.3-only — negotiated 1.2 sends empty cert list |
 | §7.2 GraphQL | `post` | M4 |
 | §7.3 gRPC | `post` | oxl 0.26.0 `net/grpc` shipped → M4 |

@@ -1,0 +1,13 @@
+name: Get users
+description: List users endpoint
+method: GET
+url: http://localhost:8000/users
+headers:
+  - name: Accept
+    value: application/json
+  - name: X-Off
+    value: skip
+    enabled: false
+params:
+  - name: limit
+    value: "10"

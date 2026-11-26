@@ -258,12 +258,19 @@ fn test_jump_mode() {
 
 fn test_degrade_toasts() {
     a := new_app()
-    dispatch(a, kev("j", true, false, false)) // send-request
+    dispatch(a, kev("j", true, false, false)) // send-request → plan err
     testing.expect_eq(len(a.toasts), 1, "toast raised")
     t := a.toasts[0]
     testing.expect_eq(t.level, 2, "degrade is error level")
-    dispatch(a, kev("g", true, false, false)) // search-requests
+    dispatch(a, kev("j", false, true, false)) // alt+j stream → degrade
     testing.expect_eq(len(a.toasts), 2, "second toast")
+    // ctrl+g search-requests now focuses the sidebar search — no toast
+    a2 := new_app()
+    n := len(a2.toasts)
+    dispatch(a2, kev("g", true, false, false))
+    testing.expect_eq(len(a2.toasts), n, "search-requests does not toast")
+    testing.expect_eq(a2.focus, FSidebar, "search-requests focuses sidebar")
+    testing.expect(a2.coll_searching, "tree search input open")
 }
 
 fn test_new_close_tabs() {

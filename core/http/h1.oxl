@@ -118,36 +118,62 @@ fn (t mut TmoTlsReader) asreader() -> io.Reader {
 // req.follow) through roundtrip; the final Resp is returned.
 fn (t H1) send(req: ref model.Req) -> [model.Resp, err] {
     rt_sigpipe_ignore()
-    cur := new(model.Req{method: req.method, url: req.url, headers: req.headers, body: req.body, timeout_ms: req.timeout_ms, follow: req.follow, max_redirects: req.max_redirects, httpver: req.httpver, synth: req.synth, verify: req.verify, h2: req.h2, ssl_min: req.ssl_min, ssl_max: req.ssl_max, cert_pem: req.cert_pem, key_pem: req.key_pem, proxies: req.proxies, proxy_env: req.proxy_env, no_proxy: req.no_proxy})
+    cur := new(model.Req{method: req.method, url: req.url, headers: req.headers, body: req.body, timeout_ms: req.timeout_ms, follow: req.follow, max_redirects: req.max_redirects, httpver: req.httpver, synth: req.synth, verify: req.verify, jar_off: req.jar_off, h2: req.h2, ssl_min: req.ssl_min, ssl_max: req.ssl_max, cert_pem: req.cert_pem, key_pem: req.key_pem, proxies: req.proxies, proxy_env: req.proxy_env, no_proxy: req.no_proxy})
     hops := 0
-    jar := "" // jar-lite: "n=v; n=v" accumulated across hops (ADR 0023)
+    let jar: []model.Header = nil // jar-lite: set-cookie pairs across hops (ADR 0023)
     let hs: []model.Hop = nil
+    // corpus §7.1: the timeout bounds the WHOLE exchange — connect +
+    // upload + redirects + body — not each hop separately.
+    deadline := 0
+    if req.timeout_ms > 0 {
+        deadline = now_ms() + req.timeout_ms
+    }
+    bad := model.Resp{status: 0, reason: "", headers: nil, body: nil, elapsed_ms: 0.0, remote: "", version: "", hops: nil, req_head: "", trace: nil, tls_ver: 0}
+    last := bad
     for true {
+        if deadline > 0 {
+            rem := deadline - now_ms()
+            if rem <= 0 {
+                return last, errors.new("http: request timed out after " + itoa(req.timeout_ms) + "ms")
+            }
+            cur.timeout_ms = rem
+        }
         cap := new(model.Hop)
         [resp, e] = t.roundtrip(cur, cap)
         if e != nil {
             return resp, e
         }
-        // collect Set-Cookie name=value pairs into jar-lite
-        i := 0
-        for i < len(resp.headers) {
-            sc := resp.headers[i]
-            i = i + 1
-            if lwr(sc.name) != "set-cookie" {
-                continue
-            }
-            pair := sc.value
-            semi := find(pair, ";")
-            if semi >= 0 {
-                pair = substr(pair, 0, semi)
-            }
-            if len(pair) > 0 && find(pair, "=") > 0 {
-                cname := substr(pair, 0, find(pair, "="))
-                if find(jar, cname + "=") < 0 {
-                    if len(jar) > 0 {
-                        jar = jar + "; "
+        last = resp
+        // collect Set-Cookie name=value pairs into jar-lite — a same-
+        // named cookie replaces (upstream jar semantics); req.jar_off
+        // (posting attach_cookies=false) skips the jar entirely.
+        if !cur.jar_off {
+            i := 0
+            for i < len(resp.headers) {
+                sc := resp.headers[i]
+                i = i + 1
+                if lwr(sc.name) != "set-cookie" {
+                    continue
+                }
+                pair := sc.value
+                semi := find(pair, ";")
+                if semi >= 0 {
+                    pair = substr(pair, 0, semi)
+                }
+                if len(pair) > 0 && find(pair, "=") > 0 {
+                    cname := substr(pair, 0, find(pair, "="))
+                    seen := false
+                    k := 0
+                    for k < len(jar) {
+                        if jar[k].name == cname {
+                            jar[k].value = pair
+                            seen = true
+                        }
+                        k = k + 1
                     }
-                    jar = jar + pair
+                    if !seen {
+                        jar = push(jar, model.Header{name: cname, value: pair})
+                    }
                 }
             }
         }
@@ -158,6 +184,11 @@ fn (t H1) send(req: ref model.Req) -> [model.Resp, err] {
         }
         loc := hdr_get(resp.headers, "location")
         if len(loc) == 0 {
+            // redirect status without a target ends the chain — keep
+            // the Resp contract uniform: hops non-nil (len() on a nil
+            // own handle traps) and req_head installed.
+            resp.hops = new(hs)
+            resp.req_head = cap.req_head
             return resp, nil
         }
         eff := cur.max_redirects
@@ -168,7 +199,7 @@ fn (t H1) send(req: ref model.Req) -> [model.Resp, err] {
             return resp, errors.new("http: Too many redirects (--max-redirects=" + itoa(eff) + ")")
         }
         hops = hops + 1
-        hs = push(hs, model.Hop{req_head: cap.req_head, status: cap.status, reason: cap.reason, version: cap.version, headers: cap.headers, body: cap.body, elapsed_ms: cap.elapsed_ms, remote: cap.remote})
+        hs = push(hs, model.Hop{req_head: cap.req_head, status: cap.status, reason: cap.reason, version: cap.version, headers: cap.headers, body: cap.body, elapsed_ms: cap.elapsed_ms, remote: cap.remote, url: cur.url})
         [bu, be] = url.parse(cur.url)
         if be != nil {
             return resp, be
@@ -193,22 +224,33 @@ fn (t H1) send(req: ref model.Req) -> [model.Resp, err] {
             cur.body = model.Body.Empty
         }
         cur.headers = redirect_headers(cur.headers, cross, drop)
-        if len(jar) > 0 {
+        // jarred cookies re-attach same-origin only — forwarding them
+        // cross-origin would undo the redirect_headers strip.
+        if len(jar) > 0 && !cross {
+            cv := ""
+            k := 0
+            for k < len(jar) {
+                if k > 0 {
+                    cv = cv + "; "
+                }
+                cv = cv + jar[k].value
+                k = k + 1
+            }
             if hdr_has(cur.headers, "cookie") {
-                k := 0
+                k = 0
                 for k < len(cur.headers) {
                     if lwr(cur.headers[k].name) == "cookie" {
-                        cur.headers[k].value = cur.headers[k].value + "; " + jar
+                        cur.headers[k].value = cur.headers[k].value + "; " + cv
                     }
                     k = k + 1
                 }
             } else {
-                cur.headers = push(cur.headers, model.Header{name: "Cookie", value: jar})
+                cur.headers = push(cur.headers, model.Header{name: "Cookie", value: cv})
             }
         }
         cur.url = nu.string()
     }
-    return model.Resp{status: 0, reason: "", headers: nil, body: nil, elapsed_ms: 0.0, remote: "", version: "", hops: nil, req_head: "", trace: nil, tls_ver: 0}, nil
+    return bad, nil
 }
 
 // request is the package-level convenience on a shared zero-value

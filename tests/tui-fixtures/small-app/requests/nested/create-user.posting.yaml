@@ -1,0 +1,12 @@
+name: Create user
+method: post
+url: $BASE/users
+headers:
+  - name: Content-Type
+    value: application/json
+body:
+  content: |
+    {"name": "ada"}
+options:
+  follow_redirects: false
+  timeout: 2.5

@@ -1,0 +1,307 @@
+package yaml
+
+// DOM-subset YAML tests — the .posting.yaml / config.yaml grammar
+// corpus-posting.md §5 needs: block maps/seqs, quoted + block
+// scalars, comments; out-of-subset constructs error with a line.
+import "std/errors"
+import "std/testing"
+
+// ymap_idx finds a key in a map node's ordered pairs (-1 = miss).
+fn ymap_idx(n: ref YNode, key: str) -> int {
+    i := 0
+    for i < len(n.pairs) {
+        if n.pairs[i].key == key {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn test_parse_flat_map() {
+    [n, e] = parse("name: get users\nmethod: GET\nurl: http://x/y\n")
+    testing.expect(e == nil, "flat map parses")
+    testing.expect_eq(n.kind, 1, "root is map")
+    testing.expect_eq(len(n.pairs), 3, "three pairs")
+    mi := ymap_idx(n, "method")
+    testing.expect_streq(n.pairs[mi].val.s, "GET", "method val")
+    testing.expect_streq(n.pairs[0].key, "name", "order kept")
+}
+
+fn test_parse_nested_map_and_seq() {
+    src := "headers:\n  - name: A\n    value: '1'\n  - name: B\n    value: \"2\"\nbody:\n  content: hi\n"
+    [n, e] = parse(src)
+    testing.expect(e == nil, "nested parses")
+    hs := n.pairs[ymap_idx(n, "headers")].val
+    testing.expect_eq(hs.kind, 2, "headers is seq")
+    testing.expect_eq(len(hs.items), 2, "two items")
+    it0 := hs.items[0]
+    testing.expect_eq(it0.kind, 1, "item is map")
+    ni := ymap_idx(it0, "name")
+    vi := ymap_idx(it0, "value")
+    testing.expect_streq(it0.pairs[ni].val.s, "A", "item key")
+    testing.expect_streq(it0.pairs[vi].val.s, "1", "quoted val")
+    bd := n.pairs[ymap_idx(n, "body")].val
+    testing.expect_eq(bd.kind, 1, "body map")
+    testing.expect_streq(bd.pairs[ymap_idx(bd, "content")].val.s, "hi", "nested val")
+}
+
+fn test_parse_quotes_and_escapes() {
+    [n, e] = parse("a: 'it''s'\nb: \"x\\ny\"\nc: plain # comment\n")
+    testing.expect(e == nil, "quotes parse")
+    testing.expect_streq(n.pairs[ymap_idx(n, "a")].val.s, "it's", "single quote")
+    testing.expect_streq(n.pairs[ymap_idx(n, "b")].val.s, "x\ny", "escape n")
+    testing.expect_streq(n.pairs[ymap_idx(n, "c")].val.s, "plain", "comment cut")
+}
+
+fn test_parse_block_scalars() {
+    lit := "body:\n  content: |\n    line1\n    line2\n"
+    [n, e] = parse(lit)
+    testing.expect(e == nil, "literal parses")
+    bd := n.pairs[ymap_idx(n, "body")].val
+    c := bd.pairs[ymap_idx(bd, "content")].val
+    testing.expect_streq(c.s, "line1\nline2\n", "literal keeps newlines")
+    fol := "s: >\n  aa\n  bb\n"
+    [n2, e2] = parse(fol)
+    testing.expect(e2 == nil, "folded parses")
+    testing.expect_streq(n2.pairs[ymap_idx(n2, "s")].val.s, "aa bb\n", "folded joins")
+    strip := "s: |-\n  aa\n  bb\n"
+    [n3, e3] = parse(strip)
+    testing.expect(e3 == nil, "strip parses")
+    testing.expect_streq(n3.pairs[ymap_idx(n3, "s")].val.s, "aa\nbb", "strip chomps")
+}
+
+fn test_parse_empty_and_seq_of_scalars() {
+    [n, e] = parse("a:\nb: 5\nlist:\n  - one\n  - two\n")
+    testing.expect(e == nil, "parses")
+    a := n.pairs[ymap_idx(n, "a")].val
+    testing.expect_eq(a.kind, 0, "empty val scalar")
+    testing.expect_streq(a.s, "", "empty text")
+    l := n.pairs[ymap_idx(n, "list")].val
+    testing.expect_eq(len(l.items), 2, "two scalars")
+    testing.expect_streq(l.items[1].s, "two", "item text")
+}
+
+fn test_parse_seq_nested_blocks() {
+    src := "items:\n  - name: n1\n    opts:\n      a: 1\n      b: 2\n  - x\n"
+    [n, e] = parse(src)
+    testing.expect(e == nil, "parses")
+    its := n.pairs[ymap_idx(n, "items")].val
+    testing.expect_eq(len(its.items), 2, "two items")
+    it0 := its.items[0]
+    o := it0.pairs[ymap_idx(it0, "opts")].val
+    testing.expect_eq(o.kind, 1, "nested map")
+    testing.expect_streq(o.pairs[ymap_idx(o, "b")].val.s, "2", "deep val")
+    testing.expect_streq(its.items[1].s, "x", "scalar item")
+}
+
+fn test_parse_deeper_seq_item_continuation() {
+    // `- key: v` then sibling keys at item indent and a child block.
+    src := "rows:\n  - name: a\n    value: v\n    meta:\n      x: 1\n  - name: b\n    value: w\n"
+    [n, e] = parse(src)
+    testing.expect(e == nil, "parses")
+    rs := n.pairs[ymap_idx(n, "rows")].val
+    testing.expect_eq(len(rs.items), 2, "two")
+    r0 := rs.items[0]
+    testing.expect_streq(r0.pairs[ymap_idx(r0, "value")].val.s, "v", "row val")
+    testing.expect_eq(r0.pairs[ymap_idx(r0, "meta")].val.kind, 1, "meta map")
+    r1 := rs.items[1]
+    testing.expect_streq(r1.pairs[ymap_idx(r1, "name")].val.s, "b", "row2")
+}
+
+fn test_parse_unsupported_constructs() {
+    [_n, e] = parse("a: &anchor x\n")
+    testing.expect(e != nil, "anchor rejected")
+    [_n2, e2] = parse("a: *ref\n")
+    testing.expect(e2 != nil, "alias rejected")
+    [_n3, e3] = parse("a: [1, 2]\n")
+    testing.expect(e3 != nil, "flow rejected")
+    [_n4, e4] = parse("---\na: 1\n")
+    testing.expect(e4 != nil, "doc marker rejected")
+    [_n5, e5] = parse("a: !tag x\n")
+    testing.expect(e5 != nil, "tag rejected")
+    [_n6, e6] = parse("\ta: 1\n")
+    testing.expect(e6 != nil, "tab indent rejected")
+}
+
+fn test_parse_key_only_map_inside_seq_scalars() {
+    // colon inside quoted scalar; dash-at-indent-0 seq
+    src := "k: \"v with: colon\"\nlist2:\n- a\n- b\n"
+    [n, e] = parse(src)
+    testing.expect(e == nil, "parses")
+    testing.expect_streq(n.pairs[ymap_idx(n, "k")].val.s, "v with: colon", "colon in quotes")
+    l := n.pairs[ymap_idx(n, "list2")].val
+    testing.expect_eq(len(l.items), 2, "dash-at-indent-0 seq")
+}
+
+fn test_emit_roundtrip() {
+    root := new(YNode)
+    root.kind = 1
+    root.pairs = push(root.pairs, YPair{key: "name", val: new(YNode{kind: 0, s: "get users", pairs: nil, items: nil, line: 0, force_quote: false, plain: false})})
+    hs := new(YNode)
+    hs.kind = 2
+    it := new(YNode)
+    it.kind = 1
+    it.pairs = push(it.pairs, YPair{key: "name", val: new(YNode{kind: 0, s: "A", pairs: nil, items: nil, line: 0, force_quote: false, plain: false})})
+    it.pairs = push(it.pairs, YPair{key: "value", val: new(YNode{kind: 0, s: "1", pairs: nil, items: nil, line: 0, force_quote: true, plain: false})})
+    hs.items = push(hs.items, it)
+    root.pairs = push(root.pairs, YPair{key: "headers", val: hs})
+    b := new(YNode)
+    b.kind = 1
+    b.pairs = push(b.pairs, YPair{key: "content", val: new(YNode{kind: 0, s: "l1\nl2\n", pairs: nil, items: nil, line: 0, force_quote: false, plain: false})})
+    root.pairs = push(root.pairs, YPair{key: "body", val: b})
+    out := emit(root)
+    [n2, e2] = parse(out)
+    testing.expect(e2 == nil, "emit output parses")
+    testing.expect_streq(n2.pairs[ymap_idx(n2, "name")].val.s, "get users", "rt name")
+    h2 := n2.pairs[ymap_idx(n2, "headers")].val
+    testing.expect_eq(len(h2.items), 1, "rt items")
+    hi := h2.items[0]
+    testing.expect_streq(hi.pairs[ymap_idx(hi, "value")].val.s, "1", "rt quoted scalar stays str")
+    b2 := n2.pairs[ymap_idx(n2, "body")].val
+    testing.expect_streq(b2.pairs[ymap_idx(b2, "content")].val.s, "l1\nl2\n", "rt block scalar")
+}
+
+fn test_emit_scalar_safety() {
+    root := new(YNode)
+    root.kind = 1
+    // bool/num-looking strings must quote so YAML readers keep str
+    root.pairs = push(root.pairs, YPair{key: "s", val: new(YNode{kind: 0, s: "true", pairs: nil, items: nil, line: 0, force_quote: true, plain: false})})
+    root.pairs = push(root.pairs, YPair{key: "n", val: new(YNode{kind: 0, s: "42", pairs: nil, items: nil, line: 0, force_quote: true, plain: false})})
+    root.pairs = push(root.pairs, YPair{key: "plain", val: new(YNode{kind: 0, s: "abc", pairs: nil, items: nil, line: 0, force_quote: false, plain: false})})
+    out := emit(root)
+    testing.expect(find(out, "\"true\"") >= 0, "bool-lookalike quoted")
+    testing.expect(find(out, "\"42\"") >= 0, "num-lookalike quoted")
+    testing.expect(find(out, "plain: abc") >= 0, "safe scalar plain")
+}
+
+fn test_parse_line_numbers_on_error() {
+    [_n, e] = parse("a: 1\nb: &bad\n")
+    testing.expect(e != nil, "errors")
+    if e != nil {
+        testing.expect(find(errors.msg(e), "line 2") >= 0, "line number in err")
+    }
+}
+
+fn test_parse_double_quoted_escape_rules() {
+    // \" and \\ are real escapes; everything else errors — YAML's
+    // full escape set is out of the DOM subset.
+    [n, e] = parse("a: \"q\\\"w\\\\z\"\n")
+    testing.expect(e == nil, "quote+backslash escapes parse")
+    testing.expect_streq(n.pairs[ymap_idx(n, "a")].val.s, "q\"w\\z", "escapes decode")
+    [_n2, e2] = parse("a: \"x\\u0041\"\n")
+    testing.expect(e2 != nil, "\\u rejected")
+    [_n3, e3] = parse("a: \"x\\q\"\n")
+    testing.expect(e3 != nil, "unknown escape rejected")
+}
+
+fn test_parse_seq_item_block_scalar_blanks() {
+    // a blank line inside a seq-item block scalar is content, not a
+    // separator — the virtual slice must carry it through.
+    src := "items:\n  - name: n1\n    note: |\n      first\n\n      last\n"
+    [n, e] = parse(src)
+    testing.expect(e == nil, "parses")
+    its := n.pairs[ymap_idx(n, "items")].val
+    it0 := its.items[0]
+    note := it0.pairs[ymap_idx(it0, "note")].val
+    testing.expect_streq(note.s, "first\n\nlast\n", "blank line kept in scalar")
+}
+
+fn test_emit_block_scalar_chomping() {
+    root := new(YNode)
+    root.kind = 1
+    root.pairs = push(root.pairs, YPair{key: "strip", val: new(YNode{kind: 0, s: "a\nb", pairs: nil, items: nil, line: 0, force_quote: false, plain: false})})
+    root.pairs = push(root.pairs, YPair{key: "clip", val: new(YNode{kind: 0, s: "a\nb\n", pairs: nil, items: nil, line: 0, force_quote: false, plain: false})})
+    root.pairs = push(root.pairs, YPair{key: "keep", val: new(YNode{kind: 0, s: "a\nb\n\n", pairs: nil, items: nil, line: 0, force_quote: false, plain: false})})
+    out := emit(root)
+    testing.expect(find(out, "strip: |-\n") >= 0, "strip tag")
+    testing.expect(find(out, "clip: |\n") >= 0, "clip tag")
+    testing.expect(find(out, "keep: |+\n") >= 0, "keep tag")
+    [n2, e2] = parse(out)
+    testing.expect(e2 == nil, "chomped emit reparses")
+    testing.expect_streq(n2.pairs[ymap_idx(n2, "strip")].val.s, "a\nb", "strip rt")
+    testing.expect_streq(n2.pairs[ymap_idx(n2, "clip")].val.s, "a\nb\n", "clip rt")
+    testing.expect_streq(n2.pairs[ymap_idx(n2, "keep")].val.s, "a\nb\n\n", "keep rt")
+}
+
+fn test_empty_containers_roundtrip() {
+    // {} / [] parse to empty containers and emit inline — a bare
+    // "key:" would reparse as an empty scalar instead.
+    [n, e] = parse("graphql: {}\nparams: []\n")
+    testing.expect(e == nil, "flow empties parse")
+    g := n.pairs[ymap_idx(n, "graphql")].val
+    testing.expect_eq(g.kind, 1, "{} is map")
+    p := n.pairs[ymap_idx(n, "params")].val
+    testing.expect_eq(p.kind, 2, "[] is list")
+    root := new(YNode)
+    root.kind = 1
+    em := new(YNode)
+    em.kind = 1
+    root.pairs = push(root.pairs, YPair{key: "graphql", val: em})
+    el := new(YNode)
+    el.kind = 2
+    root.pairs = push(root.pairs, YPair{key: "params", val: el})
+    seq := new(YNode)
+    seq.kind = 2
+    sm := new(YNode)
+    sm.kind = 1
+    seq.items = push(seq.items, sm)
+    root.pairs = push(root.pairs, YPair{key: "xs", val: seq})
+    out := emit(root)
+    testing.expect(find(out, "graphql: {}") >= 0, "empty map inline")
+    testing.expect(find(out, "params: []") >= 0, "empty list inline")
+    testing.expect(find(out, "- {}") >= 0, "empty map seq item")
+    [n2, e2] = parse(out)
+    testing.expect(e2 == nil, "emit reparses")
+    testing.expect_eq(n2.pairs[ymap_idx(n2, "graphql")].val.kind, 1, "map survives")
+    testing.expect_eq(n2.pairs[ymap_idx(n2, "params")].val.kind, 2, "list survives")
+    testing.expect_eq(n2.pairs[ymap_idx(n2, "xs")].val.items[0].kind, 1, "seq item map survives")
+}
+
+fn test_empty_flow_trailing_comment() {
+    // "{} # note" — a comment after the token must not push it into
+    // pscalar, which rejects the opening brace.
+    [n, e] = parse("graphql: {} # note\nparams: []   # c\n")
+    testing.expect(e == nil, "flow + comment parses")
+    testing.expect_eq(n.pairs[ymap_idx(n, "graphql")].val.kind, 1, "map kind")
+    testing.expect_eq(n.pairs[ymap_idx(n, "params")].val.kind, 2, "list kind")
+    // non-comment tails still reject
+    [n2, e2] = parse("graphql: {}junk\n")
+    testing.expect(e2 != nil, "trailing junk rejected")
+}
+
+fn test_block_scalar_unsafe_falls_back_dq() {
+    // Every line leading with spaces can't round-trip a block scalar —
+    // the min content indent is stripped on reload. Same for
+    // whitespace-only lines and a "\r" at end-of-line. Those emit as
+    // escaped double-quoted scalars instead.
+    root := new(YNode)
+    root.kind = 1
+    lead := new(YNode)
+    lead.kind = 0
+    lead.s = "  a\n  b\n"
+    root.pairs = push(root.pairs, YPair{key: "lead", val: lead})
+    ws := new(YNode)
+    ws.kind = 0
+    ws.s = "a\n   \nb\n"
+    root.pairs = push(root.pairs, YPair{key: "ws", val: ws})
+    cr := new(YNode)
+    cr.kind = 0
+    cr.s = "a\r\nb\n"
+    root.pairs = push(root.pairs, YPair{key: "cr", val: cr})
+    ok := new(YNode)
+    ok.kind = 0
+    ok.s = "a\n  b\n"
+    root.pairs = push(root.pairs, YPair{key: "ok", val: ok})
+    out := emit(root)
+    testing.expect(find(out, "lead: \"") >= 0, "indented emits double-quoted")
+    testing.expect(find(out, "ws: \"") >= 0, "ws-only line double-quoted")
+    testing.expect(find(out, "cr: \"") >= 0, "eol-cr double-quoted")
+    testing.expect(find(out, "ok: |") >= 0, "safe still block")
+    [n2, e2] = parse(out)
+    testing.expect(e2 == nil, "emit reparses")
+    testing.expect_streq(n2.pairs[ymap_idx(n2, "lead")].val.s, "  a\n  b\n", "leading kept")
+    testing.expect_streq(n2.pairs[ymap_idx(n2, "ws")].val.s, "a\n   \nb\n", "ws line kept")
+    testing.expect_streq(n2.pairs[ymap_idx(n2, "cr")].val.s, "a\r\nb\n", "cr kept")
+    testing.expect_streq(n2.pairs[ymap_idx(n2, "ok")].val.s, "a\n  b\n", "block rt")
+}

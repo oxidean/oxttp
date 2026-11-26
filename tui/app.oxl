@@ -40,8 +40,14 @@ fn new_app() -> own App {
     a.body = new_text_view("")
     a.body_edit = false
     a.body_ct = 0
-    a.resp_view = new_text_view("No response yet — send lands in S10.")
+    a.resp_view = new_text_view("(no response yet — ctrl+j sends)")
     a.resp_rows = new_list(0)
+    a.resp_title = "response"
+    a.resp_class = -1
+    a.env = nil
+    a.env_name = "(none)"
+    a.confirm_arg = ""
+    a.sending = false
     a.pal_query = new_line_edit("")
     a.pal_sel = 0
     a.tabsearch = new_list(0)
@@ -61,17 +67,17 @@ fn new_app() -> own App {
 // .posting.yaml trees). One info row keeps nav bindings exercisable.
 fn stub_tree() -> Tree {
     t := Tree{nodes: mkslice(TreeNode, 0), cur: 0, anchor: -1, filter: ""}
-    t.nodes = push(t.nodes, TreeNode{name: "(no collection loaded — lands S10)", depth: 0, is_dir: false, open: false, stub: true})
+    t.nodes = push(t.nodes, TreeNode{name: "(no collection loaded — pass a directory)", depth: 0, is_dir: false, open: false, stub: true, path: "", kind: "", err: ""})
     return t
 }
 
 // demo_tree — test fixture with folders so tree nav is real.
 fn demo_tree() -> Tree {
     t := Tree{nodes: mkslice(TreeNode, 0), cur: 0, anchor: -1, filter: ""}
-    t.nodes = push(t.nodes, TreeNode{name: "api/", depth: 0, is_dir: true, open: true, stub: false})
-    t.nodes = push(t.nodes, TreeNode{name: "get-users", depth: 1, is_dir: false, open: false, stub: false})
-    t.nodes = push(t.nodes, TreeNode{name: "create-user", depth: 1, is_dir: false, open: false, stub: false})
-    t.nodes = push(t.nodes, TreeNode{name: "health", depth: 0, is_dir: false, open: false, stub: false})
+    t.nodes = push(t.nodes, TreeNode{name: "api/", depth: 0, is_dir: true, open: true, stub: false, path: "", kind: "", err: ""})
+    t.nodes = push(t.nodes, TreeNode{name: "get-users", depth: 1, is_dir: false, open: false, stub: false, path: "", kind: "", err: ""})
+    t.nodes = push(t.nodes, TreeNode{name: "create-user", depth: 1, is_dir: false, open: false, stub: false, path: "", kind: "", err: ""})
+    t.nodes = push(t.nodes, TreeNode{name: "health", depth: 0, is_dir: false, open: false, stub: false, path: "", kind: "", err: ""})
     return t
 }
 
@@ -85,8 +91,12 @@ fn new_draft() -> RDraft {
         req_tab: 0, resp_tab: 0, body_ct: 0,
         headers: new_kv(), query_kv: new_kv(), path_kv: new_kv(),
         body: new_text_view(""),
-        resp_view: new_text_view("No response yet — send lands in S10."),
-        resp_rows: new_list(0)}
+        resp_view: new_text_view("(no response yet — ctrl+j sends)"),
+        resp_rows: new_list(0),
+        resp_hdr_rows: nil, resp_ck_rows: nil, resp_tr_rows: nil,
+        resp_title: "response", resp_class: -1,
+        path: "", auth_text: "", opts_text: "", info_text: "",
+        preq: nil, resp_size: 0, elapsed_ms: 0.0}
 }
 
 fn copy_kv_rows(rows: []KVRow) -> []KVRow {
@@ -140,7 +150,14 @@ fn draft_capture(a: ref App) -> RDraft {
         req_tab: a.req_tab, resp_tab: a.resp_tab, body_ct: a.body_ct,
         headers: copy_kv(a.headers), query_kv: copy_kv(a.query_kv),
         path_kv: copy_kv(a.path_kv), body: copy_tv(a.body),
-        resp_view: copy_tv(a.resp_view), resp_rows: a.resp_rows}
+        resp_view: copy_tv(a.resp_view), resp_rows: a.resp_rows,
+        resp_hdr_rows: copy_strs(a.resp_hdr_rows),
+        resp_ck_rows: copy_strs(a.resp_ck_rows),
+        resp_tr_rows: copy_strs(a.resp_tr_rows),
+        resp_title: a.resp_title, resp_class: a.resp_class,
+        path: a.path, auth_text: a.auth_text, opts_text: a.opts_text,
+        info_text: a.info_text, preq: a.preq,
+        resp_size: a.resp_size, elapsed_ms: a.elapsed_ms}
 }
 
 fn draft_restore(a: mut App, d: RDraft) {
@@ -156,6 +173,26 @@ fn draft_restore(a: mut App, d: RDraft) {
     a.body = copy_tv(d.body)
     a.resp_view = copy_tv(d.resp_view)
     a.resp_rows = d.resp_rows
+    a.resp_hdr_rows = copy_strs(d.resp_hdr_rows)
+    a.resp_ck_rows = copy_strs(d.resp_ck_rows)
+    a.resp_tr_rows = copy_strs(d.resp_tr_rows)
+    a.resp_title = d.resp_title
+    a.resp_class = d.resp_class
+    a.path = d.path
+    a.auth_text = d.auth_text
+    a.opts_text = d.opts_text
+    a.info_text = d.info_text
+    a.preq = d.preq
+    a.resp_size = d.resp_size
+    a.elapsed_ms = d.elapsed_ms
+}
+
+// pin_tab — any draft mutation pins a preview tab (corpus §4.5:
+// preview tabs promote on edit).
+fn pin_tab(a: mut App) {
+    if a.cur_tab < len(a.tabs) {
+        a.tabs[a.cur_tab].preview = false
+    }
 }
 
 // tab_select switches request tabs: capture the live editor into the
@@ -198,11 +235,60 @@ fn push_modal(a: mut App, m: int) {
         a.tabsearch.sel = a.cur_tab
     }
     if m == MHistory {
-        a.hist = new_list(0)
+        a.hist = new_list(len(a.history))
+    }
+    if m == MEnvSwitch {
+        a.vars = new_list(1 + len(a.env_names))
+        a.vars.sel = 0
+        i := 0
+        for i < len(a.env_names) {
+            if a.env_names[i] == a.env_name {
+                a.vars.sel = i + 1
+            }
+            i = i + 1
+        }
+    }
+    if m == MVariables {
+        var_rows_build(a)
     }
     if m == MSaveReq {
         a.save_field = 0
+        a.save_name = new_line_edit("")
+        a.save_file = new_line_edit("")
+        a.save_folder = new_line_edit("")
+        a.save_desc = new_line_edit("")
+        t := a.tabs[a.cur_tab].title
+        if t != "Untitled request" {
+            a.save_name = new_line_edit(t)
+        }
+        if a.preq != nil {
+            a.save_desc = new_line_edit(a.preq.description)
+        }
+        if len(a.path) > 0 {
+            a.save_file = new_line_edit(basename(a.path))
+            rd := rel_dir(a.path, a.coll_dir)
+            if len(rd) > 0 {
+                a.save_folder = new_line_edit(rd)
+            }
+        }
     }
+}
+
+// rel_dir — path's folder relative to the collection dir ("", ".",
+// or a/b) — prefills the save modal's folder field.
+fn rel_dir(path: str, coll: str) -> str {
+    if len(coll) == 0 || len(path) <= len(coll) {
+        return ""
+    }
+    if substr(path, 0, len(coll) + 1) != coll + "/" {
+        return ""
+    }
+    rest := substr(path, len(coll) + 1, len(path))
+    d := collection.path_dir(rest)
+    if d == "." {
+        return ""
+    }
+    return d
 }
 
 fn pop_modal(a: mut App) {
@@ -685,6 +771,67 @@ fn dispatch(a: mut App, ev: term.KeyEvent) -> int {
         }
         return ENone
     }
+    // live tree search owns the sidebar while its input is open —
+    // plain runes and the line-edit keys drive the query (the tree
+    // filters on coll.filter), enter commits, escape clears, up/down
+    // still walk the tree. ctrl/alt chords and unhandled named keys
+    // dispatch normally so fixed/global keys stay reachable (§1.6).
+    if a.focus == FSidebar && a.coll_searching {
+        if ev.key.kind() == 0 {
+            r := ev.key as term.Key.Rune
+            if !ev.ctrl && !ev.alt {
+                a.coll_search.insert(r.ch)
+                a.coll.filter = a.coll_search.text
+                return ENone
+            }
+        } else {
+            nc := ev.key as term.Key.Named
+            if nc.code == term.KeyEnter {
+                a.coll_searching = false
+                return ENone
+            }
+            if nc.code == term.KeyEscape {
+                a.coll_searching = false
+                a.coll_search = new_line_edit("")
+                a.coll.filter = ""
+                return ENone
+            }
+            if nc.code == term.KeyBackspace {
+                a.coll_search.backspace()
+                a.coll.filter = a.coll_search.text
+                return ENone
+            }
+            if nc.code == term.KeyDelete {
+                a.coll_search.del_right()
+                a.coll.filter = a.coll_search.text
+                return ENone
+            }
+            if nc.code == term.KeyLeft {
+                a.coll_search.move(a.coll_search.cur - 1, false)
+                return ENone
+            }
+            if nc.code == term.KeyRight {
+                a.coll_search.move(a.coll_search.cur + 1, false)
+                return ENone
+            }
+            if nc.code == term.KeyHome {
+                a.coll_search.home()
+                return ENone
+            }
+            if nc.code == term.KeyEnd {
+                a.coll_search.end()
+                return ENone
+            }
+            if nc.code == term.KeyUp {
+                a.coll.move(-1, false)
+                return ENone
+            }
+            if nc.code == term.KeyDown {
+                a.coll.move(1, false)
+                return ENone
+            }
+        }
+    }
     // widget layer
     wbs := widget_bindings(a)
     bi := find_binding(wbs, ev)
@@ -743,6 +890,7 @@ fn fixed_action(a: mut App, act: str) -> int {
             if a.coll_searching || len(a.coll_search.text) > 0 {
                 a.coll_searching = false
                 a.coll_search = new_line_edit("")
+                a.coll.filter = ""
                 return ENone
             }
         }
@@ -754,7 +902,7 @@ fn fixed_action(a: mut App, act: str) -> int {
 // global_action — the 18 rebindable action ids.
 fn global_action(a: mut App, act: str) -> int {
     if act == "send-request" {
-        a.degrade("send-request lands S10")
+        return begin_send(a)
     } else if act == "stream" {
         a.degrade("streams land M4 (gRPC/WS oxl-blocked)")
     } else if act == "jump" {
@@ -805,7 +953,12 @@ fn global_action(a: mut App, act: str) -> int {
     } else if act == "search-tabs" {
         push_modal(a, MSearchTabs)
     } else if act == "search-requests" {
-        a.degrade("collection search lands S10")
+        // corpus action focuses the collection browser + opens its
+        // search input (the "/" search lives on the tree).
+        a.sidebar_on = true
+        a.focus = FSidebar
+        a.coll_searching = true
+        a.coll_search = new_line_edit("")
     } else if act == "focus-url" {
         a.focus = FUrl
     } else if act == "focus-method" {
@@ -893,9 +1046,9 @@ fn widget_action(a: mut App, act: str, ev: term.KeyEvent) -> int {
         sync_path_kv(a)
     } else if act == "url-enter" {
         if is_curl_text(a.url.text) {
-            a.degrade("curl import lands S10")
+            a.degrade("curl import — paste parsing lands S11")
         } else {
-            a.degrade("send-request lands S10")
+            return begin_send(a)
         }
     } else if act == "copy-url" {
         a.degrade("clipboard copy — no clipboard API in std")
@@ -918,12 +1071,14 @@ fn widget_action(a: mut App, act: str, ev: term.KeyEvent) -> int {
             if a.resp_tab < 0 {
                 a.resp_tab = len(resp_tabs()) - 1
             }
+            a.resp_rows = new_list(resp_row_count(a))
         }
     } else if act == "tab-next" {
         if a.focus == FReqTabs {
             a.req_tab = (a.req_tab + 1) - ((a.req_tab + 1) / req_tab_count(a)) * req_tab_count(a)
         } else if a.focus == FRespTabs {
             a.resp_tab = (a.resp_tab + 1) - ((a.resp_tab + 1) / len(resp_tabs())) * len(resp_tabs())
+            a.resp_rows = new_list(resp_row_count(a))
         }
     } else if act == "tab-enter" {
         if a.focus == FReqTabs {
@@ -1103,13 +1258,11 @@ fn widget_action(a: mut App, act: str, ev: term.KeyEvent) -> int {
     } else if act == "tree-escape" {
         return fixed_action(a, "escape")
     } else if act == "tree-dup" {
-        a.degrade("duplicate request — needs collections (S10)")
+        tree_dup(a)
     } else if act == "tree-delete" {
-        a.confirm_msg = "Delete request? (collections land S10)"
-        a.confirm_action = "tree-delete"
-        push_modal(a, MConfirm)
+        tree_delete(a)
     } else if act == "tree-open" {
-        a.degrade("open request — collections land S10")
+        tree_open(a)
     } else if act == "escape" {
         return fixed_action(a, "escape")
     }
@@ -1306,6 +1459,7 @@ fn kv_cell_redo(a: mut App) {
 // edit target resolution for text mutations: a focused KV table owns
 // the press (active or implicit cell edit); otherwise the URL field.
 fn edit_backspace(a: mut App) {
+    pin_tab(a)
     if a.focus == FReqPane {
         w := active_kv(a)
         if w >= 0 {
@@ -1318,6 +1472,7 @@ fn edit_backspace(a: mut App) {
 }
 
 fn edit_del_right(a: mut App) {
+    pin_tab(a)
     if a.focus == FReqPane {
         w := active_kv(a)
         if w >= 0 {
@@ -1398,6 +1553,7 @@ fn widget_wants_text(a: ref App) -> bool {
 }
 
 fn widget_text_char(a: mut App, ch: str) -> int {
+    pin_tab(a)
     if a.focus == FUrl {
         a.url.insert(ch)
         if ch == "$" && !a.hinted_vars {
@@ -1450,8 +1606,14 @@ fn sync_path_kv(a: mut App) {
     names := mkslice(str, 0)
     i := 0
     u := a.url.text
+    // ":name" counts only as a path SEGMENT start — "host:8080",
+    // "scheme://", userinfo, and query text must not mint rows.
     for i < len(u) {
-        if byteat(u, i) == 58 {
+        c := byteat(u, i)
+        if c == 63 || c == 35 { // ? # — path ends
+            break
+        }
+        if c == 58 && (i == 0 || byteat(u, i - 1) == 47) {
             j := i + 1
             for j < len(u) && is_word_byte(byteat(u, j)) {
                 j = j + 1
@@ -1488,10 +1650,21 @@ fn sync_path_kv(a: mut App) {
     }
 }
 
+// body_locked — the buffer holds a non-editable placeholder (loaded
+// form_data/multipart/file body): keystrokes must not pretend to
+// edit what draft_to_request discards anyway.
+fn body_locked(a: ref App) -> bool {
+    return a.preq != nil && a.preq.body != nil && !a.preq.body.has_content
+}
+
 // body editor: the S9 body area is a TextView buffer the focused
 // pane appends into (full smart-edit is S10); insert + backspace +
 // pairing handled at line level.
 fn body_insert(a: mut App, ch: str) {
+    if body_locked(a) {
+        return
+    }
+    pin_tab(a)
     // rebuild lines: insert at (cy, cx)
     if len(a.body.lines) == 0 {
         a.body.lines = push(a.body.lines, "")
@@ -1574,6 +1747,10 @@ fn auto_indent(after: str, ln: str) -> str {
 }
 
 fn body_backspace(a: mut App) {
+    if body_locked(a) {
+        return
+    }
+    pin_tab(a)
     if len(a.body.lines) == 0 {
         return
     }
@@ -1718,7 +1895,7 @@ fn modal_action(a: mut App, m: int, act: str, ev: term.KeyEvent) -> int {
     if m == MConfirm {
         if act == "confirm-yes" {
             pop_modal(a)
-            a.degrade("confirmed: " + a.confirm_action + " — lands S10")
+            confirm_yes(a)
         }
         return ENone
     }
@@ -1740,8 +1917,9 @@ fn modal_action(a: mut App, m: int, act: str, ev: term.KeyEvent) -> int {
     }
     if m == MEnvSwitch {
         if act == "env-pick" {
-            pop_modal(a)
-            a.degrade("environment switch — env files land S10/S11")
+            env_pick(a)
+        } else {
+            rows_action(a, act)
         }
         return ENone
     }
@@ -1765,6 +1943,7 @@ fn jump_action(a: mut App, act: str) -> int {
     if act == "jump-resp-body" {
         a.focus = FRespPane
         a.resp_tab = 0
+        a.resp_rows = new_list(resp_row_count(a))
         return ENone
     }
     if act == "jump-history" {
@@ -1917,19 +2096,19 @@ fn apply_method_idx(a: mut App, i: int) {
 fn palette_items() -> []PItem {
     t := mkslice(PItem, 0)
     t = push(t, PItem{name: "New request", action: "new-request", degrade: ""})
-    t = push(t, PItem{name: "Open request", action: "", degrade: "open request — collections land S10"})
-    t = push(t, PItem{name: "Duplicate request", action: "", degrade: "collections land S10"})
-    t = push(t, PItem{name: "Delete request", action: "", degrade: "collections land S10"})
+    t = push(t, PItem{name: "Open request", action: "open-request", degrade: ""})
+    t = push(t, PItem{name: "Duplicate request", action: "tree-dup", degrade: ""})
+    t = push(t, PItem{name: "Delete request", action: "tree-delete", degrade: ""})
     t = push(t, PItem{name: "Close tab", action: "close-tab", degrade: ""})
     t = push(t, PItem{name: "Pin tab (keep-tab)", action: "keep-tab", degrade: ""})
     t = push(t, PItem{name: "Search tabs", action: "search-tabs", degrade: ""})
-    t = push(t, PItem{name: "Search requests", action: "", degrade: "collections land S10"})
-    t = push(t, PItem{name: "Send request", action: "send-request", degrade: "send lands S10"})
+    t = push(t, PItem{name: "Search requests", action: "search-requests", degrade: ""})
+    t = push(t, PItem{name: "Send request", action: "send-request", degrade: ""})
     t = push(t, PItem{name: "Save request", action: "save-request", degrade: ""})
     t = push(t, PItem{name: "Save response", action: "", degrade: "responses land S10"})
     t = push(t, PItem{name: "Switch environment", action: "env-switch", degrade: ""})
     t = push(t, PItem{name: "Variables", action: "variables", degrade: ""})
-    t = push(t, PItem{name: "Reload collection", action: "", degrade: "collections land S10"})
+    t = push(t, PItem{name: "Reload collection", action: "reload-collection", degrade: ""})
     t = push(t, PItem{name: "OAuth sign-in", action: "", degrade: "OAuth2 lands M4"})
     t = push(t, PItem{name: "gRPC stream open/end", action: "stream", degrade: "gRPC oxl-blocked (#223)"})
     t = push(t, PItem{name: "WebSocket disconnect", action: "", degrade: "WS oxl-blocked (#220)"})
@@ -1937,7 +2116,7 @@ fn palette_items() -> []PItem {
     t = push(t, PItem{name: "Import curl from clipboard", action: "", degrade: "no clipboard API in std"})
     t = push(t, PItem{name: "Export as curl", action: "", degrade: "export lands S10"})
     t = push(t, PItem{name: "Export as grpcurl", action: "", degrade: "gRPC oxl-blocked (#223)"})
-    t = push(t, PItem{name: "Export as YAML", action: "", degrade: "collections land S10"})
+    t = push(t, PItem{name: "Export as YAML", action: "", degrade: "no clipboard API in std"})
     t = push(t, PItem{name: "Toggle collection sidebar", action: "toggle-collection", degrade: ""})
     t = push(t, PItem{name: "Toggle layout vertical/horizontal", action: "toggle-layout", degrade: ""})
     t = push(t, PItem{name: "Theme…", action: "", degrade: "themes land M4"})
@@ -2034,6 +2213,25 @@ fn run_named_action(a: mut App, act: str) -> int {
         }
         return ENone
     }
+    if act == "reload-collection" {
+        load_collection(a)
+        a.toast(1, "collection reloaded")
+        return ENone
+    }
+    if act == "open-request" {
+        a.sidebar_on = true
+        a.focus = FSidebar
+        a.toast(0, "enter on a request opens it")
+        return ENone
+    }
+    if act == "tree-dup" {
+        tree_dup(a)
+        return ENone
+    }
+    if act == "tree-delete" {
+        tree_delete(a)
+        return ENone
+    }
     return global_action(a, act)
 }
 
@@ -2048,6 +2246,7 @@ fn vars_action(a: mut App, act: str) -> int {
         a.vars_filtering = true
     } else if act == "vars-reveal" {
         a.vars_reveal = !a.vars_reveal
+        var_rows_build(a)
     } else if act == "rows-up" {
         a.vars.move(-1, false)
     } else if act == "rows-down" {
@@ -2056,11 +2255,43 @@ fn vars_action(a: mut App, act: str) -> int {
     return ENone
 }
 
+// rows_action runs the shared rows-* nav actions against whichever
+// list the current modal/widget context owns (rows_move/home/end
+// dispatch internally). Returns false for non-rows actions.
+fn rows_action(a: mut App, act: str) -> bool {
+    if act == "rows-up" {
+        rows_move(a, -1, false)
+    } else if act == "rows-down" {
+        rows_move(a, 1, false)
+    } else if act == "rows-ext-up" {
+        rows_move(a, -1, true)
+    } else if act == "rows-ext-down" {
+        rows_move(a, 1, true)
+    } else if act == "rows-home" {
+        rows_home(a, false)
+    } else if act == "rows-end" {
+        rows_end(a, false)
+    } else if act == "rows-ext-first" {
+        rows_home(a, true)
+    } else if act == "rows-ext-last" {
+        rows_end(a, true)
+    } else if act == "rows-pgup" {
+        rows_move(a, -10, false)
+    } else if act == "rows-pgdn" {
+        rows_move(a, 10, false)
+    } else {
+        return false
+    }
+    return true
+}
+
 fn hist_action(a: mut App, act: str) -> int {
     if act == "hist-open" {
-        a.degrade("open history entry — history lands S10")
+        hist_open(a)
     } else if act == "hist-delete" {
-        a.degrade("delete history entry — history lands S10")
+        hist_delete(a)
+    } else {
+        rows_action(a, act)
     }
     return ENone
 }
@@ -2075,7 +2306,7 @@ fn save_action(a: mut App, act: str) -> int {
         a.save_field = (a.save_field + 1) - ((a.save_field + 1) / 4) * 4
     } else if act == "save-confirm" {
         pop_modal(a)
-        a.degrade("save-request — collections land S10")
+        save_do(a)
     } else if act == "edit-backspace" {
         save_field_bs(a)
     } else if act == "edit-left" {
