@@ -70,7 +70,8 @@ fn cli_locate_args(args: []str) -> Out {
         return Out{code: 0, stdout: "Default collection directory:\n" + config.default_coll_dir() + "\n", stderr: ""}
     }
     if what == "themes" {
-        return Out{code: 0, stdout: "Themes directory:\n" + config.config_dir() + "/themes\n", stderr: ""}
+        // Upstream paths.ThemeDir — user themes live in the DATA dir.
+        return Out{code: 0, stdout: "Themes directory:\n" + config.data_dir() + "/themes\n", stderr: ""}
     }
     return Out{code: 2, stdout: "", stderr: "Unknown thing to locate: \"" + what + "\"\n"}
 }
