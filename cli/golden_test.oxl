@@ -383,7 +383,7 @@ fn g_run(name: str) {
         tty = 0
         data = ""
     }
-    r := execute(o.intent, envp, data, tty)
+    r := execute(o.intent, envp, data, tty, 0)
     // files: post-state — `path<TAB><exists-check>` asserts the file
     // was written, then removes it so the tree stays clean.
     fi := 0

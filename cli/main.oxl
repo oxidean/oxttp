@@ -189,7 +189,11 @@ fn main() {
                 }
             }
         }
-        r := execute(o.intent, envpairs, data, tty)
+        otty := 0
+        if term.isatty(term.stdout_fd()) {
+            otty = 1
+        }
+        r := execute(o.intent, envpairs, data, tty, otty)
         if len(r.stdout) > 0 {
             write_all(os.stdout(), r.stdout)
         }

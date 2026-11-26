@@ -27,7 +27,27 @@ fn xrun(argv: str, env: str, port: int) -> own Run {
     }
     o := resolve(pe(argv2, env), ev(env))
     testing.expect_eq(o.exec, 1, "execs: " + o.stderr)
-    return execute(o.intent, ev(env), "", 1)
+    return execute(o.intent, ev(env), "", 1, 0)
+}
+
+// xtrun is xrun with the stdout tty flag on — for TTY-gated
+// output paths (binary suppressor, colors, latin1 sanitize).
+fn xtrun(argv: str, env: str, port: int) -> own Run {
+    u := "http://127.0.0.1:" + itoa(port)
+    argv2 := ""
+    i := 0
+    for i < len(argv) {
+        if i + 5 <= len(argv) && substr(argv, i, i + 5) == "{URL}" {
+            argv2 = argv2 + u
+            i = i + 5
+        } else {
+            argv2 = argv2 + substr(argv, i, i + 1)
+            i = i + 1
+        }
+    }
+    o := resolve(pe(argv2, env), ev(env))
+    testing.expect_eq(o.exec, 1, "execs: " + o.stderr)
+    return execute(o.intent, ev(env), "", 1, 1)
 }
 
 fn srv(script: []str) -> own FxLike {
@@ -210,7 +230,16 @@ fn test_exec_pretty_json() {
     f := srv(str1("200 OK\nContent-Type: application/json\n\n{\"a\":1,\"b\":true}"))
     r := xrun("--pretty\nformat\n--print\nb\n{URL}/x", "", f.port)
     testing.expect_eq(r.code, 0, "pretty exit 0")
-    testing.expect(find(r.stdout, "{\n  \"a\": 1,\n  \"b\": true\n}") >= 0, "pretty body: " + r.stdout)
+    // upstream default json.indent = 4 (WI-0016)
+    testing.expect(find(r.stdout, "{\n    \"a\": 1,\n    \"b\": true\n}") >= 0, "pretty body: " + r.stdout)
+    // --format-options json.indent:2 + headers.sort (was deferred)
+    f2 := srv(str1("200 OK\nContent-Type: application/json\nx-b: 2\na-b: 1\n\n{\"z\":1}"))
+    r2b := xrun("--pretty\nformat\n--format-options\njson.indent:2\n--print\nhb\n{URL}/x", "", f2.port)
+    testing.expect(find(r2b.stdout, "{\n  \"z\": 1\n}") >= 0, "fmt indent2: " + r2b.stdout)
+    // headers.sort under pretty.format; HTTP/1.x heads are titlecased
+    ai := find(r2b.stdout, "A-B: 1")
+    zi := find(r2b.stdout, "X-B: 2")
+    testing.expect(ai >= 0 && zi > ai, "sorted resp headers: " + r2b.stdout)
     r2 := xrun("--pretty\ncolors\n--print\nb\n--offline\nexample.org", "", 1)
     testing.expect(find(r2.stderr, "colors/style unsupported") >= 0, "colors warn: " + r2.stderr)
 }

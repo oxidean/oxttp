@@ -183,7 +183,8 @@ fn test_value_format_options() {
     o5 := r("--format-options\njson.format:maybe\nexample.org")
     diag(o5, "invalid value 'json.format:maybe' for '--format-options <FORMAT_OPTIONS>': Invalid value 'maybe' in 'json.format:maybe'")
     o6 := r("--format-options\nJSON.INDENT:2\n--format-options\nheaders.sort:true,json.indent:4\nexample.org")
-    testing.expect_eq(o6.code, 1, "merged parses (then defers)")
+    testing.expect_eq(o6.code, 0, "merged parses — WI-0016 un-defers")
+    testing.expect_eq(o6.exec, 1, "fmt-opts route to exec")
     fo := o6.intent.fmt_opts
     testing.expect_eq(len(fo), 2, "2 merged keys")
     testing.expect_streq(fo[0], "json.indent=4", "json.indent last wins")

@@ -163,9 +163,10 @@ fn hget(hs: []model.Header, name: str) -> str {
     return hs[i].value
 }
 
-// htitle renders the display (title-cased) header lines in order,
-// skipping dead slots.
-fn htitle(hs: []model.Header) -> str {
+// htitle renders the display header lines in order, skipping dead
+// slots. `title` applies HTTP/1.x title-casing (h2/h3 heads keep
+// lowercase names); values get the latin1+UTF-8-annotation display.
+fn htitle(hs: []model.Header, title: int, out_tty: int) -> str {
     out := ""
     i := 0
     for i < len(hs) {
@@ -174,7 +175,13 @@ fn htitle(hs: []model.Header) -> str {
         if len(h.name) == 0 {
             continue
         }
-        out = out + titlecase(h.name) + ": " + h.value + "\n"
+        nm := h.name
+        if title != 0 {
+            nm = titlecase(nm)
+        } else {
+            nm = elwr(nm)
+        }
+        out = out + nm + ": " + hdr_value_display(h.value, out_tty) + "\n"
     }
     return out
 }
@@ -1429,7 +1436,7 @@ fn reason_of(code: int, wire: str) -> str {
 
 // req_head_render draws the request head exactly as xh prints it:
 // status line + title-cased headers + blank line.
-fn req_head_render(i: ref Intent, p: ref ReqPlan) -> str {
+fn req_head_render(i: ref Intent, p: ref ReqPlan, f: ref Fmt) -> str {
     [u, _e] = url.parse(p.req.url)
     uri := "/"
     uhost := ""
@@ -1468,7 +1475,12 @@ fn req_head_render(i: ref Intent, p: ref ReqPlan) -> str {
     if !hhas(dh, "host") {
         dh = push(dh, model.Header{name: "Host", value: uhost})
     }
-    return i.eff_method + " " + uri + " " + ver + "\n" + htitle(dh) + "\n"
+    if f.headers_sort != 0 {
+        let sd: own []model.Header = hsort_copy(dh)
+        dh = sd[:]
+    }
+    // titlecase only for HTTP/1.x heads (upstream headers_fmt).
+    return i.eff_method + " " + uri + " " + ver + "\n" + htitle(dh, booli(ver != "HTTP/2.0"), f.out_tty) + "\n"
 }
 
 fn body_len_of(b: model.Body) -> int {
@@ -1492,116 +1504,23 @@ fn render_form_str(fs: []model.KV) -> str {
     return out
 }
 
-// resp_head_render: "HTTP/x.y CODE reason" + title-cased headers.
-fn resp_head_render(version: str, status: int, reason: str, headers: []model.Header) -> str {
+// resp_head_render: "HTTP/x.y CODE reason" + headers (sorted +
+// title-cased for HTTP/1.x only, latin1/UTF-8-annotated values).
+fn resp_head_render(version: str, status: int, reason: str, headers: []model.Header, f: ref Fmt) -> str {
     ver := version
     if len(ver) == 0 {
         ver = "1.1"
     }
-    return "HTTP/" + ver + " " + itoa(status) + " " + reason_of(status, reason) + "\n" + htitle(headers) + "\n"
-}
-
-// body_render: verbatim, or the binary suppressor for NUL bodies.
-// When pretty is format/all/colors and the body looks like a JSON
-// object/array, pretty-print with 2-space indent (colors ≡ format
-// for now — no ANSI).
-fn body_render(body: []byte, pretty: str) -> str {
-    i := 0
-    for i < len(body) {
-        if body[i] == 0 {
-            return "+-----------------------------------------+\n| NOTE: binary data not shown in terminal |\n+-----------------------------------------+\n\n"
-        }
-        i = i + 1
+    let hh: []model.Header = headers
+    if f.headers_sort != 0 {
+        let sh: own []model.Header = hsort_copy(headers)
+        hh = sh[:]
     }
-    s := body as str
-    if pretty == "format" || pretty == "all" || pretty == "colors" {
-        return json_pretty2(s)
+    t1 := 1
+    if len(ver) >= 1 && substr(ver, 0, 1) != "1" {
+        t1 = 0
     }
-    return s
-}
-
-// json_pretty2 pretty-prints a JSON object/array with 2-space indent;
-// non-JSON-looking input is returned unchanged (simple scanner, no
-// external formatter).
-fn json_pretty2(s: str) -> str {
-    t := trim_ows(s)
-    if len(t) == 0 {
-        return s
-    }
-    c0 := byteat(t, 0)
-    if c0 != 123 && c0 != 91 {
-        return s
-    }
-    out := ""
-    indent := 0
-    in_str := 0
-    esc := 0
-    i := 0
-    n := len(t)
-    for i < n {
-        c := byteat(t, i)
-        if in_str != 0 {
-            out = out + substr(t, i, i + 1)
-            if esc != 0 {
-                esc = 0
-            } else if c == 92 {
-                esc = 1
-            } else if c == 34 {
-                in_str = 0
-            }
-            i = i + 1
-            continue
-        }
-        if c == 34 {
-            in_str = 1
-            out = out + "\""
-            i = i + 1
-            continue
-        }
-        if c == 32 || c == 9 || c == 10 || c == 13 {
-            i = i + 1
-            continue
-        }
-        if c == 123 || c == 91 {
-            out = out + substr(t, i, i + 1) + "\n"
-            indent = indent + 1
-            out = out + spaces2(indent)
-            i = i + 1
-            continue
-        }
-        if c == 125 || c == 93 {
-            indent = indent - 1
-            if indent < 0 {
-                indent = 0
-            }
-            out = out + "\n" + spaces2(indent) + substr(t, i, i + 1)
-            i = i + 1
-            continue
-        }
-        if c == 44 {
-            out = out + ",\n" + spaces2(indent)
-            i = i + 1
-            continue
-        }
-        if c == 58 {
-            out = out + ": "
-            i = i + 1
-            continue
-        }
-        out = out + substr(t, i, i + 1)
-        i = i + 1
-    }
-    return out
-}
-
-fn spaces2(n: int) -> str {
-    out := ""
-    i := 0
-    for i < n {
-        out = out + "  "
-        i = i + 1
-    }
-    return out
+    return "HTTP/" + ver + " " + itoa(status) + " " + reason_of(status, reason) + "\n" + htitle(hh, t1, f.out_tty) + "\n"
 }
 
 // shquote wraps s in single quotes for a POSIX shell, escaping
@@ -1859,9 +1778,10 @@ fn human_bytes(n: int) -> str {
 
 // --- the orchestration
 
-fn execute(i: ref Intent, envpairs: []str, stdin: str, stdin_tty: int) -> own Run {
+fn execute(i: ref Intent, envpairs: []str, stdin: str, stdin_tty: int, out_tty: int) -> own Run {
     r := new(Run)
     p := plan(i, envpairs, stdin, stdin_tty)
+    f := fmt_of(i, out_tty)
     prog := i.prog
     if len(p.err) > 0 {
         r.code = 1
@@ -1892,13 +1812,13 @@ fn execute(i: ref Intent, envpairs: []str, stdin: str, stdin_tty: int) -> own Ru
     hs := i.hist_set
     out := ""
     if ps.req_h != 0 {
-        out = out + req_head_render(i, p)
+        out = out + req_head_render(i, p, f)
     }
     if ps.req_b != 0 {
         // Body::Empty prints nothing; a zero-length real body prints \n\n
         if p.req.body.kind() != 0 {
             bd := req_body_bytes(p.req.body)
-            out = out + body_render(bd, i.pretty) + "\n\n"
+            out = out + req_body_render(bd, f, p.req.headers)
         }
     }
     if i.offline != 0 {
@@ -1972,10 +1892,13 @@ fn execute(i: ref Intent, envpairs: []str, stdin: str, stdin_tty: int) -> own Ru
             hp := resp.hops[k]
             k = k + 1
             if hs.res_h != 0 {
-                out = out + resp_head_render(hp.version, hp.status, hp.reason, hp.headers)
+                out = out + resp_head_render(hp.version, hp.status, hp.reason, hp.headers, f)
             }
             if hs.res_b != 0 {
-                out = out + body_render(hp.body, i.pretty) + "\n"
+                out = out + resp_body_render(hp.body, f, hp.headers, i.response_mime, i.response_charset, i.stream)
+                // upstream print_separator() — runs iff response_body
+                // is in history_print
+                out = out + "\n"
             }
             if hs.res_m != 0 {
                 out = out + "Elapsed time: " + fmt5(hp.elapsed_ms / 1000.0) + "s\nRemote address: " + hp.remote + "\n\n"
@@ -2027,7 +1950,7 @@ fn execute(i: ref Intent, envpairs: []str, stdin: str, stdin_tty: int) -> own Ru
             if i.quiet < 1 {
                 warn = warn + "Download \"" + dest + "\" is already complete\n"
             }
-            r.stderr = resp_head_render(resp.version, resp.status, resp.reason, resp.headers) + warn
+            r.stderr = resp_head_render(resp.version, resp.status, resp.reason, resp.headers, f) + warn
             r.code = 0
             session_maybe_save(i, envpairs, p, p.req.headers)
             return r
@@ -2064,7 +1987,7 @@ fn execute(i: ref Intent, envpairs: []str, stdin: str, stdin_tty: int) -> own Ru
                 warn = warn + "Done. " + human_bytes(written) + " in " + fmt5(resp.elapsed_ms / 1000.0) + "s (" + human_bytes(rate_of(written, resp.elapsed_ms)) + "/s)\n"
             }
             // headers go to stderr in download mode
-            r.stderr = resp_head_render(resp.version, resp.status, resp.reason, resp.headers) + warn
+            r.stderr = resp_head_render(resp.version, resp.status, resp.reason, resp.headers, f) + warn
             r.code = code
             session_maybe_save(i, envpairs, p, p.req.headers)
             return r
@@ -2076,10 +1999,10 @@ fn execute(i: ref Intent, envpairs: []str, stdin: str, stdin_tty: int) -> own Ru
         return r
     }
     if ps.res_h != 0 {
-        out = out + resp_head_render(resp.version, resp.status, resp.reason, resp.headers)
+        out = out + resp_head_render(resp.version, resp.status, resp.reason, resp.headers, f)
     }
     if ps.res_b != 0 {
-        out = out + body_render(resp.body, i.pretty)
+        out = out + resp_body_render(resp.body, f, resp.headers, i.response_mime, i.response_charset, i.stream)
     }
     if ps.res_b != 0 && ps.res_m != 0 {
         out = out + "\n"

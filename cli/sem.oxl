@@ -1368,10 +1368,6 @@ fn resolve(m: own args.Matches, envpairs: []str) -> own Out {
         defer_out(o, prog, "--unix-socket is unsupported in this build")
         return o
     }
-    if len(o.intent.fmt_opts[:]) > 0 {
-        defer_out(o, prog, "--format-options is unsupported in this build")
-        return o
-    }
     o.exec = 1
     return o
 }
