@@ -102,6 +102,7 @@ struct RDraft {
     body: TextView,
     resp_view: TextView,
     resp_rows: ListCur,
+    resp_body: str,  // received body text (resp_view may re-indent it)
     resp_hdr_rows: []str,
     resp_ck_rows: []str,
     resp_tr_rows: []str,
@@ -260,6 +261,7 @@ struct App {
     body_ct: int,        // 0 json 1 text 2 xml 3 html
     resp_view: TextView,
     resp_rows: ListCur,
+    resp_body: str,      // received body text — save-response writes this
     resp_hdr_rows: []str,
     resp_ck_rows: []str,
     resp_tr_rows: []str,
@@ -340,6 +342,10 @@ struct App {
     vsug_sel: int,
     vsug_pos: int,        // url byte index of the activating '$'
     ext_cmd: str,         // pending external command (EExt effect)
+    ext_file: str,        // staged per-op temp file; removed after the run
+    ext_edit: bool,       // editor op — file loads back into ext_tab's body
+    ext_tab: int,         // originating tab for the write-back (-1 none)
+    env_flagged: bool,    // a -e/--env was given on the command line
 
     // hit-test rects cached from last render (mouse dispatch)
     r_sidebar_x: int, r_sidebar_w: int,

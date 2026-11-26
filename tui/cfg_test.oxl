@@ -221,6 +221,35 @@ fn test_env_memory_roundtrip() {
     testing.expect_streq(c.env_name, "(none)", "label none after clear")
 }
 
+fn test_env_local_only_file() {
+    // a <name>.local.env with no <name>.env still forms an env —
+    // the pair resolves in the first dir holding either side.
+    d := "/tmp/oxttp-local-only"
+    os.mkdir_all(d)
+    p := d + "/solo.local.env"
+    os.writefile_(p, "ONLY=localval\n")
+    dirs := mkslice(str, 1)
+    dirs[0] = d
+    names := env_names_dirs(dirs)
+    testing.expect_eq(len(names), 1, "local-only name discovered")
+    testing.expect_streq(names[0], "solo", "stem strips .local")
+    fs := env_files_named(dirs, "solo")
+    testing.expect_eq(len(fs), 1, "local file resolves")
+    testing.expect_streq(fs[0], p, "local path")
+    s := env_set_dirs(dirs, names, nil)
+    lr := s.lookup("ONLY")
+    testing.expect(lr.ok, "local-only var resolves")
+    testing.expect_streq(lr.value, "localval", "local-only value")
+    // base wins over local's dir when the base file exists first
+    os.writefile_(d + "/solo.env", "ONLY=baseval\n")
+    s2 := env_set_dirs(dirs, names, nil)
+    lr2 := s2.lookup("ONLY")
+    testing.expect_streq(lr2.value, "localval", "local still on top of base")
+    os.remove(p)
+    os.remove(d + "/solo.env")
+    os.remove_all(d)
+}
+
 // ---------- disk history ----------
 
 fn hist_test_ent(title: str, url: str) -> HistEnt {
@@ -256,6 +285,22 @@ fn test_history_disk_roundtrip() {
     testing.expect_eq(b.history[1].status, 200, "status round-trip")
 }
 
+fn test_history_lock_sidecar() {
+    scratch_coll()
+    a := new_app()
+    a.coll_dir = COLL_SCRATCH + "-lock"
+    a.data_dir = DATA_SCRATCH
+    hist_append(a, hist_test_ent("one", "http://x/1"))
+    f := hist_file_of(a)
+    testing.expect(!os.exists(f + ".lock"), "lock released after append")
+    // a stale lock FILE (older builds left one) is broken so the
+    // append still lands
+    os.writefile_(f + ".lock", "")
+    hist_append(a, hist_test_ent("two", "http://x/2"))
+    hl := hist_read(f)
+    testing.expect_eq(len(hl.ents), 2, "stale lock file broken")
+}
+
 fn test_history_disabled_memory_only() {
     scratch_coll()
     a := new_app()
@@ -285,6 +330,70 @@ fn test_history_caps() {
     testing.expect_eq(hl.ents[0].id, 6, "oldest dropped")
 }
 
+// ---------- f3/f4 staging + editor write-back ----------
+
+fn test_ext_stage_and_apply_edit() {
+    a := new_app()
+    a.body = new_text_view("line1\nline2")
+    fx := ext_stage(a, "editor-cmd", join_lines(a.body.lines), ".txt", true)
+    testing.expect_eq(fx, EExt, "stages EExt")
+    testing.expect_streq(a.ext_cmd, "editor-cmd", "cmd stored bare")
+    testing.expect(a.ext_edit, "editor op marked")
+    testing.expect_eq(a.ext_tab, 0, "current tab recorded")
+    f := a.ext_file
+    testing.expect(len(f) > 0, "file path recorded")
+    testing.expect(os.exists(f), "staged file exists")
+    // a second stage gets a different path — no cross-op clobber
+    fx2 := ext_stage(a, "pager-cmd", "x", ".txt", false)
+    testing.expect_eq(fx2, EExt, "pager also stages")
+    testing.expect(a.ext_file != f, "unique per-op file")
+    testing.expect(!a.ext_edit, "pager stays read-only")
+    os.remove(a.ext_file)
+    // editor write-back: changed text lands in the live body + pins
+    a.ext_file = f
+    a.ext_edit = true
+    a.ext_tab = 0
+    os.writefile_(f, "edited body")
+    testing.expect(a.tabs[0].preview, "tab starts preview")
+    ext_apply_edit(a, f, 0)
+    testing.expect_streq(join_lines(a.body.lines), "edited body", "body loaded back")
+    testing.expect(!a.tabs[0].preview, "write-back pins the tab")
+    // unchanged text is a no-op
+    n := len(a.toasts)
+    ext_apply_edit(a, f, 0)
+    testing.expect_eq(len(a.toasts), n, "unchanged text skips write")
+    os.remove(f)
+    // empty cmd toasts + stages nothing (fresh app — the staged
+    // file field keeps the prior op's path, by design)
+    a2 := new_app()
+    fx3 := ext_stage(a2, "", "x", ".txt", false)
+    testing.expect_eq(fx3, ENone, "no cmd → no ext")
+    testing.expect_eq(len(a2.ext_file), 0, "no file staged")
+}
+
+// ---------- save response ----------
+
+fn test_sresp_save_writes_received_body() {
+    a := new_app()
+    // the view is the re-indented pretty copy; the file must get the
+    // compact bytes the server sent.
+    a.resp_body = "{\"a\":1,\"b\":2}"
+    a.resp_view = new_text_view("{\n  \"a\": 1,\n  \"b\": 2\n}")
+    f := "sresp-test-out.json"
+    rm_quiet(f)
+    a.sresp_in = new_line_edit(f)
+    testing.expect(sresp_save(a), "save commits")
+    got := os.readfile_(f)
+    testing.expect_streq(got, "{\"a\":1,\"b\":2}", "raw body written")
+    os.remove(f)
+    // an existing file still refuses (never overwrites)
+    a2 := new_app()
+    a2.resp_body = "x"
+    a2.sresp_in = new_line_edit("AGENTS.md")  // exists in repo root
+    a2.toasts = mkslice(Toast, 0)
+    testing.expect(!sresp_save(a2), "existing refused")
+}
+
 // ---------- variables edit/add/revert ----------
 
 fn var_row_idx(a: ref App, name: str) -> int {
@@ -296,6 +405,35 @@ fn var_row_idx(a: ref App, name: str) -> int {
         i = i + 1
     }
     return -1
+}
+
+fn test_vars_commit_unchanged_secret() {
+    scratch_coll()
+    a := app_in(COLL_SCRATCH)
+    // edit a masked secret and press enter untouched — the mask must
+    // not become a session override.
+    var_rows_build(a)
+    si := var_row_idx(a, "API_SECRET")
+    testing.expect(si >= 0, "secret row present")
+    a.vars.sel = si
+    vars_action(a, "vars-edit")
+    testing.expect_streq(a.var_edit.text, "••••", "seeded with mask")
+    testing.expect(vars_commit(a), "commit returns")
+    lr := a.env.lookup("API_SECRET")
+    testing.expect(lr.ok, "secret still resolves")
+    testing.expect_streq(lr.value, "tok123", "real value kept")
+    i := 0
+    for i < len(a.session_vars) {
+        testing.expect(a.session_vars[i].name != "API_SECRET", "no session override")
+        i = i + 1
+    }
+    // a changed value still writes the override
+    a.vars.sel = var_row_idx(a, "API_SECRET")
+    vars_action(a, "vars-edit")
+    a.var_edit = new_line_edit("newsecret")
+    testing.expect(vars_commit(a), "changed commits")
+    lr2 := a.env.lookup("API_SECRET")
+    testing.expect_streq(lr2.value, "newsecret", "override applied")
 }
 
 fn test_vars_edit_add_revert() {
@@ -423,10 +561,50 @@ fn test_curl_import_basics() {
     testing.expect_eq(len(r5.params), 2, "query params")
     testing.expect_streq(r5.params[0].name, "a", "param name")
     testing.expect_streq(r5.params[1].value, "2", "param value")
-    // -G moves -d onto the query string
+    // -G moves -d onto the query — carried as params rows so the
+    // planner sends every pair exactly once
     r6 := curl_ok("curl -G http://ex.test/g -d a=1 -d b=2")
-    testing.expect(find(r6.url, "a=1") >= 0, "data on the url")
+    testing.expect_eq(len(r6.params), 2, "data became query rows")
+    testing.expect_streq(r6.params[0].name, "a", "row name")
     testing.expect_streq(r6.method, "", "-G stays method-less (GET)")
+    // the query lives in params only — never duplicated on the URL
+    r7 := curl_ok("curl 'http://ex.test/dup?tag=a&tag=b'")
+    testing.expect_streq(r7.url, "http://ex.test/dup", "query off the url")
+    testing.expect_eq(len(r7.params), 2, "pairs kept")
+    // fragment survives the strip
+    r8 := curl_ok("curl 'http://ex.test/fr?x=1#frag'")
+    testing.expect_streq(r8.url, "http://ex.test/fr#frag", "fragment kept")
+    testing.expect_eq(len(r8.params), 1, "param row")
+}
+
+fn test_curl_import_shell_words() {
+    // comments only start at a word boundary — a '#' mid-word (or
+    // quoted) stays part of the word (URL fragments work).
+    r := curl_ok("curl http://ex.test/a # -X DELETE")
+    testing.expect_streq(r.url, "http://ex.test/a", "comment ignored")
+    testing.expect_streq(r.method, "", "comment args not applied")
+    r2 := curl_ok("curl http://ex.test/a#frag")
+    testing.expect_streq(r2.url, "http://ex.test/a#frag", "fragment kept")
+    // quoted words resume tokenizing at the closing quote — args
+    // after them are not dropped.
+    r4 := curl_ok("curl -H \"Accept: text/plain\" http://ex.test/q")
+    testing.expect_streq(r4.url, "http://ex.test/q", "url after \"..\"")
+    testing.expect_streq(r4.headers[0].value, "text/plain", "header value")
+    r5 := curl_ok("curl -d $'a\\nb' http://ex.test/d")
+    testing.expect_streq(r5.url, "http://ex.test/d", "url after $'..'")
+    testing.expect_streq(r5.body.content, "a\nb", "ansi-c escape")
+}
+
+fn test_curl_import_insecure_toggle() {
+    r := curl_ok("curl -k https://ex.test/k")
+    testing.expect(!r.options.verify_ssl, "-k clears verify")
+    testing.expect_eq(r.options.set_mask & 2, 2, "verify mask set")
+    // the last of -k / --no-insecure wins
+    r2 := curl_ok("curl -k --no-insecure https://ex.test/k2")
+    testing.expect(r2.options.verify_ssl, "--no-insecure restores")
+    testing.expect_eq(r2.options.set_mask & 2, 0, "no explicit disable")
+    r3 := curl_ok("curl --no-insecure -k https://ex.test/k3")
+    testing.expect(!r3.options.verify_ssl, "last flag wins again")
 }
 
 fn test_curl_import_data() {
@@ -452,6 +630,9 @@ fn test_curl_import_data() {
     testing.expect_eq(len(r4.body.form_data), 1, "one row, no & split")
     testing.expect_streq(r4.body.form_data[0].name, "q", "row name")
     testing.expect_streq(r4.body.form_data[0].value, "a b&c", "decoded value")
+    // literal values may contain '@' — only the file form rejects
+    r5 := curl_ok("curl http://ex.test/u5 --data-urlencode 'name=a@b'")
+    testing.expect(r5.body.has_form_data, "literal @ stays")
 }
 
 fn test_curl_import_json() {
@@ -514,6 +695,10 @@ fn test_curl_import_auth() {
     testing.expect_streq(r4.auth.type, "bearer_token", "header → bearer")
     testing.expect_streq(r4.auth.bearer_token.token, "abc", "bearer creds")
     testing.expect_eq(len(r4.headers), 0, "auth header consumed")
+    // an explicit Authorization header beats --user (curl precedence)
+    r5 := curl_ok("curl -H 'Authorization: Bearer" + " tk' -u demo:pass http://ex.test/h2")
+    testing.expect_streq(r5.auth.type, "bearer_token", "explicit header wins")
+    testing.expect_streq(r5.auth.bearer_token.token, "tk", "bearer kept")
 }
 
 fn test_curl_import_flags() {
@@ -539,11 +724,40 @@ fn test_curl_import_flags() {
     testing.expect_streq(r6.headers[1].value, "http://ref.test", "referer value")
 }
 
+fn test_curl_import_json_file() {
+    // a file-backed --json still claims the JSON defaults
+    r := curl_ok("curl http://ex.test/jf --json @payload.json")
+    testing.expect(r.body.has_file, "file body")
+    testing.expect_streq(r.body.file, "payload.json", "file path")
+    testing.expect_streq(r.body.content_type, "application/json", "json ct default")
+    saw_ct := false
+    saw_acc := false
+    i := 0
+    for i < len(r.headers) {
+        if ascii_eq(r.headers[i].name, "Content-Type") {
+            saw_ct = true
+        }
+        if ascii_eq(r.headers[i].name, "Accept") {
+            saw_acc = true
+        }
+        i = i + 1
+    }
+    testing.expect(saw_ct && saw_acc, "json defaults synthesized")
+    // explicit Content-Type survives
+    r2 := curl_ok("curl http://ex.test/jf2 -H 'Content-Type: text/x' --json @p.json")
+    testing.expect_streq(r2.body.content_type, "text/x", "explicit ct kept")
+    // a non-json file body keeps the form-urlencoded default
+    r3 := curl_ok("curl http://ex.test/bf --data-binary @bin.dat")
+    testing.expect_streq(r3.body.content_type, "application/x-www-form-urlencoded", "non-json default")
+}
+
 fn test_curl_import_errors() {
     curl_err("wget http://x", "not a curl command")
     curl_err("curl", "no URL")
     curl_err("curl 'unterminated", "unterminated")
     curl_err("curl http://x -d @file.txt", "not supported")
+    curl_err("curl http://x --data-urlencode name@payload.txt", "not supported")
+    curl_err("curl http://x --data-urlencode @payload.txt", "not supported")
     curl_err("curl http://x -F noequals", "name=value")
     curl_err("curl http://x -T whole.bin", "--data-binary")
     curl_err("curl http://x -F f=@- ", "regular file path")

@@ -114,6 +114,7 @@ fn new_draft() -> RDraft {
         body: new_text_view(""),
         resp_view: new_text_view("(no response yet — ctrl+j sends)"),
         resp_rows: new_list(0),
+        resp_body: "",
         resp_hdr_rows: nil, resp_ck_rows: nil, resp_tr_rows: nil,
         resp_title: "response", resp_class: -1,
         path: "", auth_text: "", opts_text: "", info_text: "",
@@ -172,6 +173,7 @@ fn draft_capture(a: ref App) -> RDraft {
         headers: copy_kv(a.headers), query_kv: copy_kv(a.query_kv),
         path_kv: copy_kv(a.path_kv), body: copy_tv(a.body),
         resp_view: copy_tv(a.resp_view), resp_rows: a.resp_rows,
+        resp_body: a.resp_body,
         resp_hdr_rows: copy_strs(a.resp_hdr_rows),
         resp_ck_rows: copy_strs(a.resp_ck_rows),
         resp_tr_rows: copy_strs(a.resp_tr_rows),
@@ -194,6 +196,7 @@ fn draft_restore(a: mut App, d: RDraft) {
     a.body = copy_tv(d.body)
     a.resp_view = copy_tv(d.resp_view)
     a.resp_rows = d.resp_rows
+    a.resp_body = d.resp_body
     a.resp_hdr_rows = copy_strs(d.resp_hdr_rows)
     a.resp_ck_rows = copy_strs(d.resp_ck_rows)
     a.resp_tr_rows = copy_strs(d.resp_tr_rows)
@@ -1195,9 +1198,18 @@ fn widget_action(a: mut App, act: str, ev: term.KeyEvent) -> int {
             cmd = a.pager_json
             ext = ".json"
         }
-        return ext_stage(a, cmd, body_text_for(a), ext)
+        return ext_stage(a, cmd, body_text_for(a), ext, false)
     } else if act == "body-editor" {
-        return ext_stage(a, a.editor, body_text_for(a), ".txt")
+        ext := ".txt"
+        if a.focus == FRespPane && resp_body_json(a) {
+            ext = ".json"
+        } else if a.focus == FReqPane && a.body_ct == 0 {
+            ext = ".json"
+        }
+        // only an editable request body loads back — the response
+        // pane and placeholder bodies stay read-only (upstream).
+        return ext_stage(a, a.editor, body_text_for(a), ext,
+            a.focus == FReqPane && !body_locked(a))
     } else if act == "body-newline" {
         body_insert(a, "\n")
     } else if act == "body-backspace" {

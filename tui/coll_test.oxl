@@ -347,6 +347,48 @@ fn test_env_switch() {
     testing.expect(!lr3.ok, "dev vars gone")
 }
 
+fn test_env_file_flag_suppresses_recall() {
+    scratch_coll()
+    a := app_in(COLL_SCRATCH)
+    push_modal(a, MEnvSwitch)
+    a.vars.sel = 1
+    env_pick(a) // remembers dev under environments.json
+    testing.expect_streq(remember_recall(a), "dev", "pick remembered")
+    // a launch with -e FILE: the remembered env must not merge in —
+    // the file is the env the user asked for.
+    f := COLL_SCRATCH + "/extra.env"
+    os.writefile_(f, "EXTRA=1\n")
+    b := new_app()
+    b.data_dir = DATA_SCRATCH
+    let av: []str = nil
+    av = push(av, "posting")
+    av = push(av, "-e")
+    av = push(av, f)
+    av = push(av, COLL_SCRATCH)
+    parse_argv_args(b, av)
+    testing.expect(b.env_flagged, "-e file flagged")
+    load_collection(b)
+    testing.expect_eq(len(b.env_active), 0, "recall suppressed by file -e")
+    lr := b.env.lookup("EXTRA")
+    testing.expect(lr.ok, "file var loaded")
+    lr2 := b.env.lookup("WHO")
+    testing.expect(!lr2.ok, "remembered dev stays out")
+    // a named -e still activates (recall moot — env_active non-empty)
+    c := new_app()
+    c.data_dir = DATA_SCRATCH
+    let av2: []str = nil
+    av2 = push(av2, "posting")
+    av2 = push(av2, "-e")
+    av2 = push(av2, "dev")
+    av2 = push(av2, COLL_SCRATCH)
+    parse_argv_args(c, av2)
+    load_collection(c)
+    testing.expect_eq(len(c.env_active), 1, "named -e active")
+    lr3 := c.env.lookup("WHO")
+    testing.expect_streq(lr3.value, "devlocal", "named -e resolves")
+    os.remove(f)
+}
+
 fn test_variables_rows_masking() {
     scratch_coll()
     a := app_in(COLL_SCRATCH)

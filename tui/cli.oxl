@@ -281,6 +281,11 @@ fn run_env(root: str, envs: []str) -> own RunEnv {
                 re.err = e + ": " + errors.msg(pe)
                 return re
             }
+            wi := 0
+            for wi < len(p.warns) {
+                es.warns = push(es.warns, p.warns[wi])
+                wi = wi + 1
+            }
             es.layers = push(es.layers, env.EnvLayer{name: e, source: "file", vars: p.vars})
         } else {
             if !os.exists(root + "/" + e + ".env") {
@@ -290,8 +295,20 @@ fn run_env(root: str, envs: []str) -> own RunEnv {
             active = push(active, e)
         }
     }
-    es = env.build_set(root, active, nil)
-    re.es = es
+    built := env.build_set(root, active, nil)
+    // file layers come last — file values take precedence over the
+    // named stack (and their parse warns merge in, not replace).
+    i = 0
+    for i < len(es.layers) {
+        built.layers = push(built.layers, es.layers[i])
+        i = i + 1
+    }
+    i = 0
+    for i < len(es.warns) {
+        built.warns = push(built.warns, es.warns[i])
+        i = i + 1
+    }
+    re.es = built
     return re
 }
 
@@ -364,6 +381,18 @@ fn run_exec(o: ref RunOpts, t: http.Transport) -> own RunRep {
         if n.is_dir {
             continue
         }
+        // ADR-0038: scripts and empty urls abort before any send —
+        // the whole selection validates first (upstream run.go).
+        if len(n.req.url) == 0 {
+            rep.err = n.rel + ": request has no URL"
+            rep.code = 1
+            return rep
+        }
+        if n.req.scripts != nil && (len(n.req.scripts.setup) > 0 || len(n.req.scripts.on_request) > 0 || len(n.req.scripts.on_response) > 0) {
+            rep.err = n.rel + ": Posting 3 doesn't run Python scripts; remove or replace its scripts before running headlessly"
+            rep.code = 1
+            return rep
+        }
     }
     // count runnable
     total := 0
@@ -401,22 +430,6 @@ fn run_exec(o: ref RunOpts, t: http.Transport) -> own RunRep {
             first_j = false
             continue
         }
-        if len(n.req.url) == 0 {
-            rep.lines = push(rep.lines, "FAILED " + n.rel + ": empty url\n")
-            failed = failed + 1
-            if o.fail_fast { stop = true }
-            jresults = jappend(jresults, first_j, "{\"file\":" + jesc(n.rel) + ",\"outcome\":\"failed\",\"error\":\"empty url\"}")
-            first_j = false
-            continue
-        }
-        if n.req.scripts != nil && (len(n.req.scripts.setup) > 0 || len(n.req.scripts.on_request) > 0 || len(n.req.scripts.on_response) > 0) {
-            rep.lines = push(rep.lines, "FAILED " + n.rel + ": Posting 3 doesn't run Python scripts; remove or replace its scripts before running headlessly\n")
-            failed = failed + 1
-            if o.fail_fast { stop = true }
-            jresults = jappend(jresults, first_j, "{\"file\":" + jesc(n.rel) + ",\"outcome\":\"failed\",\"error\":\"scripts unsupported\"}")
-            first_j = false
-            continue
-        }
         if len(n.req.captures) > 0 {
             rep.lines = push(rep.lines, "FAILED " + n.rel + ": captures unsupported in this build — lands M4\n")
             failed = failed + 1
@@ -442,6 +455,32 @@ fn run_exec(o: ref RunOpts, t: http.Transport) -> own RunRep {
         }
         if len(cr.s.ssl_ca_bundle) > 0 && sp.req.verify == "yes" {
             sp.req.verify = cr.s.ssl_ca_bundle
+        }
+        // ssl.certificate_path/key_file carry the client identity —
+        // a configured file that can't be read fails the request
+        // rather than silently sending without it.
+        cert_err := ""
+        if len(cr.s.ssl_certificate_path) > 0 {
+            if !os.exists(cr.s.ssl_certificate_path) {
+                cert_err = "ssl.certificate_path: file not found"
+            } else {
+                sp.req.cert_pem = os.readfile_(cr.s.ssl_certificate_path)
+                if len(cr.s.ssl_key_file) > 0 {
+                    if !os.exists(cr.s.ssl_key_file) {
+                        cert_err = "ssl.key_file: file not found"
+                    } else {
+                        sp.req.key_pem = os.readfile_(cr.s.ssl_key_file)
+                    }
+                }
+            }
+        }
+        if len(cert_err) > 0 {
+            rep.lines = push(rep.lines, "FAILED " + n.rel + ": " + cert_err + "\n")
+            failed = failed + 1
+            if o.fail_fast { stop = true }
+            jresults = jappend(jresults, first_j, "{\"file\":" + jesc(n.rel) + ",\"outcome\":\"failed\",\"error\":" + jesc(cert_err) + "}")
+            first_j = false
+            continue
         }
         [resp, se] = t.send(sp.req)
         if se != nil {

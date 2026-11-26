@@ -109,6 +109,26 @@ fn test_run_parse() {
     testing.expect(rp.code == 2, "missing val")
 }
 
+fn test_run_env_file_layers() {
+    dir := "/tmp/oxttp-runenv-test"
+    os.mkdir_all(dir)
+    os.writefile_(dir + "/dev.env", "A=named\n")
+    f := dir + "/prod.env"
+    os.writefile_(f, "B=file\nA=filewins\n")
+    let envs: []str = nil
+    envs = push(envs, "dev")
+    envs = push(envs, f)
+    re := run_env(dir, envs)
+    testing.expect(len(re.err) == 0, "err: " + re.err)
+    lr := re.es.lookup("B")
+    testing.expect(lr.ok, "file var present")
+    testing.expect_streq(lr.value, "file", "file value")
+    lr2 := re.es.lookup("A")
+    testing.expect(lr2.ok, "named var resolves")
+    testing.expect_streq(lr2.value, "filewins", "file layer wins over named")
+    os.remove_all(dir)
+}
+
 // stage_run builds a scratch collection with one good + one
 // script-carrying request and runs run_exec over a fake transport.
 fn test_run_exec() {
@@ -121,17 +141,33 @@ fn test_run_exec() {
     o.target = dir
     fx := FakeSend{resp: fake_resp(200, "text/plain", "hi", nil), fail: ""}
     rep := run_exec(o, fx)
+    // ADR-0038: a scripted request aborts the whole run BEFORE any
+    // send — the valid request never reaches the transport.
+    testing.expect(rep.code == 1, "abort code")
+    testing.expect(find(rep.err, "scripted.posting.yaml") >= 0, "err names file")
+    testing.expect(find(rep.err, "Python scripts") >= 0, "err names scripts")
+    testing.expect_eq(len(rep.lines), 0, "nothing ran")
+    // an empty-url request aborts the same way
+    os.remove(dir + "/scripted.posting.yaml")
+    os.writefile_(dir + "/nourl.posting.yaml", "name: nu\nmethod: GET\nurl: \"\"\n")
+    rep = run_exec(o, fx)
+    testing.expect(rep.code == 1, "empty-url abort code")
+    testing.expect(find(rep.err, "request has no URL") >= 0, "empty-url err")
+    testing.expect_eq(len(rep.lines), 0, "nothing sent")
+    // a fully valid collection runs every request
+    os.remove(dir + "/nourl.posting.yaml")
+    os.writefile_(dir + "/ok2.posting.yaml", "name: ok2\nmethod: GET\nurl: http://x.test/b\n")
+    rep = run_exec(o, fx)
     testing.expect(len(rep.err) == 0, "err: " + rep.err)
-    testing.expect(rep.code == 1, "code (script fails)")
+    testing.expect(rep.code == 0, "clean run passes")
     testing.expect(len(rep.lines) == 3, "2 req + summary")
-    testing.expect(find(rep.lines[0], "PASSED") >= 0 || find(rep.lines[1], "PASSED") >= 0, "one pass")
-    testing.expect(find(rep.lines[2], "1 passed") >= 0, "summary")
-    // fail-fast + json
+    testing.expect(find(rep.lines[2], "2 passed") >= 0, "summary")
+    // fail-fast + json on a clean run
     o.fail_fast = true
     o.json = true
     rep = run_exec(o, fx)
     testing.expect(find(rep.lines[0], "\"results\"") >= 0, "json head")
-    testing.expect(find(rep.lines[0], "\"failed\":1") >= 0, "json failed")
+    testing.expect(find(rep.lines[0], "\"passed\":2") >= 0, "json passed")
     // single-file non-.posting.yaml rejects
     os.writefile_(dir + "/not.txt", "x")
     o.target = dir + "/not.txt"
