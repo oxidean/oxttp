@@ -4,6 +4,9 @@ work_item_id: WI-0014
 run_id: run_1795670881948_641180
 kind: clarification
 question: 'Ship gate: WI-0014 S10 TUI collections + envs + send path is verified and ready to push/PR — needs human approval to proceed (branch feat/wi-0014-s10-tui-send, PR title ''feat(tui): S10 collections and send path'').'
-status: pending
+status: answered
+answer: 'Approved — PR #16 squash-merged as 4243460 after resolving the Req/Resp field-union conflict with #15; green CI on merge head; substitute subagent review (CHANGES_REQUESTED → gating timeout-freeze fix landed and verified), all threads resolved.'
 created_by: ox-agent
+answered_by: Jesse
 created_at: "2026-11-26T05:28:20Z"
+answered_at: "2026-11-26T16:45:44Z"
