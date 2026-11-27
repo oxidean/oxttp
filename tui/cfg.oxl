@@ -24,6 +24,10 @@ import "std/crypto/rand"
 
 import "std/time"
 
+import "std/strings"
+
+import "std/strconv"
+
 import "github.com/oxidean/oxttp/core/config"
 
 import "github.com/oxidean/oxttp/core/env"
@@ -31,6 +35,17 @@ import "github.com/oxidean/oxttp/core/env"
 import "github.com/oxidean/oxttp/core/term"
 
 import "github.com/oxidean/oxttp/core/model"
+
+// rt_open_write_mode creates under (mode|0200)&0777, umask-masked,
+// with O_EXCL — the staged pager/editor file can carry secrets, so
+// it must be born 0600 rather than 0666&~umask in a shared temp dir.
+// src feeds only the Windows EFS-attribute check (no file is being
+// replaced here, so the temp dir stands in).
+extern fn rt_open_write_mode(path: str, mode: int, src: str) -> int
+
+extern fn rt_fd_write(fd: int, b: []byte) -> int
+
+extern fn rt_fd_close(fd: int) -> int
 
 // ---------- dir seams ----------
 
@@ -274,7 +289,7 @@ fn remember_save(a: ref App, name: str) {
         os.mkdir_all(dir)
     }
     lock := hist_lock(f)
-    if len(lock) == 0 {
+    if len(lock.path) == 0 {
         return
     }
     obj := json.jobj()
@@ -520,7 +535,7 @@ fn hist_read(f: str) -> HistLoad {
 // hist_write — the full rewrite: envelope + entries, tmp + rename.
 // Trims to MaxEntries newest first, then MaxBytes newest-fitting
 // (sizes measured on the marshaled entry, like upstream).
-fn hist_write(a: mut App, f: str, ents: []HistEnt, next_id: int) {
+fn hist_write(a: mut App, f: str, ents: []HistEnt, next_id: int) -> bool {
     for len(ents) > HistMaxEntries {
         ents = ents[1:]
     }
@@ -552,9 +567,16 @@ fn hist_write(a: mut App, f: str, ents: []HistEnt, next_id: int) {
     }
     tmp := f + ".tmp"
     n := os.writefile_(tmp, json.tojson(o) + "\n")
-    if n >= 0 {
-        os.rename(tmp, f)
+    if n < 0 {
+        os.remove(tmp)
+        return false
     }
+    re := os.rename(tmp, f)
+    if re != nil {
+        os.remove(tmp)
+        return false
+    }
+    return true
 }
 
 // hist_load — populate a.history from the per-collection file when
@@ -585,34 +607,104 @@ fn hist_load(a: mut App) {
 
 // hist_lock — the .lock sidecar as a one-entry directory: mkdir is
 // atomic so every session honors the same lock across read + id +
-// publish. Spins ~2s for a live writer, then breaks a stale lock
-// once (a crashed writer would wedge the collection otherwise).
-// "" = lock stayed held.
-fn hist_lock(f: str) -> str {
+// publish. Spins ~2s for a live writer, then breaks the lock only
+// when its owner is provably gone — a crashed writer would wedge the
+// collection otherwise, but a live one must never lose it.
+struct HistLock {
+    path: str
+    token: str
+}
+
+// hist_lock_stale_ms — a held lock is breakable only when its owner
+// is far older than any plausible history write (the 50 MiB cap
+// bounds the slowest publish); anything fresher belongs to a live
+// writer and stays held.
+let HistLockStaleMs = 30000
+
+fn hist_lock_token() -> str {
+    [rb, re] = rand.bytes(8)
+    if re != nil {
+        return "ffffffffffffffff"
+    }
+    return hex.encode(rb)
+}
+
+// hist_lock_mark — register the owner inside the lock dir so a
+// breaker can tell a live writer from a crashed one.
+fn hist_lock_mark(lock: str, token: str) {
+    os.writefile_(lock + "/owner", token + " " + itoa(time.unix_ms()))
+}
+
+// hist_lock_stale — the lock may be broken when its owner never
+// registered (crashed mid-acquire, or a lock from before owner
+// tokens) or its timestamp is older than any plausible write. A
+// missing owner file gets one grace beat: a live acquirer lands it
+// microseconds after mkdir, so an ownerless dir that survives 50ms
+// is dead.
+fn hist_lock_stale(lock: str) -> bool {
+    o := os.readfile_(lock + "/owner")
+    if len(o) == 0 {
+        time.sleep_ms(50)
+        o = os.readfile_(lock + "/owner")
+        if len(o) == 0 {
+            return true
+        }
+    }
+    parts := strings.split(strings.trim(o), " ")
+    if parts == nil {
+        return true
+    }
+    parts = parts.next
+    if parts == nil {
+        return true
+    }
+    [ms, me] = strconv.atoi(strings.trim(parts.v))
+    if me != nil {
+        return true
+    }
+    return time.unix_ms() - ms > HistLockStaleMs
+}
+
+fn hist_lock(f: str) -> HistLock {
     lock := f + ".lock"
     // older builds left a .lock FILE — clear it so the dir can take.
     if os.exists(lock) && !os.isdir(lock) {
         os.remove(lock)
     }
+    token := hist_lock_token()
     tries := 0
     for tries < 40 {
         e := os.mkdir(lock)
         if e == nil {
-            return lock
+            hist_lock_mark(lock, token)
+            return HistLock{path: lock, token: token}
         }
         time.sleep_ms(50)
         tries = tries + 1
     }
-    os.remove_all(lock)
-    e := os.mkdir(lock)
-    if e == nil {
-        return lock
+    if hist_lock_stale(lock) {
+        os.remove_all(lock)
+        e := os.mkdir(lock)
+        if e == nil {
+            hist_lock_mark(lock, token)
+            return HistLock{path: lock, token: token}
+        }
     }
-    return ""
+    return HistLock{path: "", token: ""}
 }
 
-fn hist_unlock(lock: str) {
-    os.remove_all(lock)
+// hist_unlock — remove the lock only while our owner token still
+// matches: if the lock was broken and re-acquired by another writer
+// mid-publish, theirs is not ours to delete.
+fn hist_unlock(l: HistLock) {
+    if len(l.path) == 0 {
+        return
+    }
+    parts := strings.split(strings.trim(os.readfile_(l.path + "/owner")), " ")
+    if parts == nil || parts.v != l.token {
+        return
+    }
+    os.remove_all(l.path)
 }
 
 // hist_append — fold the newest entry into the disk file under the
@@ -632,7 +724,7 @@ fn hist_append(a: mut App, he: HistEnt) -> int {
         os.mkdir_all(dir)
     }
     lock := hist_lock(f)
-    if len(lock) == 0 {
+    if len(lock.path) == 0 {
         a.toast(2, "history: busy — entry kept in memory only")
         return 0
     }
@@ -646,7 +738,12 @@ fn hist_append(a: mut App, he: HistEnt) -> int {
         return 0
     }
     hl.ents = push(hl.ents, he)
-    hist_write(a, f, hl.ents, hl.next_id + 1)
+    if !hist_write(a, f, hl.ents, hl.next_id + 1) {
+        // the row never reached disk — report unpersisted so the
+        // caller doesn't mark it saved under an id that isn't there.
+        hist_unlock(lock)
+        return 0
+    }
     hist_unlock(lock)
     return he.id
 }
@@ -670,7 +767,7 @@ fn hist_delete_save(a: mut App, gone: HistEnt) {
         os.mkdir_all(dir)
     }
     lock := hist_lock(f)
-    if len(lock) == 0 {
+    if len(lock.path) == 0 {
         a.toast(2, "history: busy — delete kept in memory only")
         return
     }
@@ -684,7 +781,7 @@ fn hist_delete_save(a: mut App, gone: HistEnt) {
         hit := false
         if gone.id != 0 && e.id == gone.id {
             hit = true
-        } else if gone.id == 0 && e.method == gone.method && e.url == gone.url && e.status == gone.status {
+        } else if gone.id == 0 && e.id == 0 && e.method == gone.method && e.url == gone.url && e.status == gone.status {
             hit = true
         }
         if hit && !removed {
@@ -693,7 +790,9 @@ fn hist_delete_save(a: mut App, gone: HistEnt) {
         }
         out = push(out, e)
     }
-    hist_write(a, f, out, hl.next_id)
+    if !hist_write(a, f, out, hl.next_id) {
+        a.toast(2, "history: write failed — delete kept in memory only")
+    }
     hist_unlock(lock)
 }
 
@@ -733,8 +832,28 @@ fn ext_stage(a: mut App, cmd: str, text: str, ext: str, edit: bool) -> int {
         return ENone
     }
     f := os.temp_dir() + "/posting-" + hex.encode(rb) + ext
-    n := os.writefile_(f, text)
-    if n < 0 {
+    // 384 = 0600 — the stage is born owner-only; other local users
+    // must never read staged request/response text.
+    fd := rt_open_write_mode(f, 384, os.temp_dir())
+    if fd < 0 {
+        a.toast(2, "temp file failed")
+        return ENone
+    }
+    b := text as []byte
+    off := 0
+    ok := true
+    for off < len(b) {
+        w := rt_fd_write(fd, b[off:])
+        if w <= 0 {
+            ok = false
+            break
+        }
+        off = off + w
+    }
+    if rt_fd_close(fd) < 0 {
+        ok = false
+    }
+    if !ok {
         os.remove(f)
         a.toast(2, "temp file failed")
         return ENone

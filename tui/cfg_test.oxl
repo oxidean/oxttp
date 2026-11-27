@@ -8,6 +8,9 @@ package main
 
 import "std/testing"
 import "std/os"
+import "std/os/exec"
+import "std/strings"
+import "std/time"
 import "std/errors"
 import "github.com/oxidean/oxttp/core/config"
 import "github.com/oxidean/oxttp/core/collection"
@@ -301,6 +304,55 @@ fn test_history_lock_sidecar() {
     testing.expect_eq(len(hl.ents), 2, "stale lock file broken")
 }
 
+fn test_history_lock_owner_token() {
+    scratch_coll()
+    a := new_app()
+    a.coll_dir = COLL_SCRATCH + "-locktok"
+    a.data_dir = DATA_SCRATCH
+    f := hist_file_of(a)
+    dir := data_dir_of(a) + "/history"
+    if !os.isdir(dir) {
+        os.mkdir_all(dir)
+    }
+    lock := f + ".lock"
+    os.mkdir(lock)
+    tok := hist_lock_token()
+    hist_lock_mark(lock, tok)
+    testing.expect(!hist_lock_stale(lock), "fresh owner is not stale")
+    // an owner far older than any plausible write is dead
+    os.writefile_(lock + "/owner", tok + " " + itoa(time.unix_ms() - HistLockStaleMs - 1))
+    testing.expect(hist_lock_stale(lock), "old owner is stale")
+    // an ownerless dir survives one grace beat, then counts as dead
+    os.remove_all(lock)
+    os.mkdir(lock)
+    testing.expect(hist_lock_stale(lock), "ownerless lock is stale")
+    os.remove_all(lock)
+    // unlock removes only while the recorded token still matches
+    os.mkdir(lock)
+    hist_lock_mark(lock, tok)
+    hist_unlock(HistLock{path: lock, token: "0000000000000000"})
+    testing.expect(os.exists(lock), "foreign token keeps the lock")
+    hist_unlock(HistLock{path: lock, token: tok})
+    testing.expect(!os.exists(lock), "owning token releases the lock")
+}
+
+fn test_history_append_write_failure_unpersisted() {
+    scratch_coll()
+    a := new_app()
+    a.coll_dir = COLL_SCRATCH + "-nowrite"
+    a.data_dir = DATA_SCRATCH
+    f := hist_file_of(a)
+    dir := data_dir_of(a) + "/history"
+    os.mkdir_all(dir)
+    // the publish target occupied by a directory — tmp+rename fails,
+    // so the row must come back unpersisted instead of carrying an
+    // id that never landed on disk.
+    os.mkdir(f)
+    nid := hist_append(a, hist_test_ent("one", "http://x/1"))
+    testing.expect_eq(nid, 0, "failed publish returns no id")
+    os.remove_all(f)
+}
+
 fn test_history_disabled_memory_only() {
     scratch_coll()
     a := new_app()
@@ -363,6 +415,16 @@ fn test_ext_stage_and_apply_edit() {
     f := a.ext_file
     testing.expect(len(f) > 0, "file path recorded")
     testing.expect(os.exists(f), "staged file exists")
+    // the stage is born 0600 — staged text can carry secrets and
+    // must never sit world-readable in a shared temp dir.
+    sargs := mkslice(str, 0)
+    sargs = push(sargs, "-c")
+    sargs = push(sargs, "%a")
+    sargs = push(sargs, f)
+    scm := exec.cmd("stat", sargs)
+    [so, se] = scm.output()
+    testing.expect(se == nil, "stat ran")
+    testing.expect_streq(strings.trim(so.stdout as str), "600", "stage mode is 0600")
     // a second stage gets a different path — no cross-op clobber
     fx2 := ext_stage(a, "pager-cmd", "x", ".txt", false)
     testing.expect_eq(fx2, EExt, "pager also stages")
@@ -711,12 +773,12 @@ fn test_curl_import_auth() {
     testing.expect_streq(r3.auth.type, "bearer_token", "bearer type")
     testing.expect_streq(r3.auth.bearer_token.token, "tok-1", "bearer token")
     // an Authorization header upgrades to the auth block, header row gone
-    r4 := curl_ok("curl http://ex.test/h -H 'Authorization: Bearer" + " abc'")
+    r4 := curl_ok("curl http://ex.test/h -H 'Authorization: ***" + " abc'")
     testing.expect_streq(r4.auth.type, "bearer_token", "header → bearer")
     testing.expect_streq(r4.auth.bearer_token.token, "abc", "bearer creds")
     testing.expect_eq(len(r4.headers), 0, "auth header consumed")
     // an explicit Authorization header beats --user (curl precedence)
-    r5 := curl_ok("curl -H 'Authorization: Bearer" + " tk' -u demo:pass http://ex.test/h2")
+    r5 := curl_ok("curl -H 'Authorization: ***" + " tk' -u demo:pass http://ex.test/h2")
     testing.expect_streq(r5.auth.type, "bearer_token", "explicit header wins")
     testing.expect_streq(r5.auth.bearer_token.token, "tk", "bearer kept")
 }
