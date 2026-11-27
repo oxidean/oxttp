@@ -1,0 +1,832 @@
+package config
+
+// core/config — Posting's settings surface (ADR-0034): the flat
+// Settings struct covering all 40 corpus §2 keys, decode off
+// core/yaml with upstream's "whole file ignored on any type
+// error" rule, the POSTING_* env override layer (__ nesting),
+// enum validation warnings, and the XDG paths table. App wiring
+// (apply_settings) lives in tui/cfg.oxl — Settings never reaches
+// widgets directly (ADR-0033 boundary).
+
+import "std/errors"
+import "std/os"
+import "github.com/oxidean/oxttp/core/model"
+import "github.com/oxidean/oxttp/core/yaml"
+
+struct Settings {
+    theme: str,
+    sidebar_gradient: str,
+    theme_directory: str,
+    load_user_themes: bool,
+    load_builtin_themes: bool,
+    layout: str,
+    spacing: str,
+    nerd_fonts: int, // -1 unset | 0 | 1
+    use_host_environment: bool,
+    watch_env_files: bool,
+    watch_collection_files: bool,
+    watch_themes: bool,
+    use_xresources: bool,
+    animation: str,
+    history_enabled: bool,
+    response_prettify_json: bool,
+    response_show_size_and_time: bool,
+    heading_visible: bool,
+    heading_show_host: bool,
+    heading_show_version: bool,
+    heading_hostname: str,
+    url_bar_show_value_preview: bool,
+    url_bar_hide_secrets_in_value_preview: bool,
+    collection_browser_position: str,
+    collection_browser_show_on_startup: bool,
+    command_palette_theme_preview: bool,
+    text_input_blinking_cursor: bool,
+    focus_on_startup: str,
+    focus_on_response: str,
+    focus_on_request_open: str,
+    editor: str,
+    pager: str,
+    pager_json: str,
+    curl_export_extra_args: str,
+    keymap: []model.KV,
+    remote_control_enabled: bool,
+    ssl_ca_bundle: str,
+    ssl_certificate_path: str,
+    ssl_key_file: str,
+    ssl_password: str,
+}
+
+fn cerr(msg: str) -> err {
+    return errors.new(msg)
+}
+
+fn chr(c: int) -> str {
+    b := mkslice(byte, 1)
+    b[0] = c
+    return b as str
+}
+
+fn lower_ascii(s: str) -> str {
+    let out = ""
+    i := 0
+    for i < len(s) {
+        c := byteat(s, i)
+        if c >= 65 && c <= 90 {
+            c = c + 32
+        }
+        out = out + chr(c)
+        i = i + 1
+    }
+    return out
+}
+
+fn upper_ascii(s: str) -> str {
+    let out = ""
+    i := 0
+    for i < len(s) {
+        c := byteat(s, i)
+        if c >= 97 && c <= 122 {
+            c = c - 32
+        }
+        out = out + chr(c)
+        i = i + 1
+    }
+    return out
+}
+
+fn trim_space(s: str) -> str {
+    a := 0
+    e := len(s)
+    for a < e {
+        c := byteat(s, a)
+        if !(c == 32 || c == 9 || c == 10 || c == 13) {
+            break
+        }
+        a = a + 1
+    }
+    for e > a {
+        c := byteat(s, e - 1)
+        if !(c == 32 || c == 9 || c == 10 || c == 13) {
+            break
+        }
+        e = e - 1
+    }
+    return substr(s, a, e)
+}
+
+// ---------- paths (upstream paths.py) ----------
+
+fn is_abs(p: str) -> bool {
+    return len(p) > 0 && byteat(p, 0) == 47
+}
+
+fn config_home() -> str {
+    x := os.getenv("XDG_CONFIG_HOME")
+    if is_abs(x) {
+        return x
+    }
+    return os.getenv("HOME") + "/.config"
+}
+
+fn data_home() -> str {
+    x := os.getenv("XDG_DATA_HOME")
+    if is_abs(x) {
+        return x
+    }
+    return os.getenv("HOME") + "/.local/share"
+}
+
+fn config_dir() -> str { return config_home() + "/posting" }
+fn data_dir() -> str { return data_home() + "/posting" }
+
+fn config_file() -> str {
+    cf := os.getenv("POSTING_CONFIG_FILE")
+    if is_abs(cf) {
+        return cf
+    }
+    return config_dir() + "/config.yaml"
+}
+
+fn theme_dir(s: ref Settings) -> str {
+    if len(s.theme_directory) > 0 {
+        return s.theme_directory
+    }
+    // Upstream paths.ThemeDir: user themes live under the DATA dir,
+    // not the config dir.
+    return data_dir() + "/themes"
+}
+
+fn history_dir() -> str { return data_dir() + "/history" }
+fn env_memory_file() -> str { return data_dir() + "/environments.json" }
+fn default_coll_dir() -> str { return data_dir() + "/default" }
+
+// ---------- defaults (upstream config.py Defaults) ----------
+
+fn defaults() -> own Settings {
+    s := new(Settings)
+    s.theme = "galaxy"
+    s.sidebar_gradient = "theme"
+    s.theme_directory = ""
+    s.load_user_themes = true
+    s.load_builtin_themes = true
+    s.layout = "vertical"
+    s.spacing = "standard"
+    s.nerd_fonts = -1
+    s.use_host_environment = false
+    s.watch_env_files = true
+    s.watch_collection_files = true
+    s.watch_themes = true
+    s.use_xresources = false
+    s.animation = "none"
+    s.history_enabled = true
+    s.response_prettify_json = true
+    s.response_show_size_and_time = true
+    s.heading_visible = true
+    s.heading_show_host = true
+    s.heading_show_version = true
+    s.heading_hostname = ""
+    s.url_bar_show_value_preview = true
+    s.url_bar_hide_secrets_in_value_preview = true
+    s.collection_browser_position = "left"
+    s.collection_browser_show_on_startup = true
+    s.command_palette_theme_preview = true
+    s.text_input_blinking_cursor = true
+    s.focus_on_startup = "url"
+    s.focus_on_response = ""
+    s.focus_on_request_open = ""
+    s.editor = os.getenv("EDITOR")
+    s.pager = os.getenv("PAGER")
+    s.pager_json = ""
+    s.curl_export_extra_args = ""
+    s.keymap = nil
+    s.remote_control_enabled = true
+    s.ssl_ca_bundle = ""
+    s.ssl_certificate_path = ""
+    s.ssl_key_file = ""
+    s.ssl_password = ""
+    return s
+}
+
+// ---------- decode helpers ----------
+
+fn scal(v: ref yaml.YNode, what: str) -> [str, err] {
+    if v == nil || v.kind != 0 {
+        return "", cerr(what + " must be a scalar")
+    }
+    return v.s, nil
+}
+
+fn tobool(v: ref yaml.YNode, what: str) -> [bool, err] {
+    [s, e] = scal(v, what)
+    if e != nil {
+        return false, e
+    }
+    if s == "true" || s == "True" || s == "TRUE" || s == "yes" || s == "Yes" || s == "YES" || s == "on" || s == "On" || s == "ON" || s == "y" || s == "Y" {
+        return true, nil
+    }
+    if s == "false" || s == "False" || s == "FALSE" || s == "no" || s == "No" || s == "NO" || s == "off" || s == "Off" || s == "OFF" || s == "n" || s == "N" {
+        return false, nil
+    }
+    return false, cerr(what + " must be a bool")
+}
+
+fn ym_idx(n: ref yaml.YNode, key: str) -> int {
+    if n == nil || n.kind != 1 {
+        return -1
+    }
+    i := 0
+    for i < len(n.pairs) {
+        if n.pairs[i].key == key {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// ---------- flat + section leaf getters ----------
+// A present-but-wrong-typed leaf is a type error — upstream drops
+// the whole file on the first one (yaml.Unmarshal strictness).
+// Getters return `cur` when the key is absent (mut params can't
+// take struct fields in oxl).
+
+fn flat_s(root: ref yaml.YNode, key: str, cur: str) -> [str, err] {
+    i := ym_idx(root, key)
+    if i < 0 {
+        return cur, nil
+    }
+    [v, e] = scal(root.pairs[i].val, key)
+    if e != nil {
+        return cur, cerr(key + " must be a scalar")
+    }
+    return v, nil
+}
+
+fn flat_b(root: ref yaml.YNode, key: str, cur: bool) -> [bool, err] {
+    i := ym_idx(root, key)
+    if i < 0 {
+        return cur, nil
+    }
+    [v, e] = tobool(root.pairs[i].val, key)
+    if e != nil {
+        return cur, cerr(key + " must be a bool")
+    }
+    return v, nil
+}
+
+fn sect_b(root: ref yaml.YNode, sect: str, key: str, cur: bool) -> [bool, err] {
+    si := ym_idx(root, sect)
+    if si < 0 {
+        return cur, nil
+    }
+    sec := root.pairs[si].val
+    if sec.kind != 1 {
+        return cur, cerr(sect + " must be a mapping")
+    }
+    li := ym_idx(sec, key)
+    if li < 0 {
+        return cur, nil
+    }
+    [v, e] = tobool(sec.pairs[li].val, sect + "." + key)
+    if e != nil {
+        return cur, cerr(sect + "." + key + " must be a bool")
+    }
+    return v, nil
+}
+
+fn sect_s(root: ref yaml.YNode, sect: str, key: str, cur: str) -> [str, err] {
+    si := ym_idx(root, sect)
+    if si < 0 {
+        return cur, nil
+    }
+    sec := root.pairs[si].val
+    if sec.kind != 1 {
+        return cur, cerr(sect + " must be a mapping")
+    }
+    li := ym_idx(sec, key)
+    if li < 0 {
+        return cur, nil
+    }
+    [v, e] = scal(sec.pairs[li].val, sect + "." + key)
+    if e != nil {
+        return cur, cerr(sect + "." + key + " must be a scalar")
+    }
+    return v, nil
+}
+
+// ---------- file decode ----------
+
+fn decode(root: ref yaml.YNode, s: mut Settings) -> err {
+    if root == nil || root.kind != 1 {
+        return cerr("config must be a mapping")
+    }
+    [v1, e1] = flat_s(root, "theme", s.theme)
+    if e1 != nil { return e1 }
+    s.theme = v1
+    [v2, e2] = flat_s(root, "sidebar_gradient", s.sidebar_gradient)
+    if e2 != nil { return e2 }
+    s.sidebar_gradient = v2
+    [v3, e3] = flat_s(root, "theme_directory", s.theme_directory)
+    if e3 != nil { return e3 }
+    s.theme_directory = v3
+    [v4, e4] = flat_b(root, "load_user_themes", s.load_user_themes)
+    if e4 != nil { return e4 }
+    s.load_user_themes = v4
+    [v5, e5] = flat_b(root, "load_builtin_themes", s.load_builtin_themes)
+    if e5 != nil { return e5 }
+    s.load_builtin_themes = v5
+    [v6, e6] = flat_s(root, "layout", s.layout)
+    if e6 != nil { return e6 }
+    s.layout = v6
+    [v7, e7] = flat_s(root, "spacing", s.spacing)
+    if e7 != nil { return e7 }
+    s.spacing = v7
+    i := ym_idx(root, "nerd_fonts")
+    if i >= 0 {
+        [nb, ne] = tobool(root.pairs[i].val, "nerd_fonts")
+        if ne != nil {
+            return cerr("nerd_fonts must be a bool")
+        }
+        if nb {
+            s.nerd_fonts = 1
+        } else {
+            s.nerd_fonts = 0
+        }
+    }
+    [v8, e8] = flat_b(root, "use_host_environment", s.use_host_environment)
+    if e8 != nil { return e8 }
+    s.use_host_environment = v8
+    [v9, e9] = flat_b(root, "watch_env_files", s.watch_env_files)
+    if e9 != nil { return e9 }
+    s.watch_env_files = v9
+    [v10, e10] = flat_b(root, "watch_collection_files", s.watch_collection_files)
+    if e10 != nil { return e10 }
+    s.watch_collection_files = v10
+    [v11, e11] = flat_b(root, "watch_themes", s.watch_themes)
+    if e11 != nil { return e11 }
+    s.watch_themes = v11
+    [v12, e12] = flat_b(root, "use_xresources", s.use_xresources)
+    if e12 != nil { return e12 }
+    s.use_xresources = v12
+    [v13, e13] = flat_s(root, "animation", s.animation)
+    if e13 != nil { return e13 }
+    s.animation = v13
+    [v14, e14] = flat_s(root, "editor", s.editor)
+    if e14 != nil { return e14 }
+    s.editor = v14
+    [v15, e15] = flat_s(root, "pager", s.pager)
+    if e15 != nil { return e15 }
+    s.pager = v15
+    [v16, e16] = flat_s(root, "pager_json", s.pager_json)
+    if e16 != nil { return e16 }
+    s.pager_json = v16
+    [v17, e17] = flat_s(root, "curl_export_extra_args", s.curl_export_extra_args)
+    if e17 != nil { return e17 }
+    s.curl_export_extra_args = v17
+    i = ym_idx(root, "keymap")
+    if i >= 0 {
+        km := root.pairs[i].val
+        if km.kind != 1 {
+            return cerr("keymap must be a mapping")
+        }
+        j := 0
+        for j < len(km.pairs) {
+            [kvs, kve] = scal(km.pairs[j].val, "keymap." + km.pairs[j].key)
+            if kve != nil {
+                return cerr("keymap." + km.pairs[j].key + " must be a scalar")
+            }
+            s.keymap = push(s.keymap, model.KV{name: km.pairs[j].key, value: kvs, enabled: true})
+            j = j + 1
+        }
+    }
+    [v18, e18] = sect_b(root, "history", "enabled", s.history_enabled)
+    if e18 != nil { return e18 }
+    s.history_enabled = v18
+    [v19, e19] = sect_b(root, "response", "prettify_json", s.response_prettify_json)
+    if e19 != nil { return e19 }
+    s.response_prettify_json = v19
+    [v20, e20] = sect_b(root, "response", "show_size_and_time", s.response_show_size_and_time)
+    if e20 != nil { return e20 }
+    s.response_show_size_and_time = v20
+    [v21, e21] = sect_b(root, "heading", "visible", s.heading_visible)
+    if e21 != nil { return e21 }
+    s.heading_visible = v21
+    [v22, e22] = sect_b(root, "heading", "show_host", s.heading_show_host)
+    if e22 != nil { return e22 }
+    s.heading_show_host = v22
+    [v23, e23] = sect_b(root, "heading", "show_version", s.heading_show_version)
+    if e23 != nil { return e23 }
+    s.heading_show_version = v23
+    [v24, e24] = sect_s(root, "heading", "hostname", s.heading_hostname)
+    if e24 != nil { return e24 }
+    s.heading_hostname = v24
+    [v25, e25] = sect_b(root, "url_bar", "show_value_preview", s.url_bar_show_value_preview)
+    if e25 != nil { return e25 }
+    s.url_bar_show_value_preview = v25
+    [v26, e26] = sect_b(root, "url_bar", "hide_secrets_in_value_preview", s.url_bar_hide_secrets_in_value_preview)
+    if e26 != nil { return e26 }
+    s.url_bar_hide_secrets_in_value_preview = v26
+    [v27, e27] = sect_s(root, "collection_browser", "position", s.collection_browser_position)
+    if e27 != nil { return e27 }
+    s.collection_browser_position = v27
+    [v28, e28] = sect_b(root, "collection_browser", "show_on_startup", s.collection_browser_show_on_startup)
+    if e28 != nil { return e28 }
+    s.collection_browser_show_on_startup = v28
+    [v29, e29] = sect_b(root, "command_palette", "theme_preview", s.command_palette_theme_preview)
+    if e29 != nil { return e29 }
+    s.command_palette_theme_preview = v29
+    [v30, e30] = sect_b(root, "text_input", "blinking_cursor", s.text_input_blinking_cursor)
+    if e30 != nil { return e30 }
+    s.text_input_blinking_cursor = v30
+    [v31, e31] = sect_s(root, "focus", "on_startup", s.focus_on_startup)
+    if e31 != nil { return e31 }
+    s.focus_on_startup = v31
+    [v32, e32] = sect_s(root, "focus", "on_response", s.focus_on_response)
+    if e32 != nil { return e32 }
+    s.focus_on_response = v32
+    [v33, e33] = sect_s(root, "focus", "on_request_open", s.focus_on_request_open)
+    if e33 != nil { return e33 }
+    s.focus_on_request_open = v33
+    [v34, e34] = sect_b(root, "remote_control", "enabled", s.remote_control_enabled)
+    if e34 != nil { return e34 }
+    s.remote_control_enabled = v34
+    [v35, e35] = sect_s(root, "ssl", "ca_bundle", s.ssl_ca_bundle)
+    if e35 != nil { return e35 }
+    s.ssl_ca_bundle = v35
+    [v36, e36] = sect_s(root, "ssl", "certificate_path", s.ssl_certificate_path)
+    if e36 != nil { return e36 }
+    s.ssl_certificate_path = v36
+    [v37, e37] = sect_s(root, "ssl", "key_file", s.ssl_key_file)
+    if e37 != nil { return e37 }
+    s.ssl_key_file = v37
+    [v38, e38] = sect_s(root, "ssl", "password", s.ssl_password)
+    if e38 != nil { return e38 }
+    s.ssl_password = v38
+    return nil
+}
+
+// ---------- env leaf table ----------
+// kind: 0 str, 1 bool, 2 nerd-bool, 3 map (can't be env-set).
+
+struct EnvLeaf { path: str, kind: int }
+
+fn env_leaves() -> []EnvLeaf {
+    let t: []EnvLeaf = nil
+    t = push(t, EnvLeaf{path: "theme", kind: 0})
+    t = push(t, EnvLeaf{path: "sidebar_gradient", kind: 0})
+    t = push(t, EnvLeaf{path: "theme_directory", kind: 0})
+    t = push(t, EnvLeaf{path: "load_user_themes", kind: 1})
+    t = push(t, EnvLeaf{path: "load_builtin_themes", kind: 1})
+    t = push(t, EnvLeaf{path: "layout", kind: 0})
+    t = push(t, EnvLeaf{path: "spacing", kind: 0})
+    t = push(t, EnvLeaf{path: "nerd_fonts", kind: 2})
+    t = push(t, EnvLeaf{path: "use_host_environment", kind: 1})
+    t = push(t, EnvLeaf{path: "watch_env_files", kind: 1})
+    t = push(t, EnvLeaf{path: "watch_collection_files", kind: 1})
+    t = push(t, EnvLeaf{path: "watch_themes", kind: 1})
+    t = push(t, EnvLeaf{path: "use_xresources", kind: 1})
+    t = push(t, EnvLeaf{path: "animation", kind: 0})
+    t = push(t, EnvLeaf{path: "editor", kind: 0})
+    t = push(t, EnvLeaf{path: "pager", kind: 0})
+    t = push(t, EnvLeaf{path: "pager_json", kind: 0})
+    t = push(t, EnvLeaf{path: "curl_export_extra_args", kind: 0})
+    t = push(t, EnvLeaf{path: "keymap", kind: 3})
+    t = push(t, EnvLeaf{path: "history__enabled", kind: 1})
+    t = push(t, EnvLeaf{path: "response__prettify_json", kind: 1})
+    t = push(t, EnvLeaf{path: "response__show_size_and_time", kind: 1})
+    t = push(t, EnvLeaf{path: "heading__visible", kind: 1})
+    t = push(t, EnvLeaf{path: "heading__show_host", kind: 1})
+    t = push(t, EnvLeaf{path: "heading__show_version", kind: 1})
+    t = push(t, EnvLeaf{path: "heading__hostname", kind: 0})
+    t = push(t, EnvLeaf{path: "url_bar__show_value_preview", kind: 1})
+    t = push(t, EnvLeaf{path: "url_bar__hide_secrets_in_value_preview", kind: 1})
+    t = push(t, EnvLeaf{path: "collection_browser__position", kind: 0})
+    t = push(t, EnvLeaf{path: "collection_browser__show_on_startup", kind: 1})
+    t = push(t, EnvLeaf{path: "command_palette__theme_preview", kind: 1})
+    t = push(t, EnvLeaf{path: "text_input__blinking_cursor", kind: 1})
+    t = push(t, EnvLeaf{path: "focus__on_startup", kind: 0})
+    t = push(t, EnvLeaf{path: "focus__on_response", kind: 0})
+    t = push(t, EnvLeaf{path: "focus__on_request_open", kind: 0})
+    t = push(t, EnvLeaf{path: "remote_control__enabled", kind: 1})
+    t = push(t, EnvLeaf{path: "ssl__ca_bundle", kind: 0})
+    t = push(t, EnvLeaf{path: "ssl__certificate_path", kind: 0})
+    t = push(t, EnvLeaf{path: "ssl__key_file", kind: 0})
+    t = push(t, EnvLeaf{path: "ssl__password", kind: 0})
+    return t
+}
+
+fn env_name(path: str) -> str {
+    return "POSTING_" + upper_ascii(path)
+}
+
+// set_path applies one env value to the leaf named by path —
+// bool leaves decode via upstream's env_bool spelling set.
+fn set_path(s: mut Settings, path: str, v: str) -> err {
+    [b, be] = env_bool(v)
+    bool_ok := be == nil
+    if path == "theme" {
+        s.theme = v
+    } else if path == "sidebar_gradient" {
+        s.sidebar_gradient = v
+    } else if path == "theme_directory" {
+        s.theme_directory = v
+    } else if path == "load_user_themes" {
+        if !bool_ok { return cerr("load_user_themes must be a bool") }
+        s.load_user_themes = b
+    } else if path == "load_builtin_themes" {
+        if !bool_ok { return cerr("load_builtin_themes must be a bool") }
+        s.load_builtin_themes = b
+    } else if path == "layout" {
+        s.layout = v
+    } else if path == "spacing" {
+        s.spacing = v
+    } else if path == "nerd_fonts" {
+        if !bool_ok { return cerr("nerd_fonts must be a bool") }
+        if b { s.nerd_fonts = 1 } else { s.nerd_fonts = 0 }
+    } else if path == "use_host_environment" {
+        if !bool_ok { return cerr("use_host_environment must be a bool") }
+        s.use_host_environment = b
+    } else if path == "watch_env_files" {
+        if !bool_ok { return cerr("watch_env_files must be a bool") }
+        s.watch_env_files = b
+    } else if path == "watch_collection_files" {
+        if !bool_ok { return cerr("watch_collection_files must be a bool") }
+        s.watch_collection_files = b
+    } else if path == "watch_themes" {
+        if !bool_ok { return cerr("watch_themes must be a bool") }
+        s.watch_themes = b
+    } else if path == "use_xresources" {
+        if !bool_ok { return cerr("use_xresources must be a bool") }
+        s.use_xresources = b
+    } else if path == "animation" {
+        s.animation = v
+    } else if path == "editor" {
+        s.editor = v
+    } else if path == "pager" {
+        s.pager = v
+    } else if path == "pager_json" {
+        s.pager_json = v
+    } else if path == "curl_export_extra_args" {
+        s.curl_export_extra_args = v
+    } else if path == "keymap" {
+        return cerr("keymap is not a scalar setting")
+    } else if path == "history__enabled" {
+        if !bool_ok { return cerr("history.enabled must be a bool") }
+        s.history_enabled = b
+    } else if path == "response__prettify_json" {
+        if !bool_ok { return cerr("response.prettify_json must be a bool") }
+        s.response_prettify_json = b
+    } else if path == "response__show_size_and_time" {
+        if !bool_ok { return cerr("response.show_size_and_time must be a bool") }
+        s.response_show_size_and_time = b
+    } else if path == "heading__visible" {
+        if !bool_ok { return cerr("heading.visible must be a bool") }
+        s.heading_visible = b
+    } else if path == "heading__show_host" {
+        if !bool_ok { return cerr("heading.show_host must be a bool") }
+        s.heading_show_host = b
+    } else if path == "heading__show_version" {
+        if !bool_ok { return cerr("heading.show_version must be a bool") }
+        s.heading_show_version = b
+    } else if path == "heading__hostname" {
+        s.heading_hostname = v
+    } else if path == "url_bar__show_value_preview" {
+        if !bool_ok { return cerr("url_bar.show_value_preview must be a bool") }
+        s.url_bar_show_value_preview = b
+    } else if path == "url_bar__hide_secrets_in_value_preview" {
+        if !bool_ok { return cerr("url_bar.hide_secrets_in_value_preview must be a bool") }
+        s.url_bar_hide_secrets_in_value_preview = b
+    } else if path == "collection_browser__position" {
+        s.collection_browser_position = v
+    } else if path == "collection_browser__show_on_startup" {
+        if !bool_ok { return cerr("collection_browser.show_on_startup must be a bool") }
+        s.collection_browser_show_on_startup = b
+    } else if path == "command_palette__theme_preview" {
+        if !bool_ok { return cerr("command_palette.theme_preview must be a bool") }
+        s.command_palette_theme_preview = b
+    } else if path == "text_input__blinking_cursor" {
+        if !bool_ok { return cerr("text_input.blinking_cursor must be a bool") }
+        s.text_input_blinking_cursor = b
+    } else if path == "focus__on_startup" {
+        s.focus_on_startup = v
+    } else if path == "focus__on_response" {
+        s.focus_on_response = v
+    } else if path == "focus__on_request_open" {
+        s.focus_on_request_open = v
+    } else if path == "remote_control__enabled" {
+        if !bool_ok { return cerr("remote_control.enabled must be a bool") }
+        s.remote_control_enabled = b
+    } else if path == "ssl__ca_bundle" {
+        s.ssl_ca_bundle = v
+    } else if path == "ssl__certificate_path" {
+        s.ssl_certificate_path = v
+    } else if path == "ssl__key_file" {
+        s.ssl_key_file = v
+    } else if path == "ssl__password" {
+        s.ssl_password = v
+    } else {
+        return cerr("unknown setting " + path)
+    }
+    return nil
+}
+
+fn env_bool(v: str) -> [bool, err] {
+    if v == "1" || v == "yes" || v == "on" || v == "true" || v == "y" {
+        return true, nil
+    }
+    if v == "0" || v == "no" || v == "off" || v == "false" || v == "n" {
+        return false, nil
+    }
+    return false, cerr("invalid bool " + v)
+}
+
+// apply_env merges POSTING_* pairs ("NAME=value"). Unknown names
+// are ignored (upstream iterates os.environ the same way); empty
+// values skip; POSTING_CONFIG_FILE skips. A KNOWN leaf with an
+// undecodable value drops the whole env layer — upstream
+// semantics verbatim.
+fn apply_env(s: mut Settings, pairs: []str) -> str {
+    table := env_leaves()
+    i := 0
+    for i < len(pairs) {
+        p := pairs[i]
+        i = i + 1
+        eq := find(p, "=")
+        if eq < 0 {
+            continue
+        }
+        name := substr(p, 0, eq)
+        val := substr(p, eq + 1, len(p))
+        if len(val) == 0 || name == "POSTING_CONFIG_FILE" {
+            continue
+        }
+        if len(name) < 8 || substr(name, 0, 8) != "POSTING_" {
+            continue
+        }
+        rest := lower_ascii(substr(name, 8, len(name)))
+        j := 0
+        hit := -1
+        for j < len(table) {
+            if table[j].path == rest {
+                hit = j
+            }
+            j = j + 1
+        }
+        if hit < 0 {
+            continue
+        }
+        leaf := table[hit]
+        if leaf.kind == 3 {
+            return "keymap cannot be set from the environment"
+        }
+        e := set_path(s, leaf.path, val)
+        if e != nil {
+            return errors.msg(e) + " (" + name + ")"
+        }
+    }
+    return ""
+}
+
+// posting_env_pairs builds the probe list prod passes to load —
+// getenv over every known leaf name (unknown POSTING_* names are
+// ignored upstream anyway, so probing only knowns is equivalent).
+fn posting_env_pairs() -> []str {
+    let out: []str = nil
+    table := env_leaves()
+    i := 0
+    for i < len(table) {
+        n := env_name(table[i].path)
+        v := os.getenv(n)
+        if len(v) > 0 {
+            out = push(out, n + "=" + v)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ---------- validate ----------
+
+fn validate(s: mut Settings) -> []str {
+    let warns: []str = nil
+    if s.layout != "vertical" && s.layout != "horizontal" {
+        warns = push(warns, "Unknown layout \"" + s.layout + "\"; using \"vertical\"")
+        s.layout = "vertical"
+    }
+    if s.spacing != "standard" && s.spacing != "compact" {
+        warns = push(warns, "Unknown spacing \"" + s.spacing + "\"; using \"standard\"")
+        s.spacing = "standard"
+    }
+    if s.collection_browser_position != "left" && s.collection_browser_position != "right" {
+        warns = push(warns, "Unknown collection_browser.position \"" + s.collection_browser_position + "\"; using \"left\"")
+        s.collection_browser_position = "left"
+    }
+    if !(s.focus_on_startup == "" || s.focus_on_startup == "url" || s.focus_on_startup == "method" || s.focus_on_startup == "collection") {
+        warns = push(warns, "Unknown focus.on_startup \"" + s.focus_on_startup + "\"; using \"url\"")
+        s.focus_on_startup = "url"
+    }
+    if !(s.focus_on_response == "" || s.focus_on_response == "body" || s.focus_on_response == "tabs") {
+        warns = push(warns, "Unknown focus.on_response \"" + s.focus_on_response + "\"; using \"\"")
+        s.focus_on_response = ""
+    }
+    if !(s.focus_on_request_open == "" || s.focus_on_request_open == "headers" || s.focus_on_request_open == "body" || s.focus_on_request_open == "query" || s.focus_on_request_open == "info" || s.focus_on_request_open == "url" || s.focus_on_request_open == "method" || s.focus_on_request_open == "path") {
+        warns = push(warns, "Unknown focus.on_request_open \"" + s.focus_on_request_open + "\"; using \"\"")
+        s.focus_on_request_open = ""
+    }
+    return warns
+}
+
+// ---------- load ----------
+
+struct LoadRes {
+    s: own Settings,
+    warns: []str,
+}
+
+fn load_file_into(s: mut Settings, file: str) -> err {
+    src := os.readfile_(file)
+    [root, pe] = yaml.parse(src)
+    if pe != nil {
+        return pe
+    }
+    return decode(root, s)
+}
+
+// load reads file ("" → config_file()) then merges envpairs —
+// pass posting_env_pairs() in prod. Returns settings + warnings.
+// Missing file is silent; unreadable/undecodable file falls back
+// to defaults with a warn (upstream verbatim). A failing env
+// layer drops only env overrides — file values survive.
+fn load(file: str, envpairs: []str) -> own LoadRes {
+    r := new(LoadRes)
+    s := defaults()
+    let warns: []str = nil
+    if len(file) == 0 {
+        file = config_file()
+    }
+    read_err := ""
+    if os.exists(file) {
+        e := load_file_into(s, file)
+        if e != nil {
+            s = defaults()
+            read_err = errors.msg(e)
+            warns = push(warns, "Couldn't read " + file + ": " + read_err)
+        }
+    }
+    // Two-pass env merge: validate every pair against a scratch
+    // settings first so a bad value drops the WHOLE env layer —
+    // file values (and defaults when the file is missing) survive
+    // untouched. Single-pass mutation would leak env leaves applied
+    // before the failing one.
+    env_err := ""
+    probe := defaults()
+    env_err = apply_env(probe, envpairs)
+    if len(env_err) == 0 {
+        apply_env(s, envpairs)
+    }
+    if len(env_err) > 0 {
+        warns = push(warns, "Ignoring POSTING_ environment settings: " + env_err)
+    }
+    vw := validate(s)
+    i := 0
+    for i < len(vw) {
+        warns = push(warns, vw[i])
+        i = i + 1
+    }
+    r.s = s
+    r.warns = warns
+    return r
+}
+
+// keys_for — upstream KeysFor: keymap entry replaces defaults
+// wholesale; blank/absent falls back.
+fn keys_for(s: ref Settings, action: str, dflts: []str) -> []str {
+    i := 0
+    for i < len(s.keymap) {
+        if s.keymap[i].name == action {
+            v := s.keymap[i].value
+            if len(v) == 0 {
+                return dflts
+            }
+            let out: []str = nil
+            rest := v
+            for len(rest) > 0 {
+                part := rest
+                c := find(rest, ",")
+                if c >= 0 {
+                    part = substr(rest, 0, c)
+                    rest = substr(rest, c + 1, len(rest))
+                } else {
+                    rest = ""
+                }
+                part = trim_space(lower_ascii(part))
+                if len(part) > 0 {
+                    out = push(out, part)
+                }
+            }
+            return out
+        }
+        i = i + 1
+    }
+    return dflts
+}

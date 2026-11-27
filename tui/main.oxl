@@ -8,6 +8,9 @@ package main
 // input decoder into layered keymap dispatch, then renders the shell
 // (header / url bar / sidebar / request / response / footer) and
 // presents. SIGINT or the quit action exits; SIGWINCH rebuilds.
+// S11: flag exits (-h / bad flag) before the session opens; config +
+// POSTING_* env load with upstream warns; EExt suspends the session
+// for f3/f4 externals.
 
 import "std/os"
 
@@ -15,12 +18,50 @@ import "std/errors"
 
 import "std/time"
 
+import "github.com/oxidean/oxttp/core/config"
+
 import "github.com/oxidean/oxttp/core/term"
 
 import "github.com/oxidean/oxttp/shared/version"
 
+fn emit_file(f: os.File, s: str) {
+    b := mkslice(byte, len(s))
+    i := 0
+    for i < len(s) {
+        b[i] = byteat(s, i)
+        i = i + 1
+    }
+    [n, we] = f.write(b)
+    if we != nil || n < len(b) {
+        os.quit(1)
+    }
+}
+
 fn main() {
     ver := version.get()
+    // Subcommands run headless — dispatch before any session open
+    // (corpus §1.1: import|locate|remote|run|version).
+    if os.nargs() > 1 && cli_is_sub(os.args(1)) {
+        r := cli_main()
+        if len(r.stdout) > 0 {
+            emit_file(os.stdout(), r.stdout)
+        }
+        if len(r.stderr) > 0 {
+            emit_file(os.stderr(), r.stderr)
+        }
+        os.quit(r.code)
+    }
+    a := new_app()
+    parse_argv(a)
+    if a.exit_code >= 0 {
+        // -h → usage on stdout (0); bad flag → usage on stderr (2).
+        if a.exit_code == 0 {
+            emit_file(os.stdout(), a.exit_text)
+        } else {
+            emit_file(os.stderr(), a.exit_text)
+        }
+        os.quit(a.exit_code)
+    }
     [sess, e] = term.open_session()
     if e != nil {
         // Non-tty (CI / pipes): keep the one-line banner.
@@ -28,12 +69,14 @@ fn main() {
         return
     }
     defer sess.close()
-    a := new_app()
-    parse_argv(a)
-    if a.quit {
-        // -h/--help/-v/--version — the banner is the whole output.
-        println("oxttp-tui " + ver)
-        return
+    // config.yaml + POSTING_* env → settings; upstream warns surface as
+    // startup toasts on the first painted frame.
+    lr := config.load("", config.posting_env_pairs())
+    apply_settings(a, lr.s)
+    wi := 0
+    for wi < len(lr.warns) {
+        a.toast(2, lr.warns[wi])
+        wi = wi + 1
     }
     load_collection(a)
     dec := term.new_decoder()
@@ -75,6 +118,11 @@ fn main() {
                     sess.scr.present()
                     exec_send(a)
                     a.sending = false
+                }
+                if fx == EExt {
+                    // f3/f4 external pager/editor: suspend → sh -c →
+                    // resume; run_ext toasts non-zero exits.
+                    run_ext(a, sess)
                 }
                 i = i + 1
             }

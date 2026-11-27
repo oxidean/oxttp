@@ -1,0 +1,852 @@
+package main
+
+// curlimp — §7.7 curl-command import (upstream internal/curl
+// Parse subset): shell word split (single/double quotes, $'..'
+// ANSI-C, backslash line-continuations) then flag semantics →
+// PRequest. The value-taking flag table is verbatim so unknown
+// options still consume their argument instead of eating the URL.
+
+import "std/errors"
+
+import "std/encoding/base64"
+
+import "github.com/oxidean/oxttp/core/collection"
+
+import "github.com/oxidean/oxttp/core/model"
+
+// ---------- shell word split (upstream shell.go Split) ----------
+
+fn sh_split(command: str) -> [[]str, err] {
+    let words: []str = nil
+    word := ""
+    in_word := false
+    s := command
+    i := 0
+    for i < len(s) {
+        c := byteat(s, i)
+        if c == 32 || c == 9 || c == 10 || c == 13 {
+            if in_word {
+                words = push(words, word)
+                word = ""
+                in_word = false
+            }
+            i = i + 1
+            continue
+        }
+        if c == 92 { // backslash
+            if i + 1 >= len(s) {
+                i = i + 1
+                continue
+            }
+            next := byteat(s, i + 1)
+            i = i + 1
+            if next == 10 {
+                i = i + 1
+                continue
+            }
+            if next == 13 && i + 1 < len(s) && byteat(s, i + 1) == 10 {
+                i = i + 2
+                continue
+            }
+            word = word + byte_str(next)
+            in_word = true
+            i = i + 1
+            continue
+        }
+        if c == 39 { // single quote — verbatim until the next one
+            end := -1
+            j := i + 1
+            for j < len(s) {
+                if byteat(s, j) == 39 {
+                    end = j
+                    j = len(s)
+                }
+                j = j + 1
+            }
+            if end < 0 {
+                return words, errors.new("unterminated ' quote")
+            }
+            word = word + substr(s, i + 1, end)
+            in_word = true
+            i = end + 1
+            continue
+        }
+        if c == 36 && i + 1 < len(s) && byteat(s, i + 1) == 39 { // $'..' ANSI-C escapes
+            j := i + 2
+            closed := false
+            for j < len(s) && !closed {
+                cj := byteat(s, j)
+                if cj == 39 {
+                    closed = true
+                } else {
+                    if cj == 92 && j + 1 < len(s) {
+                        cn := byteat(s, j + 1)
+                        if cn == 110 {
+                            word = word + "\n"
+                            j = j + 1
+                        } else if cn == 116 {
+                            word = word + "\t"
+                            j = j + 1
+                        } else if cn == 114 {
+                            word = word + "\r"
+                            j = j + 1
+                        } else if cn == 120 {
+                            v := 0
+                            k := 0
+                            for k < 2 && j + 2 < len(s) && hex_digit(byteat(s, j + 2)) >= 0 {
+                                v = v * 16 + hex_digit(byteat(s, j + 2))
+                                j = j + 1
+                                k = k + 1
+                            }
+                            word = word + byte_str(v % 256)
+                            j = j + 1
+                        } else if cn >= 48 && cn <= 55 {
+                            v := 0
+                            k := 0
+                            for k < 3 && j + 1 < len(s) && byteat(s, j + 1) >= 48 && byteat(s, j + 1) <= 55 {
+                                v = v * 8 + byteat(s, j + 1) - 48
+                                j = j + 1
+                                k = k + 1
+                            }
+                            word = word + byte_str(v % 256)
+                        } else {
+                            word = word + byte_str(cn)
+                            j = j + 1
+                        }
+                    } else {
+                        word = word + byte_str(cj)
+                    }
+                }
+                j = j + 1
+            }
+            if !closed {
+                return words, errors.new("unterminated $'..' quote")
+            }
+            in_word = true
+            i = j
+            continue
+        }
+        if c == 34 { // double quote — " \ $ ` and \<newline> escape
+            j := i + 1
+            closed := false
+            for j < len(s) && !closed {
+                cj := byteat(s, j)
+                if cj == 34 {
+                    closed = true
+                } else {
+                    if cj == 92 && j + 1 < len(s) {
+                        cn := byteat(s, j + 1)
+                        if cn == 34 || cn == 92 || cn == 36 || cn == 96 {
+                            word = word + byte_str(cn)
+                            j = j + 1
+                        } else if cn == 10 {
+                            j = j + 1
+                        } else {
+                            word = word + byte_str(cj)
+                        }
+                    } else {
+                        word = word + byte_str(cj)
+                    }
+                }
+                j = j + 1
+            }
+            if !closed {
+                return words, errors.new("unterminated \" quote")
+            }
+            in_word = true
+            i = j
+            continue
+        }
+        if c == 35 && !in_word { // '#' starts a comment only at a word start
+            for i < len(s) && byteat(s, i) != 10 {
+                i = i + 1
+            }
+            continue
+        }
+        word = word + byte_str(c)
+        in_word = true
+        i = i + 1
+    }
+    if in_word {
+        words = push(words, word)
+    }
+    return words, nil
+}
+
+// ---------- flag tables ----------
+
+// curl_valued — upstream flagsWithValues verbatim: options Posting
+// doesn't use stay listed so their argument isn't eaten as the URL.
+fn curl_valued(f: str) -> bool {
+    if f == "-X" || f == "--request" || f == "-H" || f == "--header" { return true }
+    if f == "-d" || f == "--data" || f == "--data-raw" || f == "--data-binary" || f == "--data-ascii" || f == "--data-urlencode" || f == "--json" { return true }
+    if f == "-F" || f == "--form" || f == "--form-string" { return true }
+    if f == "-u" || f == "--user" || f == "-b" || f == "--cookie" || f == "-A" || f == "--user-agent" || f == "-e" || f == "--referer" { return true }
+    if f == "-m" || f == "--max-time" || f == "-x" || f == "--proxy" || f == "--url" { return true }
+    if f == "-o" || f == "--output" || f == "-w" || f == "--write-out" || f == "-c" || f == "--cookie-jar" { return true }
+    if f == "--connect-timeout" || f == "--retry" || f == "--retry-delay" || f == "--retry-max-time" || f == "--max-redirs" { return true }
+    if f == "--cacert" || f == "--capath" || f == "-E" || f == "--cert" || f == "--key" || f == "--cert-type" || f == "--key-type" || f == "--pass" { return true }
+    if f == "-r" || f == "--range" || f == "-T" || f == "--upload-file" || f == "--resolve" || f == "--connect-to" || f == "-U" || f == "--proxy-user" { return true }
+    if f == "-K" || f == "--config" || f == "--limit-rate" || f == "-y" || f == "--speed-time" || f == "-Y" || f == "--speed-limit" { return true }
+    if f == "--interface" || f == "--dns-servers" || f == "--oauth2-bearer" || f == "--aws-sigv4" || f == "-D" || f == "--dump-header" { return true }
+    if f == "--trace" || f == "--trace-ascii" || f == "--stderr" || f == "-z" || f == "--time-cond" || f == "--variable" || f == "--expand-data" { return true }
+    if f == "-Q" || f == "--quote" || f == "-t" || f == "--telnet-option" || f == "--unix-socket" || f == "--abstract-unix-socket" { return true }
+    return false
+}
+
+// Cut3 is strings.Cut — before/match-after/found (multi-return
+// is [T,err] only, so the triple rides a struct).
+struct Cut3 {
+    a: str,
+    b: str,
+    ok: bool,
+}
+
+fn cut(s: str, sep: str) -> Cut3 {
+    i := find(s, sep)
+    if i < 0 {
+        return Cut3{a: s, b: "", ok: false}
+    }
+    return Cut3{a: substr(s, 0, i), b: substr(s, i + len(sep), len(s)), ok: true}
+}
+
+fn trim_ws(s: str) -> str {
+    a := 0
+    for a < len(s) && (byteat(s, a) == 32 || byteat(s, a) == 9) {
+        a = a + 1
+    }
+    b := len(s)
+    for b > a && (byteat(s, b - 1) == 32 || byteat(s, b - 1) == 9) {
+        b = b - 1
+    }
+    return substr(s, a, b)
+}
+
+// ---------- parse ----------
+
+struct CurlAcc {
+    preq: own collection.PRequest,
+    method: str,
+    raw_url: str,
+    data: []str,
+    data_json: []int, // 1 when the part came from --json
+    form: []model.Part,
+    body_file: str,
+    body_file_json: bool,
+    user: str,
+    digest: bool,
+    get_mode: bool,
+    head_mode: bool,
+    follow_set: bool,
+    follow: bool,
+    cookies: []str,
+    insecure: bool,
+    max_time: float,
+    proxy: str,
+    bearer: str,
+}
+
+fn add_curl_header(c: mut CurlAcc, raw: str) {
+    cv := cut(raw, ":")
+    if !cv.ok {
+        n := len(raw)
+        if n > 0 && byteat(raw, n - 1) == 59 { // "Name;" → empty header
+            kv := model.KV{name: substr(raw, 0, n - 1), value: "", enabled: true}
+            c.preq.headers = push(c.preq.headers, kv)
+        }
+        return
+    }
+    c.preq.headers = push(c.preq.headers, model.KV{name: trim_ws(cv.a), value: trim_ws(cv.b), enabled: true})
+}
+
+fn curl_bool(c: mut CurlAcc, flag: str) {
+    if flag == "-k" || flag == "--insecure" {
+        c.insecure = true
+    } else if flag == "--no-insecure" {
+        c.insecure = false
+    } else if flag == "-L" || flag == "--location" || flag == "--location-trusted" {
+        c.follow_set = true
+        c.follow = true
+    } else if flag == "--no-location" {
+        c.follow_set = true
+        c.follow = false
+    } else if flag == "--digest" {
+        c.digest = true
+    } else if flag == "--basic" {
+        c.digest = false
+    } else if flag == "-G" || flag == "--get" {
+        c.get_mode = true
+    } else if flag == "-I" || flag == "--head" {
+        c.head_mode = true
+    }
+}
+
+// urlenc — query-escape for --data-urlencode (limited: leaves
+// unreserved bytes, encodes the rest uppercase-hex).
+fn urlenc(s: str) -> str {
+    out := ""
+    i := 0
+    for i < len(s) {
+        c := byteat(s, i)
+        unres := (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 45 || c == 95 || c == 46 || c == 126
+        if unres {
+            out = out + byte_str(c)
+        } else {
+            out = out + "%" + hex_byte_str(c)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn hex_byte_str(c: int) -> str {
+    d1 := "0123456789ABCDEF"
+    return substr(d1, c / 16, c / 16 + 1) + substr(d1, c - c / 16 * 16, c - c / 16 * 16 + 1)
+}
+
+fn urlencode_data(v: str) -> str {
+    if len(v) > 0 && byteat(v, 0) == 61 {
+        return urlenc(substr(v, 1, len(v)))
+    }
+    cv2 := cut(v, "=")
+    name := cv2.a
+    content := cv2.b
+    if cv2.ok {
+        return name + "=" + urlenc(content)
+    }
+    return urlenc(v)
+}
+
+fn parse_curl_part(c: mut CurlAcc, v: str, literal: bool) -> err {
+    cv3 := cut(v, "=")
+    name := cv3.a
+    value := cv3.b
+    if !cv3.ok || len(name) == 0 {
+        return errors.new("multipart fields need a name=value")
+    }
+    p := model.Part{name: name, value: "", file: "", filename: "", content_type: "", enabled: true, is_file: false}
+    if literal {
+        p.value = value
+        c.form = push(c.form, p)
+        return nil
+    }
+    if len(value) > 0 && (byteat(value, 0) == 60 || byteat(value, 0) == 40) {
+        return errors.new("file-content fields and nested multipart aren't supported; use text or @path")
+    }
+    if len(value) > 0 && byteat(value, 0) == 64 {
+        p.is_file = true
+        value = substr(value, 1, len(value))
+    }
+    // ;type= / ;filename= suffixes split on ';'
+    content := value
+    rest := ""
+    ci := find(value, ";")
+    if ci >= 0 {
+        content = substr(value, 0, ci)
+        rest = substr(value, ci + 1, len(value))
+    }
+    if p.is_file {
+        if len(content) == 0 || content == "-" {
+            return errors.new("multipart files need a regular file path, not stdin")
+        }
+        p.file = content
+    } else {
+        p.value = content
+    }
+    for len(rest) > 0 {
+        tk := cut(rest, ";")
+        tok := tk.a
+        rest = tk.b
+        if !tk.ok {
+            rest = ""
+        }
+        if len(tok) > 5 && substr(tok, 0, 5) == "type=" {
+            p.content_type = substr(tok, 5, len(tok))
+        } else if len(tok) > 9 && substr(tok, 0, 9) == "filename=" {
+            p.filename = substr(tok, 9, len(tok))
+        }
+    }
+    c.form = push(c.form, p)
+    return nil
+}
+
+// import_curl parses one curl command into a PRequest — the url
+// carries the raw URL; query params split into params rows like
+// upstream. Unreachable flag corners keep upstream's error text.
+fn import_curl(command: str) -> [own collection.PRequest, err] {
+    c := new(CurlAcc)
+    c.preq = new(collection.PRequest)
+    [tokens, se] = sh_split(command)
+    if se != nil {
+        return c.preq, se
+    }
+    if len(tokens) == 0 || tokens[0] != "curl" {
+        return c.preq, errors.new("not a curl command")
+    }
+    i := 0
+    args := tokens[:len(tokens) - 1]
+    args = tokens[1:]
+    for i < len(args) {
+        arg := args[i]
+        flag := ""
+        value := ""
+        has_value := false
+        is_flag := false
+        if arg == "--" {
+            if i + 1 < len(args) && len(c.raw_url) == 0 {
+                c.raw_url = args[i + 1]
+            }
+            i = len(args)
+            continue
+        }
+        if len(arg) > 2 && byteat(arg, 0) == 45 && byteat(arg, 1) == 45 {
+            is_flag = true
+            flag = arg
+            na := cut(arg, "=")
+            if na.ok && curl_valued(na.a) {
+                flag = na.a
+                value = na.b
+                has_value = true
+            }
+        } else if len(arg) > 1 && byteat(arg, 0) == 45 {
+            is_flag = true
+            // short cluster: walk letters; first valued short takes
+            // the rest of the cluster (or the next arg) as value.
+            cluster := substr(arg, 1, len(arg))
+            j := 0
+            for j < len(cluster) {
+                short := "-" + substr(cluster, j, j + 1)
+                if curl_valued(short) {
+                    flag = short
+                    if j + 1 < len(cluster) {
+                        value = substr(cluster, j + 1, len(cluster))
+                        has_value = true
+                    }
+                    j = len(cluster)
+                } else {
+                    curl_bool(c, short)
+                }
+                j = j + 1
+            }
+            if len(flag) == 0 {
+                i = i + 1
+                continue
+            }
+        } else {
+            if len(c.raw_url) == 0 {
+                c.raw_url = arg
+            }
+            i = i + 1
+            continue
+        }
+        if curl_valued(flag) && !has_value {
+            if i + 1 >= len(args) {
+                return c.preq, errors.new(flag + " needs a value")
+            }
+            i = i + 1
+            value = args[i]
+        }
+        if flag == "-X" || flag == "--request" {
+            c.method = upper_ascii(value)
+        } else if flag == "-H" || flag == "--header" {
+            add_curl_header(c, value)
+        } else if flag == "-d" || flag == "--data" || flag == "--data-raw" || flag == "--data-binary" || flag == "--data-ascii" {
+            if flag == "--data-binary" && len(value) > 0 && byteat(value, 0) == 64 {
+                if len(c.body_file) > 0 || value == "@" || value == "@-" {
+                    return c.preq, errors.new("use one regular file with --data-binary @path")
+                }
+                c.body_file = substr(value, 1, len(value))
+                i = i + 1
+                continue
+            }
+            if flag != "--data-raw" && len(value) > 0 && byteat(value, 0) == 64 {
+                return c.preq, errors.new("file-backed " + flag + " is not supported; use --data-binary @path")
+            }
+            c.data = push(c.data, value)
+            c.data_json = push(c.data_json, 0)
+        } else if flag == "--data-urlencode" {
+            // name@file / @file read the file's contents — we can't
+            // represent that; only the literal forms import. curl
+            // checks '=' first: 'user@domain=value' is a literal
+            // field, '@' is file-backed only with no '=' present.
+            eq := find(value, "=")
+            at := find(value, "@")
+            if eq < 0 && at >= 0 {
+                return c.preq, errors.new("file-backed --data-urlencode (@path) is not supported; pass a literal value")
+            }
+            c.data = push(c.data, urlencode_data(value))
+            c.data_json = push(c.data_json, 0)
+        } else if flag == "--json" {
+            if len(value) > 0 && byteat(value, 0) == 64 {
+                if len(c.body_file) > 0 || value == "@" || value == "@-" {
+                    return c.preq, errors.new("use one regular file with --json @path")
+                }
+                c.body_file = substr(value, 1, len(value))
+                c.body_file_json = true
+                i = i + 1
+                continue
+            }
+            c.data = push(c.data, value)
+            c.data_json = push(c.data_json, 1)
+        } else if flag == "-F" || flag == "--form" || flag == "--form-string" {
+            pe := parse_curl_part(c, value, flag == "--form-string")
+            if pe != nil {
+                return c.preq, pe
+            }
+        } else if flag == "-T" || flag == "--upload-file" {
+            return c.preq, errors.new("use --data-binary @path with -X PUT to import a whole-file upload")
+        } else if flag == "-u" || flag == "--user" {
+            c.user = value
+        } else if flag == "-b" || flag == "--cookie" {
+            c.cookies = push(c.cookies, value)
+        } else if flag == "-A" || flag == "--user-agent" {
+            c.preq.headers = push(c.preq.headers, model.KV{name: "User-Agent", value: value, enabled: true})
+        } else if flag == "-e" || flag == "--referer" {
+            c.preq.headers = push(c.preq.headers, model.KV{name: "Referer", value: value, enabled: true})
+        } else if flag == "-m" || flag == "--max-time" {
+            c.max_time = atof_small(value)
+        } else if flag == "-x" || flag == "--proxy" {
+            c.proxy = value
+        } else if flag == "--url" {
+            c.raw_url = value
+        } else if flag == "--oauth2-bearer" {
+            c.bearer = value
+        } else {
+            curl_bool(c, flag)
+        }
+        i = i + 1
+    }
+    if len(c.raw_url) == 0 {
+        return c.preq, errors.new("the curl command has no URL")
+    }
+    nform := len(c.form)
+    ndata := len(c.data)
+    has_file := len(c.body_file) > 0
+    if (nform > 0 && (ndata > 0 || has_file || c.head_mode || c.get_mode)) || (has_file && (ndata > 0 || c.get_mode)) {
+        return c.preq, errors.new("cannot combine multipart, file and data body modes")
+    }
+    c.preq.options = new(collection.POptions)
+    c.preq.options.follow_redirects = true
+    c.preq.options.verify_ssl = true
+    c.preq.options.attach_cookies = true
+    c.preq.options.substitute_body_variables = true
+    c.preq.options.timeout = 5.0
+    c.preq.options.set_mask = 0
+    if c.follow_set {
+        c.preq.options.follow_redirects = c.follow
+        c.preq.options.set_mask = c.preq.options.set_mask | 1
+    }
+    if c.insecure {
+        c.preq.options.verify_ssl = false
+        c.preq.options.set_mask = c.preq.options.set_mask | 2
+    }
+    if c.max_time > 0.0 {
+        c.preq.options.timeout = c.max_time
+        c.preq.options.set_mask = c.preq.options.set_mask | 32
+    }
+    if len(c.proxy) > 0 {
+        c.preq.options.proxy_url = c.proxy
+        c.preq.options.set_mask = c.preq.options.set_mask | 16
+    }
+    if len(c.cookies) > 0 {
+        cv := ""
+        k := 0
+        for k < len(c.cookies) {
+            if k > 0 {
+                cv = cv + "; "
+            }
+            cv = cv + c.cookies[k]
+            k = k + 1
+        }
+        c.preq.headers = push(c.preq.headers, model.KV{name: "Cookie", value: cv, enabled: true})
+    }
+    // Authorization headers become auth blocks (easier to edit).
+    let kept: []model.KV = nil
+    i = 0
+    for i < len(c.preq.headers) {
+        h := c.preq.headers[i]
+        i = i + 1
+        if ascii_eq(h.name, "Authorization") && c.preq.auth == nil {
+            sc := cut(h.value, " ")
+            scheme := sc.a
+            creds := sc.b
+            ls := lower_ascii(scheme)
+            if ls == "bearer" {
+                c.preq.auth = new(collection.PAuth)
+                c.preq.auth.type = "bearer_token"
+                c.preq.auth.bearer_token = new(collection.PBearer)
+                c.preq.auth.bearer_token.token = trim_ws(creds)
+                continue
+            }
+            if ls == "basic" {
+                [decoded, de] = base64.decode(trim_ws(creds))
+                if de == nil {
+                    up := cut(decoded as str, ":")
+                    usr := up.a
+                    pw := up.b
+                    c.preq.auth = new(collection.PAuth)
+                    c.preq.auth.type = "basic"
+                    c.preq.auth.basic = new(collection.PBasic)
+                    c.preq.auth.basic.username = usr
+                    c.preq.auth.basic.password = pw
+                    continue
+                }
+            }
+        }
+        kept = push(kept, h)
+    }
+    c.preq.headers = kept
+    if len(c.bearer) > 0 && c.preq.auth == nil {
+        c.preq.auth = new(collection.PAuth)
+        c.preq.auth.type = "bearer_token"
+        c.preq.auth.bearer_token = new(collection.PBearer)
+        c.preq.auth.bearer_token.token = c.bearer
+    }
+    if len(c.user) > 0 && c.preq.auth == nil {
+        up2 := cut(c.user, ":")
+        usr := up2.a
+        pw := up2.b
+        c.preq.auth = new(collection.PAuth)
+        c.preq.auth.type = "basic"
+        if c.digest {
+            c.preq.auth.type = "digest"
+            c.preq.auth.digest = new(collection.PBasic)
+            c.preq.auth.digest.username = usr
+            c.preq.auth.digest.password = pw
+        } else {
+            c.preq.auth.basic = new(collection.PBasic)
+            c.preq.auth.basic.username = usr
+            c.preq.auth.basic.password = pw
+        }
+    }
+    // body: join data parts (& between non-json), pick the mode.
+    // A file-backed --json still claims the JSON defaults.
+    joined := ""
+    data_is_json := c.body_file_json
+    i = 0
+    for i < len(c.data) {
+        if len(joined) > 0 && c.data_json[i] == 0 {
+            joined = joined + "&"
+        }
+        joined = joined + c.data[i]
+        if c.data_json[i] == 1 {
+            data_is_json = true
+        }
+        i = i + 1
+    }
+    if data_is_json {
+        names := mkslice(str, 2)
+        names[0] = "Content-Type"
+        names[1] = "Accept"
+        j := 0
+        for j < len(names) {
+            if curl_hdr(c.preq.headers, names[j]) == "" {
+                c.preq.headers = push(c.preq.headers, model.KV{name: names[j], value: "application/json", enabled: true})
+            }
+            j = j + 1
+        }
+    }
+    if c.get_mode && ndata > 0 {
+        // -G moves data onto the URL as the query string.
+        bf := cut(c.raw_url, "#")
+        base := bf.a
+        frag := bf.b
+        hasf := bf.ok
+        if str_contains(base, "?") {
+            base = base + "&" + joined
+        } else {
+            base = base + "?" + joined
+        }
+        c.raw_url = base
+        if hasf {
+            c.raw_url = c.raw_url + "#" + frag
+        }
+    } else if nform > 0 {
+        c.preq.body = new(collection.PBody)
+        c.preq.body.has_multipart = true
+        c.preq.body.multipart = c.form
+    } else if has_file {
+        c.preq.body = new(collection.PBody)
+        c.preq.body.has_file = true
+        c.preq.body.file = c.body_file
+        ct := curl_hdr(c.preq.headers, "Content-Type")
+        if len(ct) == 0 {
+            ct = "application/x-www-form-urlencoded"
+        }
+        c.preq.body.content_type = ct
+    } else if ndata > 0 {
+        ct := curl_hdr(c.preq.headers, "Content-Type")
+        mm := cut(ct, ";")
+        media := mm.a
+        media = lower_ascii(trim_ws(media))
+        c.preq.body = new(collection.PBody)
+        c.preq.body.has_content = true
+        c.preq.body.content = joined
+        if data_is_json {
+            if len(ct) == 0 {
+                c.preq.body.content_type = "application/json"
+            } else {
+                c.preq.body.content_type = ct
+            }
+        } else if media == "application/x-www-form-urlencoded" || (len(media) == 0 && looks_like_form(joined)) {
+            c.preq.body.has_content = false
+            c.preq.body.has_form_data = true
+            c.preq.body.form_data = parse_curl_form(joined)
+            c.preq.body.content_type = "application/x-www-form-urlencoded"
+        } else if len(media) == 0 && json_ok(joined) {
+            c.preq.body.content_type = "application/json"
+        } else {
+            if len(media) == 0 {
+                c.preq.body.content_type = "text/plain"
+            } else {
+                c.preq.body.content_type = media
+            }
+        }
+    }
+    if len(c.method) > 0 {
+        c.preq.method = c.method
+    } else if c.head_mode {
+        c.preq.method = "HEAD"
+    } else if (ndata > 0 && !c.get_mode) || nform > 0 || has_file {
+        c.preq.method = "POST"
+    }
+    if !valid_curl_method(c.preq.method) {
+        return c.preq, errors.new("unsupported method \"" + c.preq.method + "\"")
+    }
+    // the query lives in params rows only — the URL keeps just the
+    // fragment so the planner can't send every pair twice.
+    c.preq.url = c.raw_url
+    qq := cut(c.raw_url, "?")
+    if qq.ok {
+        q3 := cut(qq.b, "#")
+        c.preq.params = parse_curl_form(q3.a)
+        c.preq.url = qq.a
+        if q3.ok {
+            c.preq.url = c.preq.url + "#" + q3.b
+        }
+    }
+    return c.preq, nil
+}
+
+fn curl_hdr(hs: []model.KV, name: str) -> str {
+    i := 0
+    for i < len(hs) {
+        if hs[i].enabled && ascii_eq(hs[i].name, name) {
+            return hs[i].value
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn looks_like_form(data: str) -> bool {
+    if len(data) == 0 || str_contains(data, " ") || str_contains(data, "\n") || str_contains(data, "{") || str_contains(data, "}") || str_contains(data, "[") || str_contains(data, "]") || str_contains(data, "\"") {
+        return false
+    }
+    rest := data
+    for len(rest) > 0 {
+        pc := cut(rest, "&")
+        pair := pc.a
+        rest = pc.b
+        if !pc.ok {
+            rest = ""
+        }
+        if !str_contains(pair, "=") {
+            return false
+        }
+    }
+    return true
+}
+
+fn parse_curl_form(data: str) -> []model.KV {
+    let out: []model.KV = nil
+    rest := data
+    for len(rest) > 0 {
+        pc2 := cut(rest, "&")
+        pair := pc2.a
+        rest = pc2.b
+        if !pc2.ok {
+            rest = ""
+        }
+        if len(pair) == 0 {
+            continue
+        }
+        nv := cut(pair, "=")
+        out = push(out, model.KV{name: curl_unescape(nv.a), value: curl_unescape(nv.b), enabled: true})
+    }
+    return out
+}
+
+// curl_unescape — QueryUnescape: '+'→' ', %XX decode; bad escapes
+// keep the source (upstream unescape falls back on error).
+fn curl_unescape(s: str) -> str {
+    if !str_contains(s, "%") && !str_contains(s, "+") {
+        return s
+    }
+    out := ""
+    i := 0
+    for i < len(s) {
+        c := byteat(s, i)
+        if c == 43 {
+            out = out + " "
+        } else if c == 37 && i + 2 < len(s) && hex_digit(byteat(s, i + 1)) >= 0 && hex_digit(byteat(s, i + 2)) >= 0 {
+            v := hex_digit(byteat(s, i + 1)) * 16 + hex_digit(byteat(s, i + 2))
+            out = out + byte_str(v)
+            i = i + 2
+        } else {
+            out = out + byte_str(c)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// json_ok — minimal "is this object/array JSON" sniff used for the
+// mediaType=="" branch (upstream json.Valid — full validation is
+// out of scope; a leading { or [ with a closer is enough here).
+fn json_ok(s: str) -> bool {
+    t := trim_ws(s)
+    if len(t) < 2 {
+        return false
+    }
+    f := byteat(t, 0)
+    l := byteat(t, len(t) - 1)
+    return (f == 123 && l == 125) || (f == 91 && l == 93)
+}
+
+fn valid_curl_method(m: str) -> bool {
+    if len(m) == 0 {
+        return true // default GET — upstream leaves Method unset
+    }
+    return m == "GET" || m == "POST" || m == "PUT" || m == "PATCH" || m == "DELETE" || m == "HEAD" || m == "OPTIONS"
+}
+
+fn atof_small(s: str) -> float {
+    // float.parse if available — fallback a tiny manual parser.
+    neg := false
+    i := 0
+    if len(s) > 0 && byteat(s, 0) == 45 {
+        neg = true
+        i = 1
+    }
+    whole := 0.0
+    for i < len(s) && byteat(s, i) >= 48 && byteat(s, i) <= 57 {
+        whole = whole * 10.0 + itof(byteat(s, i) - 48)
+        i = i + 1
+    }
+    frac := 0.0
+    if i < len(s) && byteat(s, i) == 46 {
+        i = i + 1
+        scale := 0.1
+        for i < len(s) && byteat(s, i) >= 48 && byteat(s, i) <= 57 {
+            frac = frac + itof(byteat(s, i) - 48) * scale
+            scale = scale * 0.1
+            i = i + 1
+        }
+    }
+    v := whole + frac
+    if neg {
+        return 0.0 - v
+    }
+    return v
+}

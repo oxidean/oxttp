@@ -1,0 +1,229 @@
+package config
+
+// core/config tests — decode/merge/validate/paths contracts.
+
+import "std/testing"
+import "github.com/oxidean/oxttp/core/model"
+import "github.com/oxidean/oxttp/core/yaml"
+import "std/os"
+
+fn test_defaults() {
+    s := defaults()
+    testing.expect_streq(s.theme, "galaxy", "theme")
+    testing.expect_streq(s.sidebar_gradient, "theme", "gradient")
+    testing.expect_streq(s.layout, "vertical", "layout")
+    testing.expect_streq(s.collection_browser_position, "left", "pos")
+    testing.expect_streq(s.focus_on_startup, "url", "focus_on_startup")
+    testing.expect(s.load_user_themes, "load_user_themes")
+    testing.expect(s.history_enabled, "history_enabled")
+    testing.expect(s.heading_visible, "heading_visible")
+    testing.expect(s.text_input_blinking_cursor, "blink")
+    testing.expect(s.nerd_fonts == -1, "nerd_fonts unset")
+    testing.expect(s.remote_control_enabled, "remote")
+    testing.expect_streq(s.animation, "none", "animation")
+}
+
+fn test_decode_full() {
+    src := "theme: nord\nlayout: horizontal\nsidebar_gradient: off\nnerd_fonts: false\nuse_host_environment: true\nhistory:\n  enabled: false\nresponse:\n  prettify_json: false\n  show_size_and_time: false\nheading:\n  visible: false\n  show_host: false\n  show_version: false\n  hostname: \"[b]mybox[/]\"\nurl_bar:\n  show_value_preview: false\n  hide_secrets_in_value_preview: false\ncollection_browser:\n  position: right\n  show_on_startup: false\ncommand_palette:\n  theme_preview: false\ntext_input:\n  blinking_cursor: false\nfocus:\n  on_startup: collection\n  on_response: body\n  on_request_open: headers\nremote_control:\n  enabled: false\nssl:\n  ca_bundle: /ca.pem\n  certificate_path: /cert.pem\n  key_file: /key.pem\n  password: pw\neditor: nano\npager: less\npager_json: jq .\ncurl_export_extra_args: \"--http2\"\nkeymap:\n  posting.quit: ctrl+x\n"
+    [root, pe] = yaml.parse(src)
+    testing.expect(pe == nil, "parse")
+    s := defaults()
+    testing.expect(decode(root, s) == nil, "decode")
+    testing.expect_streq(s.theme, "nord", "theme")
+    testing.expect_streq(s.layout, "horizontal", "layout")
+    testing.expect(s.nerd_fonts == 0, "nerd_fonts")
+    testing.expect(s.use_host_environment, "hostenv")
+    testing.expect(!s.history_enabled, "hist")
+    testing.expect(!s.response_prettify_json, "prettify")
+    testing.expect(!s.response_show_size_and_time, "sizeandtime")
+    testing.expect(!s.heading_visible, "hvis")
+    testing.expect(!s.heading_show_host, "hhost")
+    testing.expect(!s.heading_show_version, "hver")
+    testing.expect_streq(s.heading_hostname, "[b]mybox[/]", "hostname")
+    testing.expect(!s.url_bar_show_value_preview, "urlprev")
+    testing.expect(!s.url_bar_hide_secrets_in_value_preview, "hidesecrets")
+    testing.expect_streq(s.collection_browser_position, "right", "pos")
+    testing.expect(!s.collection_browser_show_on_startup, "cbshow")
+    testing.expect(!s.command_palette_theme_preview, "palprev")
+    testing.expect(!s.text_input_blinking_cursor, "blink")
+    testing.expect_streq(s.focus_on_startup, "collection", "fsu")
+    testing.expect_streq(s.focus_on_response, "body", "fr")
+    testing.expect_streq(s.focus_on_request_open, "headers", "fro")
+    testing.expect(!s.remote_control_enabled, "remote")
+    testing.expect_streq(s.ssl_ca_bundle, "/ca.pem", "ca")
+    testing.expect_streq(s.ssl_certificate_path, "/cert.pem", "cert")
+    testing.expect_streq(s.ssl_key_file, "/key.pem", "key")
+    testing.expect_streq(s.ssl_password, "pw", "pw")
+    testing.expect_streq(s.editor, "nano", "editor")
+    testing.expect_streq(s.pager, "less", "pager")
+    testing.expect_streq(s.pager_json, "jq .", "pagerjson")
+    testing.expect_streq(s.curl_export_extra_args, "--http2", "cexport")
+    testing.expect(len(s.keymap) == 1, "keymap len")
+    testing.expect_streq(s.keymap[0].name, "posting.quit", "km name")
+    testing.expect_streq(s.keymap[0].value, "ctrl+x", "km val")
+}
+
+fn test_decode_bad_bool() {
+    src := "history:\n  enabled: maybe\n"
+    [root, pe] = yaml.parse(src)
+    testing.expect(pe == nil, "parse")
+    s := defaults()
+    testing.expect(decode(root, s) != nil, "expected bool error")
+}
+
+fn test_decode_section_not_map() {
+    src := "heading: flat\n"
+    [root, pe] = yaml.parse(src)
+    testing.expect(pe == nil, "parse")
+    s := defaults()
+    testing.expect(decode(root, s) != nil, "expected mapping error")
+}
+
+fn test_decode_keymap_bad() {
+    src := "keymap:\n  posting.quit: [a]\n"
+    [root, pe] = yaml.parse(src)
+    if pe != nil {
+        return // flow seq unsupported already
+    }
+    s := defaults()
+    testing.expect(decode(root, s) != nil, "keymap scalar error")
+}
+
+fn test_decode_unknown_keys_ignored() {
+    src := "bogus_key: 5\ntheme: dracula\n"
+    [root, pe] = yaml.parse(src)
+    testing.expect(pe == nil, "parse")
+    s := defaults()
+    testing.expect(decode(root, s) == nil, "unknown key tolerated")
+    testing.expect_streq(s.theme, "dracula", "theme")
+}
+
+fn test_env_layer() {
+    s := defaults()
+    let pairs: []str = nil
+    pairs = push(pairs, "POSTING_THEME=nord")
+    pairs = push(pairs, "POSTING_HEADING__SHOW_HOST=false")
+    pairs = push(pairs, "POSTING_LAYOUT=horizontal")
+    pairs = push(pairs, "POSTING_UNKNOWN_THING=x")
+    pairs = push(pairs, "OTHER_NAME=skip")
+    pairs = push(pairs, "POSTING_FOCUS__ON_RESPONSE=body")
+    pairs = push(pairs, "POSTING_CONFIG_FILE=/ignored")
+    pairs = push(pairs, "POSTING_NERD_FONTS=1")
+    pairs = push(pairs, "POSTING_EMPTY=")
+    err := apply_env(s, pairs)
+    testing.expect_streq(err, "", "apply_env err")
+    testing.expect_streq(s.theme, "nord", "theme")
+    testing.expect(!s.heading_show_host, "showhost")
+    testing.expect_streq(s.layout, "horizontal", "layout")
+    testing.expect_streq(s.focus_on_response, "body", "for")
+    testing.expect(s.nerd_fonts == 1, "nerd on")
+}
+
+fn test_env_bool_spellings() {
+    let trues: []str = nil
+    trues = push(trues, "1")
+    trues = push(trues, "yes")
+    trues = push(trues, "on")
+    trues = push(trues, "true")
+    i := 0
+    for i < len(trues) {
+        s := defaults()
+        let pairs: []str = nil
+        pairs = push(pairs, "POSTING_WATCH_THEMES=" + trues[i])
+        apply_env(s, pairs)
+        testing.expect(s.watch_themes, "spell " + trues[i])
+        i = i + 1
+    }
+    s := defaults()
+    let pairs: []str = nil
+    pairs = push(pairs, "POSTING_WATCH_THEMES=nah")
+    testing.expect(len(apply_env(s, pairs)) > 0, "bad bool errors")
+    testing.expect(s.watch_themes == true, "unchanged on bad")
+}
+
+fn test_env_keymap_nukes() {
+    s := defaults()
+    let pairs: []str = nil
+    pairs = push(pairs, "POSTING_THEME=nord")
+    pairs = push(pairs, "POSTING_KEYMAP=x")
+    testing.expect(len(apply_env(s, pairs)) > 0, "keymap env errors")
+}
+
+fn test_validate_warnings() {
+    s := defaults()
+    s.layout = "diag"
+    s.spacing = "wide"
+    s.collection_browser_position = "top"
+    s.focus_on_startup = "mars"
+    s.focus_on_response = "moon"
+    s.focus_on_request_open = "saturn"
+    warns := validate(s)
+    testing.expect(len(warns) == 6, "warn count")
+    testing.expect_streq(s.layout, "vertical", "layout reset")
+    testing.expect_streq(s.focus_on_startup, "url", "focus reset")
+    testing.expect_streq(s.focus_on_response, "", "fresp reset")
+}
+
+fn test_keys_for() {
+    s := defaults()
+    let d: []str = nil
+    d = push(d, "ctrl+q")
+    got := keys_for(s, "posting.quit", d)
+    testing.expect(len(got) == 1, "default len")
+    s.keymap = push(s.keymap, model.KV{name: "posting.quit", value: "Ctrl+X , F2", enabled: true})
+    got = keys_for(s, "posting.quit", d)
+    testing.expect(len(got) == 2, "custom len")
+    testing.expect_streq(got[0], "ctrl+x", "k0")
+    testing.expect_streq(got[1], "f2", "k1")
+    s.keymap[0].value = ""
+    got = keys_for(s, "posting.quit", d)
+    testing.expect(len(got) == 1, "blank->defaults")
+}
+
+fn test_paths() {
+    testing.expect(len(config_dir()) > 0, "config_dir")
+    testing.expect(find(history_dir(), "posting") >= 0, "history_dir shape")
+    testing.expect(is_abs(config_file()), "config_file abs")
+    testing.expect(find(env_memory_file(), "environments.json") >= 0, "env memory name")
+    testing.expect(find(default_coll_dir(), "posting") >= 0, "default coll")
+}
+
+fn test_load_missing_silent() {
+    r := load("/nonexistent-oxttp-cfg.yaml", nil)
+    testing.expect(len(r.warns) == 0, "warns")
+    testing.expect_streq(r.s.theme, "galaxy", "theme default")
+}
+
+fn test_load_bad_file_warns() {
+    d := "/tmp/oxttp-cfg-test"
+    os.mkdir_all(d)
+    f := d + "/bad.yaml"
+    os.writefile_(f, "history:\n  enabled: [oops\n")
+    r := load(f, nil)
+    testing.expect(len(r.warns) >= 1, "warn expected")
+    testing.expect_streq(r.s.theme, "galaxy", "defaults kept")
+}
+
+fn test_load_env_failure_is_atomic() {
+    // a bad env value drops the WHOLE env layer — good env leaves
+    // applied before it must not leak, even with no config file.
+    d := "/tmp/oxttp-cfg-env-atomic"
+    os.mkdir_all(d)
+    let pairs: []str = nil
+    pairs = push(pairs, "POSTING_THEME=nord")
+    pairs = push(pairs, "POSTING_WATCH_THEMES=nah")
+    pairs = push(pairs, "POSTING_LAYOUT=horizontal")
+    r := load(d + "/missing.yaml", pairs)
+    testing.expect(len(r.warns) >= 1, "warn expected")
+    testing.expect(find(r.warns[0], "Ignoring POSTING_") >= 0 || len(r.warns) > 1, "env warn present")
+    testing.expect_streq(r.s.theme, "galaxy", "no env leak on missing file")
+    testing.expect_streq(r.s.layout, "vertical", "layout stays default")
+    testing.expect(r.s.watch_themes, "watch stays default")
+    // with a readable file, file values survive and env drops whole
+    f := d + "/ok.yaml"
+    os.writefile_(f, "theme: catppuccin\nlayout: horizontal\n")
+    r = load(f, pairs)
+    testing.expect_streq(r.s.theme, "catppuccin", "file theme kept")
+    testing.expect_streq(r.s.layout, "horizontal", "file layout kept")
+    testing.expect(r.s.watch_themes, "env bool not applied")
+}

@@ -1,0 +1,212 @@
+package main
+
+// S11 themes: quantize primaries/edges, the 37-entry catalog
+// (names, order, dark/light split), user-theme decode (valid,
+// missing-primary, bad-hex, dark:false→light base), directory
+// scan (sort, same-name override, problem strings).
+
+import "std/testing"
+
+import "std/os"
+
+import "std/errors"
+
+import "github.com/oxidean/oxttp/core/config"
+
+let THEME_SCRATCH = "/tmp/oxttp-tui-theme-test"
+
+fn test_quantize_primaries() {
+    testing.expect_eq(quantize("#ff0000"), 1, "red → 1")
+    testing.expect_eq(quantize("#00ff00"), 2, "green → 2")
+    testing.expect_eq(quantize("#ffff00"), 3, "yellow → 3")
+    testing.expect_eq(quantize("#0000ff"), 4, "blue → 4")
+    testing.expect_eq(quantize("#ff00ff"), 5, "magenta → 5")
+    testing.expect_eq(quantize("#00ffff"), 6, "cyan → 6")
+    testing.expect_eq(quantize("#ffffff"), 7, "white → 7")
+    testing.expect_eq(quantize("#000000"), 0, "black → 0")
+}
+
+fn test_quantize_edges() {
+    // exact palette members
+    testing.expect_eq(quantize("#CD0000"), 1, "xterm red exact")
+    testing.expect_eq(quantize("#e5e5e5"), 7, "xterm white exact")
+    // short form expands (#abc → #aabbcc, nearest = white)
+    testing.expect_eq(quantize("#abc"), 7, "short hex")
+    // alpha ignored
+    testing.expect_eq(quantize("#ff0000ff"), 1, "8-digit alpha ignored")
+    testing.expect_eq(quantize("#FF5555"), 1, "case-insensitive")
+    // invalid → -1
+    testing.expect_eq(quantize("red"), -1, "no # → -1")
+    testing.expect_eq(quantize("#ff"), -1, "wrong length → -1")
+    testing.expect_eq(quantize("#gg0000"), -1, "bad digit → -1")
+    testing.expect_eq(quantize(""), -1, "empty → -1")
+}
+
+fn test_builtin_catalog() {
+    bs := builtin_themes()
+    testing.expect_eq(len(bs), 37, "37 builtin themes")
+    testing.expect_streq(bs[0].name, "rose-pine", "registry order first")
+    testing.expect_streq(bs[27].name, "lantern", "last dark")
+    testing.expect_streq(bs[28].name, "rose-pine-dawn", "first light")
+    testing.expect_streq(bs[36].name, "monokai-light", "registry order last")
+    dark := 0
+    light := 0
+    i := 0
+    for i < len(bs) {
+        if bs[i].is_light {
+            light = light + 1
+        } else {
+            dark = dark + 1
+        }
+        // every slot is a real ansi id
+        testing.expect(bs[i].primary >= 0 && bs[i].primary < 8, bs[i].name + " primary ansi")
+        testing.expect(bs[i].text >= 0 && bs[i].text < 8, bs[i].name + " text ansi")
+        i = i + 1
+    }
+    testing.expect_eq(dark, 28, "28 dark")
+    testing.expect_eq(light, 9, "9 light")
+    // spot-check: dracula error #ff5555 → red; galaxy primary #C45AFF → magenta
+    testing.expect_eq(bs[1].error, 1, "dracula error red")
+    testing.expect_eq(bs[9].primary, 5, "galaxy primary magenta")
+}
+
+fn test_theme_alias() {
+    testing.expect_streq(theme_alias(""), "galaxy", "empty → galaxy")
+    testing.expect_streq(theme_alias("posting"), "galaxy", "posting → galaxy")
+    testing.expect_streq(theme_alias("textual-dark"), "galaxy", "textual-dark → galaxy")
+    testing.expect_streq(theme_alias("catppuccin-mocha"), "catppuccin", "mocha → catppuccin")
+    testing.expect_streq(theme_alias("catppuccin-macchiato"), "catppuccin", "macchiato → catppuccin")
+    testing.expect_streq(theme_alias("catppuccin-frappe"), "catppuccin", "frappe → catppuccin")
+    testing.expect_streq(theme_alias("textual-light"), "catppuccin-latte", "textual-light → latte")
+    testing.expect_streq(theme_alias("nord"), "nord", "real name passes through")
+}
+
+fn test_parse_user_theme_valid() {
+    [u, e] = parse_user_theme("name: ocean\nprimary: \"#1E88E5\"\naccent: '#f00'\ndark: false\ntext: \"#212121\"\n")
+    testing.expect(e == nil, "valid decodes")
+    testing.expect_streq(u.name, "ocean", "name")
+    testing.expect_streq(u.primary, "#1E88E5", "primary")
+    testing.expect_streq(u.accent, "#f00", "accent")
+    testing.expect_streq(u.text, "#212121", "text")
+    testing.expect(!u.dark, "dark false")
+    testing.expect(u.dark_set, "dark seen")
+}
+
+fn test_parse_user_theme_errors() {
+    [_, e1] = parse_user_theme("primary: \"#1E88E5\"\n")
+    testing.expect(e1 != nil, "no name → err")
+    testing.expect_streq(errors.msg(e1), "the theme has no name", "name msg")
+    [_, e2] = parse_user_theme("name: x\n")
+    testing.expect(e2 != nil, "no primary → err")
+    testing.expect_streq(errors.msg(e2), "the theme has no primary colour", "primary msg")
+    [_, e3] = parse_user_theme("name: x\nprimary: \"blue\"\n")
+    testing.expect(e3 != nil, "bad hex → err")
+    testing.expect_streq(errors.msg(e3), "primary colour \"blue\" isn't a hex colour like #1e88e5", "hex msg")
+    [_, e4] = parse_user_theme("name: x\nprimary: \"#1E88E5\"\naccent: \"#12\"\n")
+    testing.expect(e4 != nil, "short hex → err")
+    testing.expect_streq(errors.msg(e4), "accent colour \"#12\" isn't a hex colour like #1e88e5", "accent msg")
+    [_, e5] = parse_user_theme("name: x\nprimary: \"#1E88E5\"\ndark: maybe\n")
+    testing.expect(e5 != nil, "non-bool dark → err")
+    // unset dark → IsDark() true upstream
+    [u6, e6] = parse_user_theme("name: x\nprimary: \"#1E88E5\"\n")
+    testing.expect(e6 == nil, "plain decodes")
+    testing.expect(!u6.dark_set, "dark unset")
+}
+
+fn test_build_user_theme_bases() {
+    [u, eu] = parse_user_theme("name: mine\nprimary: \"#ff0000\"\n")
+    testing.expect(eu == nil, "mine decodes")
+    t := build_user_theme(u)
+    testing.expect(!t.is_light, "default dark")
+    // unset fields inherit the galaxy base
+    bs := builtin_themes()
+    gi := theme_index(bs, "galaxy")
+    testing.expect_eq(t.secondary, bs[gi].secondary, "dark base secondary")
+    testing.expect_eq(t.primary, 1, "override applied")
+    [u2, eu2] = parse_user_theme("name: lite\nprimary: \"#00ff00\"\ndark: false\n")
+    testing.expect(eu2 == nil, "lite decodes")
+    t2 := build_user_theme(u2)
+    testing.expect(t2.is_light, "dark:false → light")
+    li := theme_index(bs, "catppuccin-latte")
+    testing.expect_eq(t2.secondary, bs[li].secondary, "light base secondary")
+    // foreground and text both feed the text slot; text wins
+    [u3, eu3] = parse_user_theme("name: both\nprimary: \"#111111\"\nforeground: \"#ff0000\"\ntext: \"#00ff00\"\n")
+    testing.expect(eu3 == nil, "both decodes")
+    t3 := build_user_theme(u3)
+    testing.expect_eq(t3.text, 2, "text beats foreground")
+    [u4, eu4] = parse_user_theme("name: fg\nprimary: \"#111111\"\nforeground: \"#ff0000\"\n")
+    testing.expect(eu4 == nil, "fg decodes")
+    t4 := build_user_theme(u4)
+    testing.expect_eq(t4.text, 1, "foreground feeds text")
+}
+
+fn scratch_themes() {
+    if os.exists(THEME_SCRATCH) {
+        os.remove_all(THEME_SCRATCH)
+    }
+    os.mkdir_all(THEME_SCRATCH)
+    os.writefile_(THEME_SCRATCH + "/zeta.yaml", "name: zeta\nprimary: \"#00ff00\"\n")
+    os.writefile_(THEME_SCRATCH + "/alpha.yaml", "name: alpha\nprimary: \"#0000ff\"\ndark: false\n")
+    os.writefile_(THEME_SCRATCH + "/nord.yaml", "name: nord\nprimary: \"#ff0000\"\n")
+    os.writefile_(THEME_SCRATCH + "/broken.yaml", "name: broken\nprimary: \"notacolour\"\n")
+    os.writefile_(THEME_SCRATCH + "/notes.txt", "not a theme\n")
+    os.mkdir_all(THEME_SCRATCH + "/nested.yaml")
+}
+
+fn test_scan_user_themes() {
+    scratch_themes()
+    sc := scan_user_themes(THEME_SCRATCH)
+    testing.expect_eq(len(sc.themes), 3, "3 valid themes")
+    testing.expect_eq(len(sc.problems), 1, "1 problem")
+    testing.expect(str_contains(sc.problems[0], "Couldn't load theme broken.yaml"), "problem names file")
+    testing.expect(str_contains(sc.problems[0], "isn't a hex colour"), "problem carries parse err")
+    // sorted by theme name, not file name
+    testing.expect_streq(sc.themes[0].name, "alpha", "sorted: alpha")
+    testing.expect_streq(sc.themes[1].name, "nord", "sorted: nord")
+    testing.expect_streq(sc.themes[2].name, "zeta", "sorted: zeta")
+    testing.expect(sc.themes[1].is_light == false, "user nord is dark")
+    // missing dir → empty, no problems
+    sc2 := scan_user_themes(THEME_SCRATCH + "/nope")
+    testing.expect_eq(len(sc2.themes), 0, "missing dir empty")
+    testing.expect_eq(len(sc2.problems), 0, "missing dir silent")
+}
+
+fn test_theme_lookup_user_override() {
+    scratch_themes()
+    sc := scan_user_themes(THEME_SCRATCH)
+    a := new_app()
+    a.user_themes = sc.themes
+    // same-name user theme replaces the builtin row
+    [t, e] = theme_lookup(a, "nord")
+    testing.expect(e == nil, "nord resolves")
+    testing.expect_eq(t.primary, 1, "user nord overrides builtin")
+    [t2, e2] = theme_lookup(a, "dracula")
+    testing.expect(e2 == nil, "builtin still resolves")
+    testing.expect_eq(t2.error, 1, "builtin dracula error")
+    [_, e3] = theme_lookup(a, "not-a-theme")
+    testing.expect(e3 != nil, "unknown → err")
+}
+
+fn test_theme_rows() {
+    scratch_themes()
+    sc := scan_user_themes(THEME_SCRATCH)
+    a := new_app()
+    a.user_themes = sc.themes
+    rows := theme_rows(a)
+    // Yours header + 3 user + Dark header + 28 + Light header + 9
+    testing.expect_eq(len(rows), 3 + 1 + 1 + 28 + 1 + 9, "row count")
+    testing.expect_streq(rows[0], "─ Yours ─", "yours header")
+    testing.expect_streq(rows[1], "alpha", "first user row")
+    testing.expect_streq(rows[4], "─ Dark ─", "dark header")
+    testing.expect_streq(rows[5], "rose-pine", "first dark row")
+    // load_builtin_themes off → only Yours
+    a.st = new(config.Settings)
+    a.st.load_builtin_themes = false
+    rows2 := theme_rows(a)
+    testing.expect_eq(len(rows2), 4, "user-only rows")
+    // gradient rows: theme, off, then every name
+    gr := gradient_rows(a)
+    testing.expect_eq(len(gr), 2 + 3, "gradient rows")
+    testing.expect_streq(gr[0], "theme", "gradient theme row")
+    testing.expect_streq(gr[1], "off", "gradient off row")
+}

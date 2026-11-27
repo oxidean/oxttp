@@ -1,0 +1,15 @@
+schema_version: 1
+request_id: IN-0012
+work_item_id: WI-0015
+kind: approval
+question: Ship WI-0015? S11 TUI config, flags, and subcommands is verified green (718 test lines across 13 dirs, 0 failures) and the PR is open — approval merges feat/wi-0015-s11-tui-config via PR https://github.com/oxidean/oxttp/pull/18 and transitions the work item to shipped.
+action:
+    type: transition
+    work_item_id: WI-0015
+    target: shipped
+status: approved
+answer: approved
+created_by: cli
+answered_by: JesseKoldewijn
+created_at: "2026-11-26T20:12:22Z"
+answered_at: "2026-11-27T20:39:54Z"

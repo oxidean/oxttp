@@ -1,0 +1,273 @@
+package main
+
+// tui/cli_test — subcommand surface: parse/exit-code/output
+// contracts, run_exec over the fake transport.
+
+import "std/testing"
+import "std/os"
+import "github.com/oxidean/oxttp/core/model"
+
+fn test_cli_version() {
+    r := cli_version()
+    testing.expect(r.code == 0, "code")
+    testing.expect(find(r.stdout, "Posting ") == 0, "banner")
+}
+
+fn test_cli_locate() {
+    let a: []str = nil
+    a = push(a, "locate")
+    a = push(a, "config")
+    r := cli_locate_args(a)
+    testing.expect(r.code == 0, "code")
+    testing.expect(find(r.stdout, "Config file:") == 0, "label")
+    a = push(a, "extra")
+    r = cli_locate_args(a)
+    testing.expect(r.code == 2, "too many args")
+    let b: []str = nil
+    b = push(b, "locate")
+    b = push(b, "bogus")
+    r = cli_locate_args(b)
+    testing.expect(r.code == 2, "unknown target")
+    testing.expect(find(r.stderr, "Unknown thing to locate") >= 0, "err text")
+}
+
+fn test_cli_remote() {
+    let a: []str = nil
+    a = push(a, "remote")
+    a = push(a, "list")
+    r := cli_remote_args(a)
+    testing.expect(r.code == 0, "list code")
+    testing.expect(find(r.stdout, "no running Posting") >= 0, "list text")
+    a[1] = "skill"
+    r = cli_remote_args(a)
+    testing.expect(r.code == 0, "skill code")
+    testing.expect(find(r.stdout, "posting-remote") >= 0, "skill emits md")
+    a[1] = "send"
+    r = cli_remote_args(a)
+    testing.expect(r.code == 1, "send degrade")
+    testing.expect(find(r.stderr, "unix sockets") >= 0, "send err")
+    a[1] = "--help"
+    r = cli_remote_args(a)
+    testing.expect(r.code == 0, "help")
+}
+
+fn test_cli_remote_instance_and_json() {
+    let a: []str = nil
+    a = push(a, "remote")
+    a = push(a, "--instance")
+    a = push(a, "foo")
+    a = push(a, "list")
+    r := cli_remote_args(a)
+    testing.expect(r.code == 0, "--instance consumed, list runs")
+    testing.expect(find(r.stdout, "no running Posting") >= 0, "list text")
+    // = form
+    a = nil
+    a = push(a, "remote")
+    a = push(a, "--instance=bar")
+    a = push(a, "list")
+    r = cli_remote_args(a)
+    testing.expect(r.code == 0, "--instance= form")
+    // list --json → [] → 0
+    a = nil
+    a = push(a, "remote")
+    a = push(a, "list")
+    a = push(a, "--json")
+    r = cli_remote_args(a)
+    testing.expect(r.code == 0, "list --json code")
+    testing.expect_streq(r.stdout, "[]\n", "list --json body")
+    // unknown command → usage → 2 (was 1)
+    a = nil
+    a = push(a, "remote")
+    a = push(a, "bogus")
+    r = cli_remote_args(a)
+    testing.expect(r.code == 2, "unknown cmd usage")
+    testing.expect(find(r.stderr, "usage:") >= 0, "usage text")
+}
+
+fn test_cli_import() {
+    let a: []str = nil
+    a = push(a, "import")
+    a = push(a, "-t")
+    a = push(a, "postman")
+    a = push(a, "file.json")
+    r := cli_import_args(a)
+    testing.expect(r.code == 1, "degrade code")
+    testing.expect(find(r.stderr, "postman import lands M4") >= 0, "text")
+    a[2] = "bogus"
+    r = cli_import_args(a)
+    testing.expect(r.code == 2, "bad type")
+    // zero sources → usage 2, not the M4 degrade
+    a = nil
+    a = push(a, "import")
+    a = push(a, "-t")
+    a = push(a, "postman")
+    r = cli_import_args(a)
+    testing.expect(r.code == 2, "no sources usage")
+    // --type=x / --output=x forms parse
+    a = nil
+    a = push(a, "import")
+    a = push(a, "--type=postman")
+    a = push(a, "--output=/tmp/out")
+    a = push(a, "coll.json")
+    r = cli_import_args(a)
+    testing.expect(r.code == 1, "eq forms degrade")
+    testing.expect(find(r.stderr, "postman import lands M4") >= 0, "type applied")
+}
+
+fn test_run_parse() {
+    let a: []str = nil
+    a = push(a, "run")
+    a = push(a, "-c")
+    a = push(a, "/coll")
+    a = push(a, "-e")
+    a = push(a, "dev")
+    a = push(a, "--fail-fast")
+    a = push(a, "--json")
+    a = push(a, "requests/")
+    rp := run_parse_args(a)
+    testing.expect(rp.code == 0, "code")
+    testing.expect_streq(rp.o.coll, "/coll", "coll")
+    testing.expect(len(rp.o.envs) == 1, "envs")
+    testing.expect_streq(rp.o.target, "requests/", "target")
+    testing.expect(rp.o.fail_fast, "ff")
+    testing.expect(rp.o.json, "json")
+    // --x=v form + flag after positional
+    a = nil
+    a = push(a, "run")
+    a = push(a, "req.yaml")
+    a = push(a, "--collection=/c")
+    a = push(a, "--env=prod")
+    rp = run_parse_args(a)
+    testing.expect(rp.code == 0, "code2")
+    testing.expect_streq(rp.o.coll, "/c", "coll2")
+    testing.expect_streq(rp.o.envs[0], "prod", "env2")
+    // two positionals → usage
+    a = push(a, "extra")
+    rp = run_parse_args(a)
+    testing.expect(rp.code == 2, "two positional")
+    // help
+    a = nil
+    a = push(a, "run")
+    a = push(a, "-h")
+    rp = run_parse_args(a)
+    testing.expect(rp.code == -1, "help sentinel")
+    // missing value
+    a = nil
+    a = push(a, "run")
+    a = push(a, "-c")
+    rp = run_parse_args(a)
+    testing.expect(rp.code == 2, "missing val")
+}
+
+fn test_run_env_file_layers() {
+    dir := "/tmp/oxttp-runenv-test"
+    os.mkdir_all(dir)
+    os.writefile_(dir + "/dev.env", "A=named\n")
+    f := dir + "/prod.env"
+    os.writefile_(f, "B=file\nA=filewins\n")
+    let envs: []str = nil
+    envs = push(envs, "dev")
+    envs = push(envs, f)
+    let dirs: []str = nil
+    dirs = push(dirs, dir)
+    re := run_env(dirs, envs)
+    testing.expect(len(re.err) == 0, "err: " + re.err)
+    lr := re.es.lookup("B")
+    testing.expect(lr.ok, "file var present")
+    testing.expect_streq(lr.value, "file", "file value")
+    lr2 := re.es.lookup("A")
+    testing.expect(lr2.ok, "named var resolves")
+    testing.expect_streq(lr2.value, "filewins", "file layer wins over named")
+    os.remove_all(dir)
+}
+
+// stage_run builds a scratch collection with one good + one
+// script-carrying request and runs run_exec over a fake transport.
+fn test_run_exec() {
+    dir := "/tmp/oxttp-run-test"
+    os.mkdir_all(dir)
+    os.writefile_(dir + "/ok.posting.yaml", "name: ok\nmethod: GET\nurl: http://x.test/a\n")
+    os.writefile_(dir + "/scripted.posting.yaml", "name: sc\nmethod: GET\nurl: http://x.test/b\nscripts:\n  setup: print(1)\n")
+    o := new(RunOpts)
+    o.coll = dir
+    o.target = dir
+    fx := FakeSend{resp: fake_resp(200, "text/plain", "hi", nil), fail: ""}
+    rep := run_exec(o, fx)
+    // ADR-0038: a scripted request aborts the whole run BEFORE any
+    // send — the valid request never reaches the transport.
+    testing.expect(rep.code == 1, "abort code")
+    testing.expect(find(rep.err, "scripted.posting.yaml") >= 0, "err names file")
+    testing.expect(find(rep.err, "Python scripts") >= 0, "err names scripts")
+    testing.expect_eq(len(rep.lines), 0, "nothing ran")
+    // an empty-url request aborts the same way
+    os.remove(dir + "/scripted.posting.yaml")
+    os.writefile_(dir + "/nourl.posting.yaml", "name: nu\nmethod: GET\nurl: \"\"\n")
+    rep = run_exec(o, fx)
+    testing.expect(rep.code == 1, "empty-url abort code")
+    testing.expect(find(rep.err, "request has no URL") >= 0, "empty-url err")
+    testing.expect_eq(len(rep.lines), 0, "nothing sent")
+    // a fully valid collection runs every request
+    os.remove(dir + "/nourl.posting.yaml")
+    os.writefile_(dir + "/ok2.posting.yaml", "name: ok2\nmethod: GET\nurl: http://x.test/b\n")
+    rep = run_exec(o, fx)
+    testing.expect(len(rep.err) == 0, "err: " + rep.err)
+    testing.expect(rep.code == 0, "clean run passes")
+    testing.expect(len(rep.lines) == 3, "2 req + summary")
+    testing.expect(find(rep.lines[2], "2 passed") >= 0, "summary")
+    // fail-fast + json on a clean run
+    o.fail_fast = true
+    o.json = true
+    rep = run_exec(o, fx)
+    testing.expect(find(rep.lines[0], "\"results\"") >= 0, "json head")
+    testing.expect(find(rep.lines[0], "\"passed\":2") >= 0, "json passed")
+    // single-file non-.posting.yaml rejects
+    os.writefile_(dir + "/not.txt", "x")
+    o.target = dir + "/not.txt"
+    rep = run_exec(o, fx)
+    testing.expect(rep.code == 1, "non yaml")
+    testing.expect(find(rep.err, ".posting.yaml") >= 0, "err")
+}
+
+// run ordering: requests execute sorted by collection-relative path,
+// not scan (DFS) order — a top-level "a" must precede "z/b" even
+// though the dir walk emits z's subtree first.
+fn test_run_exec_orders_by_rel() {
+    dir := "/tmp/oxttp-run-order"
+    os.remove_all(dir)
+    os.mkdir_all(dir + "/z")
+    os.writefile_(dir + "/a.posting.yaml", "name: a\nmethod: GET\nurl: http://x.test/a\n")
+    os.writefile_(dir + "/z/b.posting.yaml", "name: b\nmethod: GET\nurl: http://x.test/b\n")
+    o := new(RunOpts)
+    o.target = dir
+    fx := FakeSend{resp: fake_resp(200, "text/plain", "hi", nil), fail: ""}
+    rep := run_exec(o, fx)
+    testing.expect(len(rep.err) == 0, "err: " + rep.err)
+    testing.expect(rep.code == 0, "clean run")
+    testing.expect(len(rep.lines) == 3, "2 req + summary")
+    testing.expect(find(rep.lines[0], "PASSED a.posting.yaml") == 0, "a first")
+    testing.expect(find(rep.lines[1], "PASSED z/b.posting.yaml") == 0, "z/b second")
+    os.remove_all(dir)
+}
+
+fn test_is_utf8_and_resp_json_binary() {
+    good := "plain ascii body"
+    testing.expect(is_utf8(good as []byte), "ascii is utf8")
+    bad := mkslice(byte, 4)
+    bad[0] = 102
+    bad[1] = 254
+    bad[2] = 255
+    bad[3] = 0
+    testing.expect(!is_utf8(bad), "binary without valid utf8 rejected")
+    // resp_json emits bodyBase64 + the remote.Response fields
+    r := fake_resp(200, "text/plain", "", nil)
+    r.body = bad
+    rq := new(model.Req)
+    rq.method = "GET"
+    rq.url = "http://x.test/"
+    j := resp_json(rq, r, 1700000000000)
+    testing.expect(find(j, "\"bodyBase64\"") >= 0, "base64 body")
+    testing.expect(find(j, "\"contentType\":\"text/plain\"") >= 0, "contentType")
+    testing.expect(find(j, "\"reason\":\"OK\"") >= 0, "reason")
+    testing.expect(find(j, "\"proto\":\"HTTP/1.1\"") >= 0, "proto")
+    testing.expect(find(j, "\"receivedAt\":1700000000000") >= 0, "receivedAt")
+}

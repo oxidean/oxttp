@@ -34,6 +34,13 @@ fn parse_key(spec: str) -> [KeyPat, err] {
     }
     i := 0
     for i < len(parts) - 1 {
+        // "++" yields an empty middle part — skip it so "ctrl++"
+        // parses as ctrl + literal "+" (split_plus keeps the trailing
+        // '+' as the key).
+        if len(parts[i]) == 0 {
+            i = i + 1
+            continue
+        }
         m := upper_ascii(parts[i])
         if m == "CTRL" {
             np.ctrl = true
@@ -281,32 +288,61 @@ fn find_binding(bs: []Binding, ev: term.KeyEvent) -> int {
 
 // --- corpus §3: 18 rebindable actions (19 default keys) ---
 
-fn global_bindings() -> []Binding {
+// gbs emit one action's bindings: a keymap config entry replaces the
+// defaults wholesale (pre-validated by rebind_apply — bad specs never
+// reach the table).
+fn gbs(bs: []Binding, a: ref App, action: str, dflts: []str) -> []Binding {
+    specs := dflts
+    rs := reb_specs_for(a, action)
+    if len(rs) > 0 {
+        specs = rs
+    }
+    i := 0
+    for i < len(specs) {
+        bs = push(bs, bind(specs[i], action))
+        i = i + 1
+    }
+    return bs
+}
+
+fn specs1(a: str) -> []str {
+    o := mkslice(str, 1)
+    o[0] = a
+    return o
+}
+
+fn specs2(a: str, b: str) -> []str {
+    o := mkslice(str, 2)
+    o[0] = a
+    o[1] = b
+    return o
+}
+
+fn global_bindings(a: ref App) -> []Binding {
     bs := mkslice(Binding, 0)
-    bs = push(bs, bind("ctrl+j", "send-request"))
-    bs = push(bs, bind("alt+enter", "send-request"))
-    bs = push(bs, bind("alt+j", "stream"))
-    bs = push(bs, bind("ctrl+o", "jump"))
-    bs = push(bs, bind("ctrl+p", "commands"))
-    bs = push(bs, bind("ctrl+s", "save-request"))
-    bs = push(bs, bind("ctrl+n", "new-request"))
-    bs = push(bs, bind("alt+w", "close-tab"))
+    bs = gbs(bs, a, "send-request", specs2("ctrl+j", "alt+enter"))
+    bs = gbs(bs, a, "stream", specs1("alt+j"))
+    bs = gbs(bs, a, "jump", specs1("ctrl+o"))
+    bs = gbs(bs, a, "commands", specs1("ctrl+p"))
+    bs = gbs(bs, a, "save-request", specs1("ctrl+s"))
+    bs = gbs(bs, a, "new-request", specs1("ctrl+n"))
+    bs = gbs(bs, a, "close-tab", specs1("alt+w"))
+    bs = gbs(bs, a, "keep-tab", nil)
     // keep-tab: no default key (corpus-exact) — listed, unbound
     bs = push(bs, keep_tab_listed())
-    bs = push(bs, bind("alt+right", "next-tab"))
-    bs = push(bs, bind("alt+left", "previous-tab"))
-    bs = push(bs, bind("alt+down", "search-tabs"))
-    bs = push(bs, bind("ctrl+g", "search-requests"))
-    bs = push(bs, bind("ctrl+l", "focus-url"))
-    bs = push(bs, bind("ctrl+t", "focus-method"))
+    bs = gbs(bs, a, "next-tab", specs1("alt+right"))
+    bs = gbs(bs, a, "previous-tab", specs1("alt+left"))
+    bs = gbs(bs, a, "search-tabs", specs1("alt+down"))
+    bs = gbs(bs, a, "search-requests", specs1("ctrl+g"))
+    bs = gbs(bs, a, "focus-url", specs1("ctrl+l"))
+    bs = gbs(bs, a, "focus-method", specs1("ctrl+t"))
     // ctrl+h: arrives as CSI-u on kitty terms; the §9 byte collision
     // means plain 0x08 (backspace) toggles too wherever no widget
     // claims backspace — both bound here, widget layer decides.
-    bs = push(bs, bind("ctrl+h", "toggle-collection"))
-    bs = push(bs, bind("backspace", "toggle-collection"))
-    bs = push(bs, bind("alt+z", "expand-section"))
-    bs = push(bs, bind("ctrl+shift+v", "variables"))
-    bs = push(bs, bind("f1", "help"))
+    bs = gbs(bs, a, "toggle-collection", specs2("ctrl+h", "backspace"))
+    bs = gbs(bs, a, "expand-section", specs1("alt+z"))
+    bs = gbs(bs, a, "variables", specs1("ctrl+shift+v"))
+    bs = gbs(bs, a, "help", specs1("f1"))
     return bs
 }
 
