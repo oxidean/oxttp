@@ -13,6 +13,7 @@ import "std/strings"
 import "std/time"
 import "std/errors"
 import "github.com/oxidean/oxttp/core/config"
+import "github.com/oxidean/oxttp/core/env"
 import "github.com/oxidean/oxttp/core/collection"
 import "github.com/oxidean/oxttp/core/model"
 import "github.com/oxidean/oxttp/core/term"
@@ -251,6 +252,27 @@ fn test_env_local_only_file() {
     os.remove(p)
     os.remove(d + "/solo.env")
     os.remove_all(d)
+}
+
+fn test_env_load_file_missing_errors() {
+    // a resolved path that vanishes (or is a dir) before load must
+    // surface — silently dropping it lets a later base file win and
+    // the request goes somewhere the selected env didn't intend.
+    s := new(env.EnvSet)
+    w := env_load_file(s, "/tmp/oxttp-no-such-env-file.env", "ghost")
+    testing.expect(len(w) > 0, "missing file reports")
+    testing.expect(find(w, "missing or not a regular file") >= 0, "missing file message: " + w)
+    d := "/tmp/oxttp-env-dir"
+    os.mkdir_all(d)
+    w2 := env_load_file(s, d, "dir")
+    testing.expect(len(w2) > 0, "directory reports")
+    os.remove_all(d)
+    ok := "/tmp/oxttp-env-ok.env"
+    os.writefile_(ok, "K=v\n")
+    testing.expect_streq(env_load_file(s, ok, "ok"), "", "real file loads clean")
+    lr := s.lookup("K")
+    testing.expect(lr.ok && lr.value == "v", "loaded var resolves")
+    os.remove(ok)
 }
 
 // ---------- disk history ----------

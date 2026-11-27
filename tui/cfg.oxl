@@ -99,7 +99,7 @@ fn env_dirs(a: ref App) -> []str {
 // private; ours names the file for the warn string).
 fn env_load_file(s: ref env.EnvSet, path: str, name: str) -> str {
     if !os.exists(path) || os.isdir(path) {
-        return ""
+        return "environment file " + path + " is missing or not a regular file"
     }
     [f, fe] = os.open(path)
     if fe != nil {
