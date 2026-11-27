@@ -16,7 +16,7 @@ jobs:
     name: oxl-build
     if: github.event.action != 'edited'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
         with:
@@ -42,13 +42,15 @@ jobs:
           /tmp/oxttp-tui
 
       # `oxl test` honors only its first package-dir arg and silently
-      # ignores the rest (oxidean/oxl#131) — invoke once per leaf dir.
+      # ignores the rest (oxidean/oxl#131), and a package-dir run also
+      # executes its workspace dependencies' tests — so the two app
+      # closures (./cli and ./tui both require core+shared) cover every
+      # package's tests. Per-leaf-dir runs re-executed the whole
+      # dependency closure ~12x and blew the job timeout.
       - name: test
         run: |
-          for d in $(git ls-files '*.oxl' | xargs -n1 dirname | sort -u); do
-            echo "--- $d"
-            oxl test "$d"
-          done
+          oxl test ./cli
+          oxl test ./tui
 
   # Commit-message gate (see scripts/commit-check.sh): SemVer-prefix
   # grammar on subjects + no-AI-attribution scan, on the PR's commit
