@@ -108,32 +108,37 @@ fn fmt_of(i: ref Intent, out_tty: int) -> own Fmt {
     f.xml_indent = 2
     f.xml_format = format
     f.headers_sort = format
-    k := 0
-    for k < len(i.fmt_opts[:]) {
-        e := i.fmt_opts[k]
-        k = k + 1
-        eq := find(e, "=")
-        if eq < 0 {
-            continue
-        }
-        key := substr(e, 0, eq)
-        val := substr(e, eq + 1, len(e))
-        if key == "json.indent" {
-            [n, ne] = strconv.atoi(val)
-            if ne == nil {
-                f.json_indent = n
+    // fmt_opts is an own slice — nil on a zero-valued Intent (only
+    // resolve() initializes it); slicing nil traps (same class as the
+    // tui Hop handle crash).
+    if i.fmt_opts != nil {
+        k := 0
+        for k < len(i.fmt_opts[:]) {
+            e := i.fmt_opts[k]
+            k = k + 1
+            eq := find(e, "=")
+            if eq < 0 {
+                continue
             }
-        } else if key == "json.format" {
-            f.json_format = booli(val == "true")
-        } else if key == "xml.indent" {
-            [n, ne] = strconv.atoi(val)
-            if ne == nil {
-                f.xml_indent = n
+            key := substr(e, 0, eq)
+            val := substr(e, eq + 1, len(e))
+            if key == "json.indent" {
+                [n, ne] = strconv.atoi(val)
+                if ne == nil {
+                    f.json_indent = n
+                }
+            } else if key == "json.format" {
+                f.json_format = booli(val == "true")
+            } else if key == "xml.indent" {
+                [n, ne] = strconv.atoi(val)
+                if ne == nil {
+                    f.xml_indent = n
+                }
+            } else if key == "xml.format" {
+                f.xml_format = booli(val == "true")
+            } else if key == "headers.sort" {
+                f.headers_sort = booli(val == "true")
             }
-        } else if key == "xml.format" {
-            f.xml_format = booli(val == "true")
-        } else if key == "headers.sort" {
-            f.headers_sort = booli(val == "true")
         }
     }
     return f

@@ -276,10 +276,12 @@ fn test_construct_url() {
 }
 
 fn test_deferrals() {
-    // WI-0016 S5: --generate executes — vendored artifact on stdout.
+    // WI-0016 S5: --generate routes to exec — the vendored artifact
+    // renders in execute(), covered by the golden generate_* cases.
     og := r("--generate\nman")
     testing.expect_eq(og.code, 0, "generate man exits 0")
-    testing.expect(find(og.stdout, ".TH") >= 0, "generate man emits man page")
+    testing.expect_eq(og.exec, 1, "generate man execs")
+    testing.expect_streq(og.intent.gen, "man", "generate man kind")
     deferr(r("--unstable-m-sig-id\ni\n--unstable-m-sig-key\nk\nexample.org"), "This binary was built without message signature support. Enable the `http-message-signatures` feature.")
     deferr(r("--http-version\n3-prior-knowledge\nexample.org"), "This binary was built without support for HTTP/3. Enable the `http3` feature.")
     // WI-0013: --http-version 2* executes (ADR-0030); only h3 defers
