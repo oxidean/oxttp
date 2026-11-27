@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "id": "WI-0022",
+  "title": "M4f OAuth2 authorization flow",
+  "state": "intake",
+  "profile": "normal",
+  "current_stage": "intake",
+  "created_at": "2026-11-27T20:42:24Z"
+}
