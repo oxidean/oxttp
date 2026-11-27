@@ -1666,6 +1666,30 @@ fn trim_ows(s: str) -> str {
     return substr(s, lo, hi)
 }
 
+// trim_hdrfile: upstream header-from-file contents get .trim() — all
+// ASCII whitespace including CR/LF, not just OWS.
+fn trim_hdrfile(s: str) -> str {
+    lo := 0
+    hi := len(s)
+    for lo < hi {
+        c := byteat(s, lo)
+        if c == 32 || c == 9 || c == 10 || c == 13 {
+            lo = lo + 1
+        } else {
+            break
+        }
+    }
+    for hi > lo {
+        c := byteat(s, hi - 1)
+        if c == 32 || c == 9 || c == 10 || c == 13 {
+            hi = hi - 1
+        } else {
+            break
+        }
+    }
+    return substr(s, lo, hi)
+}
+
 fn sess_auth_header(t: str, raw: str) -> str {
     if t == "bearer" {
         return "Bearer " + raw
@@ -2125,7 +2149,10 @@ fn curl_q(s: str) -> str {
         if fc == 126 || fc == 35 || fc == 33 {
             req = 1
         }
-        if req == 0 && fnb == 1 && fc < 32 || fnb == 1 && fc == 127 {
+        if req == 0 && fnb == 1 && fc < 32 {
+            req = 1
+        }
+        if fnb == 1 && fc == 127 {
             req = 1
         }
         if req == 0 && fnb > 1 && curl_zw(fc) != 0 {
@@ -2232,9 +2259,9 @@ fn sdrop(xs: []str, v: str) -> []str {
     return out
 }
 
-// tilde_expand maps `~/x` → $HOME/x (upstream expand_tilde).
+// tilde_expand maps `~`/`~/x` → $HOME[/x] (upstream expand_tilde).
 fn tilde_expand(path: str, env: []str) -> str {
-    if len(path) >= 2 && byteat(path, 0) == 126 && byteat(path, 1) == 47 {
+    if len(path) >= 1 && byteat(path, 0) == 126 && (len(path) == 1 || byteat(path, 1) == 47) {
         h := env_get(env, "HOME")
         if len(h) > 0 {
             return h + substr(path, 1, len(path))
@@ -2611,7 +2638,13 @@ fn curl_translate(i: ref Intent, env: []str) -> own CurlC {
                 continue
             }
             cc_arg(c, "--resolve")
-            cc_arg(c, substr(rs, 0, ci2) + ":" + itoa(port) + ":" + substr(rs, ci2 + 1, len(rs)))
+            // upstream parses the addr as IpAddr — brackets around an
+            // IPv6 literal are syntax, not part of the emitted value.
+            addr := substr(rs, ci2 + 1, len(rs))
+            if len(addr) >= 2 && byteat(addr, 0) == 91 && byteat(addr, len(addr) - 1) == 93 {
+                addr = substr(addr, 1, len(addr) - 1)
+            }
+            cc_arg(c, substr(rs, 0, ci2) + ":" + itoa(port) + ":" + addr)
         }
     }
     // item headers (lowercased; unsets cancel/re-emit per upstream
@@ -2642,7 +2675,7 @@ fn curl_translate(i: ref Intent, env: []str) -> own CurlC {
                     c.err = "couldn't read header file " + h2.value
                     return c
                 }
-                vv = trim_ws(os.readfile_(fp))
+                vv = trim_hdrfile(os.readfile_(fp))
             }
             hset = sdrop(hset, nm)
             hp_n = push(hp_n, nm)

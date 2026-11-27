@@ -78,13 +78,21 @@ jobs:
       # OOM-kills the job. Swap carries the overflow until upstream
       # fixes the driver's memory profile. The hosted image already
       # ships an active /swapfile — writing to it fails ETXTBSY, so
-      # this one uses a unique path and only tops up when short.
+      # this one uses a unique path sized to available disk.
       - name: add swap for oxl test memory peak
         run: |
+          # The hosted image already ships an active /swapfile — writing
+          # to it fails ETXTBSY, so this one uses a unique path. Size it
+          # to the smaller of the memory headroom we want (~40GiB total
+          # commit) and what the runner disk can spare (~3GiB kept free).
           cur_kb=$(awk '/^SwapTotal/ {print $2}' /proc/meminfo)
-          need_kb=$((12 * 1024 * 1024))
-          if [ "$cur_kb" -lt "$need_kb" ]; then
-            want_mb=$(( (need_kb - cur_kb) / 1024 ))
+          mem_kb=$(awk '/^MemTotal/ {print $2}' /proc/meminfo)
+          want_kb=$((40 * 1024 * 1024 - mem_kb - cur_kb))
+          avail_kb=$(df -k --output=avail / | tail -1)
+          disk_kb=$((avail_kb - 3 * 1024 * 1024))
+          [ "$want_kb" -gt "$disk_kb" ] && want_kb=$disk_kb
+          if [ "$want_kb" -gt 0 ]; then
+            want_mb=$((want_kb / 1024))
             sudo fallocate -l "${want_mb}M" /oxttp-ci-swap || sudo dd if=/dev/zero of=/oxttp-ci-swap bs=1M count=$want_mb
             sudo chmod 600 /oxttp-ci-swap
             sudo mkswap /oxttp-ci-swap

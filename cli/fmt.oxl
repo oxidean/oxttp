@@ -157,30 +157,65 @@ fn charset_of(charset_arg: str, hdrs: []model.Header) -> str {
         return ""
     }
     v := lower(hdrs[i].value)
-    j := 0
-    for j + 7 <= len(v) {
-        if substr(v, j, j + 7) != "charset" {
-            j = j + 1
-            continue
+    // media-type params are `;`-separated name=value pairs; match
+    // `charset` as a param name so substrings inside other values
+    // (boundaries, filenames) can't false-positive, and honor quoted
+    // values like charset="utf-8".
+    start := 0
+    for start <= len(v) {
+        // `;` inside a quoted param value doesn't split — track quotes.
+        e := start
+        q := 0
+        for e < len(v) {
+            c3 := byteat(v, e)
+            if q != 0 {
+                if c3 == q {
+                    q = 0
+                }
+            } else if c3 == 34 || c3 == 39 {
+                q = c3
+            } else if c3 == 59 {
+                break
+            }
+            e = e + 1
         }
-        k := j + 7
-        for k < len(v) && byteat(v, k) == 32 {
-            k = k + 1
-        }
-        if k < len(v) && byteat(v, k) == 61 {
-            k = k + 1
-            for k < len(v) && byteat(v, k) == 32 {
+        seg := trim_ws(substr(v, start, e))
+        if len(seg) >= 8 && substr(seg, 0, 7) == "charset" {
+            k := 7
+            for k < len(seg) && byteat(seg, k) == 32 {
                 k = k + 1
             }
-            e := k
-            for e < len(v) && byteat(v, e) != 59 && byteat(v, e) != 32 && byteat(v, e) != 34 {
-                e = e + 1
-            }
-            if e > k {
-                return enc_lookup(substr(v, k, e))
+            if k < len(seg) && byteat(seg, k) == 61 {
+                k = k + 1
+                for k < len(seg) && byteat(seg, k) == 32 {
+                    k = k + 1
+                }
+                q := 0
+                if k < len(seg) && (byteat(seg, k) == 34 || byteat(seg, k) == 39) {
+                    q = byteat(seg, k)
+                    k = k + 1
+                }
+                e2 := k
+                for e2 < len(seg) {
+                    c2 := byteat(seg, e2)
+                    if q != 0 {
+                        if c2 == q {
+                            break
+                        }
+                    } else if c2 == 32 || c2 == 9 {
+                        break
+                    }
+                    e2 = e2 + 1
+                }
+                if e2 > k {
+                    return enc_lookup(substr(seg, k, e2))
+                }
             }
         }
-        j = j + 7
+        if e >= len(v) {
+            break
+        }
+        start = e + 1
     }
     return ""
 }
@@ -229,6 +264,11 @@ fn decode_bounded(raw: []byte, enc: str) -> str {
     if e == "windows-1252" {
         return w1252_dec(raw)
     }
+    // everything else decodes as UTF-8-lossy; an explicit UTF-8 label
+    // still gets BOM removal like upstream decode_with_bom_removal.
+    if len(raw) >= 3 && raw[0] == 239 && raw[1] == 187 && raw[2] == 191 {
+        return utf8_lossy(sliceb(raw, 3, len(raw)))
+    }
     return utf8_lossy(raw)
 }
 
@@ -243,47 +283,28 @@ fn sliceb(b: []byte, a: int, z: int) -> []byte {
 }
 
 // utf8_lossy: copy well-formed UTF-8 verbatim; malformed bytes become
-// U+FFFD (encoding_rs decode-without-bom semantics).
+// U+FFFD (encoding_rs decode-without-bom semantics). Validation is
+// delegated to u8_dec so overlongs, surrogates and >U+10FFFF count as
+// malformed exactly like Rust's from_utf8.
 fn utf8_lossy(raw: []byte) -> str {
+    s := raw as str
     out := mkslice(byte, 0)
     i := 0
     for i < len(raw) {
-        c := raw[i]
-        if c < 128 {
-            out = push(out, c)
-            i = i + 1
-            continue
-        }
-        need := 0
-        if c >= 194 && c <= 223 {
-            need = 1
-        } else if c >= 224 && c <= 239 {
-            need = 2
-        } else if c >= 240 && c <= 244 {
-            need = 3
-        }
-        ok := 1
-        j := 0
-        for need > 0 && j < need {
-            j = j + 1
-            if i + j >= len(raw) || raw[i + j] < 128 || raw[i + j] > 191 {
-                ok = 0
-                j = need
-            }
-        }
-        if need == 0 || ok == 0 {
+        fr := u8_dec(s, i)
+        if fr[1] == 1 && fr[0] >= 128 {
             out = push(out, 239)
             out = push(out, 191)
             out = push(out, 189)
             i = i + 1
             continue
         }
-        j = 0
-        for j <= need {
+        j := 0
+        for j < fr[1] {
             out = push(out, raw[i + j])
             j = j + 1
         }
-        i = i + need + 1
+        i = i + fr[1]
     }
     return out as str
 }
@@ -338,9 +359,35 @@ fn w1252_dec(raw: []byte) -> str {
         b := raw[i]
         i = i + 1
         if b >= 128 && b <= 159 {
-            // index into the 32-entry table; decode the UTF-8 char
-            ch := utf8_charat(tbl, b - 128)
-            out = pushstr(out, ch)
+            // cp1252 has 27 defined slots in 0x80–0x9F; the undefined
+            // indices {1,13,15,16,29} decode to the matching C1 control
+            // per WHATWG/encoding_rs. tbl holds only the defined glyphs,
+            // so pos counts defined indices below idx.
+            idx := b - 128
+            if idx == 1 || idx == 13 || idx == 15 || idx == 16 || idx == 29 {
+                cp := 128 + idx
+                out = push(out, (192 + cp / 64) as byte)
+                out = push(out, (128 + cp % 64) as byte)
+            } else {
+                pos := idx
+                if idx > 1 {
+                    pos = pos - 1
+                }
+                if idx > 13 {
+                    pos = pos - 1
+                }
+                if idx > 15 {
+                    pos = pos - 1
+                }
+                if idx > 16 {
+                    pos = pos - 1
+                }
+                if idx > 29 {
+                    pos = pos - 1
+                }
+                ch := utf8_charat(tbl, pos)
+                out = pushstr(out, ch)
+            }
         } else if b >= 160 {
             out = push(out, (192 + b / 64) as byte)
             out = push(out, (128 + b % 64) as byte)
@@ -376,18 +423,20 @@ fn utf8_charat(s: str, n: int) -> str {
     i := 0
     k := 0
     for i < len(s) {
-        if k == n {
-            e := i + 1
-            for e < len(s) && byteat(s, e) >= 128 && byteat(s, e) <= 191 {
-                e = e + 1
+        c := byteat(s, i)
+        // char boundary = ASCII or a lead byte (>=194); continuation
+        // bytes (128..191) belong to the preceding char.
+        if c < 128 || c >= 194 {
+            if k == n {
+                e := i + 1
+                for e < len(s) && byteat(s, e) >= 128 && byteat(s, e) <= 191 {
+                    e = e + 1
+                }
+                return substr(s, i, e)
             }
-            return substr(s, i, e)
-        }
-        for i < len(s) && byteat(s, i) >= 128 && byteat(s, i) <= 191 {
-            i = i + 1
+            k = k + 1
         }
         i = i + 1
-        k = k + 1
     }
     return ""
 }
@@ -643,29 +692,11 @@ fn hdr_value_out(v: str, f: ref Fmt) -> str {
 fn utf8_valid(s: str) -> int {
     i := 0
     for i < len(s) {
-        c := byteat(s, i)
-        if c < 128 {
-            i = i + 1
-            continue
-        }
-        need := 0
-        if c >= 194 && c <= 223 {
-            need = 1
-        } else if c >= 224 && c <= 239 {
-            need = 2
-        } else if c >= 240 && c <= 244 {
-            need = 3
-        } else {
+        fr := u8_dec(s, i)
+        if fr[1] == 1 && fr[0] >= 128 {
             return 0
         }
-        j := 0
-        for j < need {
-            j = j + 1
-            if i + j >= len(s) || byteat(s, i + j) < 128 || byteat(s, i + j) > 191 {
-                return 0
-            }
-        }
-        i = i + need + 1
+        i = i + fr[1]
     }
     return 1
 }

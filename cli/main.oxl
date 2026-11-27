@@ -177,8 +177,14 @@ fn main() {
         if term.isatty(term.stdin_fd()) {
             tty = 1
         }
+        // --generate/--curl never consume stdin — upstream returns
+        // without reading, so a piped stdin must not block the emit.
+        want_stdin := 1
+        if len(o.intent.gen) > 0 || o.intent.curl != 0 {
+            want_stdin = 0
+        }
         data := ""
-        if tty == 0 {
+        if tty == 0 && want_stdin != 0 {
             f := os.stdin()
             buf := mkslice(byte, 65536)
             for true {
@@ -194,6 +200,12 @@ fn main() {
         otty := 0
         if term.isatty(term.stdout_fd()) {
             otty = 1
+        }
+        // file sinks are not terminals upstream (Buffer::is_terminal):
+        // -o/--download must get the plain render, not ANSI colors or
+        // the binary suppressor text.
+        if len(o.intent.output) > 0 || o.intent.download != 0 {
+            otty = 0
         }
         r := execute(o.intent, envpairs, data, tty, otty)
         if len(r.stdout) > 0 {

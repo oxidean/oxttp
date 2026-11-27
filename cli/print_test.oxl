@@ -275,3 +275,41 @@ fn test_json_highlight() {
     testing.expect(find(out, "\x1b[33m\"x\"\x1b[0m") >= 0, "json string SGR: " + out)
     testing.expect(find(out, "\x1b[34mtrue\x1b[0m") >= 0, "json const SGR: " + out)
 }
+
+// WI-0016 review fixes: cp1252 C1 slots, strict UTF-8 validation,
+// explicit-charset BOM strip, quoted charset params.
+fn test_w1252_c1_slots() {
+    // 0x80→€, 0x8D→U+008D (C1 control), 0x9F→Ÿ, 0x81→U+0081
+    out := w1252_dec(("\x80\x8d\x9f\x81" as []byte))
+    testing.expect(find(out, "€") >= 0, "0x80 euro: " + out)
+    testing.expect(find(out, "\xc2\x8d") >= 0, "0x8d C1: " + out)
+    testing.expect(find(out, "Ÿ") >= 0, "0x9f Ydieresis: " + out)
+    testing.expect(find(out, "\xc2\x81") >= 0, "0x81 C1: " + out)
+}
+
+fn test_utf8_strict_validation() {
+    // surrogate ED A0 80, overlong E0 80 80, >U+10FFFF F4 90 80 80
+    testing.expect_eq(utf8_valid("\xed\xa0\x80"), 0, "surrogate invalid")
+    testing.expect_eq(utf8_valid("\xe0\x80\x80"), 0, "overlong invalid")
+    testing.expect_eq(utf8_valid("\xf4\x90\x80\x80"), 0, "range invalid")
+    testing.expect_eq(utf8_valid("héllo wörld"), 1, "valid utf8")
+    testing.expect_eq(utf8_valid("\xc3\x28"), 0, "bad continuation")
+    l := utf8_lossy(("\xed\xa0\x80x" as []byte))
+    testing.expect(find(l, "\xef\xbf\xbd") >= 0, "lossy emits FFFD: " + l)
+    testing.expect(find(l, "x") >= 0, "lossy keeps tail: " + l)
+}
+
+fn test_decode_bom_explicit_utf8() {
+    out := decode_bounded(("\xef\xbb\xbfhi" as []byte), "utf-8")
+    testing.expect_eq(len(out), 2, "explicit utf-8 strips BOM")
+    testing.expect_streq(out, "hi", "bom strip content")
+}
+
+fn test_charset_of_quoted() {
+    let hs: []model.Header = nil
+    hs = push(hs, model.Header{name: "content-type", value: "text/plain; charset=\"utf-8\""})
+    testing.expect_streq(charset_of("", hs), "UTF-8", "quoted charset")
+    let hs2: []model.Header = nil
+    hs2 = push(hs2, model.Header{name: "content-type", value: "text/plain; boundary=\"a;charset=b\"; charset=iso-8859-1"})
+    testing.expect_streq(charset_of("", hs2), "windows-1252", "param-boundary charset")
+}

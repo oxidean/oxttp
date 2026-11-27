@@ -379,6 +379,12 @@ Rewrite `core/net` (or cli) netrc reader as the upstream machine:
 - **DevD13** `curl_zw` zero-width approximation is a hand-rolled subset
   of unicode-width's set for the leading-char quote trigger —
   fidelity gap on exotic zero-width codepoints only.
+- **DevD14** formatted-body dispatch includes `xml_format` alongside
+  upstream's `(color || format_json)` — without it `--format-options
+  xml.format:true` could never reach the XML formatter (DevD5).
+- **DevD15** `--curl` `@file` body MIME detection uses a bounded
+  suffix table, not upstream's full `mime_guess` crate — uncommon
+  extensions emit `application/json` instead of their real type.
 
 ## Acceptance criteria
 
