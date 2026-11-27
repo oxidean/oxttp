@@ -5,6 +5,7 @@ package main
 
 import "std/testing"
 import "std/os"
+import "github.com/oxidean/oxttp/core/model"
 
 fn test_cli_version() {
     r := cli_version()
@@ -50,6 +51,39 @@ fn test_cli_remote() {
     testing.expect(r.code == 0, "help")
 }
 
+fn test_cli_remote_instance_and_json() {
+    let a: []str = nil
+    a = push(a, "remote")
+    a = push(a, "--instance")
+    a = push(a, "foo")
+    a = push(a, "list")
+    r := cli_remote_args(a)
+    testing.expect(r.code == 0, "--instance consumed, list runs")
+    testing.expect(find(r.stdout, "no running Posting") >= 0, "list text")
+    // = form
+    a = nil
+    a = push(a, "remote")
+    a = push(a, "--instance=bar")
+    a = push(a, "list")
+    r = cli_remote_args(a)
+    testing.expect(r.code == 0, "--instance= form")
+    // list --json → [] → 0
+    a = nil
+    a = push(a, "remote")
+    a = push(a, "list")
+    a = push(a, "--json")
+    r = cli_remote_args(a)
+    testing.expect(r.code == 0, "list --json code")
+    testing.expect_streq(r.stdout, "[]\n", "list --json body")
+    // unknown command → usage → 2 (was 1)
+    a = nil
+    a = push(a, "remote")
+    a = push(a, "bogus")
+    r = cli_remote_args(a)
+    testing.expect(r.code == 2, "unknown cmd usage")
+    testing.expect(find(r.stderr, "usage:") >= 0, "usage text")
+}
+
 fn test_cli_import() {
     let a: []str = nil
     a = push(a, "import")
@@ -62,6 +96,22 @@ fn test_cli_import() {
     a[2] = "bogus"
     r = cli_import_args(a)
     testing.expect(r.code == 2, "bad type")
+    // zero sources → usage 2, not the M4 degrade
+    a = nil
+    a = push(a, "import")
+    a = push(a, "-t")
+    a = push(a, "postman")
+    r = cli_import_args(a)
+    testing.expect(r.code == 2, "no sources usage")
+    // --type=x / --output=x forms parse
+    a = nil
+    a = push(a, "import")
+    a = push(a, "--type=postman")
+    a = push(a, "--output=/tmp/out")
+    a = push(a, "coll.json")
+    r = cli_import_args(a)
+    testing.expect(r.code == 1, "eq forms degrade")
+    testing.expect(find(r.stderr, "postman import lands M4") >= 0, "type applied")
 }
 
 fn test_run_parse() {
@@ -118,7 +168,9 @@ fn test_run_env_file_layers() {
     let envs: []str = nil
     envs = push(envs, "dev")
     envs = push(envs, f)
-    re := run_env(dir, envs)
+    let dirs: []str = nil
+    dirs = push(dirs, dir)
+    re := run_env(dirs, envs)
     testing.expect(len(re.err) == 0, "err: " + re.err)
     lr := re.es.lookup("B")
     testing.expect(lr.ok, "file var present")
@@ -174,4 +226,48 @@ fn test_run_exec() {
     rep = run_exec(o, fx)
     testing.expect(rep.code == 1, "non yaml")
     testing.expect(find(rep.err, ".posting.yaml") >= 0, "err")
+}
+
+// run ordering: requests execute sorted by collection-relative path,
+// not scan (DFS) order — a top-level "a" must precede "z/b" even
+// though the dir walk emits z's subtree first.
+fn test_run_exec_orders_by_rel() {
+    dir := "/tmp/oxttp-run-order"
+    os.remove_all(dir)
+    os.mkdir_all(dir + "/z")
+    os.writefile_(dir + "/a.posting.yaml", "name: a\nmethod: GET\nurl: http://x.test/a\n")
+    os.writefile_(dir + "/z/b.posting.yaml", "name: b\nmethod: GET\nurl: http://x.test/b\n")
+    o := new(RunOpts)
+    o.target = dir
+    fx := FakeSend{resp: fake_resp(200, "text/plain", "hi", nil), fail: ""}
+    rep := run_exec(o, fx)
+    testing.expect(len(rep.err) == 0, "err: " + rep.err)
+    testing.expect(rep.code == 0, "clean run")
+    testing.expect(len(rep.lines) == 3, "2 req + summary")
+    testing.expect(find(rep.lines[0], "PASSED a.posting.yaml") == 0, "a first")
+    testing.expect(find(rep.lines[1], "PASSED z/b.posting.yaml") == 0, "z/b second")
+    os.remove_all(dir)
+}
+
+fn test_is_utf8_and_resp_json_binary() {
+    good := "plain ascii body"
+    testing.expect(is_utf8(good as []byte), "ascii is utf8")
+    bad := mkslice(byte, 4)
+    bad[0] = 102
+    bad[1] = 254
+    bad[2] = 255
+    bad[3] = 0
+    testing.expect(!is_utf8(bad), "binary without valid utf8 rejected")
+    // resp_json emits bodyBase64 + the remote.Response fields
+    r := fake_resp(200, "text/plain", "", nil)
+    r.body = bad
+    rq := new(model.Req)
+    rq.method = "GET"
+    rq.url = "http://x.test/"
+    j := resp_json(rq, r, 1700000000000)
+    testing.expect(find(j, "\"bodyBase64\"") >= 0, "base64 body")
+    testing.expect(find(j, "\"contentType\":\"text/plain\"") >= 0, "contentType")
+    testing.expect(find(j, "\"reason\":\"OK\"") >= 0, "reason")
+    testing.expect(find(j, "\"proto\":\"HTTP/1.1\"") >= 0, "proto")
+    testing.expect(find(j, "\"receivedAt\":1700000000000") >= 0, "receivedAt")
 }

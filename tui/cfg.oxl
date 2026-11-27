@@ -620,6 +620,48 @@ fn hist_append(a: mut App, he: HistEnt) {
     hist_unlock(lock)
 }
 
+// hist_delete_save — remove one entry from the disk file under the
+// shared lock. Matches on the envelope id first (ids are unique per
+// file); id==0 entries (foreign/upstream shapes without IDs) fall
+// back to method+url+status equality so a real posting-2 row can
+// still be deleted. Other entries and next_id are preserved.
+fn hist_delete_save(a: mut App, gone: HistEnt) {
+    if !a.hist_disk {
+        return
+    }
+    f := hist_file_of(a)
+    dir := data_dir_of(a) + "/history"
+    if !os.isdir(dir) {
+        os.mkdir_all(dir)
+    }
+    lock := hist_lock(f)
+    if len(lock) == 0 {
+        a.toast(2, "history: busy — delete kept in memory only")
+        return
+    }
+    hl := hist_read(f)
+    out := mkslice(HistEnt, 0)
+    removed := false
+    i := 0
+    for i < len(hl.ents) {
+        e := hl.ents[i]
+        i = i + 1
+        hit := false
+        if gone.id != 0 && e.id == gone.id {
+            hit = true
+        } else if gone.id == 0 && e.method == gone.method && e.url == gone.url && e.status == gone.status {
+            hit = true
+        }
+        if hit && !removed {
+            removed = true
+            continue
+        }
+        out = push(out, e)
+    }
+    hist_write(a, f, out, hl.next_id)
+    hist_unlock(lock)
+}
+
 // ---------- tools (f3 pager / f4 editor) ----------
 
 // resolve_tools — config editor/pager/pager_json, POSTING_* env wins.
@@ -804,6 +846,20 @@ fn rebind_apply(a: mut App) {
             i = i + 1
             continue
         }
+        // duplicate action entries: yaml maps are last-wins upstream,
+        // so a repeated action REPLACES the earlier specs, not unions.
+        na := mkslice(str, 0)
+        nsp := mkslice(str, 0)
+        j = 0
+        for j < len(a.reb_actions) {
+            if a.reb_actions[j] != kv.name {
+                na = push(na, a.reb_actions[j])
+                nsp = push(nsp, a.reb_specs[j])
+            }
+            j = j + 1
+        }
+        a.reb_actions = na
+        a.reb_specs = nsp
         j = 0
         for j < len(specs) {
             a.reb_actions = push(a.reb_actions, kv.name)
@@ -1353,7 +1409,6 @@ fn vsug_start(a: mut App) {
     }
     a.vsug_pos = a.url.cur - 1
     a.vsug_sel = 0
-    a.vsug_on = len(vsug_names(a)) > 0 || true
     // open even when the unfiltered list would be empty-of-prefix —
     // vsug_names with empty prefix lists everything.
     a.vsug_on = len(vsug_names(a)) > 0

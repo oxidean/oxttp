@@ -203,3 +203,27 @@ fn test_load_bad_file_warns() {
     testing.expect(len(r.warns) >= 1, "warn expected")
     testing.expect_streq(r.s.theme, "galaxy", "defaults kept")
 }
+
+fn test_load_env_failure_is_atomic() {
+    // a bad env value drops the WHOLE env layer — good env leaves
+    // applied before it must not leak, even with no config file.
+    d := "/tmp/oxttp-cfg-env-atomic"
+    os.mkdir_all(d)
+    let pairs: []str = nil
+    pairs = push(pairs, "POSTING_THEME=nord")
+    pairs = push(pairs, "POSTING_WATCH_THEMES=nah")
+    pairs = push(pairs, "POSTING_LAYOUT=horizontal")
+    r := load(d + "/missing.yaml", pairs)
+    testing.expect(len(r.warns) >= 1, "warn expected")
+    testing.expect(find(r.warns[0], "Ignoring POSTING_") >= 0 || len(r.warns) > 1, "env warn present")
+    testing.expect_streq(r.s.theme, "galaxy", "no env leak on missing file")
+    testing.expect_streq(r.s.layout, "vertical", "layout stays default")
+    testing.expect(r.s.watch_themes, "watch stays default")
+    // with a readable file, file values survive and env drops whole
+    f := d + "/ok.yaml"
+    os.writefile_(f, "theme: catppuccin\nlayout: horizontal\n")
+    r = load(f, pairs)
+    testing.expect_streq(r.s.theme, "catppuccin", "file theme kept")
+    testing.expect_streq(r.s.layout, "horizontal", "file layout kept")
+    testing.expect(r.s.watch_themes, "env bool not applied")
+}

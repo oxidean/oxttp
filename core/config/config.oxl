@@ -773,13 +773,18 @@ fn load(file: str, envpairs: []str) -> own LoadRes {
             warns = push(warns, "Couldn't read " + file + ": " + read_err)
         }
     }
-    env_err := apply_env(s, envpairs)
+    // Two-pass env merge: validate every pair against a scratch
+    // settings first so a bad value drops the WHOLE env layer —
+    // file values (and defaults when the file is missing) survive
+    // untouched. Single-pass mutation would leak env leaves applied
+    // before the failing one.
+    env_err := ""
+    probe := defaults()
+    env_err = apply_env(probe, envpairs)
+    if len(env_err) == 0 {
+        apply_env(s, envpairs)
+    }
     if len(env_err) > 0 {
-        // Reload the file so env failure discards env only.
-        if len(read_err) == 0 && os.exists(file) {
-            s = defaults()
-            load_file_into(s, file)
-        }
         warns = push(warns, "Ignoring POSTING_ environment settings: " + env_err)
     }
     vw := validate(s)

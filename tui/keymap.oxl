@@ -34,6 +34,13 @@ fn parse_key(spec: str) -> [KeyPat, err] {
     }
     i := 0
     for i < len(parts) - 1 {
+        // "++" yields an empty middle part — skip it so "ctrl++"
+        // parses as ctrl + literal "+" (split_plus keeps the trailing
+        // '+' as the key).
+        if len(parts[i]) == 0 {
+            i = i + 1
+            continue
+        }
         m := upper_ascii(parts[i])
         if m == "CTRL" {
             np.ctrl = true

@@ -479,6 +479,13 @@ documented")
     friendlier, noted.
 17. `POSTING_*` env-file warn wording differs from upstream's
     settingsInEnvironmentFiles text (ours names file+var).
+18. `posting run` startup errors (missing target, missing env,
+    unreadable/malformed collection, fatal config warns) exit 1 —
+    corpus §1.4 documents 2 for usage/startup errors. Spec pinned 1
+    (run-level error → 1); review-flagged, kept for now.
+19. `posting remote` emits a text `no running Posting found` stub —
+    `--instance`/`POSTING_INSTANCE` parsed-and-ignored, `list
+    --json` → `[]`, unknown commands → usage/2 (review fixes).
 
 ## Acceptance criteria
 

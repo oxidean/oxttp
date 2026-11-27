@@ -7,8 +7,10 @@ package main
 
 import "std/os"
 import "std/errors"
+import "std/time"
 import "std/encoding/json"
 import "std/encoding/base64"
+import "std/unicode/utf8"
 import "github.com/oxidean/oxttp/core/collection"
 import "github.com/oxidean/oxttp/core/config"
 import "github.com/oxidean/oxttp/core/env"
@@ -70,8 +72,10 @@ fn cli_locate_args(args: []str) -> Out {
         return Out{code: 0, stdout: "Default collection directory:\n" + config.default_coll_dir() + "\n", stderr: ""}
     }
     if what == "themes" {
-        // Upstream paths.ThemeDir — user themes live in the DATA dir.
-        return Out{code: 0, stdout: "Themes directory:\n" + config.data_dir() + "/themes\n", stderr: ""}
+        // Upstream paths.ThemeDir honors the configured
+        // theme_directory (config.yaml / POSTING_THEME_DIRECTORY).
+        cr := config.load("", config.posting_env_pairs())
+        return Out{code: 0, stdout: "Themes directory:\n" + config.theme_dir(cr.s) + "\n", stderr: ""}
     }
     return Out{code: 2, stdout: "", stderr: "Unknown thing to locate: \"" + what + "\"\n"}
 }
@@ -85,26 +89,49 @@ fn cli_remote() -> Out {
 fn cli_remote_args(args: []str) -> Out {
     i := 1
     cmd := ""
+    json_out := false
     for i < len(args) {
         a := args[i]
+        i = i + 1
         if a == "--help" || a == "-h" {
             return Out{code: 0, stdout: "usage: posting remote [--instance NAME] <command>\n  list  send  new  env  focus  skill\n", stderr: ""}
+        }
+        if a == "--json" {
+            json_out = true
+            continue
+        }
+        // --instance NAME / --instance=NAME and POSTING_INSTANCE are
+        // parsed-and-ignored (unix-socket degrade — spec §remote).
+        if a == "--instance" {
+            if i < len(args) {
+                i = i + 1
+            }
+            continue
+        }
+        if len(a) >= 11 && substr(a, 0, 11) == "--instance=" {
+            continue
         }
         if len(cmd) == 0 && len(a) > 0 && byteat(a, 0) != 45 {
             cmd = a
         }
-        i = i + 1
     }
+    os.getenv("POSTING_INSTANCE")
     if cmd == "list" {
+        if json_out {
+            return Out{code: 0, stdout: "[]\n", stderr: ""}
+        }
         return Out{code: 0, stdout: "PID\tVERSION\tCOLLECTION\tCWD\tSOCKET\nno running Posting found\n", stderr: ""}
     }
     if cmd == "skill" {
         return Out{code: 0, stdout: SKILL_MD, stderr: ""}
     }
+    if cmd == "send" || cmd == "new" || cmd == "env" || cmd == "focus" {
+        return Out{code: 1, stdout: "", stderr: "no running Posting found (unix sockets unsupported in this build)\n"}
+    }
     if len(cmd) == 0 {
         return Out{code: 2, stdout: "", stderr: "posting remote: a command is required\n"}
     }
-    return Out{code: 1, stdout: "", stderr: "no running Posting found (unix sockets unsupported in this build)\n"}
+    return Out{code: 2, stdout: "", stderr: "usage: posting remote [--instance NAME] <command>\n  list  send  new  env  focus  skill\n"}
 }
 
 fn cli_import() -> Out {
@@ -114,16 +141,33 @@ fn cli_import() -> Out {
 fn cli_import_args(args: []str) -> Out {
     i := 1
     typ := "openapi"
+    let srcs: []str = nil
     for i < len(args) {
         a := args[i]
+        i = i + 1
+        // --type=x / --output=x forms (upstream flag splitter).
+        if len(a) >= 7 && substr(a, 0, 7) == "--type=" {
+            typ = substr(a, 7, len(a))
+            continue
+        }
+        if len(a) >= 9 && substr(a, 0, 9) == "--output=" {
+            continue
+        }
+        if len(a) >= 3 && substr(a, 0, 3) == "-t=" {
+            typ = substr(a, 3, len(a))
+            continue
+        }
+        if len(a) >= 3 && substr(a, 0, 3) == "-o=" {
+            continue
+        }
         if a == "-t" || a == "--type" {
-            if i + 1 >= len(args) {
+            if i >= len(args) {
                 return Out{code: 2, stdout: "", stderr: "posting import: --type needs a value\n"}
             }
-            typ = args[i + 1]
+            typ = args[i]
             i = i + 1
         } else if a == "-o" || a == "--output" {
-            if i + 1 >= len(args) {
+            if i >= len(args) {
                 return Out{code: 2, stdout: "", stderr: "posting import: --output needs a value\n"}
             }
             i = i + 1
@@ -131,11 +175,15 @@ fn cli_import_args(args: []str) -> Out {
             return Out{code: 0, stdout: "usage: posting import [-t openapi|postman|bruno] [-o DIR] SOURCE...\n", stderr: ""}
         } else if len(a) > 0 && byteat(a, 0) == 45 {
             return Out{code: 2, stdout: "", stderr: "posting import: unknown flag " + a + "\n"}
+        } else {
+            srcs = push(srcs, a)
         }
-        i = i + 1
     }
     if typ != "openapi" && typ != "postman" && typ != "bruno" {
         return Out{code: 2, stdout: "", stderr: "posting import: unknown type " + typ + "\n"}
+    }
+    if len(srcs) == 0 {
+        return Out{code: 2, stdout: "", stderr: "posting import: no input files\n"}
     }
     return Out{code: 1, stdout: "", stderr: "posting import: " + typ + " import lands M4 in this build\n"}
 }
@@ -154,6 +202,7 @@ struct RunRep {
     code: int,
     lines: []str,   // per-request PASS/FAIL/SKIP + summary (or json)
     err: str,       // run-level error text
+    stderr: str,    // non-fatal warnings (use_host_environment etc.)
 }
 
 fn run_usage() -> str {
@@ -241,10 +290,11 @@ fn cli_run() -> Out {
         return Out{code: 2, stdout: "", stderr: "posting run: bad arguments\nRun posting run --help for usage.\n"}
     }
     rep := run_exec(rp.o, http.H1{})
+    se := rep.stderr
     if len(rep.err) > 0 {
-        return Out{code: rep.code, stdout: join(rep.lines), stderr: "posting run: " + rep.err + "\n"}
+        se = se + "posting run: " + rep.err + "\n"
     }
-    return Out{code: rep.code, stdout: join(rep.lines), stderr: ""}
+    return Out{code: rep.code, stdout: join(rep.lines), stderr: se}
 }
 
 fn join(lines: []str) -> str {
@@ -257,16 +307,25 @@ fn join(lines: []str) -> str {
     return out
 }
 
-// run_env resolves -e names/files into an EnvSet — names load
-// <root>/<name>.env (+ .local.env) via build_set; file paths load
-// verbatim via parse_dotenv into a session-shaped last layer.
+// run_env resolves -e names/files into an EnvSet over the env search
+// dirs (corpus §5.1: CWD → collection dir → config dir). Base files
+// (posting.env, posting.local.env) layer per dir in dir order; each
+// -e then composes IN CLI ORDER — a named env resolves first-dir-
+// wins via env_files_named, a file path parses verbatim. File-path
+// -e values therefore interleave with named ones exactly as passed
+// (upstream composes --env in arg order).
 struct RunEnv { es: own env.EnvSet, err: str }
 
-fn run_env(root: str, envs: []str) -> own RunEnv {
+fn run_env(dirs: []str, envs: []str) -> own RunEnv {
     re := new(RunEnv)
     es := new(env.EnvSet)
-    let active: []str = nil
     i := 0
+    for i < len(dirs) {
+        env_load_file(es, dirs[i] + "/posting.env", "posting.env")
+        env_load_file(es, dirs[i] + "/posting.local.env", "posting.local.env")
+        i = i + 1
+    }
+    i = 0
     for i < len(envs) {
         e := envs[i]
         i = i + 1
@@ -276,40 +335,37 @@ fn run_env(root: str, envs: []str) -> own RunEnv {
                 re.err = "environment file not found: " + e
                 return re
             }
-            [p, pe] = env.parse_dotenv(os.readfile_(e), es)
-            if pe != nil {
-                re.err = e + ": " + errors.msg(pe)
-                return re
-            }
-            wi := 0
-            for wi < len(p.warns) {
-                es.warns = push(es.warns, p.warns[wi])
-                wi = wi + 1
-            }
-            es.layers = push(es.layers, env.EnvLayer{name: e, source: "file", vars: p.vars})
+            env_load_file(es, e, e)
         } else {
-            if !os.exists(root + "/" + e + ".env") {
+            fs := env_files_named(dirs, e)
+            if len(fs) == 0 {
                 re.err = "environment not found in collection: " + e
                 return re
             }
-            active = push(active, e)
+            j := 0
+            for j < len(fs) {
+                env_load_file(es, fs[j], basename(fs[j]))
+                j = j + 1
+            }
         }
     }
-    built := env.build_set(root, active, nil)
-    // file layers come last — file values take precedence over the
-    // named stack (and their parse warns merge in, not replace).
-    i = 0
-    for i < len(es.layers) {
-        built.layers = push(built.layers, es.layers[i])
-        i = i + 1
-    }
-    i = 0
-    for i < len(es.warns) {
-        built.warns = push(built.warns, es.warns[i])
-        i = i + 1
-    }
-    re.es = built
+    re.es = es
     return re
+}
+
+// dir_name — parent dir of a path ("." when none, "/" at root).
+fn dir_name(p: str) -> str {
+    i := len(p) - 1
+    for i > 0 && byteat(p, i) != 47 {
+        i = i - 1
+    }
+    if byteat(p, i) == 47 {
+        if i == 0 {
+            return "/"
+        }
+        return substr(p, 0, i)
+    }
+    return "."
 }
 
 // run_collect gathers runnable requests under target — dir → scan
@@ -321,18 +377,53 @@ fn run_exec(o: ref RunOpts, t: http.Transport) -> own RunRep {
     rep := new(RunRep)
     rep.code = 0
     rep.lines = nil
-    root := o.coll
-    if len(root) == 0 {
-        root = os.fullpath(".")
-    }
     target := o.target
     if !is_abs2(target) {
-        target = root + "/" + target
+        // relative target joins the -c collection root; without -c
+        // it resolves against CWD.
+        if len(o.coll) > 0 {
+            target = o.coll + "/" + target
+        } else {
+            target = os.fullpath(target)
+        }
     }
     if !os.exists(target) {
         rep.err = "no such file or directory: " + o.target
         rep.code = 1
         return rep
+    }
+    // collection dir: -c wins; else the target dir itself (a dir
+    // target IS the collection) or a single file's parent. Env
+    // files and collection-relative paths resolve against it —
+    // never bare CWD (upstream run.go).
+    coll_dir := o.coll
+    if len(coll_dir) == 0 {
+        if os.isdir(target) {
+            coll_dir = target
+        } else {
+            coll_dir = dir_name(target)
+        }
+    }
+    // env search dirs (corpus §5.1): CWD → collection → config dir.
+    cand := mkslice(str, 0)
+    cand = push(cand, os.fullpath("."))
+    cand = push(cand, os.fullpath(coll_dir))
+    cand = push(cand, config.config_dir())
+    let edirs: []str = nil
+    di := 0
+    for di < len(cand) {
+        seen := false
+        dj := 0
+        for dj < len(edirs) {
+            if edirs[dj] == cand[di] {
+                seen = true
+            }
+            dj = dj + 1
+        }
+        if !seen {
+            edirs = push(edirs, cand[di])
+        }
+        di = di + 1
     }
     // settings: warnings are fatal unattended (upstream run.go).
     cr := config.load("", config.posting_env_pairs())
@@ -341,7 +432,12 @@ fn run_exec(o: ref RunOpts, t: http.Transport) -> own RunRep {
         rep.code = 1
         return rep
     }
-    re := run_env(root, o.envs)
+    // use_host_environment can't merge host vars headlessly — warn
+    // on stderr like the TUI's toast (spec §run env).
+    if cr.s.use_host_environment {
+        rep.stderr = rep.stderr + "posting run: warning: use_host_environment is set but host environment variables are not merged in this build\n"
+    }
+    re := run_env(edirs, o.envs)
     if len(re.err) > 0 {
         rep.err = re.err
         rep.code = 1
@@ -408,6 +504,27 @@ fn run_exec(o: ref RunOpts, t: http.Transport) -> own RunRep {
         rep.code = 1
         return rep
     }
+    // corpus ordering is load-bearing: requests run sorted by
+    // collection-relative path, not scan (DFS) order.
+    ord := mkslice(int, 0)
+    i = 0
+    for i < len(sc.nodes) {
+        if !sc.nodes[i].is_dir {
+            ord = push(ord, i)
+        }
+        i = i + 1
+    }
+    si := 1
+    for si < len(ord) {
+        v := ord[si]
+        sj := si - 1
+        for sj >= 0 && str_lt(sc.nodes[v].rel, sc.nodes[ord[sj]].rel) {
+            ord[sj + 1] = ord[sj]
+            sj = sj - 1
+        }
+        ord[sj + 1] = v
+        si = si + 1
+    }
     // loop
     let jar: []JarEnt = nil
     passed := 0
@@ -415,14 +532,11 @@ fn run_exec(o: ref RunOpts, t: http.Transport) -> own RunRep {
     skipped := 0
     let jresults = ""
     first_j := true
-    i = 0
+    oi := 0
     stop := false
-    for i < len(sc.nodes) {
-        n := sc.nodes[i]
-        i = i + 1
-        if n.is_dir {
-            continue
-        }
+    for oi < len(ord) {
+        n := sc.nodes[ord[oi]]
+        oi = oi + 1
         if stop {
             skipped = skipped + 1
             rep.lines = push(rep.lines, "SKIPPED " + n.rel + "\n")
@@ -434,7 +548,7 @@ fn run_exec(o: ref RunOpts, t: http.Transport) -> own RunRep {
             rep.lines = push(rep.lines, "FAILED " + n.rel + ": captures unsupported in this build — lands M4\n")
             failed = failed + 1
             if o.fail_fast { stop = true }
-            jresults = jappend(jresults, first_j, "{\"file\":" + jesc(n.rel) + ",\"outcome\":\"failed\",\"error\":\"captures unsupported in this build\"}")
+            jresults = jappend(jresults, first_j, "{\"file\":" + jesc(n.rel) + ",\"name\":" + jesc(n.req.name) + ",\"outcome\":\"failed\",\"error\":\"captures unsupported in this build\"}")
             first_j = false
             continue
         }
@@ -444,12 +558,12 @@ fn run_exec(o: ref RunOpts, t: http.Transport) -> own RunRep {
             u0 = scheme_norm(u0)
             jlist = jar_for_list(jar, url_origin(u0))
         }
-        sp := collection.plan_req(n.req, es, jlist, root)
+        sp := collection.plan_req(n.req, es, jlist, coll_dir)
         if len(sp.err) > 0 {
             rep.lines = push(rep.lines, "FAILED " + n.rel + ": " + sp.err + "\n")
             failed = failed + 1
             if o.fail_fast { stop = true }
-            jresults = jappend(jresults, first_j, "{\"file\":" + jesc(n.rel) + ",\"outcome\":\"failed\",\"error\":" + jesc(sp.err) + "}")
+            jresults = jappend(jresults, first_j, "{\"file\":" + jesc(n.rel) + ",\"name\":" + jesc(n.req.name) + ",\"outcome\":\"failed\",\"error\":" + jesc(sp.err) + "}")
             first_j = false
             continue
         }
@@ -478,17 +592,18 @@ fn run_exec(o: ref RunOpts, t: http.Transport) -> own RunRep {
             rep.lines = push(rep.lines, "FAILED " + n.rel + ": " + cert_err + "\n")
             failed = failed + 1
             if o.fail_fast { stop = true }
-            jresults = jappend(jresults, first_j, "{\"file\":" + jesc(n.rel) + ",\"outcome\":\"failed\",\"error\":" + jesc(cert_err) + "}")
+            jresults = jappend(jresults, first_j, "{\"file\":" + jesc(n.rel) + ",\"name\":" + jesc(n.req.name) + ",\"outcome\":\"failed\",\"error\":" + jesc(cert_err) + "}")
             first_j = false
             continue
         }
         [resp, se] = t.send(sp.req)
+        rts := time.unix_ms()
         if se != nil {
             msg := errors.msg(se)
             rep.lines = push(rep.lines, "FAILED " + n.rel + ": " + msg + "\n")
             failed = failed + 1
             if o.fail_fast { stop = true }
-            jresults = jappend(jresults, first_j, "{\"file\":" + jesc(n.rel) + ",\"outcome\":\"failed\",\"error\":" + jesc(msg) + "}")
+            jresults = jappend(jresults, first_j, "{\"file\":" + jesc(n.rel) + ",\"name\":" + jesc(n.req.name) + ",\"outcome\":\"failed\",\"error\":" + jesc(msg) + "}")
             first_j = false
             continue
         }
@@ -498,13 +613,13 @@ fn run_exec(o: ref RunOpts, t: http.Transport) -> own RunRep {
             rep.lines = push(rep.lines, "FAILED " + n.rel + ": " + itoa(resp.status) + " " + resp.reason + "\n")
             failed = failed + 1
             if o.fail_fast { stop = true }
-            jresults = jappend(jresults, first_j, "{\"file\":" + jesc(n.rel) + ",\"outcome\":\"failed\",\"response\":" + resp_json(sp.req, resp) + "}")
+            jresults = jappend(jresults, first_j, "{\"file\":" + jesc(n.rel) + ",\"name\":" + jesc(n.req.name) + ",\"outcome\":\"failed\",\"response\":" + resp_json(sp.req, resp, rts) + "}")
             first_j = false
             continue
         }
         rep.lines = push(rep.lines, "PASSED " + n.rel + ": " + itoa(resp.status) + " " + resp.reason + " (" + ftoa(resp.elapsed_ms) + " ms)\n")
         passed = passed + 1
-        jresults = jappend(jresults, first_j, "{\"file\":" + jesc(n.rel) + ",\"name\":" + jesc(n.req.name) + ",\"outcome\":\"passed\",\"response\":" + resp_json(sp.req, resp) + "}")
+        jresults = jappend(jresults, first_j, "{\"file\":" + jesc(n.rel) + ",\"name\":" + jesc(n.req.name) + ",\"outcome\":\"passed\",\"response\":" + resp_json(sp.req, resp, rts) + "}")
         first_j = false
     }
     if o.json {
@@ -557,37 +672,42 @@ fn jappend(acc: str, first: bool, item: str) -> str {
     return acc + "," + item
 }
 
-fn resp_json(req: ref model.Req, resp: model.Resp) -> str {
+fn resp_json(req: ref model.Req, resp: model.Resp, rts: int) -> str {
     let h = ""
+    ct := ""
     i := 0
     for i < len(resp.headers) {
         if i > 0 {
             h = h + ","
         }
         h = h + "{\"name\":" + jesc(resp.headers[i].name) + ",\"value\":" + jesc(resp.headers[i].value) + "}"
-        i = i + 1
-    }
-    body := resp.body as str
-    if !is_utf8(resp.body) {
-        body = "\"bodyBase64\":" + jesc(base64.encode(resp.body)) + ","
-        return "{\"method\":" + jesc(req.method) + ",\"url\":" + jesc(req.url) + ",\"status\":" + jesc(itoa(resp.status) + " " + resp.reason) + ",\"statusCode\":" + itoa(resp.status) + ",\"headers\":[" + h + "]," + body + "\"size\":" + itoa(len(resp.body)) + ",\"elapsedMs\":" + ftoa(resp.elapsed_ms) + "}"
-    }
-    return "{\"method\":" + jesc(req.method) + ",\"url\":" + jesc(req.url) + ",\"status\":" + jesc(itoa(resp.status) + " " + resp.reason) + ",\"statusCode\":" + itoa(resp.status) + ",\"headers\":[" + h + "],\"body\":" + jesc(body) + ",\"size\":" + itoa(len(resp.body)) + ",\"elapsedMs\":" + ftoa(resp.elapsed_ms) + "}"
-}
-
-fn is_utf8(b: []byte) -> bool {
-    // cheap check: JSON must be valid UTF-8; reject NUL/controls
-    // via jesc which still escapes — upstream checks utf8.Valid.
-    // We approximate: any byte >= 0x80 unpaired → base64. For S11
-    // scope bodies are text; treat as utf8 unless NUL present.
-    i := 0
-    for i < len(b) {
-        if b[i] == 0 {
-            return false
+        if len(ct) == 0 && lower_ascii(resp.headers[i].name) == "content-type" {
+            ct = resp.headers[i].value
         }
         i = i + 1
     }
-    return true
+    // remote.Response-shaped fields (spec §run --json): reason, proto,
+    // contentType, receivedAt (unix ms — deviation 14).
+    extra := ",\"reason\":" + jesc(resp.reason)
+    if len(resp.version) > 0 {
+        extra = extra + ",\"proto\":" + jesc("HTTP/" + resp.version)
+    }
+    if len(ct) > 0 {
+        extra = extra + ",\"contentType\":" + jesc(ct)
+    }
+    extra = extra + ",\"receivedAt\":" + itoa(rts)
+    head := "{\"method\":" + jesc(req.method) + ",\"url\":" + jesc(req.url) + ",\"status\":" + jesc(itoa(resp.status) + " " + resp.reason) + ",\"statusCode\":" + itoa(resp.status) + extra + ",\"headers\":[" + h + "],"
+    tail := "\"size\":" + itoa(len(resp.body)) + ",\"elapsedMs\":" + ftoa(resp.elapsed_ms) + "}"
+    if !is_utf8(resp.body) {
+        return head + "\"bodyBase64\":" + jesc(base64.encode(resp.body)) + "," + tail
+    }
+    return head + "\"body\":" + jesc(resp.body as str) + "," + tail
+}
+
+fn is_utf8(b: []byte) -> bool {
+    // upstream checks utf8.Valid — invalid bodies go out base64 so the
+    // --json document stays well-formed.
+    return utf8.valid(b as str)
 }
 
 fn jar_for_list(jar: []JarEnt, origin: str) -> []str {

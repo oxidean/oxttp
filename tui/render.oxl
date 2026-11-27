@@ -12,6 +12,8 @@ import "std/os"
 
 import "std/errors"
 
+import "std/unicode/utf8"
+
 import "github.com/oxidean/oxttp/core/term"
 
 // palette ids (8-color SGR): 1 red, 2 green, 3 yellow, 4 blue,
@@ -177,7 +179,10 @@ fn render_header(a: ref App, scr: mut term.AnsiScreen, ver: str) {
     put_str(scr, 0, 0, s, a.theme.secondary, term.AttrBold)
 }
 
-fn render_url_bar(a: mut App, scr: mut term.AnsiScreen, cols: int) {
+// render_url_bar draws the method+url rows starting at row y —
+// y=1 under the header, y=0 when heading.visible=false pulls the
+// whole shell up one row.
+fn render_url_bar(a: mut App, scr: mut term.AnsiScreen, cols: int, y: int) {
     // method cell (clickable → method menu), then the url line-edit,
     // then a dim preview row (verbatim until vars land S10).
     mw := 10
@@ -199,14 +204,14 @@ fn render_url_bar(a: mut App, scr: mut term.AnsiScreen, cols: int) {
         off = g0
         j = g0
     }
-    put_str_max(scr, 1, 1, "[" + a.method + "]", mw - 1, a.theme.accent, term.AttrBold)
-    put_str_max(scr, mw + 2, 1, substr(a.url.text, off, len(a.url.text)), avail, 7, 0)
+    put_str_max(scr, 1, y, "[" + a.method + "]", mw - 1, a.theme.accent, term.AttrBold)
+    put_str_max(scr, mw + 2, y, substr(a.url.text, off, len(a.url.text)), avail, 7, 0)
     // url_bar.show_value_preview=false hides the substituted preview.
     if a.url_preview_on {
         prev := url_preview(a)
-        put_str_max(scr, 2, 2, "→ " + prev, cols - 4, 7, term.AttrDim)
+        put_str_max(scr, 2, y + 1, "→ " + prev, cols - 4, 7, term.AttrDim)
     }
-    fill_row(scr, 0, 3, cols, "-", 7, term.AttrDim)
+    fill_row(scr, 0, y + 2, cols, "-", 7, term.AttrDim)
     // $-suggestions float under the bar while the list is live.
     if a.vsug_on {
         ns := vsug_names(a)
@@ -216,7 +221,21 @@ fn render_url_bar(a: mut App, scr: mut term.AnsiScreen, cols: int) {
             if i == a.vsug_sel {
                 a2 = term.AttrReverse
             }
-            put_str_max(scr, mw + 2, 3 + i, " " + ns[i] + " ", 24, a.theme.accent, a2)
+            sg := " " + ns[i] + " "
+            put_str_max(scr, mw + 2, y + 2 + i, sg, 24, a.theme.accent, a2)
+            // the first suggestion row shares the separator row —
+            // redraw "-" past the text so the rule isn't clobbered.
+            if i == 0 {
+                dw := str_cols(sg)
+                if dw > 24 {
+                    dw = 24
+                }
+                fx := mw + 2 + dw
+                for fx < cols {
+                    scr.set_cell(fx, y + 2, "-", 7, -1, term.AttrDim)
+                    fx = fx + 1
+                }
+            }
             i = i + 1
         }
     }
@@ -227,7 +246,7 @@ fn render_url_bar(a: mut App, scr: mut term.AnsiScreen, cols: int) {
         if cx >= cols {
             cx = cols - 1
         }
-        scr.cursor(cx, 1, true)
+        scr.cursor(cx, y, true)
     }
 }
 
@@ -308,17 +327,13 @@ fn render_sidebar(a: mut App, scr: mut term.AnsiScreen, x: int, y: int, w: int, 
             }
         }
         // nerd_fonts resolves icon slots on the sidebar glyphs only
-        // (deviation 15): folder/file get nerd glyphs, the ASCII
+        // (deviation 15): folder/file get nerd PUA glyphs, the ASCII
         // fallback is the triangle set above.
         if a.nerd_icons {
             if n.is_dir {
-                if n.open {
-                    glyph = " "
-                } else {
-                    glyph = " "
-                }
+                glyph = utf8.encode(61563) + " " // nf-fa-folder U+F07B
             } else {
-                glyph = " "
+                glyph = utf8.encode(61462) + " " // nf-fa-file U+F016
             }
         }
         a2 := 0
@@ -809,9 +824,15 @@ fn render(a: mut App, scr: mut term.AnsiScreen, ver: str) {
     sz := scr.size()
     cols := sz.cols
     rows := sz.rows
-    render_header(a, scr, ver)
-    render_url_bar(a, scr, cols)
-    by := 4
+    // heading.visible=false hides the header row and pulls the whole
+    // shell up one row (url bar 0..2, body from 3).
+    hy := 0
+    if a.heading_on {
+        hy = 1
+        render_header(a, scr, ver)
+    }
+    render_url_bar(a, scr, cols, hy)
+    by := hy + 3
     bh := rows - 2 - by
     if bh < 3 {
         bh = 3
@@ -855,7 +876,7 @@ fn render(a: mut App, scr: mut term.AnsiScreen, ver: str) {
     a.r_resp_y = by
     a.r_resp_w = mw
     a.r_resp_h = bh
-    a.r_url_y = 1
+    a.r_url_y = hy
     a.r_url_h = 2
     if a.expanded == 1 {
         render_req_pane(a, scr, mx, by, mw, bh)

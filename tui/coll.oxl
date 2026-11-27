@@ -1481,6 +1481,7 @@ fn hist_delete(a: mut App) {
         return
     }
     idx := len(a.history) - 1 - a.hist.sel
+    gone := a.history[idx]
     out := mkslice(HistEnt, 0)
     i := 0
     for i < len(a.history) {
@@ -1494,4 +1495,7 @@ fn hist_delete(a: mut App) {
     if a.hist.sel >= len(a.history) && len(a.history) > 0 {
         a.hist.sel = len(a.history) - 1
     }
+    // history.enabled → the deletion must hit the disk file too, or
+    // the entry resurrects on next launch.
+    hist_delete_save(a, gone)
 }

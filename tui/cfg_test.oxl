@@ -314,6 +314,26 @@ fn test_history_disabled_memory_only() {
     testing.expect_eq(len(a.history), 0, "disabled load no-ops")
 }
 
+fn test_history_delete_persists() {
+    scratch_coll()
+    a := new_app()
+    a.coll_dir = COLL_SCRATCH + "-del"
+    a.data_dir = DATA_SCRATCH
+    hist_append(a, hist_test_ent("one", "http://x/1"))
+    hist_append(a, hist_test_ent("two", "http://x/2"))
+    // mirror what install_resp leaves in memory
+    hl := hist_read(hist_file_of(a))
+    a.history = hl.ents
+    a.hist = new_list(len(a.history))
+    a.hist.sel = 0 // newest-first → deletes "two"
+    hist_delete(a)
+    testing.expect_eq(len(a.history), 1, "memory entry removed")
+    hl2 := hist_read(hist_file_of(a))
+    testing.expect_eq(len(hl2.ents), 1, "disk entry removed")
+    testing.expect_streq(hl2.ents[0].title, "one", "survivor kept")
+    testing.expect_eq(hl2.next_id, 3, "next_id preserved")
+}
+
 fn test_history_caps() {
     scratch_coll()
     a := new_app()
