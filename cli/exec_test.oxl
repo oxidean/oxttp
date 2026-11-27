@@ -240,8 +240,14 @@ fn test_exec_pretty_json() {
     ai := find(r2b.stdout, "A-B: 1")
     zi := find(r2b.stdout, "X-B: 2")
     testing.expect(ai >= 0 && zi > ai, "sorted resp headers: " + r2b.stdout)
-    r2 := xrun("--pretty\ncolors\n--print\nb\n--offline\nexample.org", "", 1)
-    testing.expect(find(r2.stderr, "colors/style unsupported") >= 0, "colors warn: " + r2.stderr)
+    // WI-0016 P3: --pretty colors emits SGR under the ansi theme
+    // (method=32 green, path=4;36 cyan+underline, header name=36) and
+    // the colors/style warn-degrade is gone.
+    r2 := xrun("--pretty\ncolors\n--print\nH\n--offline\nexample.org", "", 1)
+    testing.expect(find(r2.stderr, "colors/style unsupported") < 0, "no colors warn: " + r2.stderr)
+    testing.expect(find(r2.stdout, "\x1b[32mGET\x1b[0m") >= 0, "method SGR: " + r2.stdout)
+    testing.expect(find(r2.stdout, "\x1b[4;36m/\x1b[0m") >= 0, "path SGR: " + r2.stdout)
+    testing.expect(find(r2.stdout, "\x1b[36mHost\x1b[0m") >= 0, "header name SGR: " + r2.stdout)
 }
 
 fn test_exec_continue_range_conflict() {

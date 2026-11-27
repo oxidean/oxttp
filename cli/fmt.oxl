@@ -582,24 +582,25 @@ fn xml_fmt(s: str, w: int) -> str {
 
 // --- header value display (headers_fmt.rs) -------------------------
 
-// hdr_value_display: pure-ASCII → verbatim; else latin1 (each byte →
-// codepoint, re-encoded UTF-8; control chars → U+FFFD when tty) with
-// ` (UTF-8: <text>)` when the bytes are also valid UTF-8.
-fn hdr_value_display(v: str, out_tty: int) -> str {
+// hdr_has_nonascii reports whether the value carries any byte ≥128
+// (upstream HeaderValue::to_str fails on obs-text → BadHeaderValue).
+fn hdr_has_nonascii(v: str) -> int {
     i := 0
-    nonascii := 0
     for i < len(v) {
         if byteat(v, i) >= 128 {
-            nonascii = 1
+            return 1
         }
         i = i + 1
     }
-    if nonascii == 0 {
-        return v
-    }
-    // latin1 display (byte→codepoint → UTF-8 bytes)
+    return 0
+}
+
+// hdr_latin1 renders the isomorphic-decode display form shared by
+// the plain and colored header-value paths (each byte → codepoint,
+// re-encoded UTF-8; control chars → U+FFFD when tty).
+fn hdr_latin1(v: str, out_tty: int) -> str {
     lb := mkslice(byte, 0)
-    i = 0
+    i := 0
     for i < len(v) {
         b := byteat(v, i)
         if b >= 160 {
@@ -614,11 +615,24 @@ fn hdr_value_display(v: str, out_tty: int) -> str {
         }
         i = i + 1
     }
-    disp := lb as str
-    if utf8_valid(v) != 0 {
-        return disp + " (UTF-8: " + v + ")"
+    return lb as str
+}
+
+// hdr_value_out is the header-value display for both color modes —
+// headers.rs::print_headers value branch. ASCII → header_value;
+// latin1 → error color with the optional ` (UTF-8: <v>)` annotation
+// (utf8 part in header_value, markers in default). With colors off
+// every sgr_wrap is a no-op and the output is byte-identical to the
+// old plain path.
+fn hdr_value_out(v: str, f: ref Fmt) -> str {
+    if hdr_has_nonascii(v) == 0 {
+        return sgr_wrap("header_value", v, f)
     }
-    return disp
+    disp := hdr_latin1(v, f.out_tty)
+    if utf8_valid(v) != 0 {
+        return sgr_wrap("error", disp, f) + sgr_wrap("default", " (UTF-8: ", f) + sgr_wrap("header_value", v, f) + sgr_wrap("default", ")", f)
+    }
+    return sgr_wrap("error", disp, f)
 }
 
 fn utf8_valid(s: str) -> int {
@@ -790,16 +804,402 @@ fn req_body_render(body: []byte, f: ref Fmt, hdrs: []model.Header) -> str {
     return body_text_dispatch(text, ct_of("", hdrs), f) + "\n\n"
 }
 
-// colorize — P3 lands real lexers; verbatim when color is off.
+// --- syntax highlighting (spec S4, ADR-0040) -----------------------
+//
+// Palette values are exact (gen_styles.oxl, extracted from the
+// vendored .tmTheme files); tokenization is our bounded approximation
+// of syntect's scopes — documented DevD4.
+
+// sgr_open returns the "\x1b[<params>m" opener for an element under
+// the effective theme; "" when the element is uncolored (style_sgr
+// encodes "" for ansi default/separator etc.).
+fn sgr_open(elem: str, f: ref Fmt) -> str {
+    if f.color == 0 {
+        return ""
+    }
+    p := style_sgr(f.style, elem)
+    if len(p) == 0 {
+        return ""
+    }
+    return "\x1b[" + p + "m"
+}
+
+// sgr_wrap emits one colored span; uncolored elements pass through
+// verbatim. Every span self-resets — upstream tracks a current color
+// and resets once per head/body, but per-span reset is visually
+// equivalent and keeps the approximation honest.
+fn sgr_wrap(elem: str, text: str, f: ref Fmt) -> str {
+    o := sgr_open(elem, f)
+    if len(o) == 0 {
+        return text
+    }
+    return o + text + "\x1b[0m"
+}
+
+// sgr_plain mirrors upstream print_plain: text under the theme's
+// default/foreground element (no-op when that element is uncolored,
+// e.g. the ansi theme).
+fn sgr_plain(text: str, f: ref Fmt) -> str {
+    return sgr_wrap("default", text, f)
+}
+
+// colorize — verbatim when color is off.
 fn colorize(text: str, syntax: str, f: ref Fmt) -> str {
     if f.color == 0 {
         return text
     }
-    return syntax_highlight(text, syntax, f.style)
+    return syntax_highlight(text, syntax, f)
 }
 
-// syntax_highlight — P3 implementation slot (bounded lexers per
-// syntax against the extracted theme palette). P2 stub: verbatim.
-fn syntax_highlight(text: str, syntax: str, style: str) -> str {
+// HlSpan is one classified run [st,en) of the source text.
+struct HlSpan {
+    cls: str,
+    st: int,
+    en: int,
+}
+
+// hl_push appends a span, skipping empty runs.
+fn hl_push(acc: []HlSpan, cls: str, a: int, b: int) -> []HlSpan {
+    if b > a {
+        acc = push(acc, HlSpan{cls: cls, st: a, en: b})
+    }
+    return acc
+}
+
+// hl_render wraps each span in its element color.
+fn hl_render(text: str, spans: own []HlSpan, f: ref Fmt) -> str {
+    out := ""
+    i := 0
+    for i < len(spans) {
+        sp := spans[i]
+        i = i + 1
+        out = out + sgr_wrap(sp.cls, substr(text, sp.st, sp.en), f)
+    }
+    return out
+}
+
+// is_json_ws — JSON insignificant whitespace.
+fn is_json_ws(c: int) -> int {
+    if c == 32 || c == 9 || c == 10 || c == 13 {
+        return 1
+    }
+    return 0
+}
+
+// json_string_end returns the index just past the closing quote of
+// the JSON string opening at i (backslash escapes honored).
+fn json_string_end(s: str, i: int) -> int {
+    j := i + 1
+    n := len(s)
+    for j < n {
+        c := byteat(s, j)
+        if c == 92 {
+            j = j + 2
+            continue
+        }
+        if c == 34 {
+            return j + 1
+        }
+        j = j + 1
+    }
+    return n
+}
+
+// json_num_end consumes a JSON number body (sign/digits/./eE/+/-).
+fn json_num_end(s: str, i: int) -> int {
+    j := i
+    n := len(s)
+    for j < n {
+        c := byteat(s, j)
+        if (c >= 48 && c <= 57) || c == 45 || c == 43 || c == 46 || c == 101 || c == 69 {
+            j = j + 1
+        } else {
+            break
+        }
+    }
+    return j
+}
+
+// lex_json — strings (key when followed by ':'), numbers,
+// true/false/null, everything else default. Contiguous default runs
+// are merged.
+fn lex_json(text: str) -> own []HlSpan {
+    acc := mkslice(HlSpan, 0)
+    n := len(text)
+    i := 0
+    dopen := 0
+    ds := 0
+    for i < n {
+        c := byteat(text, i)
+        cls := ""
+        en := 0
+        if c == 34 {
+            en = json_string_end(text, i)
+            j := en
+            for j < n && is_json_ws(byteat(text, j)) != 0 {
+                j = j + 1
+            }
+            if j < n && byteat(text, j) == 58 {
+                cls = "json_key"
+            } else {
+                cls = "json_string"
+            }
+        } else if c == 45 || (c >= 48 && c <= 57) {
+            en = json_num_end(text, i)
+            cls = "json_number"
+        } else if c == 116 || c == 102 || c == 110 {
+            lit := "null"
+            if c == 116 {
+                lit = "true"
+            } else if c == 102 {
+                lit = "false"
+            }
+            if i + len(lit) <= n && substr(text, i, i + len(lit)) == lit {
+                en = i + len(lit)
+                cls = "json_constant"
+            }
+        }
+        if len(cls) == 0 {
+            if dopen == 0 {
+                ds = i
+                dopen = 1
+            }
+            i = i + 1
+            continue
+        }
+        if dopen != 0 {
+            acc = hl_push(acc, "default", ds, i)
+            dopen = 0
+        }
+        acc = hl_push(acc, cls, i, en)
+        i = en
+    }
+    if dopen != 0 {
+        acc = hl_push(acc, "default", ds, n)
+    }
+    return new(acc)
+}
+
+// hl_cdata_comment scans a <!-- --> comment starting at i; returns
+// the end index (n when unterminated).
+fn hl_comment_end(s: str, i: int) -> int {
+    j := find(substr(s, i, len(s)), "-->")
+    if j < 0 {
+        return len(s)
+    }
+    return i + j + 3
+}
+
+// lex_markup — html/xml approximation: comments, tags (name →
+// markup_tag), attribute names (→ markup_attr), quoted attribute
+// values (→ json_string per the string.quoted scope), everything
+// else default.
+fn lex_markup(text: str) -> own []HlSpan {
+    acc := mkslice(HlSpan, 0)
+    n := len(text)
+    i := 0
+    dopen := 0
+    ds := 0
+    in_tag := 0
+    for i < n {
+        c := byteat(text, i)
+        if in_tag == 0 {
+            if c == 60 && i + 4 <= n && substr(text, i, i + 4) == "<!--" {
+                if dopen != 0 {
+                    acc = hl_push(acc, "default", ds, i)
+                    dopen = 0
+                }
+                en := hl_comment_end(text, i)
+                acc = hl_push(acc, "comment", i, en)
+                i = en
+                continue
+            }
+            if c == 60 {
+                // '<' opens a tag (or bogus markup — still tag-ish)
+                if dopen != 0 {
+                    acc = hl_push(acc, "default", ds, i)
+                    dopen = 0
+                }
+                acc = hl_push(acc, "markup_tag", i, i + 1)
+                i = i + 1
+                in_tag = 1
+                continue
+            }
+            if dopen == 0 {
+                ds = i
+                dopen = 1
+            }
+            i = i + 1
+            continue
+        }
+        // inside a tag: names → markup_tag until '=' or ws or '>'
+        if c == 62 {
+            if dopen != 0 {
+                acc = hl_push(acc, "default", ds, i)
+                dopen = 0
+            }
+            acc = hl_push(acc, "markup_tag", i, i + 1)
+            i = i + 1
+            in_tag = 0
+            continue
+        }
+        if c == 34 || c == 39 {
+            // quoted attr value → string.quoted scope
+            if dopen != 0 {
+                acc = hl_push(acc, "default", ds, i)
+                dopen = 0
+            }
+            q := c
+            j := i + 1
+            for j < n {
+                if byteat(text, j) == 92 {
+                    j = j + 2
+                    continue
+                }
+                if byteat(text, j) == q {
+                    break
+                }
+                j = j + 1
+            }
+            if j < n {
+                j = j + 1
+            }
+            acc = hl_push(acc, "json_string", i, j)
+            i = j
+            continue
+        }
+        if c == 61 || c == 32 || c == 9 || c == 10 || c == 13 || c == 47 {
+            // separators between attrs → default
+            if dopen == 0 {
+                ds = i
+                dopen = 1
+            }
+            i = i + 1
+            continue
+        }
+        // attr-name / tag-name char run → markup_attr? spec: attr
+        // names → markup_attr; tag names already emitted. Distinguish
+        // crudely: after '<' or '/' it's a tag name.
+        // Track: name right after '<' handled above; here words are
+        // attribute names → markup_attr.
+        if dopen != 0 {
+            acc = hl_push(acc, "default", ds, i)
+            dopen = 0
+        }
+        j := i
+        for j < n {
+            cj := byteat(text, j)
+            if cj == 32 || cj == 9 || cj == 10 || cj == 13 || cj == 61 || cj == 62 || cj == 47 || cj == 34 || cj == 39 {
+                break
+            }
+            j = j + 1
+        }
+        acc = hl_push(acc, "markup_attr", i, j)
+        i = j
+    }
+    if dopen != 0 {
+        acc = hl_push(acc, "default", ds, n)
+    }
+    return new(acc)
+}
+
+// lex_css — comments, quoted strings, numbers-with-unit, everything
+// else default.
+fn lex_css(text: str) -> own []HlSpan {
+    return lex_comments_strings_nums(text)
+}
+
+// lex_js — // and /* */ comments, quoted strings (incl. backtick
+// templates as approximation), numbers, a small keyword set →
+// json_constant.
+fn lex_js(text: str) -> own []HlSpan {
+    return lex_comments_strings_nums(text)
+}
+
+// lex_comments_strings_nums — shared bounded lexer for css/js:
+// comments (// to EOL outside strings is js-only; css has none — we
+// accept the approximation per DevD4), /* */ blocks, quoted strings
+// → json_string, numeric literals → json_number.
+fn lex_comments_strings_nums(text: str) -> own []HlSpan {
+    acc := mkslice(HlSpan, 0)
+    n := len(text)
+    i := 0
+    dopen := 0
+    ds := 0
+    for i < n {
+        c := byteat(text, i)
+        cls := ""
+        en := i
+        if c == 47 && i + 1 < n && byteat(text, i + 1) == 42 {
+            // /* */ comment
+            j := find(substr(text, i + 2, n), "*/")
+            if j < 0 {
+                en = n
+            } else {
+                en = i + 2 + j + 2
+            }
+            cls = "comment"
+        } else if c == 47 && i + 1 < n && byteat(text, i + 1) == 47 {
+            // // line comment
+            j := i + 2
+            for j < n && byteat(text, j) != 10 {
+                j = j + 1
+            }
+            en = j
+            cls = "comment"
+        } else if c == 34 || c == 39 || c == 96 {
+            q := c
+            j := i + 1
+            for j < n {
+                cj := byteat(text, j)
+                if cj == 92 {
+                    j = j + 2
+                    continue
+                }
+                if cj == q {
+                    j = j + 1
+                    break
+                }
+                j = j + 1
+            }
+            en = j
+            cls = "json_string"
+        } else if (c >= 48 && c <= 57) || (c == 46 && i + 1 < n && byteat(text, i + 1) >= 48 && byteat(text, i + 1) <= 57) {
+            en = json_num_end(text, i)
+            cls = "json_number"
+        }
+        if len(cls) == 0 {
+            if dopen == 0 {
+                ds = i
+                dopen = 1
+            }
+            i = i + 1
+            continue
+        }
+        if dopen != 0 {
+            acc = hl_push(acc, "default", ds, i)
+            dopen = 0
+        }
+        acc = hl_push(acc, cls, i, en)
+        i = en
+    }
+    if dopen != 0 {
+        acc = hl_push(acc, "default", ds, n)
+    }
+    return new(acc)
+}
+
+// syntax_highlight dispatches to the bounded lexer for the syntax
+// and wraps spans in theme colors.
+fn syntax_highlight(text: str, syntax: str, f: ref Fmt) -> str {
+    if syntax == "json" {
+        return hl_render(text, lex_json(text), f)
+    }
+    if syntax == "xml" || syntax == "html" {
+        return hl_render(text, lex_markup(text), f)
+    }
+    if syntax == "css" || syntax == "js" {
+        return hl_render(text, lex_comments_strings_nums(text), f)
+    }
     return text
 }

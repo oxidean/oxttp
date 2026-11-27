@@ -128,13 +128,80 @@ fn xtest_titlecase() {
     let hs: []model.Header = nil
     hs = push(hs, model.Header{name: "a-b", value: "1"})
     hs = push(hs, model.Header{name: "c-d", value: "2"})
-    out := htitle(hs, 1, 0)
+    fi := fmt_of(new(Intent), 0)
+    out := htitle(hs, 1, fi)
     testing.expect_streq(out, "A-B: 1\nC-D: 2\n", "htitle lines")
     // sort + h1-title off (h2 head: lowercase names, sorted)
     let hs2: []model.Header = nil
     hs2 = push(hs2, model.Header{name: "z-b", value: "1"})
     hs2 = push(hs2, model.Header{name: "a-b", value: "2"})
     sh := hsort_copy(hs2)
-    out2 := htitle(sh[:], 0, 0)
+    out2 := htitle(sh[:], 0, fi)
     testing.expect_streq(out2, "a-b: 2\nz-b: 1\n", "sorted+lowercase")
+}
+
+// WI-0016 P3 (spec AC5): palette pins — style_sgr resolves the
+// extracted tmTheme values; ansi method=32 (green), path=4;36
+// (cyan+underline), header_value uncolored.
+fn test_style_sgr_pins() {
+    testing.expect_streq(style_sgr("ansi", "method"), "32", "ansi method")
+    testing.expect_streq(style_sgr("ansi", "path"), "4;36", "ansi path")
+    testing.expect_streq(style_sgr("ansi", "header_value"), "", "ansi hval plain")
+    testing.expect_streq(style_sgr("ansi", "http_keyword"), "34", "ansi http kw")
+    testing.expect_streq(style_sgr("solarized", "method"), "38;5;33", "solarized method")
+    testing.expect_streq(style_sgr("monokai", "method"), "38;5;148", "monokai method")
+    testing.expect_streq(style_sgr("fruity", "method"), "38;5;198", "fruity method")
+    testing.expect_streq(style_sgr("ansi", "no_such_elem"), "", "unknown elem")
+}
+
+// WI-0016 P3: --pretty colors drives SGR through head renders;
+// colors-only leaves format/sort off, all enables both.
+fn test_pretty_colors_fmt() {
+    i := new(Intent)
+    i.pretty = "colors"
+    f := fmt_of(i, 0)
+    testing.expect_eq(f.color, 1, "colors → color on")
+    testing.expect_eq(f.format, 0, "colors → format off")
+    testing.expect_eq(f.headers_sort, 0, "colors → no sort")
+    i2 := new(Intent)
+    i2.pretty = "all"
+    f2 := fmt_of(i2, 0)
+    testing.expect_eq(f2.color, 1, "all → color on")
+    testing.expect_eq(f2.format, 1, "all → format on")
+    testing.expect_eq(f2.headers_sort, 1, "all → sort on")
+}
+
+// WI-0016 P3: response head under ansi colors — HTTP/version blue,
+// status blue, reason cyan, header name cyan, value plain.
+fn test_resp_head_colors() {
+    i := new(Intent)
+    i.pretty = "colors"
+    f := fmt_of(i, 0)
+    let hs: []model.Header = nil
+    hs = push(hs, model.Header{name: "content-type", value: "application/json"})
+    out := resp_head_render("1.1", 200, "", hs, f)
+    testing.expect(find(out, "\x1b[34mHTTP\x1b[0m/\x1b[34m1.1\x1b[0m") == 0, "http triple: " + out)
+    testing.expect(find(out, "\x1b[34m200\x1b[0m") >= 0, "status code: " + out)
+    testing.expect(find(out, "\x1b[36mOK\x1b[0m") >= 0, "reason: " + out)
+    testing.expect(find(out, "\x1b[36mContent-Type\x1b[0m: application/json") >= 0, "header name/value: " + out)
+    testing.expect(find(out, "\x1b[0m") >= 0, "reset present")
+    // colors off → byte-identical plain render
+    i2 := new(Intent)
+    i2.pretty = "none"
+    f2 := fmt_of(i2, 0)
+    out2 := resp_head_render("1.1", 200, "", hs, f2)
+    testing.expect(find(out2, "\x1b[") < 0, "plain has no SGR: " + out2)
+}
+
+// WI-0016 P3: json body highlighting — key/string/number/constant
+// classes under ansi (key 38;5;12, string 33, number 34).
+fn test_json_highlight() {
+    i := new(Intent)
+    i.pretty = "colors"
+    f := fmt_of(i, 0)
+    out := colorize("{\"a\":1,\"b\":\"x\",\"c\":true}", "json", f)
+    testing.expect(find(out, "\x1b[38;5;12m\"a\"\x1b[0m") >= 0, "json key SGR: " + out)
+    testing.expect(find(out, "\x1b[34m1\x1b[0m") >= 0, "json number SGR: " + out)
+    testing.expect(find(out, "\x1b[33m\"x\"\x1b[0m") >= 0, "json string SGR: " + out)
+    testing.expect(find(out, "\x1b[34mtrue\x1b[0m") >= 0, "json const SGR: " + out)
 }

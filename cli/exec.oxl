@@ -167,7 +167,7 @@ fn hget(hs: []model.Header, name: str) -> str {
 // htitle renders the display header lines in order, skipping dead
 // slots. `title` applies HTTP/1.x title-casing (h2/h3 heads keep
 // lowercase names); values get the latin1+UTF-8-annotation display.
-fn htitle(hs: []model.Header, title: int, out_tty: int) -> str {
+fn htitle(hs: []model.Header, title: int, f: ref Fmt) -> str {
     out := ""
     i := 0
     for i < len(hs) {
@@ -182,7 +182,10 @@ fn htitle(hs: []model.Header, title: int, out_tty: int) -> str {
         } else {
             nm = elwr(nm)
         }
-        out = out + nm + ": " + hdr_value_display(h.value, out_tty) + "\n"
+        // headers.rs::print_headers element order: name → header_name,
+        // ":" → header_colon, " " → default, value → header_value
+        // (latin1 → error + UTF-8 annotation), "\n" → default.
+        out = out + sgr_wrap("header_name", nm, f) + sgr_wrap("header_colon", ":", f) + sgr_plain(" ", f) + hdr_value_out(h.value, f) + sgr_plain("\n", f)
     }
     return out
 }
@@ -1816,7 +1819,26 @@ fn req_head_render(i: ref Intent, p: ref ReqPlan, f: ref Fmt) -> str {
         dh = sd[:]
     }
     // titlecase only for HTTP/1.x heads (upstream headers_fmt).
-    return i.eff_method + " " + uri + " " + ver + "\n" + htitle(dh, booli(ver != "HTTP/2.0"), f.out_tty) + "\n"
+    // headers.rs::print_request_headers element order under color:
+    // method → path(+?query) → HTTP/x.y triple → headers → reset.
+    line := ""
+    if f.color != 0 {
+        ci := find(ver, "/")
+        kw := ver
+        vn := ""
+        if ci >= 0 {
+            kw = substr(ver, 0, ci)
+            vn = substr(ver, ci + 1, len(ver))
+        }
+        line = sgr_wrap("method", i.eff_method, f) + sgr_plain(" ", f) + sgr_wrap("path", uri, f) + sgr_plain(" ", f) + sgr_wrap("http_keyword", kw, f) + sgr_wrap("http_separator", "/", f) + sgr_wrap("http_version", vn, f) + sgr_plain("\n", f)
+    } else {
+        line = i.eff_method + " " + uri + " " + ver + "\n"
+    }
+    out := line + htitle(dh, booli(ver != "HTTP/2.0"), f)
+    if f.color != 0 {
+        out = out + "\x1b[0m"
+    }
+    return out + "\n"
 }
 
 fn body_len_of(b: model.Body) -> int {
@@ -1856,7 +1878,19 @@ fn resp_head_render(version: str, status: int, reason: str, headers: []model.Hea
     if len(ver) >= 1 && substr(ver, 0, 1) != "1" {
         t1 = 0
     }
-    return "HTTP/" + ver + " " + itoa(status) + " " + reason_of(status, reason) + "\n" + htitle(hh, t1, f.out_tty) + "\n"
+    // headers.rs::print_response_headers element order under color:
+    // HTTP/x.y triple → status_code → status_reason → headers → reset.
+    line := ""
+    if f.color != 0 {
+        line = sgr_wrap("http_keyword", "HTTP", f) + sgr_wrap("http_separator", "/", f) + sgr_wrap("http_version", ver, f) + sgr_plain(" ", f) + sgr_wrap("status_code", itoa(status), f) + sgr_plain(" ", f) + sgr_wrap("status_reason", reason_of(status, reason), f) + sgr_plain("\n", f)
+    } else {
+        line = "HTTP/" + ver + " " + itoa(status) + " " + reason_of(status, reason) + "\n"
+    }
+    out := line + htitle(hh, t1, f)
+    if f.color != 0 {
+        out = out + "\x1b[0m"
+    }
+    return out + "\n"
 }
 
 // shquote wraps s in single quotes for a POSIX shell, escaping
@@ -2962,10 +2996,6 @@ fn execute(i: ref Intent, envpairs: []str, stdin: str, stdin_tty: int, out_tty: 
             warn = warn + prog + ": warning: " + p.warn[wi] + "\n"
         }
         wi = wi + 1
-    }
-    // colors/all: format-only until style lands (ADR-0006: say so).
-    if (i.pretty == "all" || i.pretty == "colors") && i.quiet < 2 {
-        warn = warn + prog + ": warning: --pretty " + i.pretty + " colors/style unsupported in this build; formatting only\n"
     }
     ps := i.print_set
     hs := i.hist_set
