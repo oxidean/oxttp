@@ -41,19 +41,40 @@ jobs:
           /tmp/oxttp --version
           /tmp/oxttp-tui
 
-      # `oxl test` honors only its first package-dir arg and silently
-      # ignores the rest (oxidean/oxl#131), and a package-dir run also
-      # executes its workspace dependencies' tests — so the two app
-      # closures (./cli and ./tui both require core+shared) cover every
-      # package's tests except core/session, which nothing imports and
-      # therefore sits outside both closures; it gets an explicit run.
-      # Per-leaf-dir runs re-executed the whole dependency closure ~12x
-      # and blew the job timeout.
-      - name: test
+  # `oxl test` honors only its first package-dir arg and silently
+  # ignores the rest (oxidean/oxl#131), and a package-dir run also
+  # executes its workspace dependencies' tests — so the two app
+  # closures (./cli and ./tui both require core+shared) cover every
+  # package's tests except core/session, which nothing imports and
+  # therefore sits outside both closures; it gets an explicit suite.
+  # Suites run as parallel jobs: serially they exceeded the ~10min
+  # wall the runner enforced on this workflow.
+  test:
+    name: oxl-test-$suite
+    if: github.event.action != 'edited'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [cli, tui, core/session]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false # PR code runs here; don't leave a token in git config
+
+      - name: install oxl toolchain
         run: |
-          oxl test ./cli
-          oxl test ./tui
-          oxl test ./core/session
+          OXL_VERSION=$(cat .oxl-version)
+          curl -fsSL -o /tmp/oxl.tar.gz \
+            "https://github.com/oxidean/oxl/releases/download/v${OXL_VERSION}/oxl-toolchain-linux-x86_64.tar.gz"
+          mkdir -p /tmp/oxl-toolchain
+          tar -xzf /tmp/oxl.tar.gz -C /tmp/oxl-toolchain --strip-components=1
+          echo "/tmp/oxl-toolchain" >> "$GITHUB_PATH"
+          /tmp/oxl-toolchain/oxl version
+
+      - name: test ${{ matrix.suite }}
+        run: oxl test ./${{ matrix.suite }}
 
   # Commit-message gate (see scripts/commit-check.sh): SemVer-prefix
   # grammar on subjects + no-AI-attribution scan, on the PR's commit
