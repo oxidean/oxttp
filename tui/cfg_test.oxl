@@ -923,3 +923,47 @@ fn test_curl_data_urlencode_at_with_equals_is_literal() {
     curl_err("curl http://x --data-urlencode name@payload.txt", "not supported")
     curl_err("curl http://x --data-urlencode @payload.txt", "not supported")
 }
+
+fn test_req_tab_for_name_kind_scoped() {
+    // focus tab names resolve against the opened request's kind —
+    // tab sets differ per kind and "options" sits at a different
+    // index; unknown names fall back to the first tab.
+    testing.expect_eq(req_tab_for_name("options", KHttp), 6, "http options idx")
+    testing.expect_eq(req_tab_for_name("options", KGrpc), 4, "grpc options idx")
+    testing.expect_eq(req_tab_for_name("metadata", KGrpc), 0, "grpc metadata idx")
+    testing.expect_eq(req_tab_for_name("body", KGrpc), 0, "unknown name falls back")
+    testing.expect_eq(req_tab_for_name("headers", KWs), 1, "ws headers idx")
+    testing.expect_eq(req_tab_for_name("params", KGraphql), 1, "graphql params idx")
+}
+
+fn test_history_unpersisted_survives_reload() {
+    scratch_coll()
+    a := new_app()
+    a.coll_dir = COLL_SCRATCH + "-reload"
+    a.data_dir = DATA_SCRATCH
+    hist_append(a, hist_test_ent("disk", "http://x/disk"))
+    // a session row that never reached the file (busy lock or
+    // oversized at append time) stays persisted=false in memory.
+    a.history = push(a.history, hist_test_ent("mem-only", "http://x/mem"))
+    hist_load(a)
+    testing.expect_eq(len(a.history), 2, "disk + session rows kept")
+    testing.expect_streq(a.history[0].url, "http://x/disk", "disk row first")
+    testing.expect_streq(a.history[1].url, "http://x/mem", "unpersisted row survives")
+    testing.expect(!a.history[1].persisted, "still unpersisted")
+    // a second reload must not duplicate the carried row
+    hist_load(a)
+    testing.expect_eq(len(a.history), 2, "no duplication on re-reload")
+}
+
+fn test_env_memory_save_breaks_stale_lock_file() {
+    scratch_coll()
+    // older builds could leave a .lock FILE beside environments.json —
+    // hist_lock clears it so the save still lands.
+    os.mkdir_all(DATA_SCRATCH)
+    os.writefile_(DATA_SCRATCH + "/environments.json.lock", "")
+    a := app_in(COLL_SCRATCH)
+    push_modal(a, MEnvSwitch)
+    a.vars.sel = 1
+    env_pick(a)
+    testing.expect_streq(remember_recall(a), "dev", "save lands past stale lock")
+}

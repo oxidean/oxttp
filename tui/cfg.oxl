@@ -264,6 +264,19 @@ fn remember_recall(a: ref App) -> str {
 fn remember_save(a: ref App, name: str) {
     f := env_memory_path(a)
     dir := data_dir_of(a)
+    // the read-rebuild-publish sequence runs under the same .lock
+    // sidecar as history — two sessions picking envs for different
+    // collections must not publish over each other's snapshot. A
+    // lock that stays held skips the persist; the in-memory pick
+    // is already applied. The data dir must exist before the lock
+    // sidecar can be created on a first save.
+    if !os.isdir(dir) {
+        os.mkdir_all(dir)
+    }
+    lock := hist_lock(f)
+    if len(lock) == 0 {
+        return
+    }
     obj := json.jobj()
     if os.exists(f) {
         j := json.jparse(os.readfile_(f))
@@ -298,14 +311,12 @@ fn remember_save(a: ref App, name: str) {
         json.jadd(keep, key, rec)
     }
     obj = keep
-    if !os.isdir(dir) {
-        os.mkdir_all(dir)
-    }
     tmp := f + ".tmp"
     n := os.writefile_(tmp, json.tojson(obj) + "\n")
     if n >= 0 {
         os.rename(tmp, f)
     }
+    hist_unlock(lock)
 }
 
 // ---------- disk history ----------
@@ -553,7 +564,23 @@ fn hist_load(a: mut App) {
         return
     }
     hl := hist_read(hist_file_of(a))
+    // disk is truth for persisted rows, but session rows that never
+    // reached the file (busy lock / oversized) must survive an
+    // explicit reload — carry them over unpersisted.
+    kept := mkslice(HistEnt, 0)
+    i := 0
+    for i < len(a.history) {
+        if !a.history[i].persisted {
+            kept = push(kept, a.history[i])
+        }
+        i = i + 1
+    }
     a.history = hl.ents
+    i = 0
+    for i < len(kept) {
+        a.history = push(a.history, kept[i])
+        i = i + 1
+    }
 }
 
 // hist_lock — the .lock sidecar as a one-entry directory: mkdir is
@@ -1021,9 +1048,12 @@ fn focus_for_name(name: str) -> int {
     return -1
 }
 
-// req_tab_for_name — request-pane focus names → req_tab index.
-fn req_tab_for_name(name: str) -> int {
-    ts := req_tabs(KHttp)
+// req_tab_for_name — request-pane focus names → req_tab index,
+// resolved against the opened request's kind (tab sets differ:
+// gRPC has no "body", WS none of the http panes). Unknown names
+// fall back to the first tab.
+fn req_tab_for_name(name: str, kind: int) -> int {
+    ts := req_tabs(kind)
     i := 0
     for i < len(ts) {
         if ascii_eq(ts[i], name) {

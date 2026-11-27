@@ -359,7 +359,7 @@ fn open_into_draft(a: mut App, path: str, preview: bool) {
     // §2.2 focus — "" defaults to url, matching upstream).
     fo := focus_for_name(a.focus_open)
     if fo == FReqPane {
-        a.req_tab = req_tab_for_name(a.focus_open)
+        a.req_tab = req_tab_for_name(a.focus_open, a.kind)
         a.focus = FReqTabs
     } else if fo >= 0 {
         a.focus = fo
