@@ -125,13 +125,16 @@ fn cli_remote_args(args: []str) -> Out {
     if cmd == "skill" {
         return Out{code: 0, stdout: SKILL_MD, stderr: ""}
     }
-    if cmd == "send" || cmd == "new" || cmd == "env" || cmd == "focus" {
+    // every instance-bound command degrades the same way — corpus
+    // §1.5: list, requests, show, open, send, response, env, save
+    // (+ new/focus) all need the socket; only list/skill work headless.
+    if cmd == "requests" || cmd == "show" || cmd == "open" || cmd == "send" || cmd == "response" || cmd == "env" || cmd == "save" || cmd == "new" || cmd == "focus" {
         return Out{code: 1, stdout: "", stderr: "no running Posting found (unix sockets unsupported in this build)\n"}
     }
     if len(cmd) == 0 {
         return Out{code: 2, stdout: "", stderr: "posting remote: a command is required\n"}
     }
-    return Out{code: 2, stdout: "", stderr: "usage: posting remote [--instance NAME] <command>\n  list  send  new  env  focus  skill\n"}
+    return Out{code: 2, stdout: "", stderr: "usage: posting remote [--instance NAME] <command>\n  list  requests  show  open  send  response  env  save  new  focus  skill\n"}
 }
 
 fn cli_import() -> Out {
@@ -318,36 +321,16 @@ struct RunEnv { es: own env.EnvSet, err: str }
 
 fn run_env(dirs: []str, envs: []str) -> own RunEnv {
     re := new(RunEnv)
+    fl := env_file_list(dirs, envs)
+    if len(fl.err) > 0 {
+        re.err = fl.err
+        return re
+    }
     es := new(env.EnvSet)
     i := 0
-    for i < len(dirs) {
-        env_load_file(es, dirs[i] + "/posting.env", "posting.env")
-        env_load_file(es, dirs[i] + "/posting.local.env", "posting.local.env")
+    for i < len(fl.files) {
+        env_load_file(es, fl.files[i], basename(fl.files[i]))
         i = i + 1
-    }
-    i = 0
-    for i < len(envs) {
-        e := envs[i]
-        i = i + 1
-        is_file := find(e, "/") >= 0 || find(e, "\\") >= 0 || (len(e) > 4 && substr(e, len(e) - 4, len(e)) == ".env")
-        if is_file {
-            if !os.exists(e) || os.isdir(e) {
-                re.err = "environment file not found: " + e
-                return re
-            }
-            env_load_file(es, e, e)
-        } else {
-            fs := env_files_named(dirs, e)
-            if len(fs) == 0 {
-                re.err = "environment not found in collection: " + e
-                return re
-            }
-            j := 0
-            for j < len(fs) {
-                env_load_file(es, fs[j], basename(fs[j]))
-                j = j + 1
-            }
-        }
     }
     re.es = es
     return re
@@ -567,7 +550,10 @@ fn run_exec(o: ref RunOpts, t: http.Transport) -> own RunRep {
             first_j = false
             continue
         }
-        if len(cr.s.ssl_ca_bundle) > 0 && sp.req.verify == "yes" {
+        // plan_req leaves verify "" (on) or "no" — never "yes";
+        // ca_bundle applies whenever the request verifies (same
+        // gate as coll.oxl's send path).
+        if len(cr.s.ssl_ca_bundle) > 0 && sp.req.verify != "no" {
             sp.req.verify = cr.s.ssl_ca_bundle
         }
         // ssl.certificate_path/key_file carry the client identity —

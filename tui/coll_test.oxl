@@ -52,6 +52,9 @@ fn rm_quiet(p: str) {
 fn app_in(dir: str) -> own App {
     a := new_app()
     a.coll_dir = dir
+    // upstream loads the implicit env base from the launch cwd only —
+    // tests launch "inside" the collection so its posting.env applies.
+    a.cwd = dir
     a.data_dir = DATA_SCRATCH
     load_collection(a)
     a.toasts = mkslice(Toast, 0) // scan warns are not under test here

@@ -180,55 +180,150 @@ fn env_names_dirs(dirs: []str) -> []str {
     return out
 }
 
-// env_files_for — the file stack a named-env pick loads: per dir the
-// base files (posting.env, posting.local.env) in dir order, then each
-// active name's first-dir-wins file (+ its .local.env sibling).
-fn env_files_for(dirs: []str, active: []str) -> []str {
+// env_stack_base — env.Stack(dir, "posting"): the dir's base pair,
+// whichever exist.
+fn env_stack_base(dir: str) -> []str {
     let out: []str = nil
-    i := 0
-    for i < len(dirs) {
-        b := dirs[i] + "/posting.env"
-        if os.exists(b) && !os.isdir(b) {
-            out = push(out, b)
-        }
-        l := dirs[i] + "/posting.local.env"
-        if os.exists(l) && !os.isdir(l) {
-            out = push(out, l)
-        }
-        i = i + 1
+    d := os.fullpath(dir)
+    b := d + "/posting.env"
+    if os.exists(b) && !os.isdir(b) {
+        out = push(out, b)
     }
-    i = 0
-    for i < len(active) {
-        fs := env_files_named(dirs, active[i])
-        j := 0
-        for j < len(fs) {
-            out = push(out, fs[j])
-            j = j + 1
+    l := d + "/posting.local.env"
+    if os.exists(l) && !os.isdir(l) {
+        out = push(out, l)
+    }
+    return out
+}
+
+// env_stack_named — env.Stack(dir, name): nil unless the dir holds
+// <name>.env or <name>.local.env (name=="posting" is the base stack
+// itself); result is the dir's base pair then the named pair.
+fn env_stack_named(dir: str, name: str) -> []str {
+    if name == "posting" {
+        return env_stack_base(dir)
+    }
+    d := os.fullpath(dir)
+    b := d + "/" + name + ".env"
+    l := d + "/" + name + ".local.env"
+    be := os.exists(b) && !os.isdir(b)
+    le := os.exists(l) && !os.isdir(l)
+    if !be && !le {
+        return nil
+    }
+    out := env_stack_base(dir)
+    if be {
+        out = push(out, b)
+    }
+    if le {
+        out = push(out, l)
+    }
+    return out
+}
+
+// str_join — ", " join for the upstream error text.
+fn str_join(xs: []str, sep: str) -> str {
+    out := ""
+    i := 0
+    for i < len(xs) {
+        if i > 0 {
+            out = out + sep
         }
+        out = out + xs[i]
         i = i + 1
     }
     return out
 }
 
-// env_set_dirs — env.build_set over the dirs list: every dir's base
-// files layer in dir order; each active name resolves first-dir-wins;
-// the session layer sits on top.
-fn env_set_dirs(dirs: []str, active: []str, session: []model.KV) -> own env.EnvSet {
-    s := new(env.EnvSet)
-    i := 0
-    for i < len(dirs) {
-        env_load_file(s, dirs[i] + "/posting.env", "posting.env")
-        env_load_file(s, dirs[i] + "/posting.local.env", "posting.local.env")
-        i = i + 1
+struct EnvFiles {
+    files: []str,
+    err: str,
+}
+
+// env_file_list — upstream environmentFiles (cmd/posting/main.go):
+// specs are raw -e values in order. An existing file appends
+// verbatim (repeat re-applies); a name resolves env.Named over dirs —
+// the first dir holding <name>.env/<name>.local.env contributes that
+// dir's base pair + the named pair, with base files already loaded
+// skipped (named files always append). Empty specs → the cwd base
+// stack only; ANY spec suppresses it. err mirrors upstream's
+// "environment %s is neither a file nor an environment in %s".
+fn env_file_list(dirs: []str, specs: []str) -> own EnvFiles {
+    r := new(EnvFiles)
+    r.files = mkslice(str, 0)
+    if len(specs) == 0 {
+        if len(dirs) > 0 {
+            r.files = env_stack_base(dirs[0])
+        }
+        return r
     }
-    i = 0
-    for i < len(active) {
-        fs := env_files_named(dirs, active[i])
+    i := 0
+    for i < len(specs) {
+        e := specs[i]
+        i = i + 1
+        if len(e) == 0 {
+            continue
+        }
+        if os.exists(e) && !os.isdir(e) {
+            r.files = push(r.files, os.fullpath(e))
+            continue
+        }
+        let named: []str = nil
+        named_dir := ""
+        di := 0
+        for di < len(dirs) {
+            st := env_stack_named(dirs[di], e)
+            if len(st) > 0 {
+                named = st
+                named_dir = dirs[di]
+                break
+            }
+            di = di + 1
+        }
+        if len(named) == 0 {
+            r.err = "environment " + e + " is neither a file nor an environment in " + str_join(dirs, ", ")
+            return r
+        }
+        base := env_stack_base(named_dir)
         j := 0
-        for j < len(fs) {
-            env_load_file(s, fs[j], basename(fs[j]))
+        for j < len(named) {
+            f := named[j]
+            in_base := false
+            k := 0
+            for k < len(base) {
+                if base[k] == f {
+                    in_base = true
+                }
+                k = k + 1
+            }
+            if in_base {
+                dup := false
+                m := 0
+                for m < len(r.files) {
+                    if r.files[m] == f {
+                        dup = true
+                    }
+                    m = m + 1
+                }
+                if dup {
+                    j = j + 1
+                    continue
+                }
+            }
+            r.files = push(r.files, f)
             j = j + 1
         }
+    }
+    return r
+}
+
+// env_set_files — load an ordered file list into an EnvSet, session
+// layer on top.
+fn env_set_files(files: []str, session: []model.KV) -> own env.EnvSet {
+    s := new(env.EnvSet)
+    i := 0
+    for i < len(files) {
+        env_load_file(s, files[i], basename(files[i]))
         i = i + 1
     }
     if len(session) > 0 {
@@ -237,11 +332,38 @@ fn env_set_dirs(dirs: []str, active: []str, session: []model.KV) -> own env.EnvS
     return s
 }
 
+// env_files_for — the resolved file stack for display (env_files).
+fn env_files_for(dirs: []str, active: []str) -> []str {
+    return env_file_list(dirs, active).files
+}
+
+// env_set_dirs — env.build_set over the dirs list via env_file_list:
+// no active specs → cwd base only; named specs → each name's
+// first-dir stack (that dir's base + own pair); the session layer
+// sits on top.
+fn env_set_dirs(dirs: []str, active: []str, session: []model.KV) -> own env.EnvSet {
+    fl := env_file_list(dirs, active)
+    s := env_set_files(fl.files, session)
+    if len(fl.err) > 0 {
+        s.warns = push(s.warns, fl.err)
+    }
+    return s
+}
+
 // rebuild_env — the resolved set after any env-state change.
 fn rebuild_env(a: mut App) {
     ds := env_dirs(a)
-    a.env = env_set_dirs(ds, a.env_active, a.session_vars)
-    a.env_files = env_files_for(ds, a.env_active)
+    fl := env_file_list(ds, a.env_active)
+    // upstream: ANY -e suppresses the implicit cwd base — file-only
+    // -e leaves just the session layer.
+    if a.env_flagged && len(a.env_active) == 0 {
+        fl.files = mkslice(str, 0)
+    }
+    a.env_files = fl.files
+    a.env = env_set_files(fl.files, a.session_vars)
+    if len(fl.err) > 0 {
+        a.env.warns = push(a.env.warns, fl.err)
+    }
 }
 
 // ---------- environments.json memory ----------
@@ -535,6 +657,37 @@ fn hist_read(f: str) -> HistLoad {
 // hist_write — the full rewrite: envelope + entries, tmp + rename.
 // Trims to MaxEntries newest first, then MaxBytes newest-fitting
 // (sizes measured on the marshaled entry, like upstream).
+// write_file_0600 — exclusive-create write for secret-bearing state
+// publishes (disk history holds response headers incl. Set-Cookie).
+// os.writefile_ lands 0666&~umask — world-readable under umask 022 —
+// while rt_open_write_mode creates (mode|0200)&0777 umask-masked with
+// O_EXCL, so the tmp file is born owner-only and rename preserves it.
+fn write_file_0600(path: str, content: str) -> int {
+    fd := rt_open_write_mode(path, 384, path)
+    if fd < 0 {
+        return -1
+    }
+    b := content as []byte
+    off := 0
+    ok := true
+    for off < len(b) {
+        w := rt_fd_write(fd, b[off:])
+        if w <= 0 {
+            ok = false
+            break
+        }
+        off = off + w
+    }
+    if rt_fd_close(fd) < 0 {
+        ok = false
+    }
+    if !ok {
+        os.remove(path)
+        return -1
+    }
+    return len(b)
+}
+
 fn hist_write(a: mut App, f: str, ents: []HistEnt, next_id: int) -> bool {
     for len(ents) > HistMaxEntries {
         ents = ents[1:]
@@ -566,9 +719,7 @@ fn hist_write(a: mut App, f: str, ents: []HistEnt, next_id: int) -> bool {
         os.mkdir_all(dir)
     }
     tmp := f + ".tmp"
-    n := os.writefile_(tmp, json.tojson(o) + "\n")
-    if n < 0 {
-        os.remove(tmp)
+    if write_file_0600(tmp, json.tojson(o) + "\n") < 0 {
         return false
     }
     re := os.rename(tmp, f)

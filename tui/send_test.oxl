@@ -89,6 +89,9 @@ fn test_begin_send_url_substitution() {
     scratch_coll()
     a := new_app()
     a.coll_dir = COLL_SCRATCH
+    // implicit env base loads from the launch cwd only — the test
+    // "launches" inside the collection so posting.env applies
+    a.cwd = COLL_SCRATCH
     a.data_dir = DATA_SCRATCH
     load_collection(a)
     a.url.text = "$BASE/users"
@@ -98,6 +101,7 @@ fn test_begin_send_url_substitution() {
     // unresolved in-url is a plan error
     a2 := new_app()
     a2.coll_dir = COLL_SCRATCH
+    a2.cwd = COLL_SCRATCH
     a2.data_dir = DATA_SCRATCH
     load_collection(a2)
     a2.url.text = "$MISSING/x"
