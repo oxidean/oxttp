@@ -23,6 +23,7 @@ struct GCase {
     has_stdin: bool,
     scripts: []str,
     files: []str,
+    envs: []str, // `env: NAME=value` lines — extra envpairs for the run
 }
 
 fn g_args(s: str) -> []str {
@@ -90,6 +91,8 @@ fn g_load(name: str) -> own GCase {
         } else if find(line, "stdin:") == 0 && len(line) == 6 {
             c.has_stdin = true
             c.stdin = ""
+        } else if find(line, "env: ") == 0 {
+            c.envs = push(c.envs, substr(line, 5, len(line)))
         } else if find(line, "files: ") == 0 {
             c.files = push(c.files, substr(line, 7, len(line)))
         } else if find(line, "script: ") == 0 {
@@ -235,7 +238,38 @@ fn g_norm(s: str) -> str {
     s = g_norm_elapsed(s)
     s = g_norm_addr(s)
     s = g_norm_done(s)
+    s = g_norm_port(s)
     return s
+}
+
+// "127.0.0.1:<digits>" → "127.0.0.1:<PORT>" — echoed request lines /
+// absolute-form targets carry the listener's ephemeral port (env
+// proxy cases). Safe to run last: fixtures never contain the raw
+// form except where this normalizer is also applied.
+fn g_norm_port(s: str) -> str {
+    out := ""
+    key := "127.0.0.1:"
+    i := 0
+    for i < len(s) {
+        if i + len(key) <= len(s) && substr(s, i, i + len(key)) == key {
+            j := i + len(key)
+            nd := 0
+            for j < len(s) && byteat(s, j) >= 48 && byteat(s, j) <= 57 {
+                j = j + 1
+                nd = nd + 1
+            }
+            if nd > 0 {
+                out = out + "127.0.0.1:<PORT>"
+            } else {
+                out = out + key
+            }
+            i = j
+        } else {
+            out = out + substr(s, i, i + 1)
+            i = i + 1
+        }
+    }
+    return out
 }
 
 fn g_repl(s: str, a: str, b: str) -> str {
@@ -336,7 +370,7 @@ fn g_norm_done(s: str) -> str {
     return out
 }
 
-// g_run drives one case end-to-end.
+// g_run drives one case end-to-end (env: lines merge into envpairs).
 fn g_run(name: str) {
     c := g_load(name)
     [l, e] = net.listen(0)
@@ -360,6 +394,15 @@ fn g_run(name: str) {
     sp := spec("oxttp")
     envp := mkslice(str, 0)
     envp = push(envp, "HOME=/nonexistent")
+    ei := 0
+    for ei < len(c.envs) {
+        ev := c.envs[ei]
+        ei = ei + 1
+        if find(ev, "{URL}") >= 0 {
+            ev = g_repl(ev, "{URL}", u)
+        }
+        envp = push(envp, ev)
+    }
     m := argsparse(sp, argv, envp)
     if m.ok == 0 {
         testing.expect(false, name + " parse: " + m.diag)
@@ -368,7 +411,12 @@ fn g_run(name: str) {
     }
     o := resolve(m, envp)
     if o.exec == 0 {
-        testing.expect(false, name + " no exec (code=" + itoa(o.code) + " err=" + o.stderr + ")")
+        // non-request Out (WI-0016: --generate/--help/--version or a
+        // resolve-time app error) — compare the Out triple directly.
+        testing.expect(find(o.stderr, "unsupported in this build") < 0, name + " deferred: " + o.stderr)
+        testing.expect_eq(o.code, g_exit(name), name + " exit")
+        testing.expect_streq(g_norm(o.stdout), g_norm(os.readfile_("tests/golden/fixtures/" + name + ".stdout")), name + " stdout")
+        testing.expect_streq(g_norm(o.stderr), g_norm(os.readfile_("tests/golden/fixtures/" + name + ".stderr")), name + " stderr")
         l.close()
         return
     }
@@ -400,11 +448,7 @@ fn g_run(name: str) {
     }
     want_out := os.readfile_("tests/golden/fixtures/" + name + ".stdout")
     want_err := os.readfile_("tests/golden/fixtures/" + name + ".stderr")
-    want_code := 0
-    [wc, wce] = strconv.atoi(os.readfile_("tests/golden/fixtures/" + name + ".exit"))
-    if wce == nil {
-        want_code = wc
-    }
+    want_code := g_exit(name)
     testing.expect_eq(r.code, want_code, name + " exit")
     testing.expect_streq(g_norm(r.stdout), g_norm(want_out), name + " stdout")
     testing.expect_streq(g_norm(r.stderr), g_norm(want_err), name + " stderr")
@@ -413,6 +457,15 @@ fn g_run(name: str) {
 
 fn argsparse(sp: own args.Spec, argv: []str, envp: []str) -> own args.Matches {
     return args.parse(sp, argv, envp)
+}
+
+// g_exit reads a case's expected exit code (default 0 on parse fail).
+fn g_exit(name: str) -> int {
+    [wc, wce] = strconv.atoi(os.readfile_("tests/golden/fixtures/" + name + ".exit"))
+    if wce == nil {
+        return wc
+    }
+    return 0
 }
 
 fn test_golden_get_echo() { g_run("get-echo") }
@@ -436,3 +489,46 @@ fn test_golden_curl_ssl_cert() { g_run("curl-ssl-cert") }
 fn test_golden_curl_proxy() { g_run("curl-proxy") }
 fn test_golden_proxy_socks5() { g_run("proxy-socks5") }
 fn test_golden_proxy_scheme() { g_run("proxy-scheme") }
+
+// WI-0016 P4 (spec S1/S8): upstream to_curl.rs::tests vectors as
+// golden cases (DevD1/D2 adapted for the proxy rows; the xhs row
+// rides exec_test's spec("xhs") runner).
+fn test_golden_curl_up_01() { g_run("curl-up-01") }
+fn test_golden_curl_up_02() { g_run("curl-up-02") }
+fn test_golden_curl_up_03() { g_run("curl-up-03") }
+fn test_golden_curl_up_04() { g_run("curl-up-04") }
+fn test_golden_curl_up_05() { g_run("curl-up-05") }
+fn test_golden_curl_up_06() { g_run("curl-up-06") }
+fn test_golden_curl_up_07() { g_run("curl-up-07") }
+fn test_golden_curl_up_09() { g_run("curl-up-09") }
+fn test_golden_curl_up_10() { g_run("curl-up-10") }
+fn test_golden_curl_up_11() { g_run("curl-up-11") }
+fn test_golden_curl_up_12() { g_run("curl-up-12") }
+fn test_golden_curl_up_13() { g_run("curl-up-13") }
+fn test_golden_curl_up_14() { g_run("curl-up-14") }
+fn test_golden_curl_up_15() { g_run("curl-up-15") }
+fn test_golden_curl_up_16() { g_run("curl-up-16") }
+fn test_golden_curl_up_17() { g_run("curl-up-17") }
+fn test_golden_curl_up_18() { g_run("curl-up-18") }
+fn test_golden_curl_up_19() { g_run("curl-up-19") }
+fn test_golden_curl_up_20() { g_run("curl-up-20") }
+fn test_golden_curl_up_21() { g_run("curl-up-21") }
+fn test_golden_curl_up_22() { g_run("curl-up-22") }
+fn test_golden_curl_up_23() { g_run("curl-up-23") }
+fn test_golden_curl_up_24() { g_run("curl-up-24") }
+
+// WI-0016 P5 (spec S5): --generate kinds — vendored artifacts with
+// bin-name/version sub; man date pinned via SOURCE_DATE_EPOCH env.
+fn test_golden_generate_bash() { g_run("generate-bash") }
+fn test_golden_generate_zsh() { g_run("generate-zsh") }
+fn test_golden_generate_fish() { g_run("generate-fish") }
+fn test_golden_generate_nushell() { g_run("generate-nushell") }
+fn test_golden_generate_powershell() { g_run("generate-powershell") }
+fn test_golden_generate_elvish() { g_run("generate-elvish") }
+fn test_golden_generate_man() { g_run("generate-man") }
+fn test_golden_generate_man_markdown() { g_run("generate-man-markdown") }
+
+// WI-0016 P7 (spec S7/S8): env: lines merge into the run's envpairs —
+// NO_PROXY bypass + HTTP_PROXY absolute-form capture end-to-end.
+fn test_golden_env_no_proxy() { g_run("env-no-proxy") }
+fn test_golden_env_proxy_echo() { g_run("env-proxy-echo") }

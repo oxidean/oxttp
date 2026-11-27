@@ -1,0 +1,1 @@
+all_proxy=localhost:1080 http_proxy= HTTP_PROXY= https_proxy= HTTPS_PROXY= no_proxy= NO_PROXY= curl http://httpbin.org/get

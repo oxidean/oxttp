@@ -47,11 +47,14 @@ struct Intent {
     raw: str,
     has_raw: int,
     pretty: str,
+    has_pretty: int,
     style: str,
     response_charset: str,
     response_mime: str,
     print: str,
+    has_print: int,
     history_print: str,
+    has_history: int,
     print_set: own Print,
     hist_set: own Print,
     verbose: int,
@@ -77,6 +80,7 @@ struct Intent {
     check_eff: int, // effective: compat + download applied
     stream: int,
     max_redirects: int,
+    has_maxredirs: int,
     eff_redirects: int,
     timeout: float,
     has_timeout: int,
@@ -330,8 +334,10 @@ fn has_url_scheme(s: str) -> bool {
     return false
 }
 
-// chk_proxy → Proxy::from_str: split at FIRST colon; the URL half
-// validates before the protocol name is checked.
+// chk_proxy → upstream Proxy::from_str: split at FIRST colon; the
+// URL half validates through the WHATWG parser (opaque schemes like
+// `localhost:1080` parse — upstream to_curl vectors rely on it)
+// before the protocol name is checked.
 fn chk_proxy(v: str) -> str {
     ci := find(v, ":")
     if ci < 0 {
@@ -339,8 +345,9 @@ fn chk_proxy(v: str) -> str {
     }
     proto := substr(v, 0, ci)
     url := substr(v, ci + 1, len(v))
-    if find(url, "://") < 0 {
-        return "Invalid proxy URL '" + url + "' for protocol '" + proto + "': relative URL without a base"
+    [_u, ue] = parse_rust_url(url)
+    if ue != nil {
+        return "Invalid proxy URL '" + url + "' for protocol '" + proto + "': " + errors.msg(ue)
     }
     p := lower(proto)
     if p != "http" && p != "https" && p != "all" {
@@ -1065,10 +1072,11 @@ fn resolve(m: own args.Matches, envpairs: []str) -> own Out {
         return o
     }
 
-    // 3. --generate short-circuits before positional semantics
+    // 3. --generate short-circuits before positional semantics —
+    // execute() renders the vendored artifact (spec S5, ADR-0041).
     if args.present(m, "generate") {
         o.intent.gen = args.get_enum(m, "generate")
-        defer_out(o, prog, "--generate is unsupported in this build")
+        o.exec = 1
         return o
     }
 
@@ -1205,6 +1213,7 @@ fn resolve(m: own args.Matches, envpairs: []str) -> own Out {
     }
     o.intent.output = args.get_str(m, "output")
     o.intent.max_redirects = args.get_int(m, "max-redirects")
+    o.intent.has_maxredirs = booli(args.present(m, "max-redirects"))
     o.intent.eff_redirects = o.intent.max_redirects
     if o.intent.follow != 0 && args.present(m, "max-redirects") == false {
         o.intent.eff_redirects = 10
@@ -1214,6 +1223,7 @@ fn resolve(m: own args.Matches, envpairs: []str) -> own Out {
         o.intent.timeout = args.get_float(m, "timeout")
     }
     o.intent.pretty = args.get_enum(m, "pretty")
+    o.intent.has_pretty = booli(args.present(m, "pretty"))
     if args.present(m, "pretty") == false {
         is_tty := 0
         if term.isatty(term.stdout_fd()) {
@@ -1230,7 +1240,9 @@ fn resolve(m: own args.Matches, envpairs: []str) -> own Out {
     }
     o.intent.response_mime = args.get_str(m, "response-mime")
     o.intent.print = args.get_str(m, "print")
+    o.intent.has_print = booli(args.present(m, "print"))
     o.intent.history_print = args.get_str(m, "history-print")
+    o.intent.has_history = booli(args.present(m, "history-print"))
     o.intent.fmt_opts = merge_fmtopts(m)
     o.intent.proxies = args.get_list(m, "proxy")
     o.intent.resolves = args.get_list(m, "resolve")

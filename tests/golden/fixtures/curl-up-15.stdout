@@ -1,0 +1,1 @@
+curl http://httpbin.org/post -F 'x=@/dev/null'

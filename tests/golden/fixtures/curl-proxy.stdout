@@ -1,1 +1,1 @@
-all_proxy='http://anyp:8080' http_proxy='http://hprox:3128' https_proxy='http://sprox:3129' no_proxy= NO_PROXY= curl -H 'Accept-Encoding: <AE>' -H 'User-Agent: <V>' -H 'Connection: <CONN>' -H 'Accept: */*' 'https://example.org/'
+all_proxy=http://anyp:8080 http_proxy=http://hprox:3128 https_proxy=http://sprox:3129 no_proxy= NO_PROXY= curl -X GET https://example.org/

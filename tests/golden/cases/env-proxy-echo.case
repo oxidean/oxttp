@@ -1,0 +1,5 @@
+# source: derived (WI-0016 spec S7/S8): HTTP_PROXY env is captured
+# and used — <ECHO> returns the absolute-form request the proxy saw.
+env: HTTP_PROXY={URL}
+argv: -b {URL}/hello
+script: <ECHO>

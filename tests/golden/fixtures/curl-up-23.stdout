@@ -1,0 +1,1 @@
+curl -g 'http://example.com/[1-100].png?q={80,90}'

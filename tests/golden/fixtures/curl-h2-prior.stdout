@@ -1,1 +1,1 @@
-curl --http2-prior-knowledge -H 'Accept-Encoding: <AE>' -H 'User-Agent: <V>' -H 'Connection: <CONN>' -H 'Accept: */*' 'https://example.org/'
+curl --http2-prior-knowledge -X GET https://example.org/

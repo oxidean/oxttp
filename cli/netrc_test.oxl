@@ -75,3 +75,138 @@ fn test_netrc_ignore_and_missing() {
     testing.expect_streq(out2, "", "missing home")
     os.remove_all(home)
 }
+
+// WI-0016 P6 (spec S6, ADR-0042) — upstream netrc.rs::tests::cases
+// ported verbatim at parser level (nrc_parse on the raw text, no
+// file I/O). Host strings take the url::Host roles: COM/ORG/UNI/
+// IP1/IP2. UNICODE row carries the DevD6 deviation (no IDNA codec
+// — non-ASCII machine hosts match literally, not punycode).
+fn nrc_find(content: str, host: str) -> own NParser {
+    p := new(NParser)
+    p.lines = nrc_lines(content)
+    p.host = nrc_host(host)
+    nrc_parse(p)
+    return p
+}
+
+// n_found mirrors upstream found(): a returned entry exists iff a
+// complete Correct entry did, else the Default (unsuppressed).
+fn n_found(content: str, host: str, login: str, has_login: int, pass: str, label: str) {
+    p := nrc_find(content, host)
+    got := ""
+    hl := -1
+    if p.e_set != 0 {
+        got = p.e_login + charat(1) + p.e_pass
+        hl = p.e_has_login
+    } else if p.suppress != 0 {
+    } else if p.d_set != 0 {
+        got = p.d_login + charat(1) + p.d_pass
+        hl = p.d_has_login
+    }
+    testing.expect(len(got) > 0, label + ": entry found")
+    testing.expect_streq(got, login + charat(1) + pass, label + ": login/pass")
+    testing.expect_eq(hl, has_login, label + ": has_login")
+}
+
+fn n_notfound(content: str, host: str, label: str) {
+    p := nrc_find(content, host)
+    if p.e_set != 0 || (p.suppress == 0 && p.d_set != 0) {
+        testing.expect(false, label + ": found an entry")
+    }
+}
+
+fn test_netrc_upstream_vectors() {
+    simple := "\nmachine example.com\nlogin user\npassword pass\n"
+    n_found(simple, "example.com", "user", 1, "pass", "SIMPLE")
+    n_notfound(simple, "example.org", "SIMPLE/ORG")
+    n_notfound(simple, "xn--9ca.com", "SIMPLE/UNI")
+    n_notfound(simple, "1.1.1.1", "SIMPLE/IP1")
+
+    oneline := "\nmachine example.com login user password pass\n"
+    n_found(oneline, "example.com", "user", 1, "pass", "ONELINE")
+    n_notfound(oneline, "example.org", "ONELINE/ORG")
+
+    multi := "\nmachine example.com login user password pass\nmachine example.org login foo password bar\n"
+    n_found(multi, "example.com", "user", 1, "pass", "MULTI/COM")
+    n_found(multi, "example.org", "foo", 1, "bar", "MULTI/ORG")
+    n_notfound(multi, "xn--9ca.com", "MULTI/UNI")
+
+    // DevD6 — upstream matches `machine É.com` to host xn--9ca.com
+    // via IDNA; we have no punycode codec so the row is inverted.
+    unicode := "\nmachine \xC3\x89.com login user password pass\n"
+    n_notfound(unicode, "xn--9ca.com", "UNICODE/UNI (DevD6)")
+    n_notfound(unicode, "example.com", "UNICODE/COM")
+
+    missing_pass := "\nmachine example.com login user\n"
+    n_notfound(missing_pass, "example.com", "MISSING_PASS")
+
+    missing_user := "\nmachine example.com password pass\ndefault login user\n"
+    n_found(missing_user, "example.com", "", 0, "pass", "MISSING_USER")
+    n_notfound(missing_user, "example.org", "MISSING_USER/ORG")
+
+    def_pw_missing_user := "\nmachine example.com password pass\ndefault password def\n"
+    n_found(def_pw_missing_user, "example.com", "", 0, "pass", "DEFAULT_PASSWORD_MISSING_USER/COM")
+    n_found(def_pw_missing_user, "example.org", "", 0, "def", "DEFAULT_PASSWORD_MISSING_USER/ORG")
+
+    def_last := "\nmachine example.com login ex password am\ndefault login def password ault\n"
+    n_found(def_last, "example.com", "ex", 1, "am", "DEFAULT_LAST/COM")
+    n_found(def_last, "example.org", "def", 1, "ault", "DEFAULT_LAST/ORG")
+
+    def_first := "\ndefault login def password ault\nmachine example.com login ex password am\n"
+    n_found(def_first, "example.com", "ex", 1, "am", "DEFAULT_FIRST/COM")
+    n_found(def_first, "example.org", "def", 1, "ault", "DEFAULT_FIRST/ORG")
+
+    acct_fb := "\nmachine example.com account acc password pass\n"
+    n_found(acct_fb, "example.com", "acc", 1, "pass", "ACCOUNT_FALLBACK")
+
+    acct_np := "\nmachine example.com password pass login log account acc\nmachine example.org password pass account acc login log\n"
+    n_found(acct_np, "example.com", "log", 1, "pass", "ACCOUNT_NOT_PREFERRED/COM")
+    n_found(acct_np, "example.org", "log", 1, "pass", "ACCOUNT_NOT_PREFERRED/ORG")
+
+    with_ip := "\nmachine 1.1.1.1 login us password pa\n"
+    n_found(with_ip, "1.1.1.1", "us", 1, "pa", "WITH_IP")
+    n_notfound(with_ip, "2.2.2.2", "WITH_IP/IP2")
+    n_notfound(with_ip, "example.com", "WITH_IP/COM")
+
+    weird_ip := "\nmachine 16843009 login us password pa\n"
+    n_found(weird_ip, "1.1.1.1", "us", 1, "pa", "WEIRD_IP")
+    n_notfound(weird_ip, "2.2.2.2", "WEIRD_IP/IP2")
+    n_notfound(weird_ip, "example.com", "WEIRD_IP/COM")
+
+    malformed := "\nI'm a malformed netrc!\n"
+    n_notfound(malformed, "example.com", "MALFORMED")
+
+    comment := "\n# machine example.com login user password pass\nmachine example.org login lo password pa\n"
+    n_notfound(comment, "example.com", "COMMENT/COM")
+    n_found(comment, "example.org", "lo", 1, "pa", "COMMENT/ORG")
+
+    octo := "\nmachine example.com login #!@$ password pass\n"
+    n_found(octo, "example.com", "#!@$", 1, "pass", "OCTOTHORPE_IN_VALUE")
+
+    sudden := "\nmachine example.com login\n"
+    n_notfound(sudden, "example.com", "SUDDEN_END")
+
+    inc_def := "\nmachine example.com login user\ndefault login u password p\n"
+    n_notfound(inc_def, "example.com", "INCOMPLETE_AND_DEFAULT/COM")
+    n_found(inc_def, "example.org", "u", 1, "p", "INCOMPLETE_AND_DEFAULT/ORG")
+
+    unk := "\nmachine example.com\nlogin user\nfoo bar\npassword pass\n"
+    n_notfound(unk, "example.com", "UNKNOWN_TOKEN_INTERRUPT")
+
+    macro := "\nmacdef foo\nmachine example.com login mac password def\nqux\n\nmachine example.com login user password pass\n"
+    n_found(macro, "example.com", "user", 1, "pass", "MACRO")
+    n_notfound(macro, "example.org", "MACRO/ORG")
+
+    macro_unterm := "\nmacdef foo\nmachine example.com login mac password def\nqux\nmachine example.com login user password pass"
+    n_notfound(macro_unterm, "example.com", "MACRO_UNTERMINATED")
+
+    macro_blank := "\nmacdef\n\nfoo\nmachine example.com login mac password def"
+    n_notfound(macro_blank, "example.com", "MACRO_BLANK_LINE_BEFORE_NAME")
+
+    many := "\nmachine\nexample.com\nlogin\n\nuser\npassword\n\npass\n"
+    n_found(many, "example.com", "user", 1, "pass", "MANY_LINES")
+
+    // \u2029 = U+2029 LINE SEPARATOR — unicode whitespace (uni_ws).
+    strange := "\nmachine\xE2\x80\xA9ok\xC3\xA9\t\xE2\x80\xA9login  u   password  p\t\t\t\r\n"
+    n_notfound(strange, "example.com", "STRANGE_CHARACTERS")
+}

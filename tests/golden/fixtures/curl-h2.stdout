@@ -1,1 +1,1 @@
-curl --http2 -H 'Accept-Encoding: <AE>' -H 'User-Agent: <V>' -H 'Connection: <CONN>' -H 'Accept: */*' 'https://example.org/x'
+curl --http2 -X GET https://example.org/x
