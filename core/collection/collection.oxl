@@ -149,6 +149,14 @@ struct SendPlan {
     err: str,
 }
 
+// ProxyPick is plan_req's proxy resolution result — the three
+// model.Req fields proxy_pick computes (ADR-0044/0046).
+struct ProxyPick {
+    proxies: []str,
+    env: []str,
+    no_proxy: str,
+}
+
 // --- decode helpers ---
 
 fn cerr(msg: str) -> err {
@@ -1806,9 +1814,138 @@ fn bad_wire(s: str) -> bool {
     return find(s, "\r") >= 0 || find(s, "\n") >= 0
 }
 
+// --- proxy surface (WI-0017, ADR-0044/0046) ----------------------
+// Corpus §7.1: "Proxy: proxy_url else env HTTP(S)_PROXY/NO_PROXY."
+// proxy_pick is pure over "NAME=value" pairs so tests need no real
+// env; collect_proxy_env is the one getenv seam.
+
+// px_trim strips surrounding whitespace — yaml scalars and env values
+// can carry it; pick_proxy trims env values again downstream.
+fn px_trim(s: str) -> str {
+    lo := 0
+    for lo < len(s) && byteat(s, lo) <= 32 {
+        lo = lo + 1
+    }
+    hi := len(s)
+    for hi > lo && byteat(s, hi - 1) <= 32 {
+        hi = hi - 1
+    }
+    return substr(s, lo, hi)
+}
+
+// px_find returns the whole "NAME=value" pair for an exact name match
+// whose value is non-empty after trimming, "" otherwise. Exact case —
+// collect_proxy_env emits canonical names only.
+fn px_find(pairs: []str, name: str) -> str {
+    i := 0
+    for i < len(pairs) {
+        p := pairs[i]
+        i = i + 1
+        eq := find(p, "=")
+        if eq <= 0 {
+            continue
+        }
+        if substr(p, 0, eq) == name {
+            if len(px_trim(substr(p, eq + 1, len(p)))) > 0 {
+                return p
+            }
+        }
+    }
+    return ""
+}
+
+// px_val returns the trimmed value of the first exact-name pair with
+// a non-empty value, "" otherwise.
+fn px_val(pairs: []str, name: str) -> str {
+    p := px_find(pairs, name)
+    if len(p) == 0 {
+        return ""
+    }
+    eq := find(p, "=")
+    return px_trim(substr(p, eq + 1, len(p)))
+}
+
+// proxy_pick resolves the request's proxy fields. An explicit
+// proxy_url becomes a single "all:"-scoped Req.proxies entry (the
+// transport splits PROTO:URL on the first colon — a bare URL would
+// misparses) and the env set is not consulted (corpus "else"; xh
+// --proxy parity). Otherwise env vars supply proxy_env/no_proxy:
+// scheme vars both cases (uppercase captured first so it wins the
+// transport's first-match scan, matching Go's getEnvAny order),
+// ALL_PROXY fallback, NO_PROXY/no_proxy first-non-empty. The httpoxy
+// guard skips HTTP_PROXY/http_proxy when REQUEST_METHOD is set —
+// cli/sem.oxl parity.
+fn proxy_pick(proxy_url: str, pairs: []str) -> ProxyPick {
+    pk := ProxyPick{proxies: nil, env: nil, no_proxy: ""}
+    u := px_trim(proxy_url)
+    if len(u) > 0 {
+        pk.proxies = push(pk.proxies, "all:" + u)
+        return pk
+    }
+    cgi := len(px_val(pairs, "REQUEST_METHOD")) > 0
+    e := px_find(pairs, "HTTPS_PROXY")
+    if len(e) > 0 {
+        pk.env = push(pk.env, e)
+    }
+    e = px_find(pairs, "https_proxy")
+    if len(e) > 0 {
+        pk.env = push(pk.env, e)
+    }
+    if !cgi {
+        e = px_find(pairs, "HTTP_PROXY")
+        if len(e) > 0 {
+            pk.env = push(pk.env, e)
+        }
+        e = px_find(pairs, "http_proxy")
+        if len(e) > 0 {
+            pk.env = push(pk.env, e)
+        }
+    }
+    e = px_find(pairs, "ALL_PROXY")
+    if len(e) > 0 {
+        pk.env = push(pk.env, e)
+    }
+    e = px_find(pairs, "all_proxy")
+    if len(e) > 0 {
+        pk.env = push(pk.env, e)
+    }
+    pk.no_proxy = px_val(pairs, "NO_PROXY")
+    if len(pk.no_proxy) == 0 {
+        pk.no_proxy = px_val(pairs, "no_proxy")
+    }
+    return pk
+}
+
+// collect_proxy_env reads the canonical proxy env names into
+// "NAME=value" pairs — the os.getenv seam (no environ iteration in
+// std/os; unset and empty are indistinguishable, empty omitted per
+// cli/main.oxl os_envpairs convention).
+fn collect_proxy_env() -> []str {
+    names := mkslice(str, 0)
+    names = push(names, "REQUEST_METHOD")
+    names = push(names, "HTTPS_PROXY")
+    names = push(names, "https_proxy")
+    names = push(names, "HTTP_PROXY")
+    names = push(names, "http_proxy")
+    names = push(names, "ALL_PROXY")
+    names = push(names, "all_proxy")
+    names = push(names, "NO_PROXY")
+    names = push(names, "no_proxy")
+    out := mkslice(str, 0)
+    i := 0
+    for i < len(names) {
+        v := os.getenv(names[i])
+        if len(v) > 0 {
+            out = push(out, names[i] + "=" + v)
+        }
+        i = i + 1
+    }
+    return out
+}
+
 // plan_req maps a decoded request + environment + cookie jar into a
 // wire model.Req — corpus §7.1. err set → caller toasts; warns → info
-// toasts (proxy etc.).
+// toasts (env-layer warnings etc.).
 fn plan_req(r: ref PRequest, envset: ref env.EnvSet, jar: []str, coll_dir: str) -> SendPlan {
     sp := SendPlan{req: nil, warns: nil, err: ""}
     if len(r.kind) > 0 {
@@ -2093,9 +2230,12 @@ fn plan_req(r: ref PRequest, envset: ref env.EnvSet, jar: []str, coll_dir: str) 
     } else {
         rq.verify = "no"
     }
-    if len(proxy) > 0 {
-        sp.warns = push(sp.warns, "proxy unsupported in this build — sending direct")
-    }
+    // WI-0017 (ADR-0044): options.proxy_url → "all:"-scoped proxies;
+    // absent → env HTTP(S)_PROXY/ALL_PROXY/NO_PROXY capture per send.
+    pk := proxy_pick(proxy, collect_proxy_env())
+    rq.proxies = pk.proxies
+    rq.proxy_env = pk.env
+    rq.no_proxy = pk.no_proxy
     // User-Agent synth tail — corpus §7.1: posting/<ver> unless set
     if !hdr_named(hdrs, "User-Agent") {
         rq.synth = push(rq.synth, model.Header{name: "User-Agent", value: "posting/" + version.get()})
