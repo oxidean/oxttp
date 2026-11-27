@@ -76,13 +76,20 @@ jobs:
       # `oxl test` peaks ~20GB RSS compiling the cli closure's test
       # variants (oxidean/oxl#232) — over the runner's 16GB RAM, which
       # OOM-kills the job. Swap carries the overflow until upstream
-      # fixes the driver's memory profile.
+      # fixes the driver's memory profile. The hosted image already
+      # ships an active /swapfile — writing to it fails ETXTBSY, so
+      # this one uses a unique path and only tops up when short.
       - name: add swap for oxl test memory peak
         run: |
-          sudo fallocate -l 12G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=12288
-          sudo chmod 600 /swapfile
-          sudo mkswap /swapfile
-          sudo swapon /swapfile
+          cur_kb=$(awk '/^SwapTotal/ {print $2}' /proc/meminfo)
+          need_kb=$((12 * 1024 * 1024))
+          if [ "$cur_kb" -lt "$need_kb" ]; then
+            want_mb=$(( (need_kb - cur_kb) / 1024 ))
+            sudo fallocate -l "${want_mb}M" /oxttp-ci-swap || sudo dd if=/dev/zero of=/oxttp-ci-swap bs=1M count=$want_mb
+            sudo chmod 600 /oxttp-ci-swap
+            sudo mkswap /oxttp-ci-swap
+            sudo swapon /oxttp-ci-swap
+          fi
           free -h
 
       - name: test ${{ matrix.suite }}
