@@ -73,6 +73,18 @@ jobs:
           echo "/tmp/oxl-toolchain" >> "$GITHUB_PATH"
           /tmp/oxl-toolchain/oxl version
 
+      # `oxl test` peaks ~20GB RSS compiling the cli closure's test
+      # variants (oxidean/oxl#232) — over the runner's 16GB RAM, which
+      # OOM-kills the job. Swap carries the overflow until upstream
+      # fixes the driver's memory profile.
+      - name: add swap for oxl test memory peak
+        run: |
+          sudo fallocate -l 12G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=12288
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+
       - name: test ${{ matrix.suite }}
         run: oxl test ./${{ matrix.suite }}
 
