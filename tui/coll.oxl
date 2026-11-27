@@ -869,10 +869,11 @@ fn save_write(a: mut App, path: str) {
 // 1.. are a.env_names — then rebuilds the resolved set.
 fn env_pick(a: mut App) {
     sel := a.vars.sel
-    a.env_named_only = sel > 0
     if sel <= 0 {
+        a.env_named_only = false
         a.env_active = nil
     } else if sel - 1 < len(a.env_names) {
+        a.env_named_only = true
         xs := mkslice(str, 0)
         xs = push(xs, a.env_names[sel - 1])
         a.env_active = xs

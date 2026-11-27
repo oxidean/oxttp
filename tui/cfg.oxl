@@ -284,8 +284,15 @@ fn env_file_list_mode(dirs: []str, specs: []str, files_ok: bool) -> own EnvFiles
         if len(e) == 0 {
             continue
         }
-        if files_ok && os.exists(e) && !os.isdir(e) {
-            r.files = push(r.files, os.fullpath(e))
+        // file specs resolve against dirs[0] (the app cwd) so the
+        // probe is honest off-process-cwd too — absolute paths pass
+        // through untouched.
+        fp := e
+        if files_ok && len(dirs) > 0 && find(e, "/") != 0 {
+            fp = dirs[0] + "/" + e
+        }
+        if files_ok && os.exists(fp) && !os.isdir(fp) {
+            r.files = push(r.files, os.fullpath(fp))
             continue
         }
         let named: []str = nil
