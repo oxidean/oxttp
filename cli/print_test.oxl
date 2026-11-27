@@ -151,6 +151,32 @@ fn test_stream_dispatch() {
     testing.expect_streq(hdr_latin1("\x85", 1), "\xef\xbf\xbd", "c1 latin1 tty fffd")
 }
 
+// --no-stream is tri-state -1 (args.state): explicit-off must take the
+// buffered path with NO content-type auto-detect — text/plain holding
+// valid JSON formats via json_text, while explicit --stream (1) leaves
+// it verbatim (stream dispatch returns non-json/xml text untouched).
+fn test_no_stream_tri_state() {
+    i := new(Intent)
+    i.pretty = "format"
+    f := fmt_of(i, 0)
+    let nh: []model.Header = nil
+    body := mkslice(byte, 0)
+    s := "{\"a\":1}"
+    j := 0
+    for j < len(s) {
+        body = push(body, byteat(s, j))
+        j = j + 1
+    }
+    out := resp_body_render(body, f, nh, "text/plain", "", -1)
+    testing.expect(find(out, "\"a\": 1") >= 0, "no-stream buffered fmt: " + out)
+    out2 := resp_body_render(body, f, nh, "text/plain", "", 1)
+    testing.expect_streq(out2, "{\"a\":1}", "stream verbatim: " + out2)
+    // absent flag (0) still auto-detects: event-stream forces stream
+    // path → verbatim even under pretty=format
+    out3 := resp_body_render(body, f, nh, "text/event-stream", "", 0)
+    testing.expect_streq(out3, "{\"a\":1}", "auto stream verbatim: " + out3)
+}
+
 fn test_meta_and_human_bytes() {
     testing.expect_streq(fmt5(0.00123), "0.00123", "fmt5")
     testing.expect_streq(fmt5(1.5), "1.50000", "fmt5 1.5")

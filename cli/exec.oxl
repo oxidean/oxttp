@@ -3375,6 +3375,12 @@ fn gen_bin_sub(s: str, prog: str) -> str {
     s = srepl(s, "'xh commands'", "'" + prog + " commands'")
     // nushell doc comment names the binary upstream-side too
     s = srepl(s, "# xh is a friendly", "# " + prog + " is a friendly")
+    // elvish: command-seed var + lookup key must stay paired
+    s = srepl(s, "var command = 'xh'", "var command = '" + prog + "'")
+    s = srepl(s, "&'xh'=", "&'" + prog + "'=")
+    // powershell: $command seed element + switch dispatch key
+    s = srepl(s, "        'xh'\n        for", "        '" + prog + "'\n        for")
+    s = srepl(s, "        'xh' {", "        '" + prog + "' {")
     return s
 }
 

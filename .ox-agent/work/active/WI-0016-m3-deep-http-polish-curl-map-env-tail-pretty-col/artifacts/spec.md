@@ -373,6 +373,12 @@ Rewrite `core/net` (or cli) netrc reader as the upstream machine:
   so only affects `req_head` synthesized h2 forms + future resp.
 - **DevD11** event-stream linewise decode = bounded charsets (DevD3);
   `--stream`+binary abort → suppressor message (upstream identical).
+- **DevD12** `field@file` JSON items embed `null` when the file holds
+  invalid JSON instead of erroring — upstream parses items eagerly;
+  ours defers to emit time. Edge case, matches plan()-side behavior.
+- **DevD13** `curl_zw` zero-width approximation is a hand-rolled subset
+  of unicode-width's set for the leading-char quote trigger —
+  fidelity gap on exotic zero-width codepoints only.
 
 ## Acceptance criteria
 

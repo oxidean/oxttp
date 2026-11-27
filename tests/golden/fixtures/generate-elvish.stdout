@@ -9,7 +9,7 @@ set edit:completion:arg-completer[oxttp] = {|@words|
     fn cand {|text desc|
         edit:complex-candidate $text &display=$text' '(spaces (- 14 (wcswidth $text)))$desc
     }
-    var command = 'xh'
+    var command = 'oxttp'
     for word $words[1..-1] {
         if (str:has-prefix $word '-') {
             break
@@ -17,7 +17,7 @@ set edit:completion:arg-completer[oxttp] = {|@words|
         set command = $command';'$word
     }
     var completions = [
-        &'xh'= {
+        &'oxttp'= {
             cand --raw 'Pass raw request data without extra processing'
             cand --pretty 'Controls output processing'
             cand --format-options 'Set output formatting options'

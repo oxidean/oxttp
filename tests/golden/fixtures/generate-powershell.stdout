@@ -7,7 +7,7 @@ Register-ArgumentCompleter -Native -CommandName 'oxttp' -ScriptBlock {
 
     $commandElements = $commandAst.CommandElements
     $command = @(
-        'xh'
+        'oxttp'
         for ($i = 1; $i -lt $commandElements.Count; $i++) {
             $element = $commandElements[$i]
             if ($element -isnot [StringConstantExpressionAst] -or
@@ -20,7 +20,7 @@ Register-ArgumentCompleter -Native -CommandName 'oxttp' -ScriptBlock {
     }) -join ';'
 
     $completions = @(switch ($command) {
-        'xh' {
+        'oxttp' {
             [CompletionResult]::new('--raw', '--raw', [CompletionResultType]::ParameterName, 'Pass raw request data without extra processing')
             [CompletionResult]::new('--pretty', '--pretty', [CompletionResultType]::ParameterName, 'Controls output processing')
             [CompletionResult]::new('--format-options', '--format-options', [CompletionResultType]::ParameterName, 'Set output formatting options')
