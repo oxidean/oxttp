@@ -7,6 +7,9 @@ action:
     type: transition
     work_item_id: WI-0015
     target: shipped
-status: pending
+status: approved
+answer: approved
 created_by: cli
+answered_by: JesseKoldewijn
 created_at: "2026-11-26T20:12:22Z"
+answered_at: "2026-11-27T20:39:54Z"
