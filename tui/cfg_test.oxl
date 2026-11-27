@@ -773,12 +773,12 @@ fn test_curl_import_auth() {
     testing.expect_streq(r3.auth.type, "bearer_token", "bearer type")
     testing.expect_streq(r3.auth.bearer_token.token, "tok-1", "bearer token")
     // an Authorization header upgrades to the auth block, header row gone
-    r4 := curl_ok("curl http://ex.test/h -H 'Authorization: ***" + " abc'")
+    r4 := curl_ok("curl http://ex.test/h -H 'Authorization: Bearer" + " abc'")
     testing.expect_streq(r4.auth.type, "bearer_token", "header → bearer")
     testing.expect_streq(r4.auth.bearer_token.token, "abc", "bearer creds")
     testing.expect_eq(len(r4.headers), 0, "auth header consumed")
     // an explicit Authorization header beats --user (curl precedence)
-    r5 := curl_ok("curl -H 'Authorization: ***" + " tk' -u demo:pass http://ex.test/h2")
+    r5 := curl_ok("curl -H 'Authorization: Bearer" + " tk' -u demo:pass http://ex.test/h2")
     testing.expect_streq(r5.auth.type, "bearer_token", "explicit header wins")
     testing.expect_streq(r5.auth.bearer_token.token, "tk", "bearer kept")
 }
