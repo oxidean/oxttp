@@ -1036,16 +1036,24 @@ fn begin_send_preq(a: mut App) -> int {
         a.pending.verify = a.ssl_ca
     }
     if len(a.ssl_cert) > 0 {
+        // a configured identity that can't load aborts the send —
+        // same rejection the headless plan applies to --cert.
         if !os.exists(a.ssl_cert) {
             a.toast(2, "ssl.certificate_path: file not found")
-        } else {
-            a.pending.cert_pem = os.readfile_(a.ssl_cert)
-            if len(a.ssl_key) > 0 && os.exists(a.ssl_key) {
-                a.pending.key_pem = os.readfile_(a.ssl_key)
+            a.pending = nil
+            return ENone
+        }
+        a.pending.cert_pem = os.readfile_(a.ssl_cert)
+        if len(a.ssl_key) > 0 {
+            if !os.exists(a.ssl_key) {
+                a.toast(2, "ssl.key_file: file not found")
+                a.pending = nil
+                return ENone
             }
-            if len(a.ssl_pass) > 0 {
-                a.toast(2, "ssl.password unsupported — encrypted keys land with mTLS M4")
-            }
+            a.pending.key_pem = os.readfile_(a.ssl_key)
+        }
+        if len(a.ssl_pass) > 0 {
+            a.toast(2, "ssl.password unsupported — encrypted keys land with mTLS M4")
         }
     }
     if len(a.pending_name) == 0 {
@@ -1191,7 +1199,7 @@ fn install_resp(a: mut App, resp: model.Resp, req_url: str) {
             m = a.pending.method
             u = a.pending.url
         }
-        he := HistEnt{id: 0, title: a.pending_name, method: m, url: u,
+        he := HistEnt{id: 0, persisted: false, title: a.pending_name, method: m, url: u,
             status: resp.status, reason: resp.reason, elapsed_ms: resp.elapsed_ms,
             size: a.resp_size, req_yaml: collection.marshal(a.pending_preq),
             resp_text: text, resp_hdr_rows: hs, resp_ck_rows: cks, resp_tr_rows: trs}
@@ -1199,8 +1207,16 @@ fn install_resp(a: mut App, resp: model.Resp, req_url: str) {
         if len(a.history) > 100 {
             a.history = a.history[len(a.history) - 100:]
         }
-        // history.enabled → the per-collection disk file too.
-        hist_append(a, he)
+        // history.enabled → the per-collection disk file too; the
+        // assigned id + persisted flag go back onto the session row
+        // so a later delete hits exactly this disk entry (an
+        // unpersisted row must never fall back onto an identical
+        // older disk entry).
+        nid := hist_append(a, he)
+        if nid != 0 {
+            a.history[len(a.history) - 1].id = nid
+            a.history[len(a.history) - 1].persisted = true
+        }
     }
     a.pending_preq = nil
     // focus.on_response: "body" → response pane Body tab; "tabs" →

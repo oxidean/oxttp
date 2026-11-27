@@ -253,7 +253,7 @@ fn test_env_local_only_file() {
 // ---------- disk history ----------
 
 fn hist_test_ent(title: str, url: str) -> HistEnt {
-    return HistEnt{id: 0, title: title, method: "GET", url: url,
+    return HistEnt{id: 0, persisted: false, title: title, method: "GET", url: url,
         status: 200, reason: "OK", elapsed_ms: 1.0, size: 1,
         req_yaml: "url: " + url + "\n", resp_text: "b",
         resp_hdr_rows: nil, resp_ck_rows: nil, resp_tr_rows: nil}
@@ -806,4 +806,120 @@ fn test_curl_apply_replaces_draft() {
     testing.expect_eq(len(a2.toasts), 1, "error toast")
     testing.expect_eq(a2.toasts[0].level, 2, "error level")
     testing.expect_streq(a2.tabs[0].draft.url.text, "", "draft untouched")
+}
+
+// ---------- review-round-2 regressions ----------
+
+fn test_rebind_preserves_uppercase_rune() {
+    // "G" must stay "G" through keymap parsing — lowercasing it
+    // would bind plain g and lose the shift requirement.
+    a := new_app()
+    st := config.defaults()
+    st.load_user_themes = false
+    st.keymap = push(st.keymap, model.KV{name: "toggle-collection", value: "G", enabled: true})
+    apply_settings(a, st)
+    specs := reb_specs_for(a, "toggle-collection")
+    testing.expect_eq(len(specs), 1, "one spec bound")
+    testing.expect_streq(specs[0], "G", "case preserved")
+    bs := global_bindings(a)
+    saw := false
+    i := 0
+    for i < len(bs) {
+        if bs[i].action == "toggle-collection" && bs[i].pat.ch == "g" && bs[i].pat.shift {
+            saw = true
+        }
+        i = i + 1
+    }
+    testing.expect(saw, "shift+g bound")
+    testing.expect(a.sidebar_on, "sidebar starts on")
+    // leave the url bar — a bare rune there is text, not a key
+    a.focus = FReqTabs
+    dispatch(a, kev("g", false, false, false))
+    testing.expect(a.sidebar_on, "plain g does not toggle")
+    dispatch(a, kev("g", false, false, true))
+    testing.expect(!a.sidebar_on, "shift+g toggles")
+}
+
+fn test_vsug_stale_anchor_invalidated() {
+    // ctrl+u removes the activating '$' — the suggestion state must
+    // not survive to rewrite unrelated text on Enter.
+    a := new_app()
+    a.focus = FUrl
+    session_set(a, "BASE", "http://x")
+    a.url.text = "$"
+    a.url.cur = 1
+    vsug_start(a)
+    testing.expect(a.vsug_on, "list open on $")
+    // the edit that deletes '$' (ctrl+u / del_to_start) leaves
+    // vsug_pos pointing at non-'$' text once new text is typed.
+    a.url.text = "AB"
+    a.url.cur = 2
+    vsug_maybe_open(a)
+    testing.expect(!a.vsug_on, "stale anchor closed the list")
+    // even with state forced back on, dispatch must not consume or
+    // apply the suggestion.
+    a.vsug_on = true
+    a.vsug_pos = 0
+    testing.expect(!vsug_dispatch(a, knamed(term.KeyEnter)), "enter passes through")
+    testing.expect(!a.vsug_on, "state cleared")
+    testing.expect_streq(a.url.text, "AB", "text untouched")
+}
+
+fn test_history_session_id_propagates() {
+    scratch_coll()
+    a := new_app()
+    a.coll_dir = COLL_SCRATCH + "-sid"
+    a.data_dir = DATA_SCRATCH
+    // an older identical disk row must survive deleting the newer
+    // session entry — same method/url/status, different title.
+    hist_append(a, hist_test_ent("old", "http://x/same"))
+    // install_resp-style: session row pushed with id 0, then
+    // hist_append's assigned id + persisted flag land back on it.
+    he := hist_test_ent("new", "http://x/same")
+    a.history = push(a.history, he)
+    nid := hist_append(a, he)
+    testing.expect(nid != 0, "append returns the disk id")
+    a.history[len(a.history) - 1].id = nid
+    a.history[len(a.history) - 1].persisted = true
+    a.hist = new_list(len(a.history))
+    a.hist.sel = 0
+    hist_delete(a)
+    hl := hist_read(hist_file_of(a))
+    testing.expect_eq(len(hl.ents), 1, "one disk row survives")
+    testing.expect_streq(hl.ents[0].title, "old", "older identical row kept")
+}
+
+fn test_history_unpersisted_delete_keeps_disk() {
+    scratch_coll()
+    a := new_app()
+    a.coll_dir = COLL_SCRATCH + "-unsaved"
+    a.data_dir = DATA_SCRATCH
+    hist_append(a, hist_test_ent("old", "http://x/same"))
+    // a session row hist_append could not persist (lock busy /
+    // oversized) carries no disk identity — deleting it must leave
+    // the file alone even though an identical row exists.
+    a.history = push(a.history, HistEnt{id: 0, persisted: false,
+        title: "new", method: "GET", url: "http://x/same", status: 200,
+        reason: "OK", elapsed_ms: 1.0, size: 1, req_yaml: "",
+        resp_text: "", resp_hdr_rows: nil, resp_ck_rows: nil,
+        resp_tr_rows: nil})
+    a.hist = new_list(len(a.history))
+    a.hist.sel = 0
+    hist_delete(a)
+    hl := hist_read(hist_file_of(a))
+    testing.expect_eq(len(hl.ents), 1, "disk row untouched")
+    testing.expect_streq(hl.ents[0].title, "old", "older row survives")
+}
+
+fn test_curl_data_urlencode_at_with_equals_is_literal() {
+    // curl checks '=' before '@': 'user@domain=value' is a literal
+    // field, not a file reference.
+    r := curl_ok("curl http://ex.test/u --data-urlencode 'user@domain=value'")
+    testing.expect(r.body.has_form_data, "literal @ field imports")
+    testing.expect_eq(len(r.body.form_data), 1, "one row")
+    testing.expect_streq(r.body.form_data[0].name, "user@domain", "name keeps @")
+    testing.expect_streq(r.body.form_data[0].value, "value", "value side")
+    // the file-backed forms still reject
+    curl_err("curl http://x --data-urlencode name@payload.txt", "not supported")
+    curl_err("curl http://x --data-urlencode @payload.txt", "not supported")
 }

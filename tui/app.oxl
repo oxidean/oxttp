@@ -185,6 +185,8 @@ fn draft_capture(a: ref App) -> RDraft {
 
 fn draft_restore(a: mut App, d: RDraft) {
     a.url = d.url
+    // a restored url invalidates any live $-suggestion anchor.
+    a.vsug_on = false
     a.method = d.method
     a.kind = d.kind
     a.req_tab = d.req_tab

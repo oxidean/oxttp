@@ -466,10 +466,12 @@ fn import_curl(command: str) -> [own collection.PRequest, err] {
             c.data_json = push(c.data_json, 0)
         } else if flag == "--data-urlencode" {
             // name@file / @file read the file's contents — we can't
-            // represent that; only the literal forms import.
+            // represent that; only the literal forms import. curl
+            // checks '=' first: 'user@domain=value' is a literal
+            // field, '@' is file-backed only with no '=' present.
             eq := find(value, "=")
             at := find(value, "@")
-            if at >= 0 && (eq < 0 || at < eq) {
+            if eq < 0 && at >= 0 {
                 return c.preq, errors.new("file-backed --data-urlencode (@path) is not supported; pass a literal value")
             }
             c.data = push(c.data, urlencode_data(value))

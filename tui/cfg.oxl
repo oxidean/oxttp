@@ -412,7 +412,7 @@ fn hist_ent_json(he: HistEnt) -> own json.Json {
 // then the upstream {ID,Request,Response} shape so real posting-2
 // files still open (resp rows/body can't map → left empty).
 fn hist_ent_from(j: ref json.Json) -> HistEnt {
-    he := HistEnt{id: 0, title: "", method: "", url: "", status: 0,
+    he := HistEnt{id: 0, persisted: true, title: "", method: "", url: "", status: 0,
         reason: "", elapsed_ms: 0.0, size: 0, req_yaml: "", resp_text: "",
         resp_hdr_rows: nil, resp_ck_rows: nil, resp_tr_rows: nil}
     if j == nil {
@@ -590,10 +590,12 @@ fn hist_unlock(lock: str) {
 
 // hist_append — fold the newest entry into the disk file under the
 // shared lock. In-memory list updates unconditionally; the file
-// write is hist_disk-gated.
-fn hist_append(a: mut App, he: HistEnt) {
+// write is hist_disk-gated. Returns the assigned disk id, or 0 when
+// the entry did not land (disabled, lock busy, oversized) so the
+// caller can mark the session row unpersisted.
+fn hist_append(a: mut App, he: HistEnt) -> int {
     if !a.hist_disk {
-        return
+        return 0
     }
     f := hist_file_of(a)
     // the lock dir sits beside the history file — the parent must
@@ -605,7 +607,7 @@ fn hist_append(a: mut App, he: HistEnt) {
     lock := hist_lock(f)
     if len(lock) == 0 {
         a.toast(2, "history: busy — entry kept in memory only")
-        return
+        return 0
     }
     hl := hist_read(f)
     he.id = hl.next_id
@@ -613,11 +615,13 @@ fn hist_append(a: mut App, he: HistEnt) {
         // an entry too large to ever fit is dropped like upstream —
         // the id is still consumed; the file keeps its entries.
         hist_write(a, f, hl.ents, hl.next_id + 1)
-    } else {
-        hl.ents = push(hl.ents, he)
-        hist_write(a, f, hl.ents, hl.next_id + 1)
+        hist_unlock(lock)
+        return 0
     }
+    hl.ents = push(hl.ents, he)
+    hist_write(a, f, hl.ents, hl.next_id + 1)
     hist_unlock(lock)
+    return he.id
 }
 
 // hist_delete_save — remove one entry from the disk file under the
@@ -626,7 +630,11 @@ fn hist_append(a: mut App, he: HistEnt) {
 // back to method+url+status equality so a real posting-2 row can
 // still be deleted. Other entries and next_id are preserved.
 fn hist_delete_save(a: mut App, gone: HistEnt) {
-    if !a.hist_disk {
+    // an entry that never reached the file (lock busy / oversized /
+    // memory-only) must not delete a same-shaped disk row — the
+    // method+url+status fallback is only for foreign disk rows,
+    // which hist_read marks persisted.
+    if !a.hist_disk || !gone.persisted {
         return
     }
     f := hist_file_of(a)
@@ -827,7 +835,8 @@ fn rebind_apply(a: mut App) {
             } else {
                 rest = ""
             }
-            part = trim_ws(lower_ascii(part))
+            // case stays — parse_key reads SHIFT+G vs g itself.
+            part = trim_ws(part)
             if len(part) > 0 {
                 specs = push(specs, part)
             }
@@ -1342,12 +1351,19 @@ fn vars_commit(a: mut App) -> bool {
 
 // ---------- $-suggestions (url bar) ----------
 
+// vsug_anchor_ok — the '$' that opened the list must still sit at
+// vsug_pos; edits that removed it (ctrl+u, undo, tab switch) leave a
+// stale anchor that must not filter or replace text.
+fn vsug_anchor_ok(a: ref App) -> bool {
+    return a.vsug_pos >= 0 && a.vsug_pos < len(a.url.text) && byteat(a.url.text, a.vsug_pos) == 36
+}
+
 // vsug_names — env var names from every layer + session, deduped,
 // matching the prefix typed after the activating '$'.
 fn vsug_names(a: ref App) -> []str {
     let out: []str = nil
     // prefix = url text between '$' and the cursor.
-    if a.url.cur <= a.vsug_pos {
+    if !vsug_anchor_ok(a) || a.url.cur <= a.vsug_pos {
         return out
     }
     pre := lower_ascii(substr(a.url.text, a.vsug_pos + 1, a.url.cur))
@@ -1386,7 +1402,7 @@ fn vsug_maybe_open(a: mut App) {
         a.vsug_on = false
         return
     }
-    if a.vsug_on && a.url.cur <= a.vsug_pos {
+    if a.vsug_on && (a.url.cur <= a.vsug_pos || !vsug_anchor_ok(a)) {
         a.vsug_on = false
     }
     if !a.vsug_on {
@@ -1418,6 +1434,9 @@ fn vsug_start(a: mut App) {
 // consumed here; any other key returns false so normal url editing
 // proceeds (and re-filters).
 fn vsug_dispatch(a: mut App, ev: term.KeyEvent) -> bool {
+    if a.vsug_on && !vsug_anchor_ok(a) {
+        a.vsug_on = false
+    }
     if !a.vsug_on {
         return false
     }

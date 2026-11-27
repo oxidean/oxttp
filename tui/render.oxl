@@ -212,33 +212,6 @@ fn render_url_bar(a: mut App, scr: mut term.AnsiScreen, cols: int, y: int) {
         put_str_max(scr, 2, y + 1, "→ " + prev, cols - 4, 7, term.AttrDim)
     }
     fill_row(scr, 0, y + 2, cols, "-", 7, term.AttrDim)
-    // $-suggestions float under the bar while the list is live.
-    if a.vsug_on {
-        ns := vsug_names(a)
-        i := 0
-        for i < len(ns) && i < 5 {
-            a2 := 0
-            if i == a.vsug_sel {
-                a2 = term.AttrReverse
-            }
-            sg := " " + ns[i] + " "
-            put_str_max(scr, mw + 2, y + 2 + i, sg, 24, a.theme.accent, a2)
-            // the first suggestion row shares the separator row —
-            // redraw "-" past the text so the rule isn't clobbered.
-            if i == 0 {
-                dw := str_cols(sg)
-                if dw > 24 {
-                    dw = 24
-                }
-                fx := mw + 2 + dw
-                for fx < cols {
-                    scr.set_cell(fx, y + 2, "-", 7, -1, term.AttrDim)
-                    fx = fx + 1
-                }
-            }
-            i = i + 1
-        }
-    }
     // text_input.blinking_cursor=false hides the cursor (no blink
     // pulse — static-on otherwise, deviation).
     if a.focus == FUrl && a.blink {
@@ -247,6 +220,40 @@ fn render_url_bar(a: mut App, scr: mut term.AnsiScreen, cols: int, y: int) {
             cx = cols - 1
         }
         scr.cursor(cx, y, true)
+    }
+}
+
+// render_vsug draws the $-suggestion rows — called AFTER the body
+// panes so their borders/content can't overwrite the selected row
+// (the list floats over the pane area while open).
+fn render_vsug(a: mut App, scr: mut term.AnsiScreen, cols: int, y: int) {
+    mw := 10
+    if !a.vsug_on {
+        return
+    }
+    ns := vsug_names(a)
+    i := 0
+    for i < len(ns) && i < 5 {
+        a2 := 0
+        if i == a.vsug_sel {
+            a2 = term.AttrReverse
+        }
+        sg := " " + ns[i] + " "
+        put_str_max(scr, mw + 2, y + 2 + i, sg, 24, a.theme.accent, a2)
+        // the first suggestion row shares the separator row —
+        // redraw "-" past the text so the rule isn't clobbered.
+        if i == 0 {
+            dw := str_cols(sg)
+            if dw > 24 {
+                dw = 24
+            }
+            fx := mw + 2 + dw
+            for fx < cols {
+                scr.set_cell(fx, y + 2, "-", 7, -1, term.AttrDim)
+                fx = fx + 1
+            }
+        }
+        i = i + 1
     }
 }
 
@@ -904,6 +911,7 @@ fn render(a: mut App, scr: mut term.AnsiScreen, ver: str) {
         a.r_resp_x = mx + rw
         a.r_resp_w = mw - rw
     }
+    render_vsug(a, scr, cols, hy)
     render_toasts(a, scr, cols, rows)
     render_footer(a, scr, cols, rows)
     render_modal(a, scr, cols, rows)

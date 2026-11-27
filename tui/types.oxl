@@ -121,6 +121,7 @@ struct RDraft {
 // history session-only, cap 100, deviation listed in spec).
 struct HistEnt {
     id: int,
+    persisted: bool,   // entry exists in the disk file — delete may touch it
     title: str,
     method: str,
     url: str,
