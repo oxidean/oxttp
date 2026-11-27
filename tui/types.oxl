@@ -238,6 +238,7 @@ struct App {
     coll_dir: str,
     env_name: str,
     env_active: []str,
+    env_named_only: bool, // picker/remembered picks resolve names, never files
     env_names: []str,
     env: own env.EnvSet,
     session_vars: []model.KV,

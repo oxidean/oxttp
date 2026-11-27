@@ -45,27 +45,16 @@ fn parse_argv_args(a: mut App, args: []str) {
                 v := args[i + 1]
                 i = i + 1
                 a.env_flagged = true
-                // a value that looks like a file path (has a separator
-                // or a .env suffix) must exist — otherwise upstream
-                // reports a missing env file rather than silently
-                // treating the path as an env NAME.
+                a.env_named_only = false
+                // specs stay ordered and raw — env_file_list resolves
+                // each as file-or-name in CLI order (corpus §6.1:
+                // later -e layers win). A value that looks like a file
+                // path (has a separator or a .env suffix) must exist —
+                // otherwise upstream reports a missing env file rather
+                // than silently treating the path as an env NAME.
                 looks_file := str_contains(v, "/") || str_contains(v, "\\") || (len(v) > 4 && substr(v, len(v) - 4, len(v)) == ".env")
                 if looks_file && (!os.exists(v) || os.isdir(v)) {
                     a.toast(2, "env file not found: " + v)
-                } else if len(v) > 0 && os.exists(v) && !os.isdir(v) {
-                    // FILE: parse directly into the session layer
-                    // (§6.1 — --env file paths resolve from CWD).
-                    es0 := new(env.EnvSet)
-                    [p, pe] = env.parse_dotenv(os.readfile_(v), es0)
-                    if pe != nil {
-                        a.toast(2, "env " + v + ": " + errors.msg(pe))
-                    } else {
-                        k := 0
-                        for k < len(p.vars) {
-                            a.session_vars = push(a.session_vars, p.vars[k])
-                            k = k + 1
-                        }
-                    }
                 } else {
                     a.env_active = push(a.env_active, v)
                 }
@@ -276,6 +265,7 @@ fn load_collection(a: mut App) {
                 xs := mkslice(str, 0)
                 xs = push(xs, rec)
                 a.env_active = xs
+                a.env_named_only = true
             }
         }
     }
@@ -879,6 +869,7 @@ fn save_write(a: mut App, path: str) {
 // 1.. are a.env_names — then rebuilds the resolved set.
 fn env_pick(a: mut App) {
     sel := a.vars.sel
+    a.env_named_only = sel > 0
     if sel <= 0 {
         a.env_active = nil
     } else if sel - 1 < len(a.env_names) {

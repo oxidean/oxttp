@@ -97,15 +97,20 @@ fn env_dirs(a: ref App) -> []str {
 
 // env_load_file — env.load_into's logic re-exposed (the package fn is
 // private; ours names the file for the warn string).
-fn env_load_file(s: ref env.EnvSet, path: str, name: str) {
+fn env_load_file(s: ref env.EnvSet, path: str, name: str) -> str {
     if !os.exists(path) || os.isdir(path) {
-        return
+        return ""
     }
+    [f, fe] = os.open(path)
+    if fe != nil {
+        return "cannot read env file " + path + ": " + errors.msg(fe)
+    }
+    f.close()
     text := os.readfile_(path)
     [p, e] = env.parse_dotenv(text, s)
     if e != nil {
         s.warns = push(s.warns, "dotenv: " + name + ": " + errors.msg(e))
-        return
+        return ""
     }
     i := 0
     for i < len(p.warns) {
@@ -113,6 +118,7 @@ fn env_load_file(s: ref env.EnvSet, path: str, name: str) {
         i = i + 1
     }
     s.layers = push(s.layers, env.EnvLayer{name: name, source: "file", vars: p.vars})
+    return ""
 }
 
 // env_files_named — the named pair in the first dir holding EITHER
@@ -185,6 +191,9 @@ fn env_names_dirs(dirs: []str) -> []str {
 fn env_stack_base(dir: str) -> []str {
     let out: []str = nil
     d := os.fullpath(dir)
+    if len(d) == 0 {
+        return nil
+    }
     b := d + "/posting.env"
     if os.exists(b) && !os.isdir(b) {
         out = push(out, b)
@@ -204,6 +213,9 @@ fn env_stack_named(dir: str, name: str) -> []str {
         return env_stack_base(dir)
     }
     d := os.fullpath(dir)
+    if len(d) == 0 {
+        return nil
+    }
     b := d + "/" + name + ".env"
     l := d + "/" + name + ".local.env"
     be := os.exists(b) && !os.isdir(b)
@@ -249,6 +261,14 @@ struct EnvFiles {
 // stack only; ANY spec suppresses it. err mirrors upstream's
 // "environment %s is neither a file nor an environment in %s".
 fn env_file_list(dirs: []str, specs: []str) -> own EnvFiles {
+    return env_file_list_mode(dirs, specs, true)
+}
+
+// env_file_list_mode — env_file_list with file-spec resolution
+// toggled: picker/remembered selections are names only, so a plain
+// file sharing the name must not shadow the env stack (corpus §6.1
+// resolves --env file-or-name; the switcher is name-typed).
+fn env_file_list_mode(dirs: []str, specs: []str, files_ok: bool) -> own EnvFiles {
     r := new(EnvFiles)
     r.files = mkslice(str, 0)
     if len(specs) == 0 {
@@ -264,7 +284,7 @@ fn env_file_list(dirs: []str, specs: []str) -> own EnvFiles {
         if len(e) == 0 {
             continue
         }
-        if os.exists(e) && !os.isdir(e) {
+        if files_ok && os.exists(e) && !os.isdir(e) {
             r.files = push(r.files, os.fullpath(e))
             continue
         }
@@ -281,8 +301,14 @@ fn env_file_list(dirs: []str, specs: []str) -> own EnvFiles {
             di = di + 1
         }
         if len(named) == 0 {
-            r.err = "environment " + e + " is neither a file nor an environment in " + str_join(dirs, ", ")
-            return r
+            // unknown spec: record and keep resolving — later specs
+            // still apply (TUI warns + continues; run_env treats any
+            // err as fatal before requests are planned).
+            if len(r.err) > 0 {
+                r.err = r.err + "; "
+            }
+            r.err = r.err + "environment " + e + " is neither a file nor an environment in " + str_join(dirs, ", ")
+            continue
         }
         base := env_stack_base(named_dir)
         j := 0
@@ -323,7 +349,10 @@ fn env_set_files(files: []str, session: []model.KV) -> own env.EnvSet {
     s := new(env.EnvSet)
     i := 0
     for i < len(files) {
-        env_load_file(s, files[i], basename(files[i]))
+        w := env_load_file(s, files[i], basename(files[i]))
+        if len(w) > 0 {
+            s.warns = push(s.warns, w)
+        }
         i = i + 1
     }
     if len(session) > 0 {
@@ -353,7 +382,10 @@ fn env_set_dirs(dirs: []str, active: []str, session: []model.KV) -> own env.EnvS
 // rebuild_env — the resolved set after any env-state change.
 fn rebuild_env(a: mut App) {
     ds := env_dirs(a)
-    fl := env_file_list(ds, a.env_active)
+    // picker/remembered selections are name-typed: a plain file
+    // sharing the name must not shadow the env stack. CLI -e specs
+    // keep upstream file-or-name resolution in argument order.
+    fl := env_file_list_mode(ds, a.env_active, !a.env_named_only)
     // upstream: ANY -e suppresses the implicit cwd base — file-only
     // -e leaves just the session layer.
     if a.env_flagged && len(a.env_active) == 0 {
@@ -718,8 +750,25 @@ fn hist_write(a: mut App, f: str, ents: []HistEnt, next_id: int) -> bool {
     if !os.isdir(dir) {
         os.mkdir_all(dir)
     }
-    tmp := f + ".tmp"
-    if write_file_0600(tmp, json.tojson(o) + "\n") < 0 {
+    // unique sibling tmp per attempt: a stale .tmp left by a crashed
+    // publish must not wedge every later append behind EEXIST.
+    body := json.tojson(o) + "\n"
+    tmp := ""
+    wi := 0
+    for wi < 100 {
+        cand := f + ".tmp"
+        if wi > 0 {
+            cand = f + ".tmp." + itoa(wi)
+        }
+        if !os.exists(cand) {
+            if write_file_0600(cand, body) >= 0 {
+                tmp = cand
+            }
+            break
+        }
+        wi = wi + 1
+    }
+    if len(tmp) == 0 {
         return false
     }
     re := os.rename(tmp, f)

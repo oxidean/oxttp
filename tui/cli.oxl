@@ -329,7 +329,11 @@ fn run_env(dirs: []str, envs: []str) -> own RunEnv {
     es := new(env.EnvSet)
     i := 0
     for i < len(fl.files) {
-        env_load_file(es, fl.files[i], basename(fl.files[i]))
+        w := env_load_file(es, fl.files[i], basename(fl.files[i]))
+        if len(w) > 0 {
+            re.err = w
+            return re
+        }
         i = i + 1
     }
     re.es = es

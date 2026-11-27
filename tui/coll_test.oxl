@@ -56,6 +56,9 @@ fn app_in(dir: str) -> own App {
     // tests launch "inside" the collection so its posting.env applies.
     a.cwd = dir
     a.data_dir = DATA_SCRATCH
+    // isolate the config dir — a developer's real config env files
+    // must not leak into fixture assertions.
+    a.cfg_dir = DATA_SCRATCH + "/cfg-empty"
     load_collection(a)
     a.toasts = mkslice(Toast, 0) // scan warns are not under test here
     return a
@@ -371,7 +374,10 @@ fn test_env_file_flag_suppresses_recall() {
     parse_argv_args(b, av)
     testing.expect(b.env_flagged, "-e file flagged")
     load_collection(b)
-    testing.expect_eq(len(b.env_active), 0, "recall suppressed by file -e")
+    // file specs now sit in env_active in CLI order (env_file_list
+    // resolves them file-first); recall stays suppressed either way.
+    testing.expect_eq(len(b.env_active), 1, "file spec tracked")
+    testing.expect_streq(b.env_active[0], f, "file spec verbatim")
     lr := b.env.lookup("EXTRA")
     testing.expect(lr.ok, "file var loaded")
     lr2 := b.env.lookup("WHO")
@@ -390,6 +396,85 @@ fn test_env_file_flag_suppresses_recall() {
     lr3 := c.env.lookup("WHO")
     testing.expect_streq(lr3.value, "devlocal", "named -e resolves")
     os.remove(f)
+}
+
+fn env_app(dir: str, specs: []str) -> own App {
+    a := new_app()
+    a.coll_dir = dir
+    a.cwd = dir
+    a.data_dir = DATA_SCRATCH
+    a.cfg_dir = DATA_SCRATCH + "/cfg-empty"
+    let av: []str = nil
+    av = push(av, "posting")
+    i := 0
+    for i < len(specs) {
+        av = push(av, "-e")
+        av = push(av, specs[i])
+        i = i + 1
+    }
+    av = push(av, dir)
+    parse_argv_args(a, av)
+    load_collection(a)
+    return a
+}
+
+fn test_env_spec_ordering() {
+    scratch_coll()
+    f := COLL_SCRATCH + "/overrides.env"
+    os.writefile_(f, "WHO=fileval\nONLY_FILE=1\n")
+    // -e file -e dev: the later spec wins shared keys.
+    let s1: []str = nil
+    s1 = push(s1, f)
+    s1 = push(s1, "dev")
+    a := env_app(COLL_SCRATCH, s1)
+    lr := a.env.lookup("WHO")
+    testing.expect_streq(lr.value, "devlocal", "later -e dev wins")
+    lr2 := a.env.lookup("ONLY_FILE")
+    testing.expect(lr2.ok, "file vars still load")
+    // -e dev -e file: order flips the winner.
+    let s2: []str = nil
+    s2 = push(s2, "dev")
+    s2 = push(s2, f)
+    b := env_app(COLL_SCRATCH, s2)
+    lr3 := b.env.lookup("WHO")
+    testing.expect_streq(lr3.value, "fileval", "later -e file wins")
+    os.remove(f)
+}
+
+fn test_env_picker_name_beats_same_named_file() {
+    scratch_coll()
+    // a plain file named "dev" must not shadow the dev env stack
+    // when the selection comes from the picker (name-typed).
+    os.writefile_(COLL_SCRATCH + "/dev", "WHO=plainfile\n")
+    a := app_in(COLL_SCRATCH)
+    push_modal(a, MEnvSwitch)
+    a.vars.sel = 1
+    env_pick(a)
+    lr := a.env.lookup("WHO")
+    testing.expect(lr.ok, "dev env resolves")
+    testing.expect_streq(lr.value, "devlocal", "named stack wins over file")
+    os.remove(COLL_SCRATCH + "/dev")
+}
+
+fn test_env_unknown_spec_keeps_later_specs() {
+    scratch_coll()
+    // -e typo -e dev: the unknown spec warns but dev still loads.
+    let s: []str = nil
+    s = push(s, "typo")
+    s = push(s, "dev")
+    a := env_app(COLL_SCRATCH, s)
+    lr := a.env.lookup("WHO")
+    testing.expect(lr.ok, "later spec still resolves")
+    testing.expect_streq(lr.value, "devlocal", "dev value intact")
+    saw := false
+    i := 0
+    for i < len(a.env.warns) {
+        if str_contains(a.env.warns[i], "environment typo") {
+            saw = true
+        }
+        i = i + 1
+    }
+    testing.expect(saw, "unknown spec warned")
 }
 
 fn test_variables_rows_masking() {
