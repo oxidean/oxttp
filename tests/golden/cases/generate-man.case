@@ -1,0 +1,3 @@
+# source: derived (WI-0016 spec S5): vendored doc/xh.1 + .TH date/version sub
+env: SOURCE_DATE_EPOCH=1700000000
+argv: --generate man

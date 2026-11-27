@@ -16,12 +16,12 @@ fn test_req_head_render() {
     testing.expect(find(out, "Accept: application/json, */*;q=0.5\n") >= 0, "json accept")
 }
 
-// req_head_for renders via the plan's request.
+// req_head_for renders via the plan's request (defaults Fmt).
 fn req_head_for(p: ref ReqPlan) -> str {
     i := new(Intent)
     i.eff_method = p.req.method
     i.http_version = ""
-    return req_head_render(i, p)
+    return req_head_render(i, p, fmt_of(i, 0))
 }
 
 fn test_req_head_synth_tail() {
@@ -42,7 +42,7 @@ fn test_req_head_cl_and_10() {
     i := new(Intent)
     i.eff_method = p.req.method
     i.http_version = "1.0"
-    out := req_head_render(i, p)
+    out := req_head_render(i, p, fmt_of(i, 0))
     testing.expect(find(out, "POST / HTTP/1.0\n") == 0, "1.0 status line")
     testing.expect(find(out, "Content-Length: 9\n") >= 0, "CL rendered: " + out)
     // Host after CL in display order
@@ -54,12 +54,14 @@ fn test_req_head_cl_and_10() {
 fn test_resp_head_render() {
     let hs: []model.Header = nil
     hs = push(hs, model.Header{name: "content-type", value: "text/plain"})
-    out := resp_head_render("1.1", 404, "", hs)
+    i := new(Intent)
+    f := fmt_of(i, 0)
+    out := resp_head_render("1.1", 404, "", hs, f)
     testing.expect(find(out, "HTTP/1.1 404 Not Found\n") == 0, "canonical reason: " + out)
     testing.expect(find(out, "Content-Type: text/plain\n") >= 0, "titlecase")
-    out2 := resp_head_render("1.0", 418, "Short and stout", hs)
+    out2 := resp_head_render("1.0", 418, "Short and stout", hs, f)
     testing.expect(find(out2, "HTTP/1.0 418 Short and stout\n") == 0, "wire reason wins")
-    out3 := resp_head_render("1.1", 799, "", hs)
+    out3 := resp_head_render("1.1", 799, "", hs, f)
     testing.expect(find(out3, "799 <unknown status code>") >= 0, "unknown fallback")
 }
 
@@ -79,12 +81,100 @@ fn test_binary_suppressor() {
     b[0] = 65
     b[1] = 0
     b[2] = 66
-    out := body_render(b, "none")
+    i := new(Intent)
+    let nh: []model.Header = nil
+    // tty out: suppressor (spec S3 — response guard is TTY-gated)
+    f := fmt_of(i, 1)
+    out := resp_body_render(b, f, nh, "", "", 0)
     testing.expect(find(out, "binary data not shown") >= 0, "suppressor note")
-    ok := body_render("plain" as []byte, "none")
-    testing.expect_streq(ok, "plain", "verbatim")
-    pretty := body_render("{\"a\":1,\"b\":[2,3]}" as []byte, "format")
-    testing.expect(find(pretty, "{\n  \"a\": 1,\n  \"b\": [\n    2,\n    3\n  ]\n}") >= 0, "json pretty: " + pretty)
+    // non-tty + no formatting: raw bytes flow (upstream passthrough)
+    f2 := fmt_of(i, 0)
+    out2 := resp_body_render(b, f2, nh, "", "", 0)
+    testing.expect_eq(len(out2), 3, "non-tty raw passthrough")
+    // request side: suppressor even piped (upstream asymmetry)
+    out3 := req_body_render(b, f2, nh)
+    testing.expect(find(out3, "binary data not shown") >= 0, "req suppressor")
+}
+
+fn test_json_fmt() {
+    i := new(Intent)
+    i.pretty = "format"
+    f := fmt_of(i, 0)
+    pretty := json_fmt("{\"a\":1,\"b\":[2,3]}", f.json_indent)
+    // upstream default json.indent = 4
+    testing.expect(find(pretty, "{\n    \"a\": 1,\n    \"b\": [\n        2,\n        3\n    ]\n}") >= 0, "json pretty indent4: " + pretty)
+    p2 := json_fmt("{\"a\":1}", 2)
+    testing.expect(find(p2, "\n  \"a\": 1") >= 0, "json indent2 opt")
+}
+
+// WI-0016 review: stream bodies take print_body_stream semantics —
+// Json formats per-value (NDJSON linewise), other text types get
+// syntax colors only, no block formatting; hdr_latin1 maps C1 bytes
+// to 2-byte UTF-8 off-tty instead of emitting raw invalid UTF-8.
+fn test_stream_dispatch() {
+    i := new(Intent)
+    i.pretty = "format"
+    f := fmt_of(i, 0)
+    let nh: []model.Header = nil
+    ndjson := mkslice(byte, 0)
+    s1 := "{\"a\":1}\n{\"b\":2}\n"
+    j := 0
+    for j < len(s1) {
+        ndjson = push(ndjson, byteat(s1, j))
+        j = j + 1
+    }
+    out := resp_body_render(ndjson, f, nh, "application/json", "", 1)
+    testing.expect(find(out, "\"a\": 1") >= 0 && find(out, "\"b\": 2") >= 0, "ndjson values formatted: " + out)
+    testing.expect(find(out, "\n{\n") >= 0 || find(out, "}\n{") >= 0, "ndjson linewise join: " + out)
+    // single doc still formats whole
+    doc := mkslice(byte, 0)
+    s2 := "{\"x\":[1,2]}"
+    j = 0
+    for j < len(s2) {
+        doc = push(doc, byteat(s2, j))
+        j = j + 1
+    }
+    out2 := resp_body_render(doc, f, nh, "application/json", "", 1)
+    testing.expect(find(out2, "\"x\": [") >= 0, "single doc formatted: " + out2)
+    // xml stream: xml_format must NOT re-indent (upstream syntax-only)
+    x := mkslice(byte, 0)
+    s3 := "<a><b>1</b></a>"
+    j = 0
+    for j < len(s3) {
+        x = push(x, byteat(s3, j))
+        j = j + 1
+    }
+    out3 := resp_body_render(x, f, nh, "application/xml", "", 1)
+    testing.expect_streq(out3, "<a><b>1</b></a>", "xml stream unformatted")
+    // latin1 header display: 0x85 → U+0085 (C2 85), not raw byte
+    testing.expect_streq(hdr_latin1("\x85", 0), "\xc2\x85", "c1 latin1 non-tty")
+    testing.expect_streq(hdr_latin1("\x85", 1), "\xef\xbf\xbd", "c1 latin1 tty fffd")
+}
+
+// --no-stream is tri-state -1 (args.state): explicit-off must take the
+// buffered path with NO content-type auto-detect — text/plain holding
+// valid JSON formats via json_text, while explicit --stream (1) leaves
+// it verbatim (stream dispatch returns non-json/xml text untouched).
+fn test_no_stream_tri_state() {
+    i := new(Intent)
+    i.pretty = "format"
+    f := fmt_of(i, 0)
+    let nh: []model.Header = nil
+    body := mkslice(byte, 0)
+    s := "{\"a\":1}"
+    j := 0
+    for j < len(s) {
+        body = push(body, byteat(s, j))
+        j = j + 1
+    }
+    out := resp_body_render(body, f, nh, "text/plain", "", -1)
+    testing.expect(find(out, "\"a\": 1") >= 0, "no-stream buffered fmt: " + out)
+    out2 := resp_body_render(body, f, nh, "text/plain", "", 1)
+    testing.expect_streq(out2, "{\"a\":1}", "stream verbatim: " + out2)
+    // absent flag (0) still auto-detects: event-stream forces stream
+    // path → verbatim even under pretty=format
+    out3 := resp_body_render(body, f, nh, "text/event-stream", "", 0)
+    testing.expect_streq(out3, "{\"a\":1}", "auto stream verbatim: " + out3)
 }
 
 fn test_meta_and_human_bytes() {
@@ -108,6 +198,118 @@ fn test_titlecase() {
     let hs: []model.Header = nil
     hs = push(hs, model.Header{name: "a-b", value: "1"})
     hs = push(hs, model.Header{name: "c-d", value: "2"})
-    out := htitle(hs)
+    fi := fmt_of(new(Intent), 0)
+    out := htitle(hs, 1, fi)
     testing.expect_streq(out, "A-B: 1\nC-D: 2\n", "htitle lines")
+    // sort + h1-title off (h2 head: lowercase names, sorted)
+    let hs2: []model.Header = nil
+    hs2 = push(hs2, model.Header{name: "z-b", value: "1"})
+    hs2 = push(hs2, model.Header{name: "a-b", value: "2"})
+    sh := hsort_copy(hs2)
+    out2 := htitle(sh[:], 0, fi)
+    testing.expect_streq(out2, "a-b: 2\nz-b: 1\n", "sorted+lowercase")
+}
+
+// WI-0016 P3 (spec AC5): palette pins — style_sgr resolves the
+// extracted tmTheme values; ansi method=32 (green), path=4;36
+// (cyan+underline), header_value uncolored.
+fn test_style_sgr_pins() {
+    testing.expect_streq(style_sgr("ansi", "method"), "32", "ansi method")
+    testing.expect_streq(style_sgr("ansi", "path"), "4;36", "ansi path")
+    testing.expect_streq(style_sgr("ansi", "header_value"), "", "ansi hval plain")
+    testing.expect_streq(style_sgr("ansi", "http_keyword"), "34", "ansi http kw")
+    testing.expect_streq(style_sgr("solarized", "method"), "38;5;33", "solarized method")
+    testing.expect_streq(style_sgr("monokai", "method"), "38;5;148", "monokai method")
+    testing.expect_streq(style_sgr("fruity", "method"), "38;5;198", "fruity method")
+    testing.expect_streq(style_sgr("ansi", "no_such_elem"), "", "unknown elem")
+}
+
+// WI-0016 P3: --pretty colors drives SGR through head renders;
+// colors-only leaves format/sort off, all enables both.
+fn test_pretty_colors_fmt() {
+    i := new(Intent)
+    i.pretty = "colors"
+    f := fmt_of(i, 0)
+    testing.expect_eq(f.color, 1, "colors → color on")
+    testing.expect_eq(f.format, 0, "colors → format off")
+    testing.expect_eq(f.headers_sort, 0, "colors → no sort")
+    i2 := new(Intent)
+    i2.pretty = "all"
+    f2 := fmt_of(i2, 0)
+    testing.expect_eq(f2.color, 1, "all → color on")
+    testing.expect_eq(f2.format, 1, "all → format on")
+    testing.expect_eq(f2.headers_sort, 1, "all → sort on")
+}
+
+// WI-0016 P3: response head under ansi colors — HTTP/version blue,
+// status blue, reason cyan, header name cyan, value plain.
+fn test_resp_head_colors() {
+    i := new(Intent)
+    i.pretty = "colors"
+    f := fmt_of(i, 0)
+    let hs: []model.Header = nil
+    hs = push(hs, model.Header{name: "content-type", value: "application/json"})
+    out := resp_head_render("1.1", 200, "", hs, f)
+    testing.expect(find(out, "\x1b[34mHTTP\x1b[0m/\x1b[34m1.1\x1b[0m") == 0, "http triple: " + out)
+    testing.expect(find(out, "\x1b[34m200\x1b[0m") >= 0, "status code: " + out)
+    testing.expect(find(out, "\x1b[36mOK\x1b[0m") >= 0, "reason: " + out)
+    testing.expect(find(out, "\x1b[36mContent-Type\x1b[0m: application/json") >= 0, "header name/value: " + out)
+    testing.expect(find(out, "\x1b[0m") >= 0, "reset present")
+    // colors off → byte-identical plain render
+    i2 := new(Intent)
+    i2.pretty = "none"
+    f2 := fmt_of(i2, 0)
+    out2 := resp_head_render("1.1", 200, "", hs, f2)
+    testing.expect(find(out2, "\x1b[") < 0, "plain has no SGR: " + out2)
+}
+
+// WI-0016 P3: json body highlighting — key/string/number/constant
+// classes under ansi (key 38;5;12, string 33, number 34).
+fn test_json_highlight() {
+    i := new(Intent)
+    i.pretty = "colors"
+    f := fmt_of(i, 0)
+    out := colorize("{\"a\":1,\"b\":\"x\",\"c\":true}", "json", f)
+    testing.expect(find(out, "\x1b[38;5;12m\"a\"\x1b[0m") >= 0, "json key SGR: " + out)
+    testing.expect(find(out, "\x1b[34m1\x1b[0m") >= 0, "json number SGR: " + out)
+    testing.expect(find(out, "\x1b[33m\"x\"\x1b[0m") >= 0, "json string SGR: " + out)
+    testing.expect(find(out, "\x1b[34mtrue\x1b[0m") >= 0, "json const SGR: " + out)
+}
+
+// WI-0016 review fixes: cp1252 C1 slots, strict UTF-8 validation,
+// explicit-charset BOM strip, quoted charset params.
+fn test_w1252_c1_slots() {
+    // 0x80→€, 0x8D→U+008D (C1 control), 0x9F→Ÿ, 0x81→U+0081
+    out := w1252_dec(("\x80\x8d\x9f\x81" as []byte))
+    testing.expect(find(out, "€") >= 0, "0x80 euro: " + out)
+    testing.expect(find(out, "\xc2\x8d") >= 0, "0x8d C1: " + out)
+    testing.expect(find(out, "Ÿ") >= 0, "0x9f Ydieresis: " + out)
+    testing.expect(find(out, "\xc2\x81") >= 0, "0x81 C1: " + out)
+}
+
+fn test_utf8_strict_validation() {
+    // surrogate ED A0 80, overlong E0 80 80, >U+10FFFF F4 90 80 80
+    testing.expect_eq(utf8_valid("\xed\xa0\x80"), 0, "surrogate invalid")
+    testing.expect_eq(utf8_valid("\xe0\x80\x80"), 0, "overlong invalid")
+    testing.expect_eq(utf8_valid("\xf4\x90\x80\x80"), 0, "range invalid")
+    testing.expect_eq(utf8_valid("héllo wörld"), 1, "valid utf8")
+    testing.expect_eq(utf8_valid("\xc3\x28"), 0, "bad continuation")
+    l := utf8_lossy(("\xed\xa0\x80x" as []byte))
+    testing.expect(find(l, "\xef\xbf\xbd") >= 0, "lossy emits FFFD: " + l)
+    testing.expect(find(l, "x") >= 0, "lossy keeps tail: " + l)
+}
+
+fn test_decode_bom_explicit_utf8() {
+    out := decode_bounded(("\xef\xbb\xbfhi" as []byte), "utf-8")
+    testing.expect_eq(len(out), 2, "explicit utf-8 strips BOM")
+    testing.expect_streq(out, "hi", "bom strip content")
+}
+
+fn test_charset_of_quoted() {
+    let hs: []model.Header = nil
+    hs = push(hs, model.Header{name: "content-type", value: "text/plain; charset=\"utf-8\""})
+    testing.expect_streq(charset_of("", hs), "UTF-8", "quoted charset")
+    let hs2: []model.Header = nil
+    hs2 = push(hs2, model.Header{name: "content-type", value: "text/plain; boundary=\"a;charset=b\"; charset=iso-8859-1"})
+    testing.expect_streq(charset_of("", hs2), "windows-1252", "param-boundary charset")
 }

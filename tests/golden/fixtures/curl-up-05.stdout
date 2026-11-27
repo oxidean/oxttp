@@ -1,0 +1,1 @@
+curl http://httpbin.org/post --data-urlencode 'x%3Dy=z=w'

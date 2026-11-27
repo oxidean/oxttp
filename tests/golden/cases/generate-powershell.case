@@ -1,0 +1,2 @@
+# source: derived (WI-0016 spec S5): vendored upstream completions + bin-name sub
+argv: --generate complete-powershell

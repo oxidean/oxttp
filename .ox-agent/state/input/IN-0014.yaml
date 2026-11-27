@@ -1,0 +1,9 @@
+schema_version: 1
+request_id: IN-0014
+work_item_id: WI-0016
+run_id: run_1795746642316_b22ec3
+kind: clarification
+question: Ship-readiness pass; requesting human approval to merge the M3 PR (durable gate).
+status: pending
+created_by: ox-agent
+created_at: "2026-11-27T03:34:32Z"

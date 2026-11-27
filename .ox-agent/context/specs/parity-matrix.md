@@ -3,7 +3,7 @@
 Definition: IN-0006 option A. Status values: `done` | `next` |
 `post` | `oxl-blocked` (cite issue).
 
-Updated: 2026-11-25 · pin oxl 0.26.0
+Updated: 2026-11-26 · pin oxl 0.26.0
 
 ## xh (`docs/corpus/corpus-xh.md`)
 
@@ -13,7 +13,7 @@ Updated: 2026-11-25 · pin oxl 0.26.0
 | §2 METHOD/URL positionals | `done` | S5 construct_url → H1 (+ https) |
 | §3 REQUEST_ITEM grammar | `done` | WI-0003 |
 | §4.1 Body modes json/form/multipart/raw/stdin | `done` | WI-0006 S5 |
-| §4.2 Print/pretty/style/meta/verbose | `next` | pretty+isatty+JSON indent done; style/colors polish later |
+| §4.2 Print/pretty/style/meta/verbose | `done` | WI-0016: fmt-opts + indent-4 JSON, sorted heads, h1 titlecase, latin1/UTF-8 annotate, charset decode, tmTheme palettes + bounded lexers, --style ×4 — DevD3/4/5/10/11 |
 | §4.3 Download/output | `done` | `-d`/`-o` + `--continue` Range/206/416 |
 | §4.4 Sessions | `done` | jar-lite + load/save (ADR-0023) |
 | §4.5 Auth basic/bearer/digest | `done` | digest §D3 retry landed |
@@ -26,10 +26,10 @@ Updated: 2026-11-25 · pin oxl 0.26.0
 | §4.6 `--http-version` 1.0/1.1 | `done` | H1 emits 1.0/1.1 |
 | §4.6 `--http-version` 2* | `done` | oxl 0.26.0 `http_version` "2"/"2-prior-knowledge" → WI-0013 |
 | §4.6 `--http-version` 3* | `oxl-blocked` | [#219](https://github.com/oxidean/oxl/issues/219) closed w/o consumable pkg — ADR-0029 |
-| §4.7 offline/curl/generate/check-status | `next`/`post` | check-status+curl done; generate `post` |
-| §5 `--curl` map | `next` | emit + Ignored warnings; map incomplete vs corpus |
-| §6 Completions/man | `post` | |
-| §7 Env vars | `next` | proxy/netrc/CA partial; finish S7 |
+| §4.7 offline/curl/generate/check-status | `done` | WI-0016: generate 8 kinds, vendored + bin-name/version/SDE-date subs |
+| §5 `--curl` map | `done` | WI-0016: spec-S1 fixed-order emit; 23 upstream to_curl vectors green — DevD1/D2 env prefixes |
+| §6 Completions/man | `done` | WI-0016: vendored completions/man via --generate |
+| §7 Env vars | `done` | WI-0016: netrc EntryState port + XH_TEST_DIGEST_AUTH_CNONCE — DevD6/7/8 |
 | §8 Exit codes / warnings | `done` | 0–6 paths covered in S5 |
 | §10 Feature gates | `done`/`oxl-blocked` | Deferrals match ADR-0024 |
 

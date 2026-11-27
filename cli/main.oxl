@@ -14,7 +14,7 @@ import "github.com/oxidean/oxttp/shared/args"
 // declared env var (verify's CA bundle fallbacks live on the table
 // and are collected separately below).
 fn envnames() -> []str {
-    v := mkslice(str, 18)
+    v := mkslice(str, 19)
     v[0] = "XH_CONFIG_DIR"
     v[1] = "XH_HTTPIE_COMPAT_MODE"
     v[2] = "HOME"
@@ -35,6 +35,8 @@ fn envnames() -> []str {
     // REQUEST_METHOD feeds the CGI guard on HTTP_PROXY capture
     // (spec sem-S5) — never consumed elsewhere.
     v[17] = "REQUEST_METHOD"
+    // Test hook for deterministic digest cnonce (spec sem-S7).
+    v[18] = "XH_TEST_DIGEST_AUTH_CNONCE"
     return v
 }
 
@@ -175,8 +177,14 @@ fn main() {
         if term.isatty(term.stdin_fd()) {
             tty = 1
         }
+        // --generate/--curl never consume stdin — upstream returns
+        // without reading, so a piped stdin must not block the emit.
+        want_stdin := 1
+        if len(o.intent.gen) > 0 || o.intent.curl != 0 {
+            want_stdin = 0
+        }
         data := ""
-        if tty == 0 {
+        if tty == 0 && want_stdin != 0 {
             f := os.stdin()
             buf := mkslice(byte, 65536)
             for true {
@@ -189,7 +197,17 @@ fn main() {
                 }
             }
         }
-        r := execute(o.intent, envpairs, data, tty)
+        otty := 0
+        if term.isatty(term.stdout_fd()) {
+            otty = 1
+        }
+        // file sinks are not terminals upstream (Buffer::is_terminal):
+        // -o/--download must get the plain render, not ANSI colors or
+        // the binary suppressor text.
+        if len(o.intent.output) > 0 || o.intent.download != 0 {
+            otty = 0
+        }
+        r := execute(o.intent, envpairs, data, tty, otty)
         if len(r.stdout) > 0 {
             write_all(os.stdout(), r.stdout)
         }

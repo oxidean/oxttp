@@ -1,0 +1,1 @@
+curl http://httpbin.org/post -H 'content-type: text/plain' --data-binary @foo.txt

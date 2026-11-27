@@ -183,7 +183,8 @@ fn test_value_format_options() {
     o5 := r("--format-options\njson.format:maybe\nexample.org")
     diag(o5, "invalid value 'json.format:maybe' for '--format-options <FORMAT_OPTIONS>': Invalid value 'maybe' in 'json.format:maybe'")
     o6 := r("--format-options\nJSON.INDENT:2\n--format-options\nheaders.sort:true,json.indent:4\nexample.org")
-    testing.expect_eq(o6.code, 1, "merged parses (then defers)")
+    testing.expect_eq(o6.code, 0, "merged parses — WI-0016 un-defers")
+    testing.expect_eq(o6.exec, 1, "fmt-opts route to exec")
     fo := o6.intent.fmt_opts
     testing.expect_eq(len(fo), 2, "2 merged keys")
     testing.expect_streq(fo[0], "json.indent=4", "json.indent last wins")
@@ -197,8 +198,13 @@ fn test_value_proxy() {
     diag(o2, "invalid value 'ftp://x' for '--proxy <PROTOCOL:URL>': Invalid proxy URL '//x' for protocol 'ftp': relative URL without a base")
     o2b := r("--proxy\nftp:http://x\nexample.org")
     diag(o2b, "invalid value 'ftp:http://x' for '--proxy <PROTOCOL:URL>': Unknown protocol to set a proxy for: ftp")
-    o3 := r("--proxy\nhttp:proxy.host:8080\nexample.org")
-    diag(o3, "invalid value 'http:proxy.host:8080' for '--proxy <PROTOCOL:URL>': Invalid proxy URL 'proxy.host:8080' for protocol 'http': relative URL without a base")
+    // url::Url::parse accepts opaque-scheme halves — `proxy.host:8080`
+    // parses (scheme `proxy.host`) so only digit-led schemes fail
+    // (upstream to_curl vectors rely on `--proxy http:localhost:1080`).
+    o3 := r("--proxy\nhttp:127.0.0.1:8000\nexample.org")
+    diag(o3, "invalid value 'http:127.0.0.1:8000' for '--proxy <PROTOCOL:URL>': Invalid proxy URL '127.0.0.1:8000' for protocol 'http': relative URL without a base")
+    o3b := r("--proxy\nhttp:proxy.host:8080\nexample.org")
+    testing.expect_eq(o3b.exec, 1, "opaque-scheme proxy URL parses")
     o4 := r("--proxy\nhttp:http://h:1\n--proxy\nall:socks5://u:p@h\nexample.org")
     testing.expect_eq(o4.exec, 1, "proxies parse and exec (WI-0013)")
     testing.expect_eq(len(o4.intent.proxies), 2, "2 proxies")
@@ -270,7 +276,12 @@ fn test_construct_url() {
 }
 
 fn test_deferrals() {
-    deferr(r("--generate\nman"), "--generate is unsupported in this build")
+    // WI-0016 S5: --generate routes to exec — the vendored artifact
+    // renders in execute(), covered by the golden generate_* cases.
+    og := r("--generate\nman")
+    testing.expect_eq(og.code, 0, "generate man exits 0")
+    testing.expect_eq(og.exec, 1, "generate man execs")
+    testing.expect_streq(og.intent.gen, "man", "generate man kind")
     deferr(r("--unstable-m-sig-id\ni\n--unstable-m-sig-key\nk\nexample.org"), "This binary was built without message signature support. Enable the `http-message-signatures` feature.")
     deferr(r("--http-version\n3-prior-knowledge\nexample.org"), "This binary was built without support for HTTP/3. Enable the `http3` feature.")
     // WI-0013: --http-version 2* executes (ADR-0030); only h3 defers

@@ -1,0 +1,1326 @@
+package main
+
+// Formatting pipeline (WI-0016 spec S2/S3/S4): effective FormatOptions,
+// ContentType dispatch, bounded charset decode, JSON/XML pretty
+// printers, latin1 header-value display, and the ANSI palette lookup
+// wired to gen_styles.oxl.
+import "std/strconv"
+
+import "std/encoding/json"
+
+import "github.com/oxidean/oxttp/core/model"
+
+// ContentType ids — mirror printer.rs's enum order.
+// 0 Json · 1 Html · 2 Xml · 3 JavaScript · 4 Css · 5 Text ·
+// 6 UrlencodedForm · 7 Multipart · 8 EventStream · 9 Unknown
+fn ct_of(mime: str, hdrs: []model.Header) -> int {
+    ct := mime
+    if len(ct) == 0 {
+        i := hfind(hdrs, "content-type")
+        if i >= 0 {
+            ct = hdrs[i].value
+        }
+    }
+    if find(ct, "json") >= 0 {
+        return 0
+    }
+    if find(ct, "xml") >= 0 {
+        return 2
+    }
+    if find(ct, "html") >= 0 {
+        return 1
+    }
+    if find(ct, "multipart") >= 0 {
+        return 7
+    }
+    if find(ct, "x-www-form-urlencoded") >= 0 {
+        return 6
+    }
+    if find(ct, "javascript") >= 0 {
+        return 3
+    }
+    if find(ct, "css") >= 0 {
+        return 4
+    }
+    if find(ct, "event-stream") >= 0 {
+        return 8
+    }
+    if find(ct, "text") >= 0 {
+        return 5
+    }
+    return 9
+}
+
+// is_text() — upstream table: Unknown, UrlencodedForm, Multipart are
+// not text; everything else is.
+fn ct_is_text(ct: int) -> int {
+    if ct == 9 || ct == 6 || ct == 7 {
+        return 0
+    }
+    return 1
+}
+
+fn ct_is_stream(ct: int) -> int {
+    if ct == 8 {
+        return 1
+    }
+    return 0
+}
+
+// Fmt — the effective printer knobs (upstream Printer::new
+// combination of Pretty + FormatOptions, resolved at exec time).
+struct Fmt {
+    color: int,        // pretty.color() — SGR emission allowed
+    format: int,       // pretty.format() — drives format*/sort defaults
+    json_indent: int,
+    json_format: int,
+    xml_indent: int,
+    xml_format: int,
+    headers_sort: int,
+    out_tty: int,
+    style: str,        // resolved theme name (auto->ansi at sem/cli)
+}
+
+// fmt_of folds i.pretty (resolved) + i.fmt_opts (canonical "k=v")
+// into the effective set: `fo.X or pretty.format()` semantics.
+fn fmt_of(i: ref Intent, out_tty: int) -> own Fmt {
+    f := new(Fmt)
+    f.out_tty = out_tty
+    f.style = i.style
+    if len(f.style) == 0 || f.style == "auto" {
+        f.style = "ansi"
+    }
+    p := i.pretty
+    color := 0
+    format := 0
+    if p == "all" {
+        color = 1
+        format = 1
+    } else if p == "colors" {
+        color = 1
+    } else if p == "format" {
+        format = 1
+    }
+    f.color = color
+    f.format = format
+    f.json_indent = 4
+    f.json_format = format
+    f.xml_indent = 2
+    f.xml_format = format
+    f.headers_sort = format
+    // fmt_opts is an own slice — nil on a zero-valued Intent (only
+    // resolve() initializes it); slicing nil traps (same class as the
+    // tui Hop handle crash).
+    if i.fmt_opts != nil {
+        k := 0
+        for k < len(i.fmt_opts[:]) {
+            e := i.fmt_opts[k]
+            k = k + 1
+            eq := find(e, "=")
+            if eq < 0 {
+                continue
+            }
+            key := substr(e, 0, eq)
+            val := substr(e, eq + 1, len(e))
+            if key == "json.indent" {
+                [n, ne] = strconv.atoi(val)
+                if ne == nil {
+                    f.json_indent = n
+                }
+            } else if key == "json.format" {
+                f.json_format = booli(val == "true")
+            } else if key == "xml.indent" {
+                [n, ne] = strconv.atoi(val)
+                if ne == nil {
+                    f.xml_indent = n
+                }
+            } else if key == "xml.format" {
+                f.xml_format = booli(val == "true")
+            } else if key == "headers.sort" {
+                f.headers_sort = booli(val == "true")
+            }
+        }
+    }
+    return f
+}
+
+// --- bounded charset decode (spec DevD3) -------------------------
+
+// charset_of: --response-charset ?: `charset=` param of the
+// content-type header ?: "" (BOM sniff at decode).
+fn charset_of(charset_arg: str, hdrs: []model.Header) -> str {
+    if len(charset_arg) > 0 {
+        return charset_arg
+    }
+    i := hfind(hdrs, "content-type")
+    if i < 0 {
+        return ""
+    }
+    v := lower(hdrs[i].value)
+    // media-type params are `;`-separated name=value pairs; match
+    // `charset` as a param name so substrings inside other values
+    // (boundaries, filenames) can't false-positive, and honor quoted
+    // values like charset="utf-8".
+    start := 0
+    for start <= len(v) {
+        // `;` inside a quoted param value doesn't split — track quotes.
+        e := start
+        q := 0
+        for e < len(v) {
+            c3 := byteat(v, e)
+            if q != 0 {
+                if c3 == q {
+                    q = 0
+                }
+            } else if c3 == 34 || c3 == 39 {
+                q = c3
+            } else if c3 == 59 {
+                break
+            }
+            e = e + 1
+        }
+        seg := trim_ws(substr(v, start, e))
+        if len(seg) >= 8 && substr(seg, 0, 7) == "charset" {
+            k := 7
+            for k < len(seg) && byteat(seg, k) == 32 {
+                k = k + 1
+            }
+            if k < len(seg) && byteat(seg, k) == 61 {
+                k = k + 1
+                for k < len(seg) && byteat(seg, k) == 32 {
+                    k = k + 1
+                }
+                q := 0
+                if k < len(seg) && (byteat(seg, k) == 34 || byteat(seg, k) == 39) {
+                    q = byteat(seg, k)
+                    k = k + 1
+                }
+                e2 := k
+                for e2 < len(seg) {
+                    c2 := byteat(seg, e2)
+                    if q != 0 {
+                        if c2 == q {
+                            break
+                        }
+                    } else if c2 == 32 || c2 == 9 {
+                        break
+                    }
+                    e2 = e2 + 1
+                }
+                if e2 > k {
+                    return enc_lookup(substr(seg, k, e2))
+                }
+            }
+        }
+        if e >= len(v) {
+            break
+        }
+        start = e + 1
+    }
+    return ""
+}
+
+// enc_compat: label is ASCII-compatible (NUL byte ⟹ binary) unless
+// it's UTF-16 (NUL bytes are normal code-unit padding).
+fn enc_ascii_compat(enc: str) -> int {
+    if enc == "UTF-16LE" || enc == "UTF-16BE" {
+        return 0
+    }
+    return 1
+}
+
+// decode_bounded: bounded decode set {UTF-8 lossy, UTF-16LE/BE,
+// windows-1252(+latin1/ascii canonical)}; BOM stripped when it
+// matches; "" → BOM sniff else UTF-8. Other valid labels decode as
+// UTF-8-lossy (spec DevD3 — no chardet, no exotic tables).
+fn decode_bounded(raw: []byte, enc: str) -> str {
+    e := enc
+    if len(e) == 0 {
+        if len(raw) >= 3 && raw[0] == 239 && raw[1] == 187 && raw[2] == 191 {
+            return utf8_lossy(sliceb(raw, 3, len(raw)))
+        }
+        if len(raw) >= 2 && raw[0] == 255 && raw[1] == 254 {
+            return utf16_dec(raw, 2, 0)
+        }
+        if len(raw) >= 2 && raw[0] == 254 && raw[1] == 255 {
+            return utf16_dec(raw, 2, 1)
+        }
+        return utf8_lossy(raw)
+    }
+    if e == "UTF-16LE" {
+        st := 0
+        if len(raw) >= 2 && raw[0] == 255 && raw[1] == 254 {
+            st = 2
+        }
+        return utf16_dec(raw, st, 0)
+    }
+    if e == "UTF-16BE" {
+        st := 0
+        if len(raw) >= 2 && raw[0] == 254 && raw[1] == 255 {
+            st = 2
+        }
+        return utf16_dec(raw, st, 1)
+    }
+    if e == "windows-1252" {
+        return w1252_dec(raw)
+    }
+    // everything else decodes as UTF-8-lossy; an explicit UTF-8 label
+    // still gets BOM removal like upstream decode_with_bom_removal.
+    if len(raw) >= 3 && raw[0] == 239 && raw[1] == 187 && raw[2] == 191 {
+        return utf8_lossy(sliceb(raw, 3, len(raw)))
+    }
+    return utf8_lossy(raw)
+}
+
+fn sliceb(b: []byte, a: int, z: int) -> []byte {
+    out := mkslice(byte, 0)
+    i := a
+    for i < z {
+        out = push(out, b[i])
+        i = i + 1
+    }
+    return out
+}
+
+// utf8_lossy: copy well-formed UTF-8 verbatim; malformed bytes become
+// U+FFFD (encoding_rs decode-without-bom semantics). Validation is
+// delegated to u8_dec so overlongs, surrogates and >U+10FFFF count as
+// malformed exactly like Rust's from_utf8.
+fn utf8_lossy(raw: []byte) -> str {
+    s := raw as str
+    out := mkslice(byte, 0)
+    i := 0
+    for i < len(raw) {
+        fr := u8_dec(s, i)
+        if fr[1] == 1 && fr[0] >= 128 {
+            out = push(out, 239)
+            out = push(out, 191)
+            out = push(out, 189)
+            i = i + 1
+            continue
+        }
+        j := 0
+        for j < fr[1] {
+            out = push(out, raw[i + j])
+            j = j + 1
+        }
+        i = i + fr[1]
+    }
+    return out as str
+}
+
+// utf16_dec: decode UTF-16 (le=0 | be=1) from offset st, lossy on odd
+// trailing byte / unpaired surrogates.
+fn utf16_dec(raw: []byte, st: int, be: int) -> str {
+    out := mkslice(byte, 0)
+    i := st
+    for i + 1 < len(raw) {
+        u := 0
+        if be != 0 {
+            u = raw[i] * 256 + raw[i + 1]
+        } else {
+            u = raw[i + 1] * 256 + raw[i]
+        }
+        i = i + 2
+        if u >= 55296 && u <= 56319 && i + 1 < len(raw) {
+            u2 := 0
+            if be != 0 {
+                u2 = raw[i] * 256 + raw[i + 1]
+            } else {
+                u2 = raw[i + 1] * 256 + raw[i]
+            }
+            if u2 >= 56320 && u2 <= 57343 {
+                u = 65536 + (u - 55296) * 1024 + (u2 - 56320)
+                i = i + 2
+            } else {
+                u = 65533
+            }
+        } else if u >= 55296 && u <= 57343 {
+            u = 65533
+        }
+        out = push_cp(out, u)
+    }
+    if i < len(raw) {
+        // odd trailing byte — encoding_rs emits U+FFFD
+        out = push(out, 239)
+        out = push(out, 191)
+        out = push(out, 189)
+    }
+    return out as str
+}
+
+// w1252_dec: windows-1252 → UTF-8; 0x80–0x9F map through the cp1252
+// table, everything else is codepoint-identical (latin1 overlay).
+fn w1252_dec(raw: []byte) -> str {
+    tbl := "€‚ƒ„…†‡ˆ‰Š‹ŒŽ‘’“”•–—˜™š›œžŸ"
+    out := mkslice(byte, 0)
+    i := 0
+    for i < len(raw) {
+        b := raw[i]
+        i = i + 1
+        if b >= 128 && b <= 159 {
+            // cp1252 has 27 defined slots in 0x80–0x9F; the undefined
+            // indices {1,13,15,16,29} decode to the matching C1 control
+            // per WHATWG/encoding_rs. tbl holds only the defined glyphs,
+            // so pos counts defined indices below idx.
+            idx := b - 128
+            if idx == 1 || idx == 13 || idx == 15 || idx == 16 || idx == 29 {
+                cp := 128 + idx
+                out = push(out, (192 + cp / 64) as byte)
+                out = push(out, (128 + cp % 64) as byte)
+            } else {
+                pos := idx
+                if idx > 1 {
+                    pos = pos - 1
+                }
+                if idx > 13 {
+                    pos = pos - 1
+                }
+                if idx > 15 {
+                    pos = pos - 1
+                }
+                if idx > 16 {
+                    pos = pos - 1
+                }
+                if idx > 29 {
+                    pos = pos - 1
+                }
+                ch := utf8_charat(tbl, pos)
+                out = pushstr(out, ch)
+            }
+        } else if b >= 160 {
+            out = push(out, (192 + b / 64) as byte)
+            out = push(out, (128 + b % 64) as byte)
+        } else {
+            out = push(out, b)
+        }
+    }
+    return out as str
+}
+
+// push_cp appends codepoint u as UTF-8 bytes.
+fn push_cp(out: []byte, u: int) -> []byte {
+    if u <= 127 {
+        out = push(out, u as byte)
+    } else if u <= 2047 {
+        out = push(out, (192 + u / 64) as byte)
+        out = push(out, (128 + u % 64) as byte)
+    } else if u <= 65535 {
+        out = push(out, (224 + u / 4096) as byte)
+        out = push(out, (128 + (u / 64) % 64) as byte)
+        out = push(out, (128 + u % 64) as byte)
+    } else {
+        out = push(out, (240 + u / 262144) as byte)
+        out = push(out, (128 + (u / 4096) % 64) as byte)
+        out = push(out, (128 + (u / 64) % 64) as byte)
+        out = push(out, (128 + u % 64) as byte)
+    }
+    return out
+}
+
+// utf8_charat returns the n-th character of a UTF-8 string.
+fn utf8_charat(s: str, n: int) -> str {
+    i := 0
+    k := 0
+    for i < len(s) {
+        c := byteat(s, i)
+        // char boundary = ASCII or a lead byte (>=194); continuation
+        // bytes (128..191) belong to the preceding char.
+        if c < 128 || c >= 194 {
+            if k == n {
+                e := i + 1
+                for e < len(s) && byteat(s, e) >= 128 && byteat(s, e) <= 191 {
+                    e = e + 1
+                }
+                return substr(s, i, e)
+            }
+            k = k + 1
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn pushstr(b: []byte, s: str) -> []byte {
+    i := 0
+    for i < len(s) {
+        b = push(b, byteat(s, i))
+        i = i + 1
+    }
+    return b
+}
+
+// --- body dispatch -------------------------------------------------
+
+// BINARY_SUPPRESSOR — upstream printer.rs L26-28 verbatim.
+fn binary_suppressor() -> str {
+    return "+-----------------------------------------+\n| NOTE: binary data not shown in terminal |\n+-----------------------------------------+\n\n"
+}
+
+// valid_json — full-parse gate (upstream IgnoredAny): the body is
+// valid iff jparse consumes it entirely. jparse returns a null node
+// for both "null" and errors, so text "null" is special-cased.
+fn valid_json(s: str) -> int {
+    v := json.jparse(s)
+    if v.kind != 0 {
+        return 1
+    }
+    if trim_ows(s) == "null" {
+        return 1
+    }
+    return 0
+}
+
+// json_fmt — pretty-printer with caller indent (moved from
+// json_pretty2; same scanner, parameterised indent width).
+fn json_fmt(s: str, ind: int) -> str {
+    t := trim_ows(s)
+    if len(t) == 0 {
+        return s
+    }
+    c0 := byteat(t, 0)
+    if c0 != 123 && c0 != 91 {
+        return s
+    }
+    out := ""
+    indent := 0
+    in_str := 0
+    esc := 0
+    i := 0
+    n := len(t)
+    for i < n {
+        c := byteat(t, i)
+        if in_str != 0 {
+            out = out + substr(t, i, i + 1)
+            if esc != 0 {
+                esc = 0
+            } else if c == 92 {
+                esc = 1
+            } else if c == 34 {
+                in_str = 0
+            }
+            i = i + 1
+            continue
+        }
+        if c == 34 {
+            in_str = 1
+            out = out + "\""
+            i = i + 1
+            continue
+        }
+        if c == 32 || c == 9 || c == 10 || c == 13 {
+            i = i + 1
+            continue
+        }
+        if c == 123 || c == 91 {
+            out = out + substr(t, i, i + 1) + "\n"
+            indent = indent + 1
+            out = out + spaces2(indent, ind)
+            i = i + 1
+            continue
+        }
+        if c == 125 || c == 93 {
+            indent = indent - 1
+            if indent < 0 {
+                indent = 0
+            }
+            out = out + "\n" + spaces2(indent, ind) + substr(t, i, i + 1)
+            i = i + 1
+            continue
+        }
+        if c == 44 {
+            out = out + ",\n" + spaces2(indent, ind)
+            i = i + 1
+            continue
+        }
+        if c == 58 {
+            out = out + ": "
+            i = i + 1
+            continue
+        }
+        out = out + substr(t, i, i + 1)
+        i = i + 1
+    }
+    return out
+}
+
+fn spaces2(n: int, w: int) -> str {
+    out := ""
+    i := 0
+    for i < n * w {
+        out = out + " "
+        i = i + 1
+    }
+    return out
+}
+
+// xml_fmt — bounded re-indent (spec DevD5): strip whitespace-only
+// text nodes and re-emit with `w`-space indentation. Malformed input
+// falls back to the verbatim string (upstream logs + raw-prints).
+fn xml_fmt(s: str, w: int) -> str {
+    t := s
+    // tokenise: <...> markup vs text runs
+    out := ""
+    depth := 0
+    pos := 0
+    n := len(t)
+    pending := ""
+    for pos < n {
+        lt := find(substr(t, pos, n), "<")
+        if lt < 0 {
+            txt := trim_ows(substr(t, pos, n))
+            if len(txt) > 0 {
+                out = out + txt
+            }
+            pos = n
+            continue
+        }
+        lt = lt + pos
+        gt := find(substr(t, lt, n), ">")
+        if gt < 0 {
+            return s
+        }
+        gt = gt + lt
+        txt := trim_ows(substr(t, pos, lt))
+        tag := substr(t, lt + 1, gt)
+        if len(txt) > 0 {
+            if len(pending) > 0 {
+                out = out + pending + txt
+            } else {
+                out = out + spaces2(depth, w) + txt
+            }
+            pending = ""
+        }
+        if len(tag) > 0 && byteat(tag, 0) == 47 {
+            // closing tag
+            depth = depth - 1
+            if depth < 0 {
+                depth = 0
+            }
+            if len(pending) > 0 {
+                out = out + pending + "<" + tag + ">"
+                pending = ""
+            } else {
+                out = out + "\n" + spaces2(depth, w) + "<" + tag + ">"
+            }
+        } else if len(tag) > 0 && (byteat(tag, 0) == 63 || byteat(tag, 0) == 33) {
+            // <?xml ?> / <!DOCTYPE>/<!---->
+            if len(pending) > 0 {
+                out = out + pending
+                pending = ""
+            }
+            out = out + spaces2(depth, w) + "<" + tag + ">\n"
+        } else {
+            selfclose := 0
+            if len(tag) > 0 && byteat(tag, len(tag) - 1) == 47 {
+                selfclose = 1
+            }
+            if len(pending) > 0 {
+                out = out + pending
+                pending = ""
+            } else {
+                out = out + spaces2(depth, w)
+            }
+            out = out + "<" + tag + ">"
+            if selfclose != 0 {
+                out = out + "\n"
+            } else {
+                depth = depth + 1
+                pending = "\n"
+            }
+        }
+        pos = gt + 1
+    }
+    return out
+}
+
+// --- header value display (headers_fmt.rs) -------------------------
+
+// hdr_has_nonascii reports whether the value carries any byte ≥128
+// (upstream HeaderValue::to_str fails on obs-text → BadHeaderValue).
+fn hdr_has_nonascii(v: str) -> int {
+    i := 0
+    for i < len(v) {
+        if byteat(v, i) >= 128 {
+            return 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// hdr_latin1 renders the isomorphic-decode display form shared by
+// the plain and colored header-value paths (each byte → codepoint,
+// re-encoded UTF-8; control chars → U+FFFD when tty).
+fn hdr_latin1(v: str, out_tty: int) -> str {
+    lb := mkslice(byte, 0)
+    i := 0
+    for i < len(v) {
+        b := byteat(v, i)
+        if out_tty != 0 && (b < 32 || (b >= 127 && b < 160)) {
+            lb = push(lb, 239)
+            lb = push(lb, 191)
+            lb = push(lb, 189)
+        } else if b >= 128 {
+            lb = push(lb, (192 + b / 64) as byte)
+            lb = push(lb, (128 + b % 64) as byte)
+        } else {
+            lb = push(lb, b)
+        }
+        i = i + 1
+    }
+    return lb as str
+}
+
+// hdr_value_out is the header-value display for both color modes —
+// headers.rs::print_headers value branch. ASCII → header_value;
+// latin1 → error color with the optional ` (UTF-8: <v>)` annotation
+// (utf8 part in header_value, markers in default). With colors off
+// every sgr_wrap is a no-op and the output is byte-identical to the
+// old plain path.
+fn hdr_value_out(v: str, f: ref Fmt) -> str {
+    if hdr_has_nonascii(v) == 0 {
+        return sgr_wrap("header_value", v, f)
+    }
+    disp := hdr_latin1(v, f.out_tty)
+    if utf8_valid(v) != 0 {
+        return sgr_wrap("error", disp, f) + sgr_wrap("default", " (UTF-8: ", f) + sgr_wrap("header_value", v, f) + sgr_wrap("default", ")", f)
+    }
+    return sgr_wrap("error", disp, f)
+}
+
+fn utf8_valid(s: str) -> int {
+    i := 0
+    for i < len(s) {
+        fr := u8_dec(s, i)
+        if fr[1] == 1 && fr[0] >= 128 {
+            return 0
+        }
+        i = i + fr[1]
+    }
+    return 1
+}
+
+// hsort_copy returns the header list sorted by lowercase name
+// (upstream sort_by_key(name.as_str()) — stable).
+fn hsort_copy(hs: []model.Header) -> own []model.Header {
+    out := mkslice(model.Header, 0)
+    i := 0
+    for i < len(hs) {
+        out = push(out, hs[i])
+        i = i + 1
+    }
+    i = 1
+    for i < len(out) {
+        k := out[i]
+        j := i - 1
+        for j >= 0 && elwr(out[j].name) > elwr(k.name) {
+            out[j + 1] = out[j]
+            j = j - 1
+        }
+        out[j + 1] = k
+        i = i + 1
+    }
+    return new(out)
+}
+
+// --- body render entry ---------------------------------------------
+
+// resp_body_render — spec S3 decision tree. `stream_flag` is the
+// --stream flag; ct/enc resolved inside.
+fn resp_body_render(body: []byte, f: ref Fmt, hdrs: []model.Header, mime: str, charset_arg: str, stream_flag: int) -> str {
+    ct := ct_of(mime, hdrs)
+    enc := charset_of(charset_arg, hdrs)
+    stream := 0
+    if stream_flag > 0 {
+        stream = 1
+    } else if stream_flag == 0 {
+        stream = ct_is_stream(ct)
+    }
+    if f.out_tty == 0 {
+        if (f.color != 0 || f.json_format != 0 || f.xml_format != 0) && ct_is_text(ct) != 0 {
+            text := decode_bounded(body, enc)
+            if stream != 0 {
+                return body_stream_dispatch(text, ct, f)
+            }
+            return body_text_dispatch(text, ct, f)
+        }
+        return body as str
+    }
+    // tty: binary guard then dispatch
+    if enc_ascii_compat(enc_or_sniff(body, enc)) != 0 {
+        i := 0
+        for i < len(body) {
+            if body[i] == 0 {
+                return binary_suppressor()
+            }
+            i = i + 1
+        }
+    }
+    text := decode_bounded(body, enc)
+    if enc_ascii_compat(enc_or_sniff(body, enc)) == 0 && find(text, "\x00") >= 0 {
+        return binary_suppressor()
+    }
+    if stream != 0 {
+        return body_stream_dispatch(text, ct, f) + "\n"
+    }
+    return body_text_dispatch(text, ct, f) + "\n"
+}
+
+// enc_or_sniff resolves the effective encoding incl. BOM sniff.
+fn enc_or_sniff(raw: []byte, enc: str) -> str {
+    if len(enc) > 0 {
+        return enc
+    }
+    if len(raw) >= 2 && raw[0] == 255 && raw[1] == 254 {
+        return "UTF-16LE"
+    }
+    if len(raw) >= 2 && raw[0] == 254 && raw[1] == 255 {
+        return "UTF-16BE"
+    }
+    return "UTF-8"
+}
+
+// body_text_dispatch — printer.rs::print_body_text port.
+fn body_text_dispatch(text: str, ct: int, f: ref Fmt) -> str {
+    if ct == 0 {
+        return json_text(text, f, 1)
+    }
+    if ct == 2 {
+        return xml_text(text, f)
+    }
+    if ct == 1 {
+        return colorize(text, "html", f)
+    }
+    if ct == 4 {
+        return colorize(text, "css", f)
+    }
+    if (ct == 5 || ct == 3) && valid_json(text) != 0 {
+        return json_text(text, f, 0)
+    }
+    if ct == 3 {
+        return colorize(text, "js", f)
+    }
+    return text
+}
+
+// json_text: format when json_format (valid-json gate when
+// check_valid); else colorize (P3) / verbatim.
+fn json_text(text: str, f: ref Fmt, check_valid: int) -> str {
+    if f.json_format == 0 {
+        return colorize(text, "json", f)
+    }
+    if check_valid != 0 && valid_json(text) == 0 {
+        return colorize(text, "json", f)
+    }
+    fmt := json_fmt(text, f.json_indent)
+    if f.color != 0 {
+        return colorize(fmt + "\n\n", "json", f)
+    }
+    return fmt + "\n\n"
+}
+
+fn xml_text(text: str, f: ref Fmt) -> str {
+    if f.xml_format == 0 {
+        return colorize(text, "xml", f)
+    }
+    fmt := xml_fmt(text, f.xml_indent)
+    if f.color != 0 {
+        return colorize(fmt + "\n\n", "xml", f)
+    }
+    return fmt + "\n\n"
+}
+
+// body_stream_dispatch — upstream print_body_stream on an already
+// buffered body: Json takes the streaming-formatter path; Xml/Html/
+// Css/JavaScript get syntax colors only (block formatting does NOT
+// apply to streams); Text/EventStream pass through decoded-verbatim.
+fn body_stream_dispatch(text: str, ct: int, f: ref Fmt) -> str {
+    if ct == 0 {
+        if f.json_format == 0 {
+            return colorize(text, "json", f)
+        }
+        fmt := stream_json_format(text, f.json_indent)
+        if f.color != 0 {
+            return colorize(fmt, "json", f)
+        }
+        return fmt
+    }
+    if ct == 2 {
+        return colorize(text, "xml", f)
+    }
+    if ct == 1 {
+        return colorize(text, "html", f)
+    }
+    if ct == 4 {
+        return colorize(text, "css", f)
+    }
+    if ct == 3 {
+        return colorize(text, "js", f)
+    }
+    return text
+}
+
+// stream_json_format — the streaming JSON formatter's observable
+// contract on a complete buffer: one whole document formats whole;
+// otherwise each complete single-line value (NDJSON) formats
+// independently and non-JSON lines pass through verbatim. Concatenated
+// multi-line documents are a documented approximation — upstream's
+// StreamDeserializer formats them, ours leaves them literal.
+fn stream_json_format(text: str, ind: int) -> str {
+    if valid_json(text) != 0 {
+        return json_fmt(text, ind)
+    }
+    lines := mkslice(str, 0)
+    pos := 0
+    n := len(text)
+    for pos < n {
+        j := find(substr(text, pos, n), "\n")
+        if j >= 0 {
+            lines = push(lines, substr(text, pos, pos + j))
+            pos = pos + j + 1
+        } else {
+            lines = push(lines, substr(text, pos, n))
+            pos = n
+        }
+    }
+    trail := 0
+    if n > 0 && byteat(text, n - 1) == 10 {
+        trail = 1
+    }
+    out := ""
+    i := 0
+    for i < len(lines) {
+        t := trim_ows(lines[i])
+        if len(t) > 0 && valid_json(t) != 0 {
+            out = out + json_fmt(t, ind)
+        } else {
+            out = out + lines[i]
+        }
+        if i + 1 < len(lines) {
+            out = out + "\n"
+        }
+        i = i + 1
+    }
+    if trail != 0 && len(out) > 0 {
+        out = out + "\n"
+    }
+    return out
+}
+
+// req_body_render: unconditional NUL → suppressor (+breathing \n);
+// else UTF-8-lossy + dispatch on the request's own content-type —
+// upstream print_request_body prints the suppressor even piped and
+// adds "\n" post-text plus a "\n" breathing line. Caller appends
+// nothing.
+fn req_body_render(body: []byte, f: ref Fmt, hdrs: []model.Header) -> str {
+    i := 0
+    for i < len(body) {
+        if body[i] == 0 {
+            return binary_suppressor() + "\n"
+        }
+        i = i + 1
+    }
+    text := utf8_lossy(body)
+    return body_text_dispatch(text, ct_of("", hdrs), f) + "\n\n"
+}
+
+// --- syntax highlighting (spec S4, ADR-0040) -----------------------
+//
+// Palette values are exact (gen_styles.oxl, extracted from the
+// vendored .tmTheme files); tokenization is our bounded approximation
+// of syntect's scopes — documented DevD4.
+
+// sgr_open returns the "\x1b[<params>m" opener for an element under
+// the effective theme; "" when the element is uncolored (style_sgr
+// encodes "" for ansi default/separator etc.).
+fn sgr_open(elem: str, f: ref Fmt) -> str {
+    if f.color == 0 {
+        return ""
+    }
+    p := style_sgr(f.style, elem)
+    if len(p) == 0 {
+        return ""
+    }
+    return "\x1b[" + p + "m"
+}
+
+// sgr_wrap emits one colored span; uncolored elements pass through
+// verbatim. Every span self-resets — upstream tracks a current color
+// and resets once per head/body, but per-span reset is visually
+// equivalent and keeps the approximation honest.
+fn sgr_wrap(elem: str, text: str, f: ref Fmt) -> str {
+    o := sgr_open(elem, f)
+    if len(o) == 0 {
+        return text
+    }
+    return o + text + "\x1b[0m"
+}
+
+// sgr_plain mirrors upstream print_plain: text under the theme's
+// default/foreground element (no-op when that element is uncolored,
+// e.g. the ansi theme).
+fn sgr_plain(text: str, f: ref Fmt) -> str {
+    return sgr_wrap("default", text, f)
+}
+
+// colorize — verbatim when color is off.
+fn colorize(text: str, syntax: str, f: ref Fmt) -> str {
+    if f.color == 0 {
+        return text
+    }
+    return syntax_highlight(text, syntax, f)
+}
+
+// HlSpan is one classified run [st,en) of the source text.
+struct HlSpan {
+    cls: str,
+    st: int,
+    en: int,
+}
+
+// hl_push appends a span, skipping empty runs.
+fn hl_push(acc: []HlSpan, cls: str, a: int, b: int) -> []HlSpan {
+    if b > a {
+        acc = push(acc, HlSpan{cls: cls, st: a, en: b})
+    }
+    return acc
+}
+
+// hl_render wraps each span in its element color.
+fn hl_render(text: str, spans: own []HlSpan, f: ref Fmt) -> str {
+    out := ""
+    i := 0
+    for i < len(spans) {
+        sp := spans[i]
+        i = i + 1
+        out = out + sgr_wrap(sp.cls, substr(text, sp.st, sp.en), f)
+    }
+    return out
+}
+
+// is_json_ws — JSON insignificant whitespace.
+fn is_json_ws(c: int) -> int {
+    if c == 32 || c == 9 || c == 10 || c == 13 {
+        return 1
+    }
+    return 0
+}
+
+// json_string_end returns the index just past the closing quote of
+// the JSON string opening at i (backslash escapes honored).
+fn json_string_end(s: str, i: int) -> int {
+    j := i + 1
+    n := len(s)
+    for j < n {
+        c := byteat(s, j)
+        if c == 92 {
+            j = j + 2
+            continue
+        }
+        if c == 34 {
+            return j + 1
+        }
+        j = j + 1
+    }
+    return n
+}
+
+// json_num_end consumes a JSON number body (sign/digits/./eE/+/-).
+fn json_num_end(s: str, i: int) -> int {
+    j := i
+    n := len(s)
+    for j < n {
+        c := byteat(s, j)
+        if (c >= 48 && c <= 57) || c == 45 || c == 43 || c == 46 || c == 101 || c == 69 {
+            j = j + 1
+        } else {
+            break
+        }
+    }
+    return j
+}
+
+// lex_json — strings (key when followed by ':'), numbers,
+// true/false/null, everything else default. Contiguous default runs
+// are merged.
+fn lex_json(text: str) -> own []HlSpan {
+    acc := mkslice(HlSpan, 0)
+    n := len(text)
+    i := 0
+    dopen := 0
+    ds := 0
+    for i < n {
+        c := byteat(text, i)
+        cls := ""
+        en := 0
+        if c == 34 {
+            en = json_string_end(text, i)
+            j := en
+            for j < n && is_json_ws(byteat(text, j)) != 0 {
+                j = j + 1
+            }
+            if j < n && byteat(text, j) == 58 {
+                cls = "json_key"
+            } else {
+                cls = "json_string"
+            }
+        } else if c == 45 || (c >= 48 && c <= 57) {
+            en = json_num_end(text, i)
+            cls = "json_number"
+        } else if c == 116 || c == 102 || c == 110 {
+            lit := "null"
+            if c == 116 {
+                lit = "true"
+            } else if c == 102 {
+                lit = "false"
+            }
+            if i + len(lit) <= n && substr(text, i, i + len(lit)) == lit {
+                en = i + len(lit)
+                cls = "json_constant"
+            }
+        }
+        if len(cls) == 0 {
+            if dopen == 0 {
+                ds = i
+                dopen = 1
+            }
+            i = i + 1
+            continue
+        }
+        if dopen != 0 {
+            acc = hl_push(acc, "default", ds, i)
+            dopen = 0
+        }
+        acc = hl_push(acc, cls, i, en)
+        i = en
+    }
+    if dopen != 0 {
+        acc = hl_push(acc, "default", ds, n)
+    }
+    return new(acc)
+}
+
+// hl_cdata_comment scans a <!-- --> comment starting at i; returns
+// the end index (n when unterminated).
+fn hl_comment_end(s: str, i: int) -> int {
+    j := find(substr(s, i, len(s)), "-->")
+    if j < 0 {
+        return len(s)
+    }
+    return i + j + 3
+}
+
+// lex_markup — html/xml approximation: comments, tags (name →
+// markup_tag), attribute names (→ markup_attr), quoted attribute
+// values (→ json_string per the string.quoted scope), everything
+// else default.
+fn lex_markup(text: str) -> own []HlSpan {
+    acc := mkslice(HlSpan, 0)
+    n := len(text)
+    i := 0
+    dopen := 0
+    ds := 0
+    in_tag := 0
+    for i < n {
+        c := byteat(text, i)
+        if in_tag == 0 {
+            if c == 60 && i + 4 <= n && substr(text, i, i + 4) == "<!--" {
+                if dopen != 0 {
+                    acc = hl_push(acc, "default", ds, i)
+                    dopen = 0
+                }
+                en := hl_comment_end(text, i)
+                acc = hl_push(acc, "comment", i, en)
+                i = en
+                continue
+            }
+            if c == 60 {
+                // '<' opens a tag (or bogus markup — still tag-ish)
+                if dopen != 0 {
+                    acc = hl_push(acc, "default", ds, i)
+                    dopen = 0
+                }
+                acc = hl_push(acc, "markup_tag", i, i + 1)
+                i = i + 1
+                in_tag = 1
+                continue
+            }
+            if dopen == 0 {
+                ds = i
+                dopen = 1
+            }
+            i = i + 1
+            continue
+        }
+        // inside a tag: names → markup_tag until '=' or ws or '>'
+        if c == 62 {
+            if dopen != 0 {
+                acc = hl_push(acc, "default", ds, i)
+                dopen = 0
+            }
+            acc = hl_push(acc, "markup_tag", i, i + 1)
+            i = i + 1
+            in_tag = 0
+            continue
+        }
+        if c == 34 || c == 39 {
+            // quoted attr value → string.quoted scope
+            if dopen != 0 {
+                acc = hl_push(acc, "default", ds, i)
+                dopen = 0
+            }
+            q := c
+            j := i + 1
+            for j < n {
+                if byteat(text, j) == 92 {
+                    j = j + 2
+                    continue
+                }
+                if byteat(text, j) == q {
+                    break
+                }
+                j = j + 1
+            }
+            if j < n {
+                j = j + 1
+            }
+            acc = hl_push(acc, "json_string", i, j)
+            i = j
+            continue
+        }
+        if c == 61 || c == 32 || c == 9 || c == 10 || c == 13 || c == 47 {
+            // separators between attrs → default
+            if dopen == 0 {
+                ds = i
+                dopen = 1
+            }
+            i = i + 1
+            continue
+        }
+        // attr-name / tag-name char run → markup_attr? spec: attr
+        // names → markup_attr; tag names already emitted. Distinguish
+        // crudely: after '<' or '/' it's a tag name.
+        // Track: name right after '<' handled above; here words are
+        // attribute names → markup_attr.
+        if dopen != 0 {
+            acc = hl_push(acc, "default", ds, i)
+            dopen = 0
+        }
+        j := i
+        for j < n {
+            cj := byteat(text, j)
+            if cj == 32 || cj == 9 || cj == 10 || cj == 13 || cj == 61 || cj == 62 || cj == 47 || cj == 34 || cj == 39 {
+                break
+            }
+            j = j + 1
+        }
+        acc = hl_push(acc, "markup_attr", i, j)
+        i = j
+    }
+    if dopen != 0 {
+        acc = hl_push(acc, "default", ds, n)
+    }
+    return new(acc)
+}
+
+// lex_css — comments, quoted strings, numbers-with-unit, everything
+// else default.
+fn lex_css(text: str) -> own []HlSpan {
+    return lex_comments_strings_nums(text)
+}
+
+// lex_js — // and /* */ comments, quoted strings (incl. backtick
+// templates as approximation), numbers, a small keyword set →
+// json_constant.
+fn lex_js(text: str) -> own []HlSpan {
+    return lex_comments_strings_nums(text)
+}
+
+// lex_comments_strings_nums — shared bounded lexer for css/js:
+// comments (// to EOL outside strings is js-only; css has none — we
+// accept the approximation per DevD4), /* */ blocks, quoted strings
+// → json_string, numeric literals → json_number.
+fn lex_comments_strings_nums(text: str) -> own []HlSpan {
+    acc := mkslice(HlSpan, 0)
+    n := len(text)
+    i := 0
+    dopen := 0
+    ds := 0
+    for i < n {
+        c := byteat(text, i)
+        cls := ""
+        en := i
+        if c == 47 && i + 1 < n && byteat(text, i + 1) == 42 {
+            // /* */ comment
+            j := find(substr(text, i + 2, n), "*/")
+            if j < 0 {
+                en = n
+            } else {
+                en = i + 2 + j + 2
+            }
+            cls = "comment"
+        } else if c == 47 && i + 1 < n && byteat(text, i + 1) == 47 {
+            // // line comment
+            j := i + 2
+            for j < n && byteat(text, j) != 10 {
+                j = j + 1
+            }
+            en = j
+            cls = "comment"
+        } else if c == 34 || c == 39 || c == 96 {
+            q := c
+            j := i + 1
+            for j < n {
+                cj := byteat(text, j)
+                if cj == 92 {
+                    j = j + 2
+                    continue
+                }
+                if cj == q {
+                    j = j + 1
+                    break
+                }
+                j = j + 1
+            }
+            en = j
+            cls = "json_string"
+        } else if (c >= 48 && c <= 57) || (c == 46 && i + 1 < n && byteat(text, i + 1) >= 48 && byteat(text, i + 1) <= 57) {
+            en = json_num_end(text, i)
+            cls = "json_number"
+        }
+        if len(cls) == 0 {
+            if dopen == 0 {
+                ds = i
+                dopen = 1
+            }
+            i = i + 1
+            continue
+        }
+        if dopen != 0 {
+            acc = hl_push(acc, "default", ds, i)
+            dopen = 0
+        }
+        acc = hl_push(acc, cls, i, en)
+        i = en
+    }
+    if dopen != 0 {
+        acc = hl_push(acc, "default", ds, n)
+    }
+    return new(acc)
+}
+
+// syntax_highlight dispatches to the bounded lexer for the syntax
+// and wraps spans in theme colors.
+fn syntax_highlight(text: str, syntax: str, f: ref Fmt) -> str {
+    if syntax == "json" {
+        return hl_render(text, lex_json(text), f)
+    }
+    if syntax == "xml" || syntax == "html" {
+        return hl_render(text, lex_markup(text), f)
+    }
+    if syntax == "css" || syntax == "js" {
+        return hl_render(text, lex_comments_strings_nums(text), f)
+    }
+    return text
+}

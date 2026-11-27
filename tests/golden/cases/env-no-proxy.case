@@ -1,0 +1,6 @@
+# source: derived (WI-0016 spec S7/S8): NO_PROXY env bypasses a
+# captured HTTP_PROXY end-to-end (dead proxy would fail if matched).
+env: HTTP_PROXY=http://127.0.0.1:1
+env: NO_PROXY=127.0.0.1
+argv: -b {URL}/hello
+script: 200 OK\nContent-Type: application/json\n\n{"ok": true}

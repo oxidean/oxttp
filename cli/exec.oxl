@@ -8,6 +8,7 @@ package main
 // sem's step-10 routing table.
 import "std/os"
 
+import "std/time"
 
 import "std/strconv"
 
@@ -163,9 +164,10 @@ fn hget(hs: []model.Header, name: str) -> str {
     return hs[i].value
 }
 
-// htitle renders the display (title-cased) header lines in order,
-// skipping dead slots.
-fn htitle(hs: []model.Header) -> str {
+// htitle renders the display header lines in order, skipping dead
+// slots. `title` applies HTTP/1.x title-casing (h2/h3 heads keep
+// lowercase names); values get the latin1+UTF-8-annotation display.
+fn htitle(hs: []model.Header, title: int, f: ref Fmt) -> str {
     out := ""
     i := 0
     for i < len(hs) {
@@ -174,7 +176,16 @@ fn htitle(hs: []model.Header) -> str {
         if len(h.name) == 0 {
             continue
         }
-        out = out + titlecase(h.name) + ": " + h.value + "\n"
+        nm := h.name
+        if title != 0 {
+            nm = titlecase(nm)
+        } else {
+            nm = elwr(nm)
+        }
+        // headers.rs::print_headers element order: name → header_name,
+        // ":" → header_colon, " " → default, value → header_value
+        // (latin1 → error + UTF-8 annotation), "\n" → default.
+        out = out + sgr_wrap("header_name", nm, f) + sgr_wrap("header_colon", ":", f) + sgr_plain(" ", f) + hdr_value_out(h.value, f) + sgr_plain("\n", f)
     }
     return out
 }
@@ -346,7 +357,411 @@ fn session_save(path: str, auth_type: str, auth_raw: str, cookies: []str, hs: []
     return nil
 }
 
-// --- netrc (spec sem-D4)
+// --- netrc (spec sem-D4 → S6: EntryState port, ADR-0042)
+
+// uni_ws reports Rust char::is_whitespace (Unicode White_Space
+// property) for a decoded codepoint — shared by the netrc word
+// splitter and the curl quoter.
+fn uni_ws(cp: int) -> int {
+    if cp >= 9 && cp <= 13 || cp == 32 {
+        return 1
+    }
+    if cp == 133 || cp == 160 || cp == 5760 {
+        return 1
+    }
+    if cp >= 8192 && cp <= 8202 {
+        return 1
+    }
+    if cp == 8232 || cp == 8233 || cp == 8239 || cp == 8287 || cp == 12288 {
+        return 1
+    }
+    return 0
+}
+
+// u8_dec decodes the UTF-8 sequence at byte i of s → [codepoint,
+// byte-len]. Malformed → [lead-byte, 1] (raw passthrough).
+fn u8_dec(s: str, i: int) -> []int {
+    out := mkslice(int, 2)
+    c := byteat(s, i)
+    out[0] = c
+    out[1] = 1
+    if c < 128 {
+        return out
+    }
+    need := 0
+    cp := 0
+    if c >= 194 && c <= 223 {
+        need = 1
+        cp = c - 192
+    } else if c >= 224 && c <= 239 {
+        need = 2
+        cp = c - 224
+    } else if c >= 240 && c <= 244 {
+        need = 3
+        cp = c - 240
+    } else {
+        return out
+    }
+    j := 0
+    for j < need {
+        j = j + 1
+        if i + j >= len(s) {
+            return out
+        }
+        b := byteat(s, i + j)
+        if b < 128 || b > 191 {
+            return out
+        }
+        cp = cp * 64 + (b - 128)
+    }
+    if need == 1 && cp < 128 || need == 2 && cp < 2048 || need == 3 && cp < 65536 {
+        return out
+    }
+    if cp >= 55296 && cp <= 57343 || cp > 1114111 {
+        return out
+    }
+    out[0] = cp
+    out[1] = need + 1
+    return out
+}
+
+// nrc_ipnum parses one WHATWG IPv4 part: 0x hex, leading-0 octal,
+// else decimal. [value, ok].
+fn nrc_ipnum(p: str) -> []int {
+    out := mkslice(int, 2)
+    if len(p) == 0 {
+        return out
+    }
+    rad := 10
+    st := 0
+    if len(p) > 2 && byteat(p, 0) == 48 && (byteat(p, 1) == 120 || byteat(p, 1) == 88) {
+        rad = 16
+        st = 2
+    } else if len(p) > 1 && byteat(p, 0) == 48 {
+        rad = 8
+        st = 1
+    }
+    v := 0
+    i := st
+    for i < len(p) {
+        c := byteat(p, i)
+        i = i + 1
+        d := -1
+        if c >= 48 && c <= 57 {
+            d = c - 48
+        } else if rad == 16 && c >= 97 && c <= 102 {
+            d = c - 87
+        } else if rad == 16 && c >= 65 && c <= 70 {
+            d = c - 55
+        }
+        if d < 0 || d >= rad {
+            return out
+        }
+        v = v * rad + d
+    }
+    out[0] = v
+    out[1] = 1
+    return out
+}
+
+// nrc_ipv4 → [u32-as-int, ok] for WHATWG 1-4 part IPv4 strings
+// (16843009 == 1.1.1.1); non-numeric → not-IPv4 → domain.
+fn nrc_ipv4(h: str) -> []int {
+    out := mkslice(int, 2)
+    vals := mkslice(int, 0)
+    seg := 0
+    i := 0
+    for i <= len(h) {
+        if i == len(h) || byteat(h, i) == 46 {
+            vr := nrc_ipnum(substr(h, seg, i))
+            ok := vr[1]
+            v := vr[0]
+            if ok == 0 {
+                return out
+            }
+            vals = push(vals, v)
+            seg = i + 1
+        }
+        i = i + 1
+    }
+    np := len(vals)
+    if np < 1 || np > 4 {
+        return out
+    }
+    j := 0
+    for j < np - 1 {
+        if vals[j] > 255 {
+            return out
+        }
+        j = j + 1
+    }
+    lim := 1
+    j = 0
+    for j < 5 - np {
+        lim = lim * 256
+        j = j + 1
+    }
+    if vals[np - 1] >= lim {
+        return out
+    }
+    ip := vals[np - 1]
+    j = 0
+    for j < np - 1 {
+        m := 1
+        k := 0
+        for k < 3 - j {
+            m = m * 256
+            k = k + 1
+        }
+        ip = ip + vals[j] * m
+        j = j + 1
+    }
+    out[0] = ip
+    out[1] = 1
+    return out
+}
+
+// nrc_host canonicalizes a host token for equality (url::Host parse
+// analog): strip one trailing dot, ASCII-casefold, IPv4-int expand.
+// Non-ASCII stays literal (documented deviation — no IDNA codec).
+fn nrc_host(s: str) -> str {
+    h := s
+    if len(h) > 1 && byteat(h, len(h) - 1) == 46 {
+        h = substr(h, 0, len(h) - 1)
+    }
+    h = elwr(h)
+    ipr := nrc_ipv4(h)
+    ok := ipr[1]
+    ip := ipr[0]
+    if ok != 0 {
+        return "4:" + itoa(ip)
+    }
+    return "d:" + h
+}
+
+// nrc_lines splits text into lines (drops \n; \r stays as ws).
+fn nrc_lines(s: str) -> own []str {
+    out := mkslice(str, 0)
+    st := 0
+    i := 0
+    for i < len(s) {
+        if byteat(s, i) == 10 {
+            out = push(out, substr(s, st, i))
+            st = i + 1
+        }
+        i = i + 1
+    }
+    out = push(out, substr(s, st, len(s)))
+    return new(out)
+}
+
+// nrc_trim strips Unicode whitespace at both ends (str::trim).
+fn nrc_trim(s: str) -> str {
+    a := 0
+    b := len(s)
+    for a < b {
+        cr := u8_dec(s, a)
+        cp := cr[0]
+        n := cr[1]
+        if uni_ws(cp) == 0 {
+            break
+        }
+        a = a + n
+    }
+    for b > a {
+        i := b - 1
+        // back up over a full UTF-8 sequence
+        for i > a && byteat(s, i) >= 128 && byteat(s, i) <= 191 {
+            i = i - 1
+        }
+        cr2 := u8_dec(s, i)
+        cp := cr2[0]
+        if uni_ws(cp) == 0 {
+            break
+        }
+        b = i
+    }
+    return substr(s, a, b)
+}
+
+// NParser is the upstream netrc.rs Parser: line-wise word reader +
+// EntryState {Wrong,Correct,Default} + finish_entry collection.
+struct NParser {
+    lines: own []str,
+    li: int,
+    pos: int,
+    host: str,
+    state: int, // 0 Wrong · 1 Correct · 2 Default
+    login: str,
+    has_login: int,
+    password: str,
+    has_pass: int,
+    account: str,
+    has_acct: int,
+    suppress: int,
+    d_login: str,
+    d_has_login: int,
+    d_pass: str,
+    d_set: int,
+    e_login: str,
+    e_has_login: int,
+    e_pass: str,
+    e_set: int,
+}
+
+// nrc_word reads the next whitespace-separated token, advancing
+// lines at EOL; "" at EOF (words are never empty).
+fn nrc_word(p: ref NParser) -> str {
+    for true {
+        if p.li >= len(p.lines) {
+            return ""
+        }
+        buf := p.lines[p.li]
+        if p.pos >= len(buf) {
+            p.li = p.li + 1
+            p.pos = 0
+            continue
+        }
+        cr := u8_dec(buf, p.pos)
+        cp := cr[0]
+        n := cr[1]
+        if uni_ws(cp) != 0 {
+            p.pos = p.pos + n
+            continue
+        }
+        st := p.pos
+        for p.pos < len(buf) {
+            cr2 := u8_dec(buf, p.pos)
+            c2 := cr2[0]
+            n2 := cr2[1]
+            if uni_ws(c2) != 0 {
+                break
+            }
+            p.pos = p.pos + n2
+        }
+        return substr(buf, st, p.pos)
+    }
+    return ""
+}
+
+// nrc_arg consumes the next word; returns it only when the parser is
+// inside a relevant entry (upstream Parser::arg).
+fn nrc_arg(p: ref NParser) -> str {
+    st := p.state
+    w := nrc_word(p)
+    if st != 0 {
+        return w
+    }
+    return ""
+}
+
+// nrc_advance moves to the next line (upstream advance_line).
+fn nrc_advance(p: ref NParser) {
+    p.li = p.li + 1
+    p.pos = 0
+}
+
+// nrc_finish ends the current entry (upstream finish_entry): an entry
+// exists iff a password was gathered; login falls back to account.
+// Correct → e_*, Default → d_*; state resets to Wrong either way.
+fn nrc_finish(p: ref NParser) {
+    lg := p.login
+    hlg := p.has_login
+    ac := p.account
+    hac := p.has_acct
+    pw := p.password
+    hpw := p.has_pass
+    st := p.state
+    p.state = 0
+    p.login = ""
+    p.has_login = 0
+    p.account = ""
+    p.has_acct = 0
+    p.password = ""
+    p.has_pass = 0
+    if hpw == 0 {
+        return
+    }
+    el := lg
+    ehl := hlg
+    if ehl == 0 {
+        el = ac
+        ehl = hac
+    }
+    if st == 1 {
+        p.e_login = el
+        p.e_has_login = ehl
+        p.e_pass = pw
+        p.e_set = 1
+    } else if st == 2 {
+        p.d_login = el
+        p.d_has_login = ehl
+        p.d_pass = pw
+        p.d_set = 1
+    }
+}
+
+fn nrc_parse(p: ref NParser) {
+    for true {
+        w := nrc_word(p)
+        if len(w) == 0 {
+            // EOF: upstream calls finish_entry() once more — the
+            // trailing entry's credentials land here.
+            nrc_finish(p)
+            break
+        }
+        if w == "default" {
+            nrc_finish(p)
+            p.state = 2
+        } else if w == "machine" {
+            nrc_finish(p)
+            nh := nrc_word(p)
+            if len(nh) > 0 {
+                if nrc_host(nh) == p.host {
+                    p.state = 1
+                    p.suppress = 1
+                } else {
+                    p.state = 0
+                }
+            }
+        } else if w == "login" {
+            v := nrc_arg(p)
+            if len(v) > 0 {
+                p.login = v
+                p.has_login = 1
+            }
+        } else if w == "password" {
+            v := nrc_arg(p)
+            if len(v) > 0 {
+                p.password = v
+                p.has_pass = 1
+            }
+        } else if w == "account" {
+            v := nrc_arg(p)
+            if len(v) > 0 {
+                p.account = v
+                p.has_acct = 1
+            }
+        } else if w == "macdef" {
+            nrc_finish(p)
+            nrc_word(p) // macro name — discarded
+            nrc_advance(p)
+            for p.li < len(p.lines) && len(nrc_trim(p.lines[p.li])) > 0 {
+                nrc_advance(p)
+            }
+        } else if byteat(w, 0) == 35 {
+            // word-initial '#' → comment: skip rest of line (a '#' in
+            // value position is a literal — OCTOTHORPE_IN_VALUE).
+            nrc_advance(p)
+        } else {
+            // unknown word ends the entry (no crash).
+            nrc_finish(p)
+        }
+        if p.e_set != 0 {
+            return
+        }
+    }
+}
 
 fn netrc_auth(i: ref Intent, env: []str) -> str {
     if i.ignore_netrc != 0 {
@@ -370,96 +785,33 @@ fn netrc_auth(i: ref Intent, env: []str) -> str {
         return ""
     }
     raw := os.readfile_(path)
+    // upstream DecodeReaderBytesBuilder: UTF-16 BOM decodes, else
+    // lossy UTF-8 — decode_bounded's ""-sniff does exactly this.
+    text := decode_bounded(raw as []byte, "")
     [u, ue] = url.parse(i.url)
     if ue != nil {
         return ""
     }
-    host := u.hostname()
-    words := split_ws(raw)
-    j := 0
-    indef := 0
-    login := ""
-    pass := ""
-    account := ""
-    for j < len(words) {
-        w := words[j]
-        j = j + 1
-        if w == "machine" || w == "default" {
-            if indef == 1 && len(login) > 0 && len(pass) > 0 {
-                return "B" + charat(1) + login + charat(1) + pass
-            }
-            mch := 0
-            if w == "machine" && j < len(words) {
-                mch = booli(words[j] == host)
-                j = j + 1
-            } else if w == "default" {
-                mch = booli(indef == 0)
-            }
-            indef = mch
-            login = ""
-            pass = ""
-            account = ""
-            continue
+    p := new(NParser)
+    p.lines = nrc_lines(text)
+    p.host = nrc_host(u.hostname())
+    nrc_parse(p)
+    if p.e_set != 0 {
+        if p.e_has_login == 0 && i.auth_type != "bearer" {
+            return ""
         }
-        if indef == 0 {
-            if w == "macdef" {
-                j = j + 1
-            }
-            continue
-        }
-        if w == "login" && j < len(words) {
-            login = words[j]
-            j = j + 1
-        } else if w == "password" && j < len(words) {
-            pass = words[j]
-            j = j + 1
-        } else if w == "account" && j < len(words) {
-            account = words[j]
-            j = j + 1
-        } else if w == "macdef" {
-            // skip to blank line — approximation: stop this entry
-            indef = 0
-        }
+        return "B" + charat(1) + p.e_login + charat(1) + p.e_pass
     }
-    if indef == 1 && len(pass) > 0 {
-        if len(login) == 0 {
-            login = account
+    if p.suppress != 0 {
+        return ""
+    }
+    if p.d_set != 0 {
+        if p.d_has_login == 0 && i.auth_type != "bearer" {
+            return ""
         }
-        if len(login) > 0 {
-            return "B" + charat(1) + login + charat(1) + pass
-        }
+        return "B" + charat(1) + p.d_login + charat(1) + p.d_pass
     }
     return ""
-}
-
-fn split_ws(s: str) -> []str {
-    let out: []str = nil
-    i := 0
-    n := len(s)
-    for i < n {
-        c := byteat(s, i)
-        if c == 32 || c == 9 || c == 10 || c == 13 {
-            i = i + 1
-            continue
-        }
-        if c == 35 { // '#' comment
-            for i < n && byteat(s, i) != 10 {
-                i = i + 1
-            }
-            continue
-        }
-        j := i
-        for j < n {
-            c2 := byteat(s, j)
-            if c2 == 32 || c2 == 9 || c2 == 10 || c2 == 13 {
-                break
-            }
-            j = j + 1
-        }
-        out = push(out, substr(s, i, j))
-        i = j
-    }
-    return out
 }
 
 fn env_get(env: []str, name: str) -> str {
@@ -1314,6 +1666,30 @@ fn trim_ows(s: str) -> str {
     return substr(s, lo, hi)
 }
 
+// trim_hdrfile: upstream header-from-file contents get .trim() — all
+// ASCII whitespace including CR/LF, not just OWS.
+fn trim_hdrfile(s: str) -> str {
+    lo := 0
+    hi := len(s)
+    for lo < hi {
+        c := byteat(s, lo)
+        if c == 32 || c == 9 || c == 10 || c == 13 {
+            lo = lo + 1
+        } else {
+            break
+        }
+    }
+    for hi > lo {
+        c := byteat(s, hi - 1)
+        if c == 32 || c == 9 || c == 10 || c == 13 {
+            hi = hi - 1
+        } else {
+            break
+        }
+    }
+    return substr(s, lo, hi)
+}
+
 fn sess_auth_header(t: str, raw: str) -> str {
     if t == "bearer" {
         return "Bearer " + raw
@@ -1429,7 +1805,7 @@ fn reason_of(code: int, wire: str) -> str {
 
 // req_head_render draws the request head exactly as xh prints it:
 // status line + title-cased headers + blank line.
-fn req_head_render(i: ref Intent, p: ref ReqPlan) -> str {
+fn req_head_render(i: ref Intent, p: ref ReqPlan, f: ref Fmt) -> str {
     [u, _e] = url.parse(p.req.url)
     uri := "/"
     uhost := ""
@@ -1468,7 +1844,31 @@ fn req_head_render(i: ref Intent, p: ref ReqPlan) -> str {
     if !hhas(dh, "host") {
         dh = push(dh, model.Header{name: "Host", value: uhost})
     }
-    return i.eff_method + " " + uri + " " + ver + "\n" + htitle(dh) + "\n"
+    if f.headers_sort != 0 {
+        let sd: own []model.Header = hsort_copy(dh)
+        dh = sd[:]
+    }
+    // titlecase only for HTTP/1.x heads (upstream headers_fmt).
+    // headers.rs::print_request_headers element order under color:
+    // method → path(+?query) → HTTP/x.y triple → headers → reset.
+    line := ""
+    if f.color != 0 {
+        ci := find(ver, "/")
+        kw := ver
+        vn := ""
+        if ci >= 0 {
+            kw = substr(ver, 0, ci)
+            vn = substr(ver, ci + 1, len(ver))
+        }
+        line = sgr_wrap("method", i.eff_method, f) + sgr_plain(" ", f) + sgr_wrap("path", uri, f) + sgr_plain(" ", f) + sgr_wrap("http_keyword", kw, f) + sgr_wrap("http_separator", "/", f) + sgr_wrap("http_version", vn, f) + sgr_plain("\n", f)
+    } else {
+        line = i.eff_method + " " + uri + " " + ver + "\n"
+    }
+    out := line + htitle(dh, booli(ver != "HTTP/2.0"), f)
+    if f.color != 0 {
+        out = out + "\x1b[0m"
+    }
+    return out + "\n"
 }
 
 fn body_len_of(b: model.Body) -> int {
@@ -1492,116 +1892,35 @@ fn render_form_str(fs: []model.KV) -> str {
     return out
 }
 
-// resp_head_render: "HTTP/x.y CODE reason" + title-cased headers.
-fn resp_head_render(version: str, status: int, reason: str, headers: []model.Header) -> str {
+// resp_head_render: "HTTP/x.y CODE reason" + headers (sorted +
+// title-cased for HTTP/1.x only, latin1/UTF-8-annotated values).
+fn resp_head_render(version: str, status: int, reason: str, headers: []model.Header, f: ref Fmt) -> str {
     ver := version
     if len(ver) == 0 {
         ver = "1.1"
     }
-    return "HTTP/" + ver + " " + itoa(status) + " " + reason_of(status, reason) + "\n" + htitle(headers) + "\n"
-}
-
-// body_render: verbatim, or the binary suppressor for NUL bodies.
-// When pretty is format/all/colors and the body looks like a JSON
-// object/array, pretty-print with 2-space indent (colors ≡ format
-// for now — no ANSI).
-fn body_render(body: []byte, pretty: str) -> str {
-    i := 0
-    for i < len(body) {
-        if body[i] == 0 {
-            return "+-----------------------------------------+\n| NOTE: binary data not shown in terminal |\n+-----------------------------------------+\n\n"
-        }
-        i = i + 1
+    let hh: []model.Header = headers
+    if f.headers_sort != 0 {
+        let sh: own []model.Header = hsort_copy(headers)
+        hh = sh[:]
     }
-    s := body as str
-    if pretty == "format" || pretty == "all" || pretty == "colors" {
-        return json_pretty2(s)
+    t1 := 1
+    if len(ver) >= 1 && substr(ver, 0, 1) != "1" {
+        t1 = 0
     }
-    return s
-}
-
-// json_pretty2 pretty-prints a JSON object/array with 2-space indent;
-// non-JSON-looking input is returned unchanged (simple scanner, no
-// external formatter).
-fn json_pretty2(s: str) -> str {
-    t := trim_ows(s)
-    if len(t) == 0 {
-        return s
+    // headers.rs::print_response_headers element order under color:
+    // HTTP/x.y triple → status_code → status_reason → headers → reset.
+    line := ""
+    if f.color != 0 {
+        line = sgr_wrap("http_keyword", "HTTP", f) + sgr_wrap("http_separator", "/", f) + sgr_wrap("http_version", ver, f) + sgr_plain(" ", f) + sgr_wrap("status_code", itoa(status), f) + sgr_plain(" ", f) + sgr_wrap("status_reason", reason_of(status, reason), f) + sgr_plain("\n", f)
+    } else {
+        line = "HTTP/" + ver + " " + itoa(status) + " " + reason_of(status, reason) + "\n"
     }
-    c0 := byteat(t, 0)
-    if c0 != 123 && c0 != 91 {
-        return s
+    out := line + htitle(hh, t1, f)
+    if f.color != 0 {
+        out = out + "\x1b[0m"
     }
-    out := ""
-    indent := 0
-    in_str := 0
-    esc := 0
-    i := 0
-    n := len(t)
-    for i < n {
-        c := byteat(t, i)
-        if in_str != 0 {
-            out = out + substr(t, i, i + 1)
-            if esc != 0 {
-                esc = 0
-            } else if c == 92 {
-                esc = 1
-            } else if c == 34 {
-                in_str = 0
-            }
-            i = i + 1
-            continue
-        }
-        if c == 34 {
-            in_str = 1
-            out = out + "\""
-            i = i + 1
-            continue
-        }
-        if c == 32 || c == 9 || c == 10 || c == 13 {
-            i = i + 1
-            continue
-        }
-        if c == 123 || c == 91 {
-            out = out + substr(t, i, i + 1) + "\n"
-            indent = indent + 1
-            out = out + spaces2(indent)
-            i = i + 1
-            continue
-        }
-        if c == 125 || c == 93 {
-            indent = indent - 1
-            if indent < 0 {
-                indent = 0
-            }
-            out = out + "\n" + spaces2(indent) + substr(t, i, i + 1)
-            i = i + 1
-            continue
-        }
-        if c == 44 {
-            out = out + ",\n" + spaces2(indent)
-            i = i + 1
-            continue
-        }
-        if c == 58 {
-            out = out + ": "
-            i = i + 1
-            continue
-        }
-        out = out + substr(t, i, i + 1)
-        i = i + 1
-    }
-    return out
-}
-
-fn spaces2(n: int) -> str {
-    out := ""
-    i := 0
-    for i < n {
-        out = out + "  "
-        i = i + 1
-    }
-    return out
+    return out + "\n"
 }
 
 // shquote wraps s in single quotes for a POSIX shell, escaping
@@ -1622,67 +1941,585 @@ fn shquote(s: str) -> str {
 
 // curl_ignored appends xh-shaped "Warning: Ignored …" lines for
 // flags that affect oxttp output/session but not the curl argv map.
-fn curl_ignored(i: ref Intent) -> str {
+// --- --curl faithful emit (WI-0016 spec S1, ADR-0039) -------------
+
+// curl_esc_cp reports the escape-needed codepoints for the $'…' form:
+// C0/C1 controls, U+2028/2029, bidi format/isolate chars (os_display
+// requires_escape ∪ is_bidi).
+fn curl_esc_cp(cp: int) -> int {
+    if cp <= 31 || cp >= 127 && cp <= 159 {
+        return 1
+    }
+    if cp == 8232 || cp == 8233 {
+        return 1
+    }
+    if cp >= 8234 && cp <= 8238 || cp >= 8294 && cp <= 8297 {
+        return 1
+    }
+    return 0
+}
+
+// curl_bidi reports the bidi ranges os_display flags for the
+// suspicious check (202A-202E, 2066-2069).
+fn curl_bidi(cp: int) -> int {
+    if cp >= 8234 && cp <= 8238 || cp >= 8294 && cp <= 8297 {
+        return 1
+    }
+    return 0
+}
+
+// curl_zw approximates unicode-width's zero-width set for the
+// leading-char quote check (combining marks, format chars, tags,
+// variation selectors).
+fn curl_zw(cp: int) -> int {
+    if cp >= 768 && cp <= 879 || cp >= 6832 && cp <= 6911 || cp >= 7616 && cp <= 7679 {
+        return 1
+    }
+    if cp >= 8400 && cp <= 8447 || cp >= 65056 && cp <= 65071 {
+        return 1
+    }
+    if cp == 173 || cp == 847 || cp == 1564 || cp == 4447 || cp == 4448 || cp == 65279 {
+        return 1
+    }
+    if cp >= 5906 && cp <= 5909 || cp >= 11647 && cp <= 11648 || cp == 12644 || cp == 65440 {
+        return 1
+    }
+    if cp >= 8203 && cp <= 8207 || cp >= 8288 && cp <= 8303 || cp >= 65520 && cp <= 65528 {
+        return 1
+    }
+    if cp >= 113824 && cp <= 113827 || cp >= 917504 && cp <= 917631 || cp >= 917760 && cp <= 917999 {
+        return 1
+    }
+    return 0
+}
+
+// hexesc renders "\xHH" uppercase-hex.
+fn hexesc(c: int) -> str {
+    h := "0123456789ABCDEF"
+    return "\\x" + charat(byteat(h, c / 16)) + charat(byteat(h, c % 16))
+}
+
+// curl_escaped ports write_escaped — the $'…' ANSI-C form used when a
+// string carries control/non-printable/bidi bytes or invalid UTF-8.
+fn curl_escaped(s: str) -> str {
+    out := "$'"
+    in_esc := 0
+    i := 0
+    for i < len(s) {
+        c := byteat(s, i)
+        if c < 128 {
+            if c == 10 {
+                out = out + "\\n"
+                in_esc = 0
+            } else if c == 9 {
+                out = out + "\\t"
+                in_esc = 0
+            } else if c == 13 {
+                out = out + "\\r"
+                in_esc = 0
+            } else if c < 32 || c == 127 {
+                out = out + hexesc(c)
+                in_esc = 1
+            } else if c == 92 || c == 39 {
+                out = out + "\\" + charat(c)
+                in_esc = 0
+            } else {
+                if in_esc != 0 && is_hexc(c) {
+                    out = out + "'$'"
+                }
+                out = out + charat(c)
+                in_esc = 0
+            }
+            i = i + 1
+            continue
+        }
+        cr := u8_dec(s, i)
+        cp := cr[0]
+        n := cr[1]
+        if n == 1 {
+            out = out + hexesc(c)
+            in_esc = 1
+            i = i + 1
+            continue
+        }
+        if curl_esc_cp(cp) != 0 {
+            j := 0
+            for j < n {
+                out = out + hexesc(byteat(s, i + j))
+                j = j + 1
+            }
+            in_esc = 1
+        } else {
+            out = out + substr(s, i, i + n)
+            in_esc = 0
+        }
+        i = i + n
+    }
+    return out + "'"
+}
+
+// curl_spliced ports write_single_escaped: 'chunk' per non-empty
+// chunk, \' between them — used when both quote kinds are unsafe.
+fn curl_spliced(s: str) -> str {
     out := ""
-    if i.offline != 0 {
-        out = out + "Warning: Ignored --offline\n"
-    }
-    if len(i.session) > 0 {
-        out = out + "Warning: Ignored --session\n"
-    }
-    if len(i.print) > 0 {
-        out = out + "Warning: Ignored --print\n"
-    }
-    if len(i.pretty) > 0 && i.pretty != "none" {
-        out = out + "Warning: Ignored --pretty\n"
-    }
-    if i.download != 0 {
-        out = out + "Warning: Ignored --download\n"
-    }
-    if len(i.resolves[:]) > 0 {
-        out = out + "Warning: Ignored --resolve\n"
-    }
-    if i.compress_n != 0 {
-        out = out + "Warning: Ignored --compress\n"
-    }
-    // WI-0013 P5 (spec sem-S4/S6): --proxy now emits (-x / env
-    // prefixes) so its Ignored line is gone; --native-tls joins the
-    // corpus §5 ignored list instead.
-    if i.native_tls != 0 {
-        out = out + "Warning: Ignored --native-tls\n"
+    st := 0
+    i := 0
+    for i <= len(s) {
+        if i == len(s) || byteat(s, i) == 39 {
+            if i > st {
+                out = out + "'" + substr(s, st, i) + "'"
+            }
+            if i < len(s) {
+                out = out + "\\'"
+            }
+            st = i + 1
+        }
+        i = i + 1
     }
     return out
 }
 
-// curl_emit translates the planned request into a curl command line
-// (corpus §5 subset: follow, method, headers, body, http1.0, -C, -o, URL).
-fn curl_emit(i: ref Intent, p: ref ReqPlan) -> str {
-    long := i.curl_long
-    fl_loc := "-L"
-    fl_x := "-X"
-    fl_h := "-H"
-    fl_d := "-d"
-    fl_c := "-C"
-    fl_o := "-o"
-    fl_e := "-E"
-    if long != 0 {
-        fl_loc = "--location"
-        fl_x = "--request"
-        fl_h = "--header"
-        fl_d = "--data"
-        fl_c = "--continue-at"
-        fl_o = "--output"
-        fl_e = "--cert"
+// curl_suspicious ports is_suspicious_bidi: 16-deep stack of
+// Formatting (202A/B/D/E) vs Isolate (2066-68); unpaired/overflow → 1.
+fn curl_suspicious(s: str) -> int {
+    st := mkslice(int, 16)
+    pos := 0
+    i := 0
+    for i < len(s) {
+        c := byteat(s, i)
+        if c < 128 {
+            i = i + 1
+            continue
+        }
+        cr := u8_dec(s, i)
+        cp := cr[0]
+        n := cr[1]
+        i = i + n
+        if cp == 8234 || cp == 8235 || cp == 8237 || cp == 8238 {
+            if pos >= 16 {
+                return 1
+            }
+            st[pos] = 1
+            pos = pos + 1
+        } else if cp == 8236 {
+            if pos == 0 {
+                return 1
+            }
+            pos = pos - 1
+            if st[pos] != 1 {
+                return 1
+            }
+        } else if cp >= 8294 && cp <= 8296 {
+            if pos >= 16 {
+                return 1
+            }
+            st[pos] = 2
+            pos = pos + 1
+        } else if cp == 8297 {
+            if pos == 0 {
+                return 1
+            }
+            pos = pos - 1
+            if st[pos] != 2 {
+                return 1
+            }
+        }
     }
-    // WI-0013 P5 (spec sem-S6): --proxy entries become env prefixes
-    // prepended to the line — EVERY occurrence emits in CLI order
-    // (upstream to_curl does the same; shell-last-wins then matches
-    // pick_proxy's last-match selection); all: rides all_proxy
-    // (curl's -x would override the scheme-specific envs). When any
-    // explicit entries exist, unspecified ambient proxy envs are
-    // cleared so the emitted command can't silently inherit a proxy
-    // the request bypassed.
-    pre := ""
+    if pos != 0 {
+        return 1
+    }
+    return 0
+}
+
+// curl_q ports os_display::Quotable::maybe_quote unix rules (spec
+// S1.10): quote iff empty ∨ first byte ∈ {~,#,!} ∨ leading
+// zero-width ∨ contains |&;<>()$`"'*?[]=^{} space/tab ∨ unicode
+// whitespace ∨ U+2800. '…' preferred, "…" when a ' is present,
+// '…'\''…' splice when both are unsafe, $'…' for non-printable.
+fn curl_q(s: str) -> str {
+    single := 1
+    double := 1
+    req := 0
+    if len(s) == 0 {
+        req = 1
+    } else {
+        fr := u8_dec(s, 0)
+        fc := fr[0]
+        fnb := fr[1]
+        if fc == 126 || fc == 35 || fc == 33 {
+            req = 1
+        }
+        if req == 0 && fnb == 1 && fc < 32 {
+            req = 1
+        }
+        if fnb == 1 && fc == 127 {
+            req = 1
+        }
+        if req == 0 && fnb > 1 && curl_zw(fc) != 0 {
+            req = 1
+        }
+    }
+    bidi := 0
+    i := 0
+    for i < len(s) {
+        c := byteat(s, i)
+        if c < 128 {
+            if c == 39 {
+                single = 0
+            }
+            if c == 34 || c == 96 || c == 36 || c == 92 {
+                double = 0
+            }
+            if req == 0 {
+                if c == 124 || c == 38 || c == 59 || c == 60 || c == 62 || c == 40 || c == 41 || c == 36 || c == 96 || c == 34 || c == 39 || c == 42 || c == 63 || c == 91 || c == 93 || c == 61 || c == 94 || c == 123 || c == 125 || c == 32 || c == 9 {
+                    req = 1
+                }
+            }
+            if c < 32 || c == 127 {
+                return curl_escaped(s)
+            }
+            i = i + 1
+            continue
+        }
+        cr := u8_dec(s, i)
+        cp := cr[0]
+        n := cr[1]
+        if n == 1 {
+            return curl_escaped(s)
+        }
+        if req == 0 && (uni_ws(cp) != 0 || cp == 10240) {
+            req = 1
+        }
+        if curl_bidi(cp) != 0 {
+            bidi = 1
+        }
+        if curl_esc_cp(cp) != 0 {
+            return curl_escaped(s)
+        }
+        i = i + n
+    }
+    if bidi != 0 && curl_suspicious(s) != 0 {
+        return curl_escaped(s)
+    }
+    if req == 0 {
+        return s
+    }
+    if single != 0 {
+        return "'" + s + "'"
+    }
+    if double != 0 {
+        return "\"" + s + "\""
+    }
+    return curl_spliced(s)
+}
+
+// form_urlenc ports serde_urlencoded's key encoding: alnum + *-._
+// literal, space → '+', else %XX uppercase.
+fn form_urlenc(s: str) -> str {
+    h := "0123456789ABCDEF"
+    out := ""
+    i := 0
+    for i < len(s) {
+        c := byteat(s, i)
+        i = i + 1
+        if c >= 97 && c <= 122 || c >= 65 && c <= 90 || c >= 48 && c <= 57 || c == 42 || c == 45 || c == 46 || c == 95 {
+            out = out + charat(c)
+        } else if c == 32 {
+            out = out + "+"
+        } else {
+            out = out + "%" + charat(byteat(h, c / 16)) + charat(byteat(h, c % 16))
+        }
+    }
+    return out
+}
+
+// sdrop_at removes index i of a str slice.
+fn sdrop_at(xs: []str, i: int) -> []str {
+    out := mkslice(str, 0)
+    j := 0
+    for j < len(xs) {
+        if j != i {
+            out = push(out, xs[j])
+        }
+        j = j + 1
+    }
+    return out
+}
+
+// sdrop removes every xs entry equal to v.
+fn sdrop(xs: []str, v: str) -> []str {
+    out := mkslice(str, 0)
+    j := 0
+    for j < len(xs) {
+        if xs[j] != v {
+            out = push(out, xs[j])
+        }
+        j = j + 1
+    }
+    return out
+}
+
+// tilde_expand maps `~`/`~/x` → $HOME[/x] (upstream expand_tilde).
+fn tilde_expand(path: str, env: []str) -> str {
+    if len(path) >= 1 && byteat(path, 0) == 126 && (len(path) == 1 || byteat(path, 1) == 47) {
+        h := env_get(env, "HOME")
+        if len(h) > 0 {
+            return h + substr(path, 1, len(path))
+        }
+    }
+    return path
+}
+
+// CurlC is the translate() accumulator: env prefixes render before
+// `curl`, warns go to stderr, err aborts the emit (exit 1).
+struct CurlC {
+    long: int,
+    args: []str,
+    env: []str,
+    warn: []str,
+    err: str,
+}
+
+fn cc_opt(c: ref CurlC, s: str, l: str) {
+    if c.long != 0 {
+        c.args = push(c.args, l)
+    } else {
+        c.args = push(c.args, s)
+    }
+}
+
+fn cc_arg(c: ref CurlC, a: str) {
+    c.args = push(c.args, a)
+}
+
+fn cc_env(c: ref CurlC, n: str, v: str) {
+    c.env = push(c.env, n + "=" + curl_q(v))
+}
+
+fn cc_warn(c: ref CurlC, w: str) {
+    c.warn = push(c.warn, w)
+}
+
+fn cc_hdr(c: ref CurlC, n: str, v: str) {
+    cc_opt(c, "-H", "--header")
+    cc_arg(c, n + ": " + v)
+}
+
+// curl_pick_method ports RequestItems::pick_method — POST iff the
+// request items form a non-empty body (raw/stdin don't count).
+fn curl_pick_method(i: ref Intent) -> str {
+    if i.body_type == 2 {
+        return "POST"
+    }
+    j := 0
+    for j < len(i.ikinds[:]) {
+        if i.ikinds[j] >= 5 && i.ikinds[j] <= 9 {
+            return "POST"
+        }
+        j = j + 1
+    }
+    return "GET"
+}
+
+// curl_is_multipart ports RequestItems::is_multipart: --multipart, or
+// --form when any FormFile is present.
+fn curl_is_multipart(i: ref Intent) -> int {
+    if i.body_type == 2 {
+        return 1
+    }
+    if i.body_type == 1 {
+        j := 0
+        for j < len(i.ikinds[:]) {
+            if i.ikinds[j] == 9 {
+                return 1
+            }
+            j = j + 1
+        }
+    }
+    return 0
+}
+
+// curl_url ports url_with_query: UrlParam items appended with
+// queryescaping (UrlParamFromFile reads propagate as errors).
+fn curl_url(i: ref Intent, c: ref CurlC, env: []str) -> str {
+    q := ""
+    j := 0
+    for j < len(i.items[:]) {
+        k := i.ikinds[j]
+        s := i.items[j]
+        j = j + 1
+        if k == 3 {
+            [iv, _e] = item.parse(s)
+            qp := iv as item.Item.UrlParam
+            q = q + "&" + url.queryescape(qp.key) + "=" + url.queryescape(qp.value)
+        } else if k == 4 {
+            [iv2, _e2] = item.parse(s)
+            qp2 := iv2 as item.Item.UrlParamFromFile
+            fp := tilde_expand(qp2.value, env)
+            if !os.exists(fp) {
+                c.err = "couldn't read file " + qp2.value
+                return ""
+            }
+            q = q + "&" + url.queryescape(qp2.key) + "=" + url.queryescape(os.readfile_(fp))
+        }
+    }
+    u := i.url
+    if len(q) > 0 {
+        if find(u, "?") >= 0 {
+            u = u + q
+        } else {
+            u = u + "?" + substr(q, 1, len(q))
+        }
+    }
+    return u
+}
+
+// curl_url_port: URL explicit port else 443 https / 80 http
+// (url.port_or_known_default for the --resolve emit).
+fn curl_url_port(i: ref Intent) -> int {
+    [u, e] = url.parse(i.url)
+    if e == nil {
+        pp := u.port()
+        if len(pp) > 0 {
+            [n, _ne] = strconv.atoi(pp)
+            return n
+        }
+    }
+    if url_scheme(i.url) == "https" {
+        return 443
+    }
+    return 80
+}
+
+// curl_translate ports to_curl.rs::translate verbatim: warnings →
+// c.warn (bare `Warning:` lines on stderr + blank separator), flags
+// in upstream order → c.args, proxy envs → c.env, item headers +
+// unsets, auth, payload. c.err carries the propagate-exit-1 errors.
+fn curl_translate(i: ref Intent, env: []str) -> own CurlC {
+    c := new(CurlC)
+    c.long = i.curl_long
+    // 1a. ignored-table warnings — upstream order, verbatim
+    if i.offline != 0 {
+        cc_warn(c, "Ignored --offline")
+    }
+    if i.body != 0 {
+        cc_warn(c, "Ignored -b/--body")
+    }
+    if i.has_print != 0 {
+        cc_warn(c, "Ignored -p/--print")
+    }
+    if i.has_pretty != 0 {
+        cc_warn(c, "Ignored --pretty")
+    }
+    if len(i.style) > 0 {
+        cc_warn(c, "Ignored -s/--style")
+    }
+    if len(i.m_sig_id) > 0 {
+        cc_warn(c, "Ignored --unstable-m-sig-id")
+    }
+    if len(i.m_sig_key) > 0 {
+        cc_warn(c, "Ignored --unstable-m-sig-key")
+    }
+    if len(i.m_sig_alg) > 0 {
+        cc_warn(c, "Ignored --unstable-m-sig-alg")
+    }
+    if len(i.m_sig_comps[:]) > 0 {
+        cc_warn(c, "Ignored --unstable-m-sig-comp")
+    }
+    if i.compress_n != 0 {
+        cc_warn(c, "Ignored -x/--compress")
+    }
+    if len(i.response_charset) > 0 {
+        cc_warn(c, "Ignored --response-charset")
+    }
+    if len(i.response_mime) > 0 {
+        cc_warn(c, "Ignored --response-mime")
+    }
+    if i.all != 0 {
+        cc_warn(c, "Ignored --all")
+    }
+    if i.has_history != 0 {
+        cc_warn(c, "Ignored -P/--history-print")
+    }
+    if len(i.session) > 0 || i.session_ro != 0 {
+        cc_warn(c, "Ignored --session")
+    }
+    if i.native_tls != 0 {
+        cc_warn(c, "Ignored --native-tls")
+    }
+    // silently ignored: --ignore-stdin, --curl, --curl-long
+    // 1b. follow + explicit non-GET method
+    if i.follow != 0 && len(i.method) > 0 && i.method != "GET" {
+        cc_warn(c, "Using a combination of -X/--request and -L/--location which may cause unintended side effects.")
+    }
+    // 2. flag block — upstream sequence
+    if i.verbose > 0 {
+        cc_opt(c, "-v", "--verbose")
+    }
+    if i.quiet > 0 {
+        cc_opt(c, "-s", "--silent")
+    }
+    if i.debug != 0 {
+        cc_arg(c, "--trace")
+        cc_arg(c, "-")
+    }
+    if i.stream == 1 {
+        cc_opt(c, "-N", "--no-buffer")
+    }
+    if i.check_status == 1 {
+        cc_opt(c, "-f", "--fail")
+    }
+    if i.follow != 0 {
+        cc_opt(c, "-L", "--location")
+    }
+    if i.has_maxredirs != 0 {
+        cc_arg(c, "--max-redirs")
+        cc_arg(c, itoa(i.max_redirects))
+    }
+    if len(i.output) > 0 {
+        cc_opt(c, "-o", "--output")
+        cc_arg(c, i.output)
+    } else if i.download != 0 {
+        cc_opt(c, "-O", "--remote-name")
+    }
+    if i.resume != 0 {
+        cc_opt(c, "-C", "--continue-at")
+        cc_arg(c, "-")
+    }
+    if i.verify == "no" {
+        cc_opt(c, "-k", "--insecure")
+    } else if len(i.verify) > 0 && i.verify != "yes" {
+        cc_arg(c, "--cacert")
+        cc_arg(c, i.verify)
+    }
+    if len(i.cert) > 0 {
+        cc_opt(c, "-E", "--cert")
+        cc_arg(c, i.cert)
+    }
+    if len(i.cert_key) > 0 {
+        cc_arg(c, "--key")
+        cc_arg(c, i.cert_key)
+    }
+    sv := ""
+    if i.ssl == "tls1" {
+        sv = "1.0"
+    }
+    if i.ssl == "tls1.1" {
+        sv = "1.1"
+    }
+    if i.ssl == "tls1.2" {
+        sv = "1.2"
+    }
+    if i.ssl == "tls1.3" {
+        sv = "1.3"
+    }
+    if len(sv) > 0 {
+        cc_arg(c, "--tlsv" + sv)
+        cc_arg(c, "--tls-max")
+        cc_arg(c, sv)
+    }
+    // proxies → env prefixes (DevD1: all:→all_proxy; DevD2: clearing
+    // emits for unset protos + no_proxy when any --proxy present).
     seen_http := 0
     seen_https := 0
     seen_all := 0
@@ -1698,128 +2535,428 @@ fn curl_emit(i: ref Intent, p: ref ReqPlan) -> str {
         purl := substr(pent, ci + 1, len(pent))
         if proto == "all" {
             seen_all = 1
-            pre = pre + "all_proxy=" + shquote(purl) + " "
+            cc_env(c, "all_proxy", purl)
         } else if proto == "http" {
             seen_http = 1
-            pre = pre + "http_proxy=" + shquote(purl) + " "
+            cc_env(c, "http_proxy", purl)
         } else if proto == "https" {
             seen_https = 1
-            pre = pre + "https_proxy=" + shquote(purl) + " "
+            cc_env(c, "https_proxy", purl)
         }
     }
     if seen_http + seen_https + seen_all > 0 {
         if seen_http == 0 {
-            pre = pre + "http_proxy= HTTP_PROXY= "
+            c.env = push(c.env, "http_proxy=")
+            c.env = push(c.env, "HTTP_PROXY=")
         }
         if seen_https == 0 {
-            pre = pre + "https_proxy= HTTPS_PROXY= "
+            c.env = push(c.env, "https_proxy=")
+            c.env = push(c.env, "HTTPS_PROXY=")
         }
         if seen_all == 0 {
-            pre = pre + "all_proxy= ALL_PROXY= "
+            c.env = push(c.env, "all_proxy=")
+            c.env = push(c.env, "ALL_PROXY=")
         }
-        // explicit --proxy bypasses env consultation entirely — an
-        // ambient NO_PROXY would let the emitted curl skip a proxy
-        // oxttp itself would have used.
-        pre = pre + "no_proxy= NO_PROXY= "
+        c.env = push(c.env, "no_proxy=")
+        c.env = push(c.env, "NO_PROXY=")
     }
-    cmd := pre + "curl"
-    if i.follow != 0 {
-        cmd = cmd + " " + fl_loc
+    if i.has_timeout != 0 {
+        cc_arg(c, "--max-time")
+        cc_arg(c, strconv.formatfloat(i.timeout))
     }
     if i.http_version == "1.0" {
-        cmd = cmd + " --http1.0"
+        cc_arg(c, "--http1.0")
     }
     if i.http_version == "1.1" {
-        cmd = cmd + " --http1.1"
+        cc_arg(c, "--http1.1")
     }
     if i.http_version == "2" {
-        cmd = cmd + " --http2"
+        cc_arg(c, "--http2")
     }
     if i.http_version == "2-prior-knowledge" {
-        cmd = cmd + " --http2-prior-knowledge"
+        cc_arg(c, "--http2-prior-knowledge")
     }
-    // 3-prior-knowledge maps to --http3-only and IS reachable under
-    // --curl: upstream's to_curl short-circuit runs before client
-    // build, so the h3 feature-gate defer never sees it (spec sem-S6).
+    // h3 IS reachable under --curl (upstream short-circuits before
+    // the feature gate): 3-prior → --http3-only.
     if i.http_version == "3-prior-knowledge" {
-        cmd = cmd + " --http3-only"
+        cc_arg(c, "--http3-only")
     }
-    if len(i.cert) > 0 {
-        cmd = cmd + " " + fl_e + " " + shquote(i.cert)
-    }
-    if len(i.cert_key) > 0 {
-        cmd = cmd + " --key " + shquote(i.cert_key)
-    }
-    // --ssl tlsX.Y -> --tlsvX.Y --tls-max X.Y; auto/ssl2.3 silent.
-    sslv := ""
-    if i.ssl == "tls1" {
-        sslv = "1.0"
-    }
-    if i.ssl == "tls1.1" {
-        sslv = "1.1"
-    }
-    if i.ssl == "tls1.2" {
-        sslv = "1.2"
-    }
-    if i.ssl == "tls1.3" {
-        sslv = "1.3"
-    }
-    if len(sslv) > 0 {
-        cmd = cmd + " --tlsv" + sslv + " --tls-max " + sslv
-    }
-    if p.resume_off > 0 {
-        cmd = cmd + " " + fl_c + " -"
-    }
-    if len(i.output) > 0 {
-        cmd = cmd + " " + fl_o + " " + shquote(i.output)
-    }
-    meth := p.req.method
-    if len(meth) == 0 {
-        meth = i.eff_method
-    }
-    has_body := 0
-    body_s := ""
-    if p.req.body.kind() != 0 {
-        bd := req_body_bytes(p.req.body)
-        body_s = bd as str
-        has_body = 1
-    }
-    // -X when not GET (curl infers POST from -d, but keep explicit
-    // method for non-GET to match corpus --request).
-    if meth != "GET" {
-        cmd = cmd + " " + fl_x + " " + shquote(meth)
-    }
-    // headers: request + synth; skip Host (curl derives from URL)
-    hi := 0
-    for hi < len(p.req.headers) {
-        h := p.req.headers[hi]
-        hi = hi + 1
-        if len(h.name) == 0 {
-            continue
+    // method emit — HEAD / OPTIONS / -h / explicit / implicit
+    if i.method == "HEAD" {
+        cc_opt(c, "-I", "--head")
+    } else if i.method == "OPTIONS" {
+        cc_opt(c, "-i", "--include")
+        cc_opt(c, "-X", "--request")
+        cc_arg(c, "OPTIONS")
+    } else if i.headers != 0 {
+        m := i.method
+        if len(m) == 0 {
+            m = curl_pick_method(i)
         }
-        if elwr(h.name) == "host" {
-            continue
+        cc_opt(c, "-I", "--head")
+        cc_opt(c, "-X", "--request")
+        cc_arg(c, m)
+        if m != "GET" {
+            cc_warn(c, "-I/--head is incompatible with sending data. Consider omitting -h/--headers.")
         }
-        cmd = cmd + " " + fl_h + " " + shquote(h.name + ": " + h.value)
+    } else if len(i.method) > 0 {
+        cc_opt(c, "-X", "--request")
+        cc_arg(c, i.method)
     }
-    hi = 0
-    for hi < len(p.req.synth) {
-        h := p.req.synth[hi]
-        hi = hi + 1
-        if len(h.name) == 0 {
-            continue
+    // URL + query items; -g when []{} present
+    furl := curl_url(i, c, env)
+    if len(c.err) > 0 {
+        return c
+    }
+    if find(furl, "[") >= 0 || find(furl, "]") >= 0 || find(furl, "{") >= 0 || find(furl, "}") >= 0 {
+        cc_opt(c, "-g", "--globoff")
+    }
+    cc_arg(c, furl)
+    if i.ipv4 != 0 && i.ipv6 == 0 {
+        cc_opt(c, "-4", "--ipv4")
+    }
+    if i.ipv6 != 0 && i.ipv4 == 0 {
+        cc_opt(c, "-6", "--ipv6")
+    }
+    if len(i.interface) > 0 {
+        cc_arg(c, "--interface")
+        cc_arg(c, i.interface)
+    }
+    if len(i.unix_socket) > 0 {
+        cc_arg(c, "--unix-socket")
+        cc_arg(c, i.unix_socket)
+    }
+    if len(i.resolves[:]) > 0 {
+        port := curl_url_port(i)
+        cc_warn(c, "Inferred port number in --resolve from request URL.")
+        ri := 0
+        for ri < len(i.resolves[:]) {
+            rs := i.resolves[ri]
+            ri = ri + 1
+            ci2 := find(rs, ":")
+            if ci2 < 0 {
+                continue
+            }
+            cc_arg(c, "--resolve")
+            // upstream parses the addr as IpAddr — brackets around an
+            // IPv6 literal are syntax, not part of the emitted value.
+            addr := substr(rs, ci2 + 1, len(rs))
+            if len(addr) >= 2 && byteat(addr, 0) == 91 && byteat(addr, len(addr) - 1) == 93 {
+                addr = substr(addr, 1, len(addr) - 1)
+            }
+            cc_arg(c, substr(rs, 0, ci2) + ":" + itoa(port) + ":" + addr)
         }
-        if elwr(h.name) == "host" {
-            continue
+    }
+    // item headers (lowercased; unsets cancel/re-emit per upstream
+    // headers()): emits keep item order, unsets follow in encounter
+    // order.
+    let hp_n: []str = nil
+    let hp_v: []str = nil
+    let hset: []str = nil
+    j := 0
+    for j < len(i.items[:]) {
+        k := i.ikinds[j]
+        s := i.items[j]
+        j = j + 1
+        if k == 0 || k == 1 {
+            nm := ""
+            vv := ""
+            if k == 0 {
+                [iv, _e] = item.parse(s)
+                h := iv as item.Item.HttpHeader
+                nm = elwr(h.key)
+                vv = h.value
+            } else {
+                [iv2, _e2] = item.parse(s)
+                h2 := iv2 as item.Item.HttpHeaderFromFile
+                nm = elwr(h2.key)
+                fp := tilde_expand(h2.value, env)
+                if !os.exists(fp) {
+                    c.err = "couldn't read header file " + h2.value
+                    return c
+                }
+                vv = trim_hdrfile(os.readfile_(fp))
+            }
+            hset = sdrop(hset, nm)
+            hp_n = push(hp_n, nm)
+            hp_v = push(hp_v, vv)
+        } else if k == 2 {
+            [iv3, _e3] = item.parse(s)
+            hu := iv3 as item.Item.HttpHeaderToUnset
+            nm2 := elwr(hu.key)
+            ni := 0
+            for ni < len(hp_n) {
+                if hp_n[ni] == nm2 {
+                    hp_n = sdrop_at(hp_n, ni)
+                    hp_v = sdrop_at(hp_v, ni)
+                    ni = ni - 1
+                }
+                ni = ni + 1
+            }
+            if !has_str(hset, nm2) {
+                hset = push(hset, nm2)
+            }
         }
-        cmd = cmd + " " + fl_h + " " + shquote(h.name + ": " + h.value)
     }
-    if has_body != 0 {
-        cmd = cmd + " " + fl_d + " " + shquote(body_s)
+    j = 0
+    for j < len(hp_n) {
+        if len(hp_v[j]) == 0 {
+            cc_opt(c, "-H", "--header")
+            cc_arg(c, hp_n[j] + ";")
+        } else {
+            cc_hdr(c, hp_n[j], hp_v[j])
+        }
+        j = j + 1
     }
-    cmd = cmd + " " + shquote(p.req.url)
-    return cmd
+    j = 0
+    for j < len(hset) {
+        cc_opt(c, "-H", "--header")
+        cc_arg(c, hset[j] + ":")
+        j = j + 1
+    }
+    if i.ignore_netrc != 0 {
+        cc_arg(c, "--no-netrc")
+    }
+    if len(i.auth) > 0 {
+        at := i.auth_type
+        if at == "digest" {
+            cc_arg(c, "--digest")
+            cc_opt(c, "-u", "--user")
+            cc_arg(c, i.auth)
+        } else if at == "bearer" {
+            cc_arg(c, "--oauth2-bearer")
+            cc_arg(c, i.auth)
+        } else {
+            cc_arg(c, "--basic")
+            cc_opt(c, "-u", "--user")
+            cc_arg(c, i.auth)
+        }
+    }
+    // payload emitters by body kind (spec S1.8)
+    if i.has_raw != 0 {
+        if i.body_type == 1 {
+            cc_hdr(c, "content-type", "application/x-www-form-urlencoded")
+        } else {
+            cc_hdr(c, "content-type", "application/json")
+            cc_hdr(c, "accept", "application/json, */*;q=0.5")
+        }
+        cc_opt(c, "-d", "--data")
+        cc_arg(c, i.raw)
+    } else if curl_is_multipart(i) != 0 {
+        j = 0
+        for j < len(i.items[:]) {
+            k := i.ikinds[j]
+            s := i.items[j]
+            j = j + 1
+            if k == 7 || k == 8 {
+                c.err = "JSON values are not supported in multipart fields"
+                return c
+            }
+            if k == 5 {
+                [iv, _e] = item.parse(s)
+                d := iv as item.Item.DataField
+                cc_opt(c, "-F", "--form")
+                cc_arg(c, d.key + "=" + d.value)
+            } else if k == 6 {
+                [iv2, _e2] = item.parse(s)
+                d2 := iv2 as item.Item.DataFieldFromFile
+                cc_opt(c, "-F", "--form")
+                cc_arg(c, d2.key + "=<" + d2.value)
+            } else if k == 9 {
+                [iv3, _e3] = item.parse(s)
+                f := iv3 as item.Item.FormFile
+                fv := f.key + "=@" + f.file_name
+                if f.has_type {
+                    fv = fv + ";type=" + f.file_type
+                }
+                if f.has_fname {
+                    fv = fv + ";filename=" + f.file_name_header
+                }
+                cc_opt(c, "-F", "--form")
+                cc_arg(c, fv)
+            }
+        }
+    } else if i.body_type == 1 {
+        // Body::Form → --data-urlencode 'enc(k)=v' per field;
+        // empty → forced urlencoded ct header.
+        nf := 0
+        j = 0
+        for j < len(i.items[:]) {
+            k := i.ikinds[j]
+            s := i.items[j]
+            j = j + 1
+            if k == 7 || k == 8 {
+                c.err = "JSON values are not supported in Form fields"
+                return c
+            }
+            if k == 5 || k == 6 {
+                kk := ""
+                vv := ""
+                if k == 5 {
+                    [iv, _e] = item.parse(s)
+                    d := iv as item.Item.DataField
+                    kk = d.key
+                    vv = d.value
+                } else {
+                    [iv2, _e2] = item.parse(s)
+                    d2 := iv2 as item.Item.DataFieldFromFile
+                    kk = d2.key
+                    fp2 := tilde_expand(d2.value, env)
+                    if !os.exists(fp2) {
+                        c.err = "couldn't read data file " + d2.value
+                        return c
+                    }
+                    vv = os.readfile_(fp2)
+                }
+                nf = nf + 1
+                cc_arg(c, "--data-urlencode")
+                cc_arg(c, form_urlenc(kk) + "=" + vv)
+            }
+        }
+        if nf == 0 {
+            cc_hdr(c, "content-type", "application/x-www-form-urlencoded")
+        }
+    } else {
+        // JSON mode — body_from_file when any FormFile is present
+        haskeyed := 0
+        hasff := 0
+        j = 0
+        for j < len(i.items[:]) {
+            if i.ikinds[j] == 9 {
+                [ivf, _ef] = item.parse(i.items[j])
+                ff3 := ivf as item.Item.FormFile
+                if len(ff3.key) > 0 {
+                    haskeyed = 1
+                }
+                hasff = 1
+            }
+            j = j + 1
+        }
+        if haskeyed != 0 {
+            c.err = "Can't use file fields in JSON mode (perhaps you meant --form?)"
+            return c
+        }
+        if hasff != 0 {
+            fct := ""
+            ffname := ""
+            nfiles := 0
+            j = 0
+            for j < len(i.items[:]) {
+                k := i.ikinds[j]
+                s := i.items[j]
+                j = j + 1
+                if k >= 5 && k <= 8 {
+                    c.err = "Request body (from a file) and request data (key=value) cannot be mixed."
+                    return c
+                }
+                if k == 9 {
+                    [ivf2, _ef2] = item.parse(s)
+                    ff2 := ivf2 as item.Item.FormFile
+                    nfiles = nfiles + 1
+                    if nfiles > 1 {
+                        c.err = "Can't read request from multiple files"
+                        return c
+                    }
+                    fct = ff2.file_type
+                    if len(fct) == 0 {
+                        fct = mime_guess(ff2.file_name)
+                    }
+                    ffname = ff2.file_name
+                }
+            }
+            cc_hdr(c, "content-type", fct)
+            cc_arg(c, "--data-binary")
+            cc_arg(c, "@" + tilde_expand(ffname, env))
+        } else {
+            // Body::Json — compact emit preserving insertion order;
+            // null body + explicit --json → the two headers only.
+            jobj := json.jobj()
+            nj := 0
+            j = 0
+            for j < len(i.items[:]) {
+                k := i.ikinds[j]
+                s := i.items[j]
+                j = j + 1
+                if k == 5 {
+                    [iv, _e] = item.parse(s)
+                    d := iv as item.Item.DataField
+                    json.jadd(jobj, d.key, json.jstr(d.value))
+                    nj = nj + 1
+                } else if k == 6 {
+                    [iv2, _e2] = item.parse(s)
+                    d2 := iv2 as item.Item.DataFieldFromFile
+                    fp3 := tilde_expand(d2.value, env)
+                    if !os.exists(fp3) {
+                        c.err = "couldn't read data file " + d2.value
+                        return c
+                    }
+                    json.jadd(jobj, d2.key, json.jstr(os.readfile_(fp3)))
+                    nj = nj + 1
+                } else if k == 7 {
+                    [iv3, _e3] = item.parse(s)
+                    d3 := iv3 as item.Item.JsonField
+                    json.jadd(jobj, json_key(d3.raw_key), d3.value)
+                    nj = nj + 1
+                } else if k == 8 {
+                    [iv4, _e4] = item.parse(s)
+                    d4 := iv4 as item.Item.JsonFieldFromFile
+                    fp4 := tilde_expand(d4.value, env)
+                    if !os.exists(fp4) {
+                        c.err = "couldn't read data file " + d4.value
+                        return c
+                    }
+                    json.jadd(jobj, json_key(d4.raw_key), json.jparse(os.readfile_(fp4)))
+                    nj = nj + 1
+                }
+            }
+            if nj > 0 {
+                cc_hdr(c, "content-type", "application/json")
+                cc_hdr(c, "accept", "application/json, */*;q=0.5")
+                cc_opt(c, "-d", "--data")
+                cc_arg(c, json.tojson(jobj))
+            } else if i.json_flag != 0 {
+                cc_hdr(c, "content-type", "application/json")
+                cc_hdr(c, "accept", "application/json, */*;q=0.5")
+            }
+        }
+    }
+    return c
 }
+
+// curl_render → the Command Display: "NAME=<q> … curl <q-arg>…".
+fn curl_render(c: ref CurlC) -> str {
+    out := ""
+    j := 0
+    for j < len(c.env) {
+        out = out + c.env[j] + " "
+        j = j + 1
+    }
+    out = out + "curl"
+    j = 0
+    for j < len(c.args) {
+        out = out + " " + curl_q(c.args[j])
+        j = j + 1
+    }
+    return out
+}
+
+// curl_warn_render → bare `Warning: <msg>` lines + one blank
+// separator iff any (upstream print_curl_translation).
+fn curl_warn_render(c: ref CurlC) -> str {
+    out := ""
+    j := 0
+    for j < len(c.warn) {
+        out = out + "Warning: " + c.warn[j] + "\n"
+        j = j + 1
+    }
+    if len(out) > 0 {
+        out = out + "\n"
+    }
+    return out
+}
+
+// shquote remains the generic shell-quoter for non-curl paths
+// (offline/session); --curl args go through curl_q instead.
 
 fn meta_render(resp: model.Resp) -> str {
     return "Elapsed time: " + fmt5(resp.elapsed_ms / 1000.0) + "s\nRemote address: " + resp.remote + "\n\n"
@@ -1859,10 +2996,33 @@ fn human_bytes(n: int) -> str {
 
 // --- the orchestration
 
-fn execute(i: ref Intent, envpairs: []str, stdin: str, stdin_tty: int) -> own Run {
+fn execute(i: ref Intent, envpairs: []str, stdin: str, stdin_tty: int, out_tty: int) -> own Run {
     r := new(Run)
-    p := plan(i, envpairs, stdin, stdin_tty)
     prog := i.prog
+    // --generate renders the vendored artifact and exits before any
+    // request planning (spec S5, ADR-0041).
+    if len(i.gen) > 0 {
+        r.code = 0
+        r.stdout = gen_emit(i.gen, prog, envpairs)
+        return r
+    }
+    // --curl runs upstream translate() FIRST — before plan()'s stdin/
+    // cert/session work — so the emit feeds off Intent alone and
+    // short-circuits --offline & plan-time errors (spec S1/AC2).
+    if i.curl != 0 {
+        cc := curl_translate(i, envpairs)
+        if len(cc.err) > 0 {
+            r.code = 1
+            r.stderr = prog + ": error: " + cc.err + "\n"
+            return r
+        }
+        r.code = 0
+        r.stdout = curl_render(cc) + "\n"
+        r.stderr = curl_warn_render(cc)
+        return r
+    }
+    p := plan(i, envpairs, stdin, stdin_tty)
+    f := fmt_of(i, out_tty)
     if len(p.err) > 0 {
         r.code = 1
         r.stderr = prog + ": error: " + p.err + "\n"
@@ -1876,29 +3036,17 @@ fn execute(i: ref Intent, envpairs: []str, stdin: str, stdin_tty: int) -> own Ru
         }
         wi = wi + 1
     }
-    // --curl: emit a curl command and exit 0 without sending (also
-    // short-circuits --offline — offline+curl still prints curl).
-    if i.curl != 0 {
-        r.code = 0
-        r.stdout = curl_emit(i, p) + "\n"
-        r.stderr = warn + curl_ignored(i)
-        return r
-    }
-    // colors/all: format-only until style lands (ADR-0006: say so).
-    if (i.pretty == "all" || i.pretty == "colors") && i.quiet < 2 {
-        warn = warn + prog + ": warning: --pretty " + i.pretty + " colors/style unsupported in this build; formatting only\n"
-    }
     ps := i.print_set
     hs := i.hist_set
     out := ""
     if ps.req_h != 0 {
-        out = out + req_head_render(i, p)
+        out = out + req_head_render(i, p, f)
     }
     if ps.req_b != 0 {
         // Body::Empty prints nothing; a zero-length real body prints \n\n
         if p.req.body.kind() != 0 {
             bd := req_body_bytes(p.req.body)
-            out = out + body_render(bd, i.pretty) + "\n\n"
+            out = out + req_body_render(bd, f, p.req.headers)
         }
     }
     if i.offline != 0 {
@@ -1972,10 +3120,13 @@ fn execute(i: ref Intent, envpairs: []str, stdin: str, stdin_tty: int) -> own Ru
             hp := resp.hops[k]
             k = k + 1
             if hs.res_h != 0 {
-                out = out + resp_head_render(hp.version, hp.status, hp.reason, hp.headers)
+                out = out + resp_head_render(hp.version, hp.status, hp.reason, hp.headers, f)
             }
             if hs.res_b != 0 {
-                out = out + body_render(hp.body, i.pretty) + "\n"
+                out = out + resp_body_render(hp.body, f, hp.headers, i.response_mime, i.response_charset, i.stream)
+                // upstream print_separator() — runs iff response_body
+                // is in history_print
+                out = out + "\n"
             }
             if hs.res_m != 0 {
                 out = out + "Elapsed time: " + fmt5(hp.elapsed_ms / 1000.0) + "s\nRemote address: " + hp.remote + "\n\n"
@@ -2027,7 +3178,7 @@ fn execute(i: ref Intent, envpairs: []str, stdin: str, stdin_tty: int) -> own Ru
             if i.quiet < 1 {
                 warn = warn + "Download \"" + dest + "\" is already complete\n"
             }
-            r.stderr = resp_head_render(resp.version, resp.status, resp.reason, resp.headers) + warn
+            r.stderr = resp_head_render(resp.version, resp.status, resp.reason, resp.headers, f) + warn
             r.code = 0
             session_maybe_save(i, envpairs, p, p.req.headers)
             return r
@@ -2064,7 +3215,7 @@ fn execute(i: ref Intent, envpairs: []str, stdin: str, stdin_tty: int) -> own Ru
                 warn = warn + "Done. " + human_bytes(written) + " in " + fmt5(resp.elapsed_ms / 1000.0) + "s (" + human_bytes(rate_of(written, resp.elapsed_ms)) + "/s)\n"
             }
             // headers go to stderr in download mode
-            r.stderr = resp_head_render(resp.version, resp.status, resp.reason, resp.headers) + warn
+            r.stderr = resp_head_render(resp.version, resp.status, resp.reason, resp.headers, f) + warn
             r.code = code
             session_maybe_save(i, envpairs, p, p.req.headers)
             return r
@@ -2076,10 +3227,10 @@ fn execute(i: ref Intent, envpairs: []str, stdin: str, stdin_tty: int) -> own Ru
         return r
     }
     if ps.res_h != 0 {
-        out = out + resp_head_render(resp.version, resp.status, resp.reason, resp.headers)
+        out = out + resp_head_render(resp.version, resp.status, resp.reason, resp.headers, f)
     }
     if ps.res_b != 0 {
-        out = out + body_render(resp.body, i.pretty)
+        out = out + resp_body_render(resp.body, f, resp.headers, i.response_mime, i.response_charset, i.stream)
     }
     if ps.res_b != 0 && ps.res_m != 0 {
         out = out + "\n"
@@ -2174,4 +3325,126 @@ fn req_body_bytes(b: model.Body) -> []byte {
         return mkslice(byte, 0)
     }
     return rb.data
+}
+
+// --- --generate (spec S5, ADR-0041) --------------------------------
+
+// srepl is a plain string replace-all (golden_test's g_repl lives in
+// the _test file — not compiled into the binary).
+fn srepl(s: str, a: str, b: str) -> str {
+    out := ""
+    i := 0
+    for i < len(s) {
+        if i + len(a) <= len(s) && substr(s, i, i + len(a)) == a {
+            out = out + b
+            i = i + len(a)
+        } else {
+            out = out + substr(s, i, i + 1)
+            i = i + 1
+        }
+    }
+    return out
+}
+
+fn two(n: int) -> str {
+    if n < 10 {
+        return "0" + itoa(n)
+    }
+    return itoa(n)
+}
+
+// epoch_ymd renders a unix epoch seconds value as YYYY-MM-DD —
+// Howard Hinnant's civil-from-days (std/time has no civil API).
+fn epoch_ymd(sec: int) -> str {
+    z := sec / 86400 + 719468
+    era := z / 146097
+    doe := z - era * 146097
+    yoe := (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    y := yoe + era * 400
+    doy := doe - (365 * yoe + yoe / 4 - yoe / 100)
+    mp := (5 * doy + 2) / 153
+    d := doy - (153 * mp + 2) / 5 + 1
+    m := mp
+    if mp < 10 {
+        m = mp + 3
+    } else {
+        m = mp - 9
+    }
+    if m <= 2 {
+        y = y + 1
+    }
+    return itoa(y) + "-" + two(m) + "-" + two(d)
+}
+
+// sde_or_now: SOURCE_DATE_EPOCH if parseable, else current epoch
+// (upstream SOURCE_DATE_EPOCH ?: today's date for .TH).
+fn sde_or_now(envpairs: []str) -> int {
+    s := env_get(envpairs, "SOURCE_DATE_EPOCH")
+    if len(s) > 0 {
+        [n, e] = strconv.atoi(s)
+        if e == nil {
+            return n
+        }
+    }
+    return time.unix()
+}
+
+// gen_bin_sub substitutes the registered command token `xh` → the
+// resolved bin name (upstream passes bin_name to clap_complete; the
+// vendored scripts are pinned to xh).
+fn gen_bin_sub(s: str, prog: str) -> str {
+    s = srepl(s, "complete -c xh", "complete -c " + prog)
+    s = srepl(s, "complete -F _xh", "complete -F _" + prog)
+    s = srepl(s, "_xh()", "_" + prog + "()")
+    s = srepl(s, "_xh_", "_" + prog + "_")
+    s = srepl(s, "#compdef xh", "#compdef " + prog)
+    s = srepl(s, "arg-completer[xh]", "arg-completer[" + prog + "]")
+    s = srepl(s, "-CommandName 'xh'", "-CommandName '" + prog + "'")
+    s = srepl(s, "export extern \"xh\"", "export extern \"" + prog + "\"")
+    s = srepl(s, "export extern xh", "export extern " + prog)
+    s = srepl(s, "nu-complete xh", "nu-complete " + prog)
+    // bash: complete-registration tail + internal cmd/case literals
+    s = srepl(s, "-o default xh", "-o default " + prog)
+    s = srepl(s, "cmd=\"xh\"", "cmd=\"" + prog + "\"")
+    s = srepl(s, "xh)", prog + ")")
+    // zsh: funcstack probe, dispatch call, compdef registration, label
+    s = srepl(s, "\"_xh\"", "\"_" + prog + "\"")
+    s = srepl(s, "_xh \"$@\"", "_" + prog + " \"$@\"")
+    s = srepl(s, "compdef _xh xh", "compdef _" + prog + " " + prog)
+    s = srepl(s, "'xh commands'", "'" + prog + " commands'")
+    // nushell doc comment names the binary upstream-side too
+    s = srepl(s, "# xh is a friendly", "# " + prog + " is a friendly")
+    // elvish: command-seed var + lookup key must stay paired
+    s = srepl(s, "var command = 'xh'", "var command = '" + prog + "'")
+    s = srepl(s, "&'xh'=", "&'" + prog + "'=")
+    // powershell: $command seed element + switch dispatch key
+    s = srepl(s, "        'xh'\n        for", "        '" + prog + "'\n        for")
+    s = srepl(s, "        'xh' {", "        '" + prog + "' {")
+    return s
+}
+
+// gen_man renders the vendored man doc with .TH date ←
+// SOURCE_DATE_EPOCH ?: today and version ← version.get().
+fn gen_man(markdown: int, envpairs: []str) -> str {
+    doc := gen_doc(markdown)
+    doc = srepl(doc, "0.26.3", version.get())
+    if markdown == 0 {
+        doc = srepl(doc, "2026-10-21", epoch_ymd(sde_or_now(envpairs)))
+    }
+    return doc
+}
+
+// gen_emit renders the vendored artifact for a --generate kind.
+fn gen_emit(kind: str, prog: str, envpairs: []str) -> str {
+    if kind == "man" {
+        return gen_man(0, envpairs)
+    }
+    if kind == "man-markdown" {
+        return gen_man(1, envpairs)
+    }
+    sh := ""
+    if len(kind) > 9 && substr(kind, 0, 9) == "complete-" {
+        sh = substr(kind, 9, len(kind))
+    }
+    return gen_bin_sub(gen_completion(sh), prog)
 }

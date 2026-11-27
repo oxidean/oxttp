@@ -1,0 +1,3 @@
+# source: upstream-test-vector to_curl.rs::tests
+# input: xh -d httpbin.org/get --curl
+argv: -d httpbin.org/get --curl

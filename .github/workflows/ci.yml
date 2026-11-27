@@ -16,7 +16,7 @@ jobs:
     name: oxl-build
     if: github.event.action != 'edited'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
         with:
@@ -41,14 +41,67 @@ jobs:
           /tmp/oxttp --version
           /tmp/oxttp-tui
 
-      # `oxl test` honors only its first package-dir arg and silently
-      # ignores the rest (oxidean/oxl#131) — invoke once per leaf dir.
-      - name: test
+  # `oxl test` honors only its first package-dir arg and silently
+  # ignores the rest (oxidean/oxl#131), and a package-dir run also
+  # executes its workspace dependencies' tests — so the two app
+  # closures (./cli and ./tui both require core+shared) cover every
+  # package's tests except core/session, which nothing imports and
+  # therefore sits outside both closures; it gets an explicit suite.
+  # Suites run as parallel jobs: serially they exceeded the ~10min
+  # wall the runner enforced on this workflow.
+  test:
+    name: oxl-test-$suite
+    if: github.event.action != 'edited'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [cli, tui, core/session]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false # PR code runs here; don't leave a token in git config
+
+      - name: install oxl toolchain
         run: |
-          for d in $(git ls-files '*.oxl' | xargs -n1 dirname | sort -u); do
-            echo "--- $d"
-            oxl test "$d"
-          done
+          OXL_VERSION=$(cat .oxl-version)
+          curl -fsSL -o /tmp/oxl.tar.gz \
+            "https://github.com/oxidean/oxl/releases/download/v${OXL_VERSION}/oxl-toolchain-linux-x86_64.tar.gz"
+          mkdir -p /tmp/oxl-toolchain
+          tar -xzf /tmp/oxl.tar.gz -C /tmp/oxl-toolchain --strip-components=1
+          echo "/tmp/oxl-toolchain" >> "$GITHUB_PATH"
+          /tmp/oxl-toolchain/oxl version
+
+      # `oxl test` peaks ~20GB RSS compiling the cli closure's test
+      # variants (oxidean/oxl#232) — over the runner's 16GB RAM, which
+      # OOM-kills the job. Swap carries the overflow until upstream
+      # fixes the driver's memory profile. The hosted image already
+      # ships an active /swapfile — writing to it fails ETXTBSY, so
+      # this one uses a unique path sized to available disk.
+      - name: add swap for oxl test memory peak
+        run: |
+          # The hosted image already ships an active /swapfile — writing
+          # to it fails ETXTBSY, so this one uses a unique path. Size it
+          # to the smaller of the memory headroom we want (~40GiB total
+          # commit) and what the runner disk can spare (~3GiB kept free).
+          cur_kb=$(awk '/^SwapTotal/ {print $2}' /proc/meminfo)
+          mem_kb=$(awk '/^MemTotal/ {print $2}' /proc/meminfo)
+          want_kb=$((40 * 1024 * 1024 - mem_kb - cur_kb))
+          avail_kb=$(df -k --output=avail / | tail -1)
+          disk_kb=$((avail_kb - 3 * 1024 * 1024))
+          [ "$want_kb" -gt "$disk_kb" ] && want_kb=$disk_kb
+          if [ "$want_kb" -gt 0 ]; then
+            want_mb=$((want_kb / 1024))
+            sudo fallocate -l "${want_mb}M" /oxttp-ci-swap || sudo dd if=/dev/zero of=/oxttp-ci-swap bs=1M count=$want_mb
+            sudo chmod 600 /oxttp-ci-swap
+            sudo mkswap /oxttp-ci-swap
+            sudo swapon /oxttp-ci-swap
+          fi
+          free -h
+
+      - name: test ${{ matrix.suite }}
+        run: oxl test ./${{ matrix.suite }}
 
   # Commit-message gate (see scripts/commit-check.sh): SemVer-prefix
   # grammar on subjects + no-AI-attribution scan, on the PR's commit

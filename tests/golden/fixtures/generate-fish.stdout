@@ -1,0 +1,150 @@
+# Complete paths after @ in options:
+function __oxttp_complete_data
+    string match -qr '^(?<prefix>.*@)(?<path>.*)' -- (commandline -ct)
+    printf '%s\n' -- $prefix(__fish_complete_path $path)
+end
+complete -c oxttp -n 'string match -qr "@" -- (commandline -ct)' -kxa "(__oxttp_complete_data)"
+
+complete -c oxttp -l raw -d 'Pass raw request data without extra processing' -r
+complete -c oxttp -l pretty -d 'Controls output processing' -r -f -a "all\t'(default) Enable both coloring and formatting'
+colors\t'Apply syntax highlighting to output'
+format\t'Pretty-print json and sort headers'
+none\t'Disable both coloring and formatting'"
+complete -c oxttp -l format-options -d 'Set output formatting options' -r
+complete -c oxttp -s s -l style -d 'Output coloring style' -r -f -a "auto\t''
+solarized\t''
+monokai\t''
+fruity\t''"
+complete -c oxttp -l response-charset -d 'Override the response encoding for terminal display purposes' -r
+complete -c oxttp -l response-mime -d 'Override the response mime type for coloring and formatting for the terminal' -r
+complete -c oxttp -s p -l print -d 'String specifying what the output should contain' -r
+complete -c oxttp -s P -l history-print -d 'The same as --print but applies only to intermediary requests/responses' -r
+complete -c oxttp -s o -l output -d 'Save output to FILE instead of stdout' -r -F
+complete -c oxttp -l session -d 'Create, or reuse and update a session' -r
+complete -c oxttp -l session-read-only -d 'Create or read a session without updating it from the request/response exchange' -r
+complete -c oxttp -s A -l auth-type -d 'Specify the auth mechanism' -r -f -a "basic\t''
+bearer\t''
+digest\t''"
+complete -c oxttp -s a -l auth -d 'Authenticate as USER with PASS (-A basic|digest) or with TOKEN (-A bearer)' -r
+complete -c oxttp -l bearer -d 'Authenticate with a bearer token' -r
+complete -c oxttp -l unstable-m-sig-id -d 'Message signature key identifier (RFC 9421)' -r
+complete -c oxttp -l unstable-m-sig-key -d 'Message signature key material (RFC 9421)' -r
+complete -c oxttp -l unstable-m-sig-alg -d 'Message signature algorithm (RFC 9421)' -r -f -a "hmac-sha256\t''
+ed25519\t''
+ecdsa-p256-sha256\t''
+ecdsa-p384-sha384\t''
+rsa-v1_5-sha256\t''
+rsa-pss-sha512\t''"
+complete -c oxttp -l unstable-m-sig-comp -d 'Comma-separated list of message signature components (RFC 9421)' -r
+complete -c oxttp -l max-redirects -d 'Number of redirects to follow. Only respected if --follow is used' -r
+complete -c oxttp -l timeout -d 'Connection timeout of the request' -r
+complete -c oxttp -l proxy -d 'Use a proxy for a protocol. For example: --proxy https:http://proxy.host:8080' -r
+complete -c oxttp -l verify -d 'If "no", skip SSL verification. If a file path, use it as a CA bundle' -r
+complete -c oxttp -l cert -d 'Use a client side certificate for SSL' -r -F
+complete -c oxttp -l cert-key -d 'A private key file to use with --cert' -r -F
+complete -c oxttp -l ssl -d 'Force a particular TLS version' -r -f -a "auto\t''
+tls1\t''
+tls1.1\t''
+tls1.2\t''
+tls1.3\t''"
+complete -c oxttp -l default-scheme -d 'The default scheme to use if not specified in the URL' -r
+complete -c oxttp -l http-version -d 'HTTP version to use' -r -f -a "1.0\t''
+1.1\t''
+2\t''
+2-prior-knowledge\t''
+3-prior-knowledge\t''"
+complete -c oxttp -l resolve -d 'Override DNS resolution for specific domain to a custom IP' -r
+complete -c oxttp -l interface -d 'Bind to a network interface or local IP address' -r
+complete -c oxttp -l unix-socket -d 'Connect using a Unix domain socket' -r -F
+complete -c oxttp -l generate -d 'Generate shell completions or man pages' -r -f -a "complete-bash\t''
+complete-elvish\t''
+complete-fish\t''
+complete-nushell\t''
+complete-powershell\t''
+complete-zsh\t''
+man\t''
+man-markdown\t''"
+complete -c oxttp -s j -l json -d '(default) Serialize data items from the command line as a JSON object'
+complete -c oxttp -s f -l form -d 'Serialize data items from the command line as form fields'
+complete -c oxttp -l multipart -d 'Like --form, but force a multipart/form-data request even without files'
+complete -c oxttp -s h -l headers -d 'Print only the response headers. Shortcut for --print=h'
+complete -c oxttp -s b -l body -d 'Print only the response body. Shortcut for --print=b'
+complete -c oxttp -s m -l meta -d 'Print only the response metadata. Shortcut for --print=m'
+complete -c oxttp -s v -l verbose -d 'Print the whole request as well as the response'
+complete -c oxttp -l debug -d 'Print full error stack traces and debug log messages'
+complete -c oxttp -l all -d 'Show any intermediary requests/responses while following redirects with --follow'
+complete -c oxttp -s q -l quiet -d 'Do not print to stdout or stderr'
+complete -c oxttp -s S -l stream -d 'Always stream the response body'
+complete -c oxttp -s x -l compress -d 'Content compressed (encoded) with Deflate algorithm'
+complete -c oxttp -s d -l download -d 'Download the body to a file instead of printing it'
+complete -c oxttp -s c -l continue -d 'Resume an interrupted download. Requires --download and --output'
+complete -c oxttp -l ignore-netrc -d 'Do not use credentials from .netrc'
+complete -c oxttp -l offline -d 'Construct HTTP requests without sending them anywhere'
+complete -c oxttp -l check-status -d '(default) Exit with an error status code if the server replies with an error'
+complete -c oxttp -s F -l follow -d 'Do follow redirects'
+complete -c oxttp -l native-tls -d 'Use the system TLS library instead of rustls (if enabled at compile time)'
+complete -c oxttp -l https -d 'Make HTTPS requests if not specified in the URL'
+complete -c oxttp -s 4 -l ipv4 -d 'Resolve hostname to ipv4 addresses only'
+complete -c oxttp -s 6 -l ipv6 -d 'Resolve hostname to ipv6 addresses only'
+complete -c oxttp -s I -l ignore-stdin -d 'Do not attempt to read stdin'
+complete -c oxttp -l curl -d 'Print a translation to a curl command'
+complete -c oxttp -l curl-long -d 'Use the long versions of curl\'s flags'
+complete -c oxttp -l help -d 'Print help'
+complete -c oxttp -l no-json
+complete -c oxttp -l no-form
+complete -c oxttp -l no-multipart
+complete -c oxttp -l no-raw
+complete -c oxttp -l no-pretty
+complete -c oxttp -l no-format-options
+complete -c oxttp -l no-style
+complete -c oxttp -l no-response-charset
+complete -c oxttp -l no-response-mime
+complete -c oxttp -l no-print
+complete -c oxttp -l no-headers
+complete -c oxttp -l no-body
+complete -c oxttp -l no-meta
+complete -c oxttp -l no-verbose
+complete -c oxttp -l no-debug
+complete -c oxttp -l no-all
+complete -c oxttp -l no-history-print
+complete -c oxttp -l no-quiet
+complete -c oxttp -l no-stream
+complete -c oxttp -l no-compress
+complete -c oxttp -l no-output
+complete -c oxttp -l no-download
+complete -c oxttp -l no-continue
+complete -c oxttp -l no-session
+complete -c oxttp -l no-session-read-only
+complete -c oxttp -l no-auth-type
+complete -c oxttp -l no-auth
+complete -c oxttp -l no-bearer
+complete -c oxttp -l no-ignore-netrc
+complete -c oxttp -l no-unstable-m-sig-id
+complete -c oxttp -l no-unstable-m-sig-key
+complete -c oxttp -l no-unstable-m-sig-alg
+complete -c oxttp -l no-unstable-m-sig-comp
+complete -c oxttp -l no-offline
+complete -c oxttp -l no-check-status
+complete -c oxttp -l no-follow
+complete -c oxttp -l no-max-redirects
+complete -c oxttp -l no-timeout
+complete -c oxttp -l no-proxy
+complete -c oxttp -l no-verify
+complete -c oxttp -l no-cert
+complete -c oxttp -l no-cert-key
+complete -c oxttp -l no-ssl
+complete -c oxttp -l no-native-tls
+complete -c oxttp -l no-default-scheme
+complete -c oxttp -l no-https
+complete -c oxttp -l no-http-version
+complete -c oxttp -l no-resolve
+complete -c oxttp -l no-interface
+complete -c oxttp -l no-ipv4
+complete -c oxttp -l no-ipv6
+complete -c oxttp -l no-unix-socket
+complete -c oxttp -l no-ignore-stdin
+complete -c oxttp -l no-curl
+complete -c oxttp -l no-curl-long
+complete -c oxttp -l no-generate
+complete -c oxttp -l no-help
+complete -c oxttp -s V -l version -d 'Print version'

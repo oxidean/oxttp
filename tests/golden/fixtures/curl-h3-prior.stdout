@@ -1,1 +1,1 @@
-curl --http3-only -H 'Accept-Encoding: <AE>' -H 'User-Agent: <V>' -H 'Connection: <CONN>' -H 'Accept: */*' 'https://example.org/'
+curl --http3-only -X GET https://example.org/

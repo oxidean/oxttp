@@ -1,0 +1,1 @@
+curl http://httpbin.org/post -H 'content-type: application/json' -H 'accept: application/json, */*;q=0.5' -d '{"x":[3]}'

@@ -27,7 +27,7 @@ fn xrun(argv: str, env: str, port: int) -> own Run {
     }
     o := resolve(pe(argv2, env), ev(env))
     testing.expect_eq(o.exec, 1, "execs: " + o.stderr)
-    return execute(o.intent, ev(env), "", 1)
+    return execute(o.intent, ev(env), "", 1, 0)
 }
 
 fn srv(script: []str) -> own FxLike {
@@ -210,9 +210,24 @@ fn test_exec_pretty_json() {
     f := srv(str1("200 OK\nContent-Type: application/json\n\n{\"a\":1,\"b\":true}"))
     r := xrun("--pretty\nformat\n--print\nb\n{URL}/x", "", f.port)
     testing.expect_eq(r.code, 0, "pretty exit 0")
-    testing.expect(find(r.stdout, "{\n  \"a\": 1,\n  \"b\": true\n}") >= 0, "pretty body: " + r.stdout)
-    r2 := xrun("--pretty\ncolors\n--print\nb\n--offline\nexample.org", "", 1)
-    testing.expect(find(r2.stderr, "colors/style unsupported") >= 0, "colors warn: " + r2.stderr)
+    // upstream default json.indent = 4 (WI-0016)
+    testing.expect(find(r.stdout, "{\n    \"a\": 1,\n    \"b\": true\n}") >= 0, "pretty body: " + r.stdout)
+    // --format-options json.indent:2 + headers.sort (was deferred)
+    f2 := srv(str1("200 OK\nContent-Type: application/json\nx-b: 2\na-b: 1\n\n{\"z\":1}"))
+    r2b := xrun("--pretty\nformat\n--format-options\njson.indent:2\n--print\nhb\n{URL}/x", "", f2.port)
+    testing.expect(find(r2b.stdout, "{\n  \"z\": 1\n}") >= 0, "fmt indent2: " + r2b.stdout)
+    // headers.sort under pretty.format; HTTP/1.x heads are titlecased
+    ai := find(r2b.stdout, "A-B: 1")
+    zi := find(r2b.stdout, "X-B: 2")
+    testing.expect(ai >= 0 && zi > ai, "sorted resp headers: " + r2b.stdout)
+    // WI-0016 P3: --pretty colors emits SGR under the ansi theme
+    // (method=32 green, path=4;36 cyan+underline, header name=36) and
+    // the colors/style warn-degrade is gone.
+    r2 := xrun("--pretty\ncolors\n--print\nH\n--offline\nexample.org", "", 1)
+    testing.expect(find(r2.stderr, "colors/style unsupported") < 0, "no colors warn: " + r2.stderr)
+    testing.expect(find(r2.stdout, "\x1b[32mGET\x1b[0m") >= 0, "method SGR: " + r2.stdout)
+    testing.expect(find(r2.stdout, "\x1b[4;36m/\x1b[0m") >= 0, "path SGR: " + r2.stdout)
+    testing.expect(find(r2.stdout, "\x1b[36mHost\x1b[0m") >= 0, "header name SGR: " + r2.stdout)
 }
 
 fn test_exec_continue_range_conflict() {
@@ -233,7 +248,7 @@ fn test_exec_curl_ignored_warn() {
     testing.expect_eq(r.code, 0, "curl exit")
     testing.expect(find(r.stderr, "Warning: Ignored --offline") >= 0, "ignored offline: " + r.stderr)
     testing.expect(find(r.stderr, "Warning: Ignored --pretty") >= 0, "ignored pretty: " + r.stderr)
-    testing.expect(find(r.stderr, "Warning: Ignored --print") >= 0, "ignored print: " + r.stderr)
+    testing.expect(find(r.stderr, "Warning: Ignored -p/--print") >= 0, "ignored print: " + r.stderr)
 }
 
 // WI-0013 P5 (spec sem-S4/S6): --native-tls joins the Ignored list
@@ -245,13 +260,14 @@ fn test_exec_curl_native_tls_ignored() {
     r2 := xrun("--curl\n--proxy\nall:http://p:1\nhttps://example.org/x", "", 1)
     testing.expect_eq(r2.code, 0, "curl exit")
     testing.expect(find(r2.stderr, "Ignored --proxy") < 0, "proxy emits now: " + r2.stderr)
-    // all: rides all_proxy env — curl's -x would override scheme envs (F4)
-    testing.expect(find(r2.stdout, "all_proxy='http://p:1'") >= 0, "all_proxy emitted: " + r2.stdout)
+    // all: rides all_proxy env — curl's -x would override scheme
+    // envs (F4); maybe_quote leaves : and / unquoted (upstream ex 11).
+    testing.expect(find(r2.stdout, "all_proxy=http://p:1") >= 0, "all_proxy emitted: " + r2.stdout)
     testing.expect(find(r2.stdout, "-x ") < 0, "no -x flag: " + r2.stdout)
     r3 := xrun("--curl-long\n--proxy\nall:http://p:1\n--cert\ntests/golden/fixtures/dev-cert.pem\n--cert-key\ntests/golden/fixtures/dev-key.pem\nhttps://example.org/x", "", 1)
-    testing.expect(find(r3.stdout, "all_proxy='http://p:1'") >= 0, "long all_proxy: " + r3.stdout)
-    testing.expect(find(r3.stdout, "--cert 'tests/golden/fixtures/dev-cert.pem'") >= 0, "long --cert: " + r3.stdout)
-    testing.expect(find(r3.stdout, "--key 'tests/golden/fixtures/dev-key.pem'") >= 0, "long --key: " + r3.stdout)
+    testing.expect(find(r3.stdout, "all_proxy=http://p:1") >= 0, "long all_proxy: " + r3.stdout)
+    testing.expect(find(r3.stdout, "--cert tests/golden/fixtures/dev-cert.pem") >= 0, "long --cert: " + r3.stdout)
+    testing.expect(find(r3.stdout, "--key tests/golden/fixtures/dev-key.pem") >= 0, "long --key: " + r3.stdout)
 }
 
 // WI-0013 P2 — ADR-0031: --native-tls on https is a warning-degrade
@@ -312,11 +328,11 @@ fn test_exec_curl_proxy_emit() {
     r := xrun("--curl\n--offline\n--proxy\nall:http://pa:1\n--proxy\nhttp:http://ph:2\n--proxy\nhttp:http://second:3\n--proxy\nhttps:http://ps:4\nhttp://example.org/", "", 1)
     testing.expect_eq(r.code, 0, "curl exit: " + r.stderr)
     o := r.stdout
-    testing.expect(find(o, "all_proxy='http://pa:1'") >= 0, "all_proxy env: " + o)
+    testing.expect(find(o, "all_proxy=http://pa:1") >= 0, "all_proxy env: " + o)
     testing.expect(find(o, " -x ") < 0, "no -x flag: " + o)
-    testing.expect(find(o, "http_proxy='http://ph:2'") >= 0, "first http proxy: " + o)
-    testing.expect(find(o, "http_proxy='http://second:3'") >= 0, "second http entry emitted (last wins): " + o)
-    testing.expect(find(o, "https_proxy='http://ps:4'") >= 0, "https proxy: " + o)
+    testing.expect(find(o, "http_proxy=http://ph:2") >= 0, "first http proxy: " + o)
+    testing.expect(find(o, "http_proxy=http://second:3") >= 0, "second http entry emitted (last wins): " + o)
+    testing.expect(find(o, "https_proxy=http://ps:4") >= 0, "https proxy: " + o)
     // all protos covered -> no ambient clearing emitted
     testing.expect(find(o, "HTTP_PROXY=") < 0, "no clearing needed: " + o)
     // only http: set -> https/all ambient envs cleared in the emit
@@ -324,7 +340,7 @@ fn test_exec_curl_proxy_emit() {
     o2 := r2.stdout
     testing.expect(find(o2, "https_proxy= HTTPS_PROXY=") >= 0, "https ambient cleared: " + o2)
     testing.expect(find(o2, "all_proxy= ALL_PROXY=") >= 0, "all ambient cleared: " + o2)
-    testing.expect(find(o2, "http_proxy='http://ph:2'") >= 0, "explicit http kept: " + o2)
+    testing.expect(find(o2, "http_proxy=http://ph:2") >= 0, "explicit http kept: " + o2)
 }
 
 // CodeRabbit review F1 — an explicitly supplied but empty --cert-key
@@ -335,4 +351,28 @@ fn test_exec_cert_key_empty() {
     testing.expect_eq(r.code, 1, "empty key exit 1")
     testing.expect(find(r.stderr, "cert-key file is empty") >= 0, "empty key err: " + r.stderr)
     os.remove("/tmp/oxttp-ckey-empty.pem")
+}
+
+// WI-0016 P4 — upstream to_curl.rs::tests row 8 needs the xhs bin
+// name (prog-driven https default scheme); golden cases all ride
+// spec("oxttp"), so this one runs through rb("xhs") + execute.
+fn test_exec_curl_upstream_xhs() {
+    o := rb("xhs", "--curl\nhttpbin.org/get\nx==3")
+    testing.expect_eq(o.exec, 1, "execs: " + o.stderr)
+    r := execute(o.intent, ev(""), "", 1, 0)
+    testing.expect_eq(r.code, 0, "curl exit")
+    testing.expect_streq(r.stdout, "curl 'https://httpbin.org/get?x=3'\n", "xhs vector: " + r.stdout)
+}
+
+// WI-0016 P6 — XH_TEST_DIGEST_AUTH_CNONCE reaches the digest path
+// end-to-end (now in envnames() so real runs see it): the scripted
+// 401 retry carries the pinned cnonce in Authorization.
+fn test_exec_digest_cnonce_env() {
+    sc := mkslice(str, 2)
+    sc[0] = "401 Unauthorized\nWWW-Authenticate: Digest realm=\"r\", nonce=\"n\", qop=auth\n\n"
+    sc[1] = "<ECHO>"
+    f := srv(sc[:])
+    r := xrun("--auth-type\ndigest\n-a\nu:p\n{URL}/x", "XH_TEST_DIGEST_AUTH_CNONCE=tsetnoc", f.port)
+    testing.expect_eq(r.code, 0, "digest retry exit: " + r.stderr)
+    testing.expect(find(r.stdout, "cnonce=\"tsetnoc\"") >= 0, "cnonce env reached Authorization: " + r.stdout)
 }
