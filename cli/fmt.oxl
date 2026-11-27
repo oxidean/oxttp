@@ -608,13 +608,13 @@ fn hdr_latin1(v: str, out_tty: int) -> str {
     i := 0
     for i < len(v) {
         b := byteat(v, i)
-        if b >= 160 {
-            lb = push(lb, (192 + b / 64) as byte)
-            lb = push(lb, (128 + b % 64) as byte)
-        } else if out_tty != 0 && (b < 32 || (b >= 127 && b < 160)) {
+        if out_tty != 0 && (b < 32 || (b >= 127 && b < 160)) {
             lb = push(lb, 239)
             lb = push(lb, 191)
             lb = push(lb, 189)
+        } else if b >= 128 {
+            lb = push(lb, (192 + b / 64) as byte)
+            lb = push(lb, (128 + b % 64) as byte)
         } else {
             lb = push(lb, b)
         }
@@ -707,6 +707,9 @@ fn resp_body_render(body: []byte, f: ref Fmt, hdrs: []model.Header, mime: str, c
     if f.out_tty == 0 {
         if (f.color != 0 || f.json_format != 0 || f.xml_format != 0) && ct_is_text(ct) != 0 {
             text := decode_bounded(body, enc)
+            if stream != 0 {
+                return body_stream_dispatch(text, ct, f)
+            }
             return body_text_dispatch(text, ct, f)
         }
         return body as str
@@ -724,6 +727,9 @@ fn resp_body_render(body: []byte, f: ref Fmt, hdrs: []model.Header, mime: str, c
     text := decode_bounded(body, enc)
     if enc_ascii_compat(enc_or_sniff(body, enc)) == 0 && find(text, "\x00") >= 0 {
         return binary_suppressor()
+    }
+    if stream != 0 {
+        return body_stream_dispatch(text, ct, f) + "\n"
     }
     return body_text_dispatch(text, ct, f) + "\n"
 }
@@ -790,6 +796,83 @@ fn xml_text(text: str, f: ref Fmt) -> str {
         return colorize(fmt, "xml", f)
     }
     return fmt
+}
+
+// body_stream_dispatch — upstream print_body_stream on an already
+// buffered body: Json takes the streaming-formatter path; Xml/Html/
+// Css/JavaScript get syntax colors only (block formatting does NOT
+// apply to streams); Text/EventStream pass through decoded-verbatim.
+fn body_stream_dispatch(text: str, ct: int, f: ref Fmt) -> str {
+    if ct == 0 {
+        if f.json_format == 0 {
+            return colorize(text, "json", f)
+        }
+        fmt := stream_json_format(text, f.json_indent)
+        if f.color != 0 {
+            return colorize(fmt, "json", f)
+        }
+        return fmt
+    }
+    if ct == 2 {
+        return colorize(text, "xml", f)
+    }
+    if ct == 1 {
+        return colorize(text, "html", f)
+    }
+    if ct == 4 {
+        return colorize(text, "css", f)
+    }
+    if ct == 3 {
+        return colorize(text, "js", f)
+    }
+    return text
+}
+
+// stream_json_format — the streaming JSON formatter's observable
+// contract on a complete buffer: one whole document formats whole;
+// otherwise each complete single-line value (NDJSON) formats
+// independently and non-JSON lines pass through verbatim. Concatenated
+// multi-line documents are a documented approximation — upstream's
+// StreamDeserializer formats them, ours leaves them literal.
+fn stream_json_format(text: str, ind: int) -> str {
+    if valid_json(text) != 0 {
+        return json_fmt(text, ind)
+    }
+    lines := mkslice(str, 0)
+    pos := 0
+    n := len(text)
+    for pos < n {
+        j := find(substr(text, pos, n), "\n")
+        if j >= 0 {
+            lines = push(lines, substr(text, pos, pos + j))
+            pos = pos + j + 1
+        } else {
+            lines = push(lines, substr(text, pos, n))
+            pos = n
+        }
+    }
+    trail := 0
+    if n > 0 && byteat(text, n - 1) == 10 {
+        trail = 1
+    }
+    out := ""
+    i := 0
+    for i < len(lines) {
+        t := trim_ows(lines[i])
+        if len(t) > 0 && valid_json(t) != 0 {
+            out = out + json_fmt(t, ind)
+        } else {
+            out = out + lines[i]
+        }
+        if i + 1 < len(lines) {
+            out = out + "\n"
+        }
+        i = i + 1
+    }
+    if trail != 0 && len(out) > 0 {
+        out = out + "\n"
+    }
+    return out
 }
 
 // req_body_render: unconditional NUL → suppressor (+breathing \n);

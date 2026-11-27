@@ -65,7 +65,7 @@ fn test_resp_head_render() {
     testing.expect(find(out3, "799 <unknown status code>") >= 0, "unknown fallback")
 }
 
-fn xtest_reason_table() {
+fn test_reason_table() {
     testing.expect_streq(canonical_reason(200), "OK", "200")
     testing.expect_streq(canonical_reason(301), "Moved Permanently", "301")
     testing.expect_streq(canonical_reason(418), "I'm a teapot", "418")
@@ -76,7 +76,7 @@ fn xtest_reason_table() {
     testing.expect_streq(reason_of(799, ""), "<unknown status code>", "fallback")
 }
 
-fn xtest_binary_suppressor() {
+fn test_binary_suppressor() {
     b := mkslice(byte, 3)
     b[0] = 65
     b[1] = 0
@@ -96,7 +96,7 @@ fn xtest_binary_suppressor() {
     testing.expect(find(out3, "binary data not shown") >= 0, "req suppressor")
 }
 
-fn xtest_json_fmt() {
+fn test_json_fmt() {
     i := new(Intent)
     i.pretty = "format"
     f := fmt_of(i, 0)
@@ -107,7 +107,51 @@ fn xtest_json_fmt() {
     testing.expect(find(p2, "\n  \"a\": 1") >= 0, "json indent2 opt")
 }
 
-fn xtest_meta_and_human_bytes() {
+// WI-0016 review: stream bodies take print_body_stream semantics —
+// Json formats per-value (NDJSON linewise), other text types get
+// syntax colors only, no block formatting; hdr_latin1 maps C1 bytes
+// to 2-byte UTF-8 off-tty instead of emitting raw invalid UTF-8.
+fn test_stream_dispatch() {
+    i := new(Intent)
+    i.pretty = "format"
+    f := fmt_of(i, 0)
+    let nh: []model.Header = nil
+    ndjson := mkslice(byte, 0)
+    s1 := "{\"a\":1}\n{\"b\":2}\n"
+    j := 0
+    for j < len(s1) {
+        ndjson = push(ndjson, byteat(s1, j))
+        j = j + 1
+    }
+    out := resp_body_render(ndjson, f, nh, "application/json", "", 1)
+    testing.expect(find(out, "\"a\": 1") >= 0 && find(out, "\"b\": 2") >= 0, "ndjson values formatted: " + out)
+    testing.expect(find(out, "\n{\n") >= 0 || find(out, "}\n{") >= 0, "ndjson linewise join: " + out)
+    // single doc still formats whole
+    doc := mkslice(byte, 0)
+    s2 := "{\"x\":[1,2]}"
+    j = 0
+    for j < len(s2) {
+        doc = push(doc, byteat(s2, j))
+        j = j + 1
+    }
+    out2 := resp_body_render(doc, f, nh, "application/json", "", 1)
+    testing.expect(find(out2, "\"x\": [") >= 0, "single doc formatted: " + out2)
+    // xml stream: xml_format must NOT re-indent (upstream syntax-only)
+    x := mkslice(byte, 0)
+    s3 := "<a><b>1</b></a>"
+    j = 0
+    for j < len(s3) {
+        x = push(x, byteat(s3, j))
+        j = j + 1
+    }
+    out3 := resp_body_render(x, f, nh, "application/xml", "", 1)
+    testing.expect_streq(out3, "<a><b>1</b></a>", "xml stream unformatted")
+    // latin1 header display: 0x85 → U+0085 (C2 85), not raw byte
+    testing.expect_streq(hdr_latin1("\x85", 0), "\xc2\x85", "c1 latin1 non-tty")
+    testing.expect_streq(hdr_latin1("\x85", 1), "\xef\xbf\xbd", "c1 latin1 tty fffd")
+}
+
+fn test_meta_and_human_bytes() {
     testing.expect_streq(fmt5(0.00123), "0.00123", "fmt5")
     testing.expect_streq(fmt5(1.5), "1.50000", "fmt5 1.5")
     testing.expect_streq(human_bytes(9), "9 B", "9 B")
@@ -121,7 +165,7 @@ fn xtest_meta_and_human_bytes() {
     testing.expect(find(m, "Remote address: 127.0.0.1:80") >= 0, "meta remote")
 }
 
-fn xtest_titlecase() {
+fn test_titlecase() {
     testing.expect_streq(titlecase("content-type"), "Content-Type", "ct")
     testing.expect_streq(titlecase("x-cdn"), "X-Cdn", "x-cdn")
     testing.expect_streq(titlecase("etag"), "Etag", "etag")

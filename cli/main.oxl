@@ -14,7 +14,7 @@ import "github.com/oxidean/oxttp/shared/args"
 // declared env var (verify's CA bundle fallbacks live on the table
 // and are collected separately below).
 fn envnames() -> []str {
-    v := mkslice(str, 18)
+    v := mkslice(str, 19)
     v[0] = "XH_CONFIG_DIR"
     v[1] = "XH_HTTPIE_COMPAT_MODE"
     v[2] = "HOME"
@@ -35,6 +35,8 @@ fn envnames() -> []str {
     // REQUEST_METHOD feeds the CGI guard on HTTP_PROXY capture
     // (spec sem-S5) — never consumed elsewhere.
     v[17] = "REQUEST_METHOD"
+    // Test hook for deterministic digest cnonce (spec sem-S7).
+    v[18] = "XH_TEST_DIGEST_AUTH_CNONCE"
     return v
 }
 

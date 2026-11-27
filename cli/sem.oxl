@@ -1332,6 +1332,15 @@ fn resolve(m: own args.Matches, envpairs: []str) -> own Out {
     }
     o.intent.url = u
 
+    // --curl short-circuits before every connection-affecting defer —
+    // upstream run() calls to_curl before client construction, so the
+    // emit path is scheme-agnostic and warns about ignored flags
+    // (msig, h3 gate, resolve, proxies) instead of exit 1.
+    if o.intent.curl != 0 {
+        o.exec = 1
+        return o
+    }
+
     // 10. deferral routing (S5+ lands real behavior)
     if msig_present(m) {
         defer_out(o, prog, "This binary was built without message signature support. Enable the `http-message-signatures` feature.")
@@ -1346,14 +1355,6 @@ fn resolve(m: own args.Matches, envpairs: []str) -> own Out {
     }
     // --native-tls warning-degrades at plan on https (ADR-0031 —
     // single TLS stack); inert on cleartext.
-    // --curl never sends: skip connection-affecting degrades so the
-    // emit path can warn about ignored flags instead of exit 1. The
-    // h3 feature gate sits below this — upstream runs to_curl before
-    // the cfg check, so --curl emits --http3-only rather than error.
-    if o.intent.curl != 0 {
-        o.exec = 1
-        return o
-    }
     if o.intent.http_version == "3-prior-knowledge" {
         defer_out(o, prog, "This binary was built without support for HTTP/3. Enable the `http3` feature.")
         return o

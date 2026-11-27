@@ -28,8 +28,8 @@ module completions {
     [ "complete-bash" "complete-elvish" "complete-fish" "complete-nushell" "complete-powershell" "complete-zsh" "man" "man-markdown" ]
   }
 
-  # xh is a friendly and fast tool for sending HTTP requests
-  export extern xh [
+  # oxttp is a friendly and fast tool for sending HTTP requests
+  export extern oxttp [
     --json(-j)                # (default) Serialize data items from the command line as a JSON object
     --form(-f)                # Serialize data items from the command line as form fields
     --multipart               # Like --form, but force a multipart/form-data request even without files

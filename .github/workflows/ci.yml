@@ -45,12 +45,15 @@ jobs:
       # ignores the rest (oxidean/oxl#131), and a package-dir run also
       # executes its workspace dependencies' tests — so the two app
       # closures (./cli and ./tui both require core+shared) cover every
-      # package's tests. Per-leaf-dir runs re-executed the whole
-      # dependency closure ~12x and blew the job timeout.
+      # package's tests except core/session, which nothing imports and
+      # therefore sits outside both closures; it gets an explicit run.
+      # Per-leaf-dir runs re-executed the whole dependency closure ~12x
+      # and blew the job timeout.
       - name: test
         run: |
           oxl test ./cli
           oxl test ./tui
+          oxl test ./core/session
 
   # Commit-message gate (see scripts/commit-check.sh): SemVer-prefix
   # grammar on subjects + no-AI-attribution scan, on the PR's commit

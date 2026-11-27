@@ -3362,7 +3362,19 @@ fn gen_bin_sub(s: str, prog: str) -> str {
     s = srepl(s, "arg-completer[xh]", "arg-completer[" + prog + "]")
     s = srepl(s, "-CommandName 'xh'", "-CommandName '" + prog + "'")
     s = srepl(s, "export extern \"xh\"", "export extern \"" + prog + "\"")
+    s = srepl(s, "export extern xh", "export extern " + prog)
     s = srepl(s, "nu-complete xh", "nu-complete " + prog)
+    // bash: complete-registration tail + internal cmd/case literals
+    s = srepl(s, "-o default xh", "-o default " + prog)
+    s = srepl(s, "cmd=\"xh\"", "cmd=\"" + prog + "\"")
+    s = srepl(s, "xh)", prog + ")")
+    // zsh: funcstack probe, dispatch call, compdef registration, label
+    s = srepl(s, "\"_xh\"", "\"_" + prog + "\"")
+    s = srepl(s, "_xh \"$@\"", "_" + prog + " \"$@\"")
+    s = srepl(s, "compdef _xh xh", "compdef _" + prog + " " + prog)
+    s = srepl(s, "'xh commands'", "'" + prog + " commands'")
+    // nushell doc comment names the binary upstream-side too
+    s = srepl(s, "# xh is a friendly", "# " + prog + " is a friendly")
     return s
 }
 

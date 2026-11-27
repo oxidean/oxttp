@@ -163,11 +163,11 @@ none\:"Disable both coloring and formatting"))' \
 (( $+functions[_oxttp_commands] )) ||
 _oxttp_commands() {
     local commands; commands=()
-    _describe -t commands 'xh commands' commands "$@"
+    _describe -t commands 'oxttp commands' commands "$@"
 }
 
-if [ "$funcstack[1]" = "_xh" ]; then
-    _xh "$@"
+if [ "$funcstack[1]" = "_oxttp" ]; then
+    _oxttp "$@"
 else
-    compdef _xh xh
+    compdef _oxttp oxttp
 fi

@@ -2,7 +2,7 @@ schema_version: 1
 project:
     name: oxttp
     # Loop per leaf dir — safer than multi-arg `oxl test` (oxidean/oxl#131 history).
-    test_command: "oxl test ./cli && oxl test ./tui"
+    test_command: "oxl test ./cli && oxl test ./tui && oxl test ./core/session"
 workflow:
     default_profile: normal
     profiles:
