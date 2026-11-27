@@ -95,8 +95,11 @@ Rewrite `curl_emit`/`curl_ignored` in `cli/exec.oxl` to mirror
    **DevD2 (kept, ADR-0021-era D7):** when ≥1 explicit `--proxy`
    present, also emit clearing `no_proxy= NO_PROXY=` so the emitted
    curl can't bypass a proxy oxttp itself would use. (Existing emit
-   clears only no_proxy/NO_PROXY — upstream emits none; keep our
-   documented clearing, do NOT expand to scheme vars.)
+   clears `no_proxy= NO_PROXY=` plus the unset scheme vars
+   `http_proxy= HTTP_PROXY=` `https_proxy= HTTPS_PROXY=`
+   `all_proxy= ALL_PROXY=` — the WI-0013 D7 documented deviation;
+   upstream emits none. Keep the documented clearing as-is; do NOT
+   expand it further.)
 10. **Quoting** = `os_display::Quotable::maybe_quote` unix rules:
     quote iff value is empty ∨ first byte ∈ {`~`,`#`,`!`} ∨ contains
     any of `|&;<>()$` backtick `"` `'` `*` `?` `[` `]` `=` `^` `{` `}`
@@ -346,8 +349,10 @@ Rewrite `core/net` (or cli) netrc reader as the upstream machine:
 
 - **DevD1** `all:`→`all_proxy=` env prefix (upstream `-x`) — corpus
   §5 L226 already pins this as ours.
-- **DevD2** ambient `no_proxy= NO_PROXY=` clearing in curl env block
-  (upstream emits none) — kept from WI-0013 D7.
+- **DevD2** ambient clearing in the curl env block — `no_proxy=
+  NO_PROXY=` plus unset-scheme-var clears (`http_proxy= HTTP_PROXY=`
+  `https_proxy= HTTPS_PROXY=` `all_proxy= ALL_PROXY=`); upstream emits
+  none — kept from WI-0013 D7.
 - **DevD3** charset decode bounded to {utf-8, utf-16le/be,
   windows-1252(+latin1/ascii)} + BOM sniff; other WHATWG labels →
   UTF-8-lossy (upstream: encoding_rs, all labels + chardet).

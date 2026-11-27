@@ -2,10 +2,10 @@
   "schema_version": 1,
   "id": "WI-0016",
   "title": "M3 deep HTTP polish — curl map, env tail, pretty/colors, generate",
-  "state": "implementing",
+  "state": "shipping",
   "profile": "normal",
-  "current_stage": "implementation",
+  "current_stage": "shipping",
   "created_at": "2026-11-26T17:50:52Z",
-  "updated_at": "2026-11-26T18:29:55Z",
+  "updated_at": "2026-11-27T02:30:30Z",
   "git_baseline": "1b1030ecdc4154810d3b6fbf1dd63954085d6ada"
 }
