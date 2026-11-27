@@ -405,7 +405,7 @@ fn pushstr(b: []byte, s: str) -> []byte {
 
 // BINARY_SUPPRESSOR — upstream printer.rs L26-28 verbatim.
 fn binary_suppressor() -> str {
-    return "+-----------------------------------------+\n| NOTE: binary data not shown in terminal |\n+-----------------------------------------+\n"
+    return "+-----------------------------------------+\n| NOTE: binary data not shown in terminal |\n+-----------------------------------------+\n\n"
 }
 
 // valid_json — full-parse gate (upstream IgnoredAny): the body is
@@ -795,9 +795,9 @@ fn xml_text(text: str, f: ref Fmt) -> str {
     }
     fmt := xml_fmt(text, f.xml_indent)
     if f.color != 0 {
-        return colorize(fmt, "xml", f)
+        return colorize(fmt + "\n\n", "xml", f)
     }
-    return fmt
+    return fmt + "\n\n"
 }
 
 // body_stream_dispatch — upstream print_body_stream on an already

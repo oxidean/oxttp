@@ -797,12 +797,18 @@ fn netrc_auth(i: ref Intent, env: []str) -> str {
     p.host = nrc_host(u.hostname())
     nrc_parse(p)
     if p.e_set != 0 {
+        if p.e_has_login == 0 && i.auth_type != "bearer" {
+            return ""
+        }
         return "B" + charat(1) + p.e_login + charat(1) + p.e_pass
     }
     if p.suppress != 0 {
         return ""
     }
     if p.d_set != 0 {
+        if p.d_has_login == 0 && i.auth_type != "bearer" {
+            return ""
+        }
         return "B" + charat(1) + p.d_login + charat(1) + p.d_pass
     }
     return ""
