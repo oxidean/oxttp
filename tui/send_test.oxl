@@ -7,6 +7,7 @@ package main
 // fake can stand in for H1 — no sockets in tests.
 
 import "std/errors"
+import "std/os"
 import "std/testing"
 import "github.com/oxidean/oxttp/core/collection"
 import "github.com/oxidean/oxttp/core/model"
@@ -88,6 +89,10 @@ fn test_begin_send_url_substitution() {
     scratch_coll()
     a := new_app()
     a.coll_dir = COLL_SCRATCH
+    // implicit env base loads from the launch cwd only — the test
+    // "launches" inside the collection so posting.env applies
+    a.cwd = COLL_SCRATCH
+    a.data_dir = DATA_SCRATCH
     load_collection(a)
     a.url.text = "$BASE/users"
     fx := begin_send(a)
@@ -96,6 +101,8 @@ fn test_begin_send_url_substitution() {
     // unresolved in-url is a plan error
     a2 := new_app()
     a2.coll_dir = COLL_SCRATCH
+    a2.cwd = COLL_SCRATCH
+    a2.data_dir = DATA_SCRATCH
     load_collection(a2)
     a2.url.text = "$MISSING/x"
     fx2 := begin_send(a2)
@@ -202,7 +209,7 @@ fn test_history_cap_newest_first() {
     stage_send(a, "http://x")
     i := 0
     for i < 105 {
-        he := HistEnt{title: "t" + itoa(i), method: "GET", url: "http://x/" + itoa(i),
+        he := HistEnt{id: 0, persisted: false, title: "t" + itoa(i), method: "GET", url: "http://x/" + itoa(i),
             status: 200, reason: "OK", elapsed_ms: 1.0, size: 1,
             req_yaml: "url: http://x\n", resp_text: "b",
             resp_hdr_rows: nil, resp_ck_rows: nil, resp_tr_rows: nil}
@@ -222,6 +229,7 @@ fn test_history_open_and_delete() {
     scratch_coll()
     a := new_app()
     a.coll_dir = COLL_SCRATCH
+    a.data_dir = DATA_SCRATCH
     load_collection(a)
     stage_send(a, "http://x/one")
     r := fake_resp(200, "application/json", "{\"k\":2}", new(mkslice(model.Hop, 0)))
@@ -266,7 +274,7 @@ fn test_history_nav_via_dispatch() {
     a := new_app()
     i := 0
     for i < 3 {
-        a.history = push(a.history, HistEnt{title: "t" + itoa(i), method: "GET",
+        a.history = push(a.history, HistEnt{id: 0, persisted: false, title: "t" + itoa(i), method: "GET",
             url: "http://x/" + itoa(i), status: 200, reason: "OK", elapsed_ms: 1.0,
             size: 1, req_yaml: "url: http://x\n", resp_text: "b",
             resp_hdr_rows: nil, resp_ck_rows: nil, resp_tr_rows: nil})
@@ -323,4 +331,36 @@ fn test_jar_origin_scoping() {
         i = i + 1
     }
     testing.expect_streq(cookies2, "sb=2; sc=3", "b.test cookies join")
+}
+
+fn test_begin_send_missing_client_cert() {
+    // a configured ssl.certificate_path that is absent aborts the
+    // send — same rejection the headless --cert plan applies; the
+    // request must not go out without its client identity.
+    a := new_app()
+    a.url.text = "https://x"
+    a.ssl_cert = "/nonexistent-client-cert.pem"
+    fx := begin_send(a)
+    testing.expect_eq(fx, ENone, "missing cert aborts the send")
+    testing.expect(a.pending == nil, "nothing staged")
+    testing.expect_eq(a.toasts[len(a.toasts)-1].level, 2, "error toast")
+    // a configured key that is absent aborts too
+    scratch_coll()
+    cert := COLL_SCRATCH + "/cert.pem"
+    os.writefile_(cert, "pem")
+    a2 := new_app()
+    a2.url.text = "https://x"
+    a2.ssl_cert = cert
+    a2.ssl_key = COLL_SCRATCH + "/missing-key.pem"
+    fx2 := begin_send(a2)
+    testing.expect_eq(fx2, ENone, "missing key aborts the send")
+    testing.expect(a2.pending == nil, "nothing staged")
+    // a readable pair still sends with the identity loaded
+    key := COLL_SCRATCH + "/key.pem"
+    os.writefile_(key, "key")
+    a2.ssl_key = key
+    fx3 := begin_send(a2)
+    testing.expect_eq(fx3, ESend, "valid identity still sends")
+    testing.expect_streq(a2.pending.cert_pem, "pem", "cert pem loaded")
+    testing.expect_streq(a2.pending.key_pem, "key", "key pem loaded")
 }

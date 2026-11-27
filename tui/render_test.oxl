@@ -7,6 +7,8 @@ import "std/testing"
 
 import "std/os"
 
+import "std/unicode/utf8"
+
 import "github.com/oxidean/oxttp/core/term"
 
 fn cell_at(s: ref term.AnsiScreen, x: int, y: int) -> str {
@@ -336,4 +338,26 @@ fn test_render_body_cursor_past_lineno() {
     scr2 := term.new_ansi(80, 24)
     render(a2, scr2, "v")
     testing.expect_eq(scr2.cx, a2.r_req_x + 5, "2-digit prefix + 1 char")
+}
+
+fn test_render_heading_hidden() {
+    scr := term.new_ansi(80, 24)
+    a := new_app()
+    a.heading_on = false
+    render(a, scr, "0.0.0-test")
+    testing.expect(!has_text(scr, 0, "oxttp-tui"), "header row hidden")
+    testing.expect(has_text(scr, 0, "[GET]"), "url bar moved up")
+    testing.expect(has_text(scr, 23, "quit"), "footer stays")
+}
+
+fn test_render_nerd_icons() {
+    scr := term.new_ansi(80, 24)
+    a := new_app()
+    a.nerd_icons = true
+    a.coll.nodes = nil
+    a.coll.nodes = push(a.coll.nodes, TreeNode{name: "dir1/", depth: 0, is_dir: true, open: false, stub: false, path: "", kind: "", err: ""})
+    a.coll.nodes = push(a.coll.nodes, TreeNode{name: "req1", depth: 0, is_dir: false, open: false, stub: false, path: "", kind: "", err: ""})
+    render(a, scr, "v")
+    testing.expect_streq(cell_at(scr, 1, 6), utf8.encode(61563), "folder nerd glyph")
+    testing.expect_streq(cell_at(scr, 1, 7), utf8.encode(61462), "file nerd glyph")
 }

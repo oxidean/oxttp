@@ -295,6 +295,52 @@ fn open_session() -> [own Session, err] {
     return s, nil
 }
 
+// suspend leaves the alt screen + restores cooked mode WITHOUT
+// disarming/ownership loss — the external-command handoff (f3 pager /
+// f4 editor) needs a real tty for the child, then resume() re-enters.
+// Signals disarm for the child's lifetime so a queued SIGINT can't
+// fire stale on return.
+fn (s mut Session) suspend() -> err {
+    f := os.stdout()
+    [_, we] = f.write(leave_seq() as []byte)
+    if s.armed != 0 {
+        signal.disarm("SIGINT")
+        signal.disarm("SIGWINCH")
+        s.armed = 0
+    }
+    re := s.raw.restore()
+    if we != nil {
+        return we
+    }
+    return re
+}
+
+// resume re-enters raw + the alt screen and rebuilds the screen buffer
+// sized to the tty (the child may have resized or trashed cells).
+fn (s mut Session) resume() -> err {
+    [raw, re] = osterm.raw(osterm.stdin_fd())
+    if re != nil {
+        return re
+    }
+    s.raw = raw
+    ae1 := signal.arm("SIGINT")
+    ae2 := signal.arm("SIGWINCH")
+    if ae1 == nil && ae2 == nil {
+        s.armed = 1
+    }
+    cols := 80
+    rows := 24
+    [sz, se] = osterm.size(osterm.stdout_fd())
+    if se == nil {
+        cols = sz.cols
+        rows = sz.rows
+    }
+    s.scr = new_ansi(cols, rows)
+    f := os.stdout()
+    [_, _we] = f.write(enter_seq() as []byte)
+    return nil
+}
+
 fn (s mut Session) close() -> err {
     // Pop the per-screen modes before leaving the alternate screen so
     // a disarm/restore failure cannot trap the parent shell on the

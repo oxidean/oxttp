@@ -14,6 +14,7 @@ import "github.com/oxidean/oxttp/core/yaml"
 
 let COLL_FIXTURE = "tests/tui-fixtures/small-app"
 let COLL_SCRATCH = "/tmp/oxttp-tui-coll-test"
+let DATA_SCRATCH = "/tmp/oxttp-tui-data-test"
 
 // scratch_coll (re)builds a tiny collection tree: a folder with a
 // nested folder, one env file pair, and a malformed file.
@@ -37,6 +38,9 @@ fn scratch_coll() {
     rm_quiet(COLL_SCRATCH + "/my-new-req.posting.yaml")
     rm_quiet(COLL_SCRATCH + "/sub/deep.posting.yaml")
     rm_quiet(COLL_SCRATCH + "/sub")
+    // env-memory + history live under the data dir — wipe so
+    // earlier runs cannot leak remembered state into assertions
+    os.remove_all(DATA_SCRATCH)
 }
 
 fn rm_quiet(p: str) {
@@ -48,6 +52,13 @@ fn rm_quiet(p: str) {
 fn app_in(dir: str) -> own App {
     a := new_app()
     a.coll_dir = dir
+    // upstream loads the implicit env base from the launch cwd only —
+    // tests launch "inside" the collection so its posting.env applies.
+    a.cwd = dir
+    a.data_dir = DATA_SCRATCH
+    // isolate the config dir — a developer's real config env files
+    // must not leak into fixture assertions.
+    a.cfg_dir = DATA_SCRATCH + "/cfg-empty"
     load_collection(a)
     a.toasts = mkslice(Toast, 0) // scan warns are not under test here
     return a
@@ -235,12 +246,16 @@ fn test_tree_delete() {
     pop_modal(a)
     testing.expect(!os.exists(COLL_SCRATCH+"/requests/zzz-bad.posting.yaml"), "file removed")
     testing.expect(node_idx(a, "zzz-bad") < 0, "row gone after reload")
-    // folder delete degrades — no modal
+    // folder delete asks "Delete <dir>/ and its contents?" then
+    // removes the whole subtree (corpus §5.1 — recursive delete).
     a.coll.cur = 0
-    n := len(a.toasts)
     tree_delete(a)
-    testing.expect_eq(len(a.modals), 0, "no confirm for folders")
-    testing.expect_eq(len(a.toasts), n + 1, "folder delete degrades")
+    testing.expect_eq(top_modal(a), MConfirm, "folder delete asks first")
+    testing.expect(find(a.confirm_msg, "and its contents") >= 0, "recursive wording")
+    confirm_yes(a)
+    pop_modal(a)
+    testing.expect(!os.exists(COLL_SCRATCH+"/requests"), "dir removed")
+    testing.expect(node_idx(a, "nested") < 0, "subtree gone after reload")
 }
 
 fn test_save_request() {
@@ -336,6 +351,130 @@ fn test_env_switch() {
     testing.expect_streq(a.env_name, "(none)", "label resets")
     lr3 := a.env.lookup("WHO")
     testing.expect(!lr3.ok, "dev vars gone")
+}
+
+fn test_env_file_flag_suppresses_recall() {
+    scratch_coll()
+    a := app_in(COLL_SCRATCH)
+    push_modal(a, MEnvSwitch)
+    a.vars.sel = 1
+    env_pick(a) // remembers dev under environments.json
+    testing.expect_streq(remember_recall(a), "dev", "pick remembered")
+    // a launch with -e FILE: the remembered env must not merge in —
+    // the file is the env the user asked for.
+    f := COLL_SCRATCH + "/extra.env"
+    os.writefile_(f, "EXTRA=1\n")
+    b := new_app()
+    b.data_dir = DATA_SCRATCH
+    let av: []str = nil
+    av = push(av, "posting")
+    av = push(av, "-e")
+    av = push(av, f)
+    av = push(av, COLL_SCRATCH)
+    parse_argv_args(b, av)
+    testing.expect(b.env_flagged, "-e file flagged")
+    load_collection(b)
+    // file specs now sit in env_active in CLI order (env_file_list
+    // resolves them file-first); recall stays suppressed either way.
+    testing.expect_eq(len(b.env_active), 1, "file spec tracked")
+    testing.expect_streq(b.env_active[0], f, "file spec verbatim")
+    lr := b.env.lookup("EXTRA")
+    testing.expect(lr.ok, "file var loaded")
+    lr2 := b.env.lookup("WHO")
+    testing.expect(!lr2.ok, "remembered dev stays out")
+    // a named -e still activates (recall moot — env_active non-empty)
+    c := new_app()
+    c.data_dir = DATA_SCRATCH
+    let av2: []str = nil
+    av2 = push(av2, "posting")
+    av2 = push(av2, "-e")
+    av2 = push(av2, "dev")
+    av2 = push(av2, COLL_SCRATCH)
+    parse_argv_args(c, av2)
+    load_collection(c)
+    testing.expect_eq(len(c.env_active), 1, "named -e active")
+    lr3 := c.env.lookup("WHO")
+    testing.expect_streq(lr3.value, "devlocal", "named -e resolves")
+    os.remove(f)
+}
+
+fn env_app(dir: str, specs: []str) -> own App {
+    a := new_app()
+    a.coll_dir = dir
+    a.cwd = dir
+    a.data_dir = DATA_SCRATCH
+    a.cfg_dir = DATA_SCRATCH + "/cfg-empty"
+    let av: []str = nil
+    av = push(av, "posting")
+    i := 0
+    for i < len(specs) {
+        av = push(av, "-e")
+        av = push(av, specs[i])
+        i = i + 1
+    }
+    av = push(av, dir)
+    parse_argv_args(a, av)
+    load_collection(a)
+    return a
+}
+
+fn test_env_spec_ordering() {
+    scratch_coll()
+    f := COLL_SCRATCH + "/overrides.env"
+    os.writefile_(f, "WHO=fileval\nONLY_FILE=1\n")
+    // -e file -e dev: the later spec wins shared keys.
+    let s1: []str = nil
+    s1 = push(s1, f)
+    s1 = push(s1, "dev")
+    a := env_app(COLL_SCRATCH, s1)
+    lr := a.env.lookup("WHO")
+    testing.expect_streq(lr.value, "devlocal", "later -e dev wins")
+    lr2 := a.env.lookup("ONLY_FILE")
+    testing.expect(lr2.ok, "file vars still load")
+    // -e dev -e file: order flips the winner.
+    let s2: []str = nil
+    s2 = push(s2, "dev")
+    s2 = push(s2, f)
+    b := env_app(COLL_SCRATCH, s2)
+    lr3 := b.env.lookup("WHO")
+    testing.expect_streq(lr3.value, "fileval", "later -e file wins")
+    os.remove(f)
+}
+
+fn test_env_picker_name_beats_same_named_file() {
+    scratch_coll()
+    // a plain file named "dev" must not shadow the dev env stack
+    // when the selection comes from the picker (name-typed).
+    os.writefile_(COLL_SCRATCH + "/dev", "WHO=plainfile\n")
+    a := app_in(COLL_SCRATCH)
+    push_modal(a, MEnvSwitch)
+    a.vars.sel = 1
+    env_pick(a)
+    lr := a.env.lookup("WHO")
+    testing.expect(lr.ok, "dev env resolves")
+    testing.expect_streq(lr.value, "devlocal", "named stack wins over file")
+    os.remove(COLL_SCRATCH + "/dev")
+}
+
+fn test_env_unknown_spec_keeps_later_specs() {
+    scratch_coll()
+    // -e typo -e dev: the unknown spec warns but dev still loads.
+    let s: []str = nil
+    s = push(s, "typo")
+    s = push(s, "dev")
+    a := env_app(COLL_SCRATCH, s)
+    lr := a.env.lookup("WHO")
+    testing.expect(lr.ok, "later spec still resolves")
+    testing.expect_streq(lr.value, "devlocal", "dev value intact")
+    saw := false
+    i := 0
+    for i < len(a.env.warns) {
+        if str_contains(a.env.warns[i], "environment typo") {
+            saw = true
+        }
+        i = i + 1
+    }
+    testing.expect(saw, "unknown spec warned")
 }
 
 fn test_variables_rows_masking() {

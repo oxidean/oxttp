@@ -1,0 +1,1053 @@
+package main
+
+// S11 cfg glue tests (plan step 8): apply_settings field map, keymap
+// rebinds (table + end-to-end dispatch), environments.json recall/
+// remember round-trip, disk history write→load + caps + enabled=false,
+// variables edit/add/revert session ops, theme picker enter/escape,
+// curl import subsets (data/json/form/auth/flags/errors).
+
+import "std/testing"
+import "std/os"
+import "std/os/exec"
+import "std/strings"
+import "std/time"
+import "std/errors"
+import "github.com/oxidean/oxttp/core/config"
+import "github.com/oxidean/oxttp/core/env"
+import "github.com/oxidean/oxttp/core/collection"
+import "github.com/oxidean/oxttp/core/model"
+import "github.com/oxidean/oxttp/core/term"
+
+// ---------- apply_settings field map ----------
+
+fn test_apply_settings_field_map() {
+    a := new_app()
+    st := config.defaults()
+    st.load_user_themes = false
+    st.layout = "horizontal"
+    st.collection_browser_position = "right"
+    st.collection_browser_show_on_startup = false
+    st.heading_visible = false
+    st.heading_show_host = false
+    st.heading_show_version = false
+    st.heading_hostname = "[b]myhost[/]"
+    st.url_bar_show_value_preview = false
+    st.url_bar_hide_secrets_in_value_preview = false
+    st.focus_on_startup = "method"
+    st.focus_on_response = "body"
+    st.focus_on_request_open = "headers"
+    st.response_prettify_json = false
+    st.response_show_size_and_time = false
+    st.history_enabled = false
+    st.command_palette_theme_preview = true
+    st.theme = "nord"
+    st.sidebar_gradient = "off"
+    st.ssl_ca_bundle = "/ca.pem"
+    st.ssl_certificate_path = "/cert.pem"
+    st.ssl_key_file = "/key.pem"
+    st.curl_export_extra_args = "--http2"
+    st.editor = "cfg-editor"
+    st.pager = "cfg-pager"
+    apply_settings(a, st)
+    testing.expect_eq(a.layout, 1, "horizontal layout")
+    testing.expect_eq(a.sidebar_pos, 1, "sidebar right")
+    testing.expect(!a.sidebar_on, "sidebar hidden on startup")
+    testing.expect(!a.heading_on, "heading off")
+    testing.expect(!a.heading_host && !a.heading_ver, "heading bits off")
+    testing.expect_streq(a.heading_hostname, "myhost", "markup stripped")
+    testing.expect(!a.url_preview_on, "url preview off")
+    testing.expect(!a.url_mask_secrets, "secret masking off")
+    testing.expect_streq(a.focus_resp, "body", "focus.on_response")
+    testing.expect_streq(a.focus_open, "headers", "focus.on_request_open")
+    testing.expect(!a.resp_prettify, "prettify off")
+    testing.expect(!a.resp_size_time, "size+time off")
+    testing.expect(!a.hist_disk, "history disabled")
+    testing.expect(a.theme_preview, "palette preview on")
+    testing.expect_streq(a.theme_name, "nord", "theme applied")
+    testing.expect_eq(a.gradient, 1, "gradient off")
+    testing.expect_streq(a.gradient_name, "off", "gradient name")
+    testing.expect_streq(a.ssl_ca, "/ca.pem", "ca bundle")
+    testing.expect_streq(a.ssl_cert, "/cert.pem", "cert")
+    testing.expect_streq(a.ssl_key, "/key.pem", "key")
+    testing.expect_streq(a.curl_args, "--http2", "curl args")
+    if len(os.getenv("POSTING_EDITOR")) == 0 {
+        testing.expect_streq(a.editor, "cfg-editor", "editor")
+    }
+    if len(os.getenv("POSTING_PAGER")) == 0 {
+        testing.expect_streq(a.pager, "cfg-pager", "pager")
+    }
+    testing.expect_eq(a.focus, FMethod, "focus.on_startup method")
+    // focus name → target helpers the open/response arms use
+    testing.expect_eq(focus_for_name("headers"), FReqPane, "headers → req pane")
+    testing.expect_eq(focus_for_name("collection"), FSidebar, "collection → sidebar")
+    testing.expect_eq(focus_for_name("url"), FUrl, "url → url bar")
+    testing.expect_eq(focus_for_name("method"), FMethod, "method → selector")
+    testing.expect_eq(focus_for_name("bogus"), -1, "unknown pane name")
+}
+
+fn test_apply_settings_warns_and_defaults() {
+    // transcript: startup with a bad config → warn toasts + defaults.
+    a := new_app()
+    st := config.defaults()
+    st.load_user_themes = false
+    st.theme = "not-a-real-theme"
+    st.sidebar_gradient = "also-not-real"
+    st.remote_control_enabled = true
+    st.use_host_environment = true
+    apply_settings(a, st)
+    testing.expect_streq(a.theme_name, "galaxy", "unknown theme falls back")
+    testing.expect_eq(a.gradient, 0, "bad gradient follows app theme")
+    saw_theme := false
+    saw_grad := false
+    saw_remote := false
+    saw_hostenv := false
+    i := 0
+    for i < len(a.toasts) {
+        t := a.toasts[i]
+        testing.expect_eq(t.level, 2, "startup warns toast at error level")
+        if find(t.msg, "Unknown theme") >= 0 {
+            saw_theme = true
+        }
+        if find(t.msg, "Unknown sidebar gradient") >= 0 {
+            saw_grad = true
+        }
+        if find(t.msg, "remote") >= 0 {
+            saw_remote = true
+        }
+        if find(t.msg, "host env") >= 0 {
+            saw_hostenv = true
+        }
+        i = i + 1
+    }
+    testing.expect(saw_theme, "unknown theme toast")
+    testing.expect(saw_grad, "unknown gradient toast")
+    testing.expect(saw_remote, "remote degrade toast")
+    testing.expect(saw_hostenv, "host env degrade toast")
+}
+
+// ---------- keymap rebinds ----------
+
+fn test_rebind_replace_and_bad_spec() {
+    a := new_app()
+    st := config.defaults()
+    st.load_user_themes = false
+    st.keymap = push(st.keymap, model.KV{name: "toggle-collection", value: "f9, ctrl+f9", enabled: true})
+    st.keymap = push(st.keymap, model.KV{name: "bogus-action", value: "f2", enabled: true})
+    st.keymap = push(st.keymap, model.KV{name: "help", value: "ctrl+bogusname", enabled: true})
+    apply_settings(a, st)
+    // multi-spec entry replaces the defaults wholesale
+    specs := reb_specs_for(a, "toggle-collection")
+    testing.expect_eq(len(specs), 2, "two specs bound")
+    testing.expect_streq(specs[0], "f9", "first spec")
+    testing.expect_streq(specs[1], "ctrl+f9", "second spec")
+    // unknown action warns and binds nothing
+    testing.expect_eq(len(reb_specs_for(a, "bogus-action")), 0, "unknown binds none")
+    // one unparseable spec skips the whole entry — defaults apply
+    testing.expect_eq(len(reb_specs_for(a, "help")), 0, "bad spec skipped")
+    saw_unknown := false
+    saw_bad := false
+    i := 0
+    for i < len(a.toasts) {
+        t := a.toasts[i]
+        testing.expect_eq(t.level, 2, "keymap warns toast at error level")
+        if find(t.msg, "unknown action bogus-action") >= 0 {
+            saw_unknown = true
+        }
+        if find(t.msg, "keymap: help") >= 0 {
+            saw_bad = true
+        }
+        i = i + 1
+    }
+    testing.expect(saw_unknown, "unknown action toast")
+    testing.expect(saw_bad, "bad spec toast")
+    // help keeps its default f1 in the live table
+    bs := global_bindings(a)
+    saw_f1 := false
+    saw_h := false
+    i = 0
+    for i < len(bs) {
+        if bs[i].action == "help" && bs[i].pat.code == term.KeyF1 {
+            saw_f1 = true
+        }
+        if bs[i].action == "toggle-collection" && bs[i].pat.ch == "h" && bs[i].pat.ctrl {
+            saw_h = true
+        }
+        i = i + 1
+    }
+    testing.expect(saw_f1, "help keeps default f1")
+    testing.expect(!saw_h, "ctrl+h default replaced")
+}
+
+fn test_rebind_end_to_end_dispatch() {
+    a := new_app()
+    st := config.defaults()
+    st.load_user_themes = false
+    st.keymap = push(st.keymap, model.KV{name: "toggle-collection", value: "f9", enabled: true})
+    apply_settings(a, st)
+    testing.expect(a.sidebar_on, "sidebar on")
+    // the custom key dispatches the action (F9 = KeyF1 + 8)
+    f9 := term.KeyF1 + 8
+    dispatch(a, knamed(f9))
+    testing.expect(!a.sidebar_on, "f9 toggles")
+    dispatch(a, knamed(f9))
+    testing.expect(a.sidebar_on, "f9 toggles back")
+    // the replaced default is gone: ctrl+h falls to global under the
+    // url bar and finds no binding now
+    dispatch(a, kev("h", true, false, false))
+    testing.expect(a.sidebar_on, "default ctrl+h gone")
+}
+
+// ---------- environments.json recall/remember ----------
+
+fn test_env_memory_roundtrip() {
+    scratch_coll()
+    a := app_in(COLL_SCRATCH)
+    // the pick persists under the data dir
+    push_modal(a, MEnvSwitch)
+    a.vars.sel = 1
+    env_pick(a)
+    testing.expect(os.exists(DATA_SCRATCH + "/environments.json"), "memory file written")
+    testing.expect_streq(remember_recall(a), "dev", "recall returns the pick")
+    // a fresh launch recalls the env automatically
+    b := app_in(COLL_SCRATCH)
+    testing.expect_eq(len(b.env_active), 1, "recalled env active")
+    testing.expect_streq(b.env_name, "dev", "recalled label")
+    lr := b.env.lookup("WHO")
+    testing.expect(lr.ok, "recalled env resolves")
+    testing.expect_streq(lr.value, "devlocal", "local layer wins")
+    // picking (none) deletes the entry
+    push_modal(b, MEnvSwitch)
+    b.vars.sel = 0
+    env_pick(b)
+    testing.expect_streq(remember_recall(b), "", "cleared pick forgets")
+    c := app_in(COLL_SCRATCH)
+    testing.expect_eq(len(c.env_active), 0, "no recall after clear")
+    testing.expect_streq(c.env_name, "(none)", "label none after clear")
+}
+
+fn test_env_local_only_file() {
+    // a <name>.local.env with no <name>.env still forms an env —
+    // the pair resolves in the first dir holding either side.
+    d := "/tmp/oxttp-local-only"
+    os.mkdir_all(d)
+    p := d + "/solo.local.env"
+    os.writefile_(p, "ONLY=localval\n")
+    dirs := mkslice(str, 1)
+    dirs[0] = d
+    names := env_names_dirs(dirs)
+    testing.expect_eq(len(names), 1, "local-only name discovered")
+    testing.expect_streq(names[0], "solo", "stem strips .local")
+    fs := env_files_named(dirs, "solo")
+    testing.expect_eq(len(fs), 1, "local file resolves")
+    testing.expect_streq(fs[0], p, "local path")
+    s := env_set_dirs(dirs, names, nil)
+    lr := s.lookup("ONLY")
+    testing.expect(lr.ok, "local-only var resolves")
+    testing.expect_streq(lr.value, "localval", "local-only value")
+    // base wins over local's dir when the base file exists first
+    os.writefile_(d + "/solo.env", "ONLY=baseval\n")
+    s2 := env_set_dirs(dirs, names, nil)
+    lr2 := s2.lookup("ONLY")
+    testing.expect_streq(lr2.value, "localval", "local still on top of base")
+    os.remove(p)
+    os.remove(d + "/solo.env")
+    os.remove_all(d)
+}
+
+fn test_env_load_file_missing_errors() {
+    // a resolved path that vanishes (or is a dir) before load must
+    // surface — silently dropping it lets a later base file win and
+    // the request goes somewhere the selected env didn't intend.
+    s := new(env.EnvSet)
+    w := env_load_file(s, "/tmp/oxttp-no-such-env-file.env", "ghost")
+    testing.expect(len(w) > 0, "missing file reports")
+    testing.expect(find(w, "missing or not a regular file") >= 0, "missing file message: " + w)
+    d := "/tmp/oxttp-env-dir"
+    os.mkdir_all(d)
+    w2 := env_load_file(s, d, "dir")
+    testing.expect(len(w2) > 0, "directory reports")
+    os.remove_all(d)
+    ok := "/tmp/oxttp-env-ok.env"
+    os.writefile_(ok, "K=v\n")
+    testing.expect_streq(env_load_file(s, ok, "ok"), "", "real file loads clean")
+    lr := s.lookup("K")
+    testing.expect(lr.ok && lr.value == "v", "loaded var resolves")
+    os.remove(ok)
+}
+
+// ---------- disk history ----------
+
+fn hist_test_ent(title: str, url: str) -> HistEnt {
+    return HistEnt{id: 0, persisted: false, title: title, method: "GET", url: url,
+        status: 200, reason: "OK", elapsed_ms: 1.0, size: 1,
+        req_yaml: "url: " + url + "\n", resp_text: "b",
+        resp_hdr_rows: nil, resp_ck_rows: nil, resp_tr_rows: nil}
+}
+
+fn test_history_disk_roundtrip() {
+    scratch_coll()
+    a := new_app()
+    a.coll_dir = COLL_SCRATCH
+    a.data_dir = DATA_SCRATCH
+    testing.expect(a.hist_disk, "new_app defaults disk history on")
+    hist_append(a, hist_test_ent("one", "http://x/1"))
+    hist_append(a, hist_test_ent("two", "http://x/2"))
+    f := hist_file_of(a)
+    testing.expect(os.exists(f), "history file written")
+    hl := hist_read(f)
+    testing.expect_eq(len(hl.ents), 2, "two entries on disk")
+    testing.expect_eq(hl.ents[0].id, 1, "first id assigned")
+    testing.expect_eq(hl.ents[1].id, 2, "second id assigned")
+    testing.expect_eq(hl.next_id, 3, "next_id advanced")
+    // load path: a fresh app restores the entries
+    b := new_app()
+    b.coll_dir = COLL_SCRATCH
+    b.data_dir = DATA_SCRATCH
+    hist_load(b)
+    testing.expect_eq(len(b.history), 2, "entries restored")
+    testing.expect_streq(b.history[0].title, "one", "fields round-trip")
+    testing.expect_streq(b.history[1].url, "http://x/2", "url round-trip")
+    testing.expect_eq(b.history[1].status, 200, "status round-trip")
+}
+
+fn test_history_lock_sidecar() {
+    scratch_coll()
+    a := new_app()
+    a.coll_dir = COLL_SCRATCH + "-lock"
+    a.data_dir = DATA_SCRATCH
+    hist_append(a, hist_test_ent("one", "http://x/1"))
+    f := hist_file_of(a)
+    testing.expect(!os.exists(f + ".lock"), "lock released after append")
+    // a stale lock FILE (older builds left one) is broken so the
+    // append still lands
+    os.writefile_(f + ".lock", "")
+    hist_append(a, hist_test_ent("two", "http://x/2"))
+    hl := hist_read(f)
+    testing.expect_eq(len(hl.ents), 2, "stale lock file broken")
+}
+
+fn test_history_lock_owner_token() {
+    scratch_coll()
+    a := new_app()
+    a.coll_dir = COLL_SCRATCH + "-locktok"
+    a.data_dir = DATA_SCRATCH
+    f := hist_file_of(a)
+    dir := data_dir_of(a) + "/history"
+    if !os.isdir(dir) {
+        os.mkdir_all(dir)
+    }
+    lock := f + ".lock"
+    os.mkdir(lock)
+    tok := hist_lock_token()
+    hist_lock_mark(lock, tok)
+    testing.expect(!hist_lock_stale(lock), "fresh owner is not stale")
+    // an owner far older than any plausible write is dead
+    os.writefile_(lock + "/owner", tok + " " + itoa(time.unix_ms() - HistLockStaleMs - 1))
+    testing.expect(hist_lock_stale(lock), "old owner is stale")
+    // an ownerless dir survives one grace beat, then counts as dead
+    os.remove_all(lock)
+    os.mkdir(lock)
+    testing.expect(hist_lock_stale(lock), "ownerless lock is stale")
+    os.remove_all(lock)
+    // unlock removes only while the recorded token still matches
+    os.mkdir(lock)
+    hist_lock_mark(lock, tok)
+    hist_unlock(HistLock{path: lock, token: "0000000000000000"})
+    testing.expect(os.exists(lock), "foreign token keeps the lock")
+    hist_unlock(HistLock{path: lock, token: tok})
+    testing.expect(!os.exists(lock), "owning token releases the lock")
+}
+
+fn test_history_append_write_failure_unpersisted() {
+    scratch_coll()
+    a := new_app()
+    a.coll_dir = COLL_SCRATCH + "-nowrite"
+    a.data_dir = DATA_SCRATCH
+    f := hist_file_of(a)
+    dir := data_dir_of(a) + "/history"
+    os.mkdir_all(dir)
+    // the publish target occupied by a directory — tmp+rename fails,
+    // so the row must come back unpersisted instead of carrying an
+    // id that never landed on disk.
+    os.mkdir(f)
+    nid := hist_append(a, hist_test_ent("one", "http://x/1"))
+    testing.expect_eq(nid, 0, "failed publish returns no id")
+    os.remove_all(f)
+}
+
+fn test_history_disabled_memory_only() {
+    scratch_coll()
+    a := new_app()
+    a.coll_dir = COLL_SCRATCH + "-nodisk"
+    a.data_dir = DATA_SCRATCH
+    a.hist_disk = false
+    hist_append(a, hist_test_ent("gone", "http://x/gone"))
+    testing.expect(!os.exists(hist_file_of(a)), "no file when disabled")
+    // load is a no-op too — memory stays whatever it was
+    hist_load(a)
+    testing.expect_eq(len(a.history), 0, "disabled load no-ops")
+}
+
+fn test_history_delete_persists() {
+    scratch_coll()
+    a := new_app()
+    a.coll_dir = COLL_SCRATCH + "-del"
+    a.data_dir = DATA_SCRATCH
+    hist_append(a, hist_test_ent("one", "http://x/1"))
+    hist_append(a, hist_test_ent("two", "http://x/2"))
+    // mirror what install_resp leaves in memory
+    hl := hist_read(hist_file_of(a))
+    a.history = hl.ents
+    a.hist = new_list(len(a.history))
+    a.hist.sel = 0 // newest-first → deletes "two"
+    hist_delete(a)
+    testing.expect_eq(len(a.history), 1, "memory entry removed")
+    hl2 := hist_read(hist_file_of(a))
+    testing.expect_eq(len(hl2.ents), 1, "disk entry removed")
+    testing.expect_streq(hl2.ents[0].title, "one", "survivor kept")
+    testing.expect_eq(hl2.next_id, 3, "next_id preserved")
+}
+
+fn test_history_caps() {
+    scratch_coll()
+    a := new_app()
+    a.coll_dir = COLL_SCRATCH + "-caps"
+    a.data_dir = DATA_SCRATCH
+    i := 0
+    for i < 105 {
+        hist_append(a, hist_test_ent("t" + itoa(i), "http://x/" + itoa(i)))
+        i = i + 1
+    }
+    hl := hist_read(hist_file_of(a))
+    testing.expect_eq(len(hl.ents), 100, "file capped at 100")
+    testing.expect_eq(hl.ents[len(hl.ents) - 1].id, 105, "newest kept")
+    testing.expect_eq(hl.ents[0].id, 6, "oldest dropped")
+}
+
+// ---------- f3/f4 staging + editor write-back ----------
+
+fn test_ext_stage_and_apply_edit() {
+    a := new_app()
+    a.body = new_text_view("line1\nline2")
+    fx := ext_stage(a, "editor-cmd", join_lines(a.body.lines), ".txt", true)
+    testing.expect_eq(fx, EExt, "stages EExt")
+    testing.expect_streq(a.ext_cmd, "editor-cmd", "cmd stored bare")
+    testing.expect(a.ext_edit, "editor op marked")
+    testing.expect_eq(a.ext_tab, 0, "current tab recorded")
+    f := a.ext_file
+    testing.expect(len(f) > 0, "file path recorded")
+    testing.expect(os.exists(f), "staged file exists")
+    // the stage is born 0600 — staged text can carry secrets and
+    // must never sit world-readable in a shared temp dir.
+    sargs := mkslice(str, 0)
+    sargs = push(sargs, "-c")
+    sargs = push(sargs, "%a")
+    sargs = push(sargs, f)
+    scm := exec.cmd("stat", sargs)
+    [so, se] = scm.output()
+    testing.expect(se == nil, "stat ran")
+    testing.expect_streq(strings.trim(so.stdout as str), "600", "stage mode is 0600")
+    // a second stage gets a different path — no cross-op clobber
+    fx2 := ext_stage(a, "pager-cmd", "x", ".txt", false)
+    testing.expect_eq(fx2, EExt, "pager also stages")
+    testing.expect(a.ext_file != f, "unique per-op file")
+    testing.expect(!a.ext_edit, "pager stays read-only")
+    os.remove(a.ext_file)
+    // editor write-back: changed text lands in the live body + pins
+    a.ext_file = f
+    a.ext_edit = true
+    a.ext_tab = 0
+    os.writefile_(f, "edited body")
+    testing.expect(a.tabs[0].preview, "tab starts preview")
+    ext_apply_edit(a, f, 0)
+    testing.expect_streq(join_lines(a.body.lines), "edited body", "body loaded back")
+    testing.expect(!a.tabs[0].preview, "write-back pins the tab")
+    // unchanged text is a no-op
+    n := len(a.toasts)
+    ext_apply_edit(a, f, 0)
+    testing.expect_eq(len(a.toasts), n, "unchanged text skips write")
+    os.remove(f)
+    // empty cmd toasts + stages nothing (fresh app — the staged
+    // file field keeps the prior op's path, by design)
+    a2 := new_app()
+    fx3 := ext_stage(a2, "", "x", ".txt", false)
+    testing.expect_eq(fx3, ENone, "no cmd → no ext")
+    testing.expect_eq(len(a2.ext_file), 0, "no file staged")
+}
+
+// ---------- save response ----------
+
+fn test_sresp_save_writes_received_body() {
+    a := new_app()
+    // the view is the re-indented pretty copy; the file must get the
+    // compact bytes the server sent.
+    a.resp_body = "{\"a\":1,\"b\":2}"
+    a.resp_view = new_text_view("{\n  \"a\": 1,\n  \"b\": 2\n}")
+    f := "sresp-test-out.json"
+    rm_quiet(f)
+    a.sresp_in = new_line_edit(f)
+    testing.expect(sresp_save(a), "save commits")
+    got := os.readfile_(f)
+    testing.expect_streq(got, "{\"a\":1,\"b\":2}", "raw body written")
+    os.remove(f)
+    // an existing file still refuses (never overwrites)
+    a2 := new_app()
+    a2.resp_body = "x"
+    a2.sresp_in = new_line_edit("AGENTS.md")  // exists in repo root
+    a2.toasts = mkslice(Toast, 0)
+    testing.expect(!sresp_save(a2), "existing refused")
+}
+
+// ---------- variables edit/add/revert ----------
+
+fn var_row_idx(a: ref App, name: str) -> int {
+    i := 0
+    for i < len(a.var_rows) {
+        if var_row_name(a.var_rows[i]) == name {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn test_vars_commit_unchanged_secret() {
+    scratch_coll()
+    a := app_in(COLL_SCRATCH)
+    // edit a masked secret and press enter untouched — the mask must
+    // not become a session override.
+    var_rows_build(a)
+    si := var_row_idx(a, "API_SECRET")
+    testing.expect(si >= 0, "secret row present")
+    a.vars.sel = si
+    vars_action(a, "vars-edit")
+    testing.expect_streq(a.var_edit.text, "••••", "seeded with mask")
+    testing.expect(vars_commit(a), "commit returns")
+    lr := a.env.lookup("API_SECRET")
+    testing.expect(lr.ok, "secret still resolves")
+    testing.expect_streq(lr.value, "tok123", "real value kept")
+    i := 0
+    for i < len(a.session_vars) {
+        testing.expect(a.session_vars[i].name != "API_SECRET", "no session override")
+        i = i + 1
+    }
+    // a changed value still writes the override
+    a.vars.sel = var_row_idx(a, "API_SECRET")
+    vars_action(a, "vars-edit")
+    a.var_edit = new_line_edit("newsecret")
+    testing.expect(vars_commit(a), "changed commits")
+    lr2 := a.env.lookup("API_SECRET")
+    testing.expect_streq(lr2.value, "newsecret", "override applied")
+}
+
+fn test_vars_edit_add_revert() {
+    scratch_coll()
+    a := app_in(COLL_SCRATCH)
+    push_modal(a, MEnvSwitch)
+    a.vars.sel = 1
+    env_pick(a) // dev + dev.local → WHO=devlocal
+    // add mode: "NAME=VALUE" writes a session layer entry
+    push_modal(a, MVariables)
+    vars_action(a, "vars-add")
+    testing.expect_eq(top_modal(a), MVarEdit, "add opens the editor")
+    a.var_edit = new_line_edit("NEWVAR=hello")
+    testing.expect(vars_commit(a), "add commits")
+    pop_modal(a)
+    lr := a.env.lookup("NEWVAR")
+    testing.expect(lr.ok, "new var resolves")
+    testing.expect_streq(lr.value, "hello", "new var value")
+    // bad add refuses and reports
+    vars_action(a, "vars-add")
+    a.var_edit = new_line_edit("NOEQUALS")
+    testing.expect(!vars_commit(a), "missing = refused")
+    pop_modal(a)
+    // edit mode: seeds from the row, writes the session override
+    var_rows_build(a)
+    wi := var_row_idx(a, "WHO")
+    testing.expect(wi >= 0, "WHO row present")
+    a.vars.sel = wi
+    vars_action(a, "vars-edit")
+    testing.expect_eq(top_modal(a), MVarEdit, "edit opens the editor")
+    testing.expect_streq(a.var_edit_name, "WHO", "edit names the row")
+    testing.expect_streq(a.var_edit.text, "devlocal", "seeded with file value")
+    a.var_edit = new_line_edit("sessval")
+    testing.expect(vars_commit(a), "edit commits")
+    pop_modal(a)
+    lr2 := a.env.lookup("WHO")
+    testing.expect_streq(lr2.value, "sessval", "session override wins")
+    // revert drops the override — the file value returns
+    var_rows_build(a)
+    a.vars.sel = var_row_idx(a, "WHO")
+    vars_action(a, "vars-revert")
+    lr3 := a.env.lookup("WHO")
+    testing.expect_streq(lr3.value, "devlocal", "revert restores file value")
+    // reverting a name with no override reports it
+    var_rows_build(a)
+    bi := var_row_idx(a, "BASE")
+    testing.expect(bi >= 0, "BASE row present")
+    a.vars.sel = bi
+    n := len(a.toasts)
+    vars_action(a, "vars-revert")
+    testing.expect_eq(len(a.toasts), n + 1, "no-override revert notes")
+    testing.expect_eq(a.toasts[len(a.toasts) - 1].level, 0, "info level")
+}
+
+// ---------- theme picker enter/escape ----------
+
+fn test_theme_picker_enter_escape() {
+    a := new_app()
+    testing.expect_streq(a.theme_name, "galaxy", "default theme")
+    push_modal(a, MTheme)
+    testing.expect_eq(top_modal(a), MTheme, "picker open")
+    rows := th_rows(a, MTheme)
+    testing.expect_streq(rows[a.th_sel], "galaxy", "cursor lands on active")
+    target := -1
+    i := 0
+    for i < len(rows) {
+        if rows[i] == "nord" {
+            target = i
+        }
+        i = i + 1
+    }
+    testing.expect(target >= 0, "nord row exists")
+    // walk toward nord — theme_preview live-applies each move
+    dir := 1
+    if target < a.th_sel {
+        dir = -1
+    }
+    guard := 0
+    for a.th_sel != target && guard < len(rows) * 2 {
+        th_move(a, MTheme, dir)
+        guard = guard + 1
+    }
+    testing.expect_eq(a.th_sel, target, "cursor on nord")
+    testing.expect_streq(a.theme_name, "nord", "preview applied on move")
+    // escape restores the snapshot
+    dispatch(a, knamed(term.KeyEscape))
+    testing.expect_eq(len(a.modals), 0, "escape closed")
+    testing.expect_streq(a.theme_name, "galaxy", "escape restored the theme")
+    // enter commits the pick
+    push_modal(a, MTheme)
+    a.th_sel = target
+    dispatch(a, knamed(term.KeyEnter))
+    testing.expect_eq(len(a.modals), 0, "enter closed")
+    testing.expect_streq(a.theme_name, "nord", "enter committed the pick")
+}
+
+// ---------- curl import ----------
+
+fn curl_ok(cmd: str) -> own collection.PRequest {
+    [r, e] = import_curl(cmd)
+    testing.expect(e == nil, "import parses: " + cmd)
+    return r
+}
+
+fn curl_err(cmd: str, want: str) {
+    [_, e] = import_curl(cmd)
+    testing.expect(e != nil, "import fails: " + cmd)
+    testing.expect(find(errors.msg(e), want) >= 0, "err mentions: " + want)
+}
+
+fn test_curl_import_basics() {
+    r := curl_ok("curl http://ex.test/a")
+    testing.expect_streq(r.url, "http://ex.test/a", "url")
+    testing.expect_streq(r.method, "", "no -X leaves method empty (decode defaults GET)")
+    r2 := curl_ok("curl -X PUT http://ex.test/b")
+    testing.expect_streq(r2.method, "PUT", "-X method")
+    r3 := curl_ok("curl http://ex.test/c -H 'X-Thing: 1' -H Accept:application/json")
+    testing.expect_eq(len(r3.headers), 2, "headers kept")
+    testing.expect_streq(r3.headers[0].name, "X-Thing", "header name")
+    testing.expect_streq(r3.headers[0].value, "1", "header value")
+    r4 := curl_ok("curl -I http://ex.test/h")
+    testing.expect_streq(r4.method, "HEAD", "-I → HEAD")
+    // query string splits into params rows
+    r5 := curl_ok("curl 'http://ex.test/q?a=1&b=2'")
+    testing.expect_eq(len(r5.params), 2, "query params")
+    testing.expect_streq(r5.params[0].name, "a", "param name")
+    testing.expect_streq(r5.params[1].value, "2", "param value")
+    // -G moves -d onto the query — carried as params rows so the
+    // planner sends every pair exactly once
+    r6 := curl_ok("curl -G http://ex.test/g -d a=1 -d b=2")
+    testing.expect_eq(len(r6.params), 2, "data became query rows")
+    testing.expect_streq(r6.params[0].name, "a", "row name")
+    testing.expect_streq(r6.method, "", "-G stays method-less (GET)")
+    // the query lives in params only — never duplicated on the URL
+    r7 := curl_ok("curl 'http://ex.test/dup?tag=a&tag=b'")
+    testing.expect_streq(r7.url, "http://ex.test/dup", "query off the url")
+    testing.expect_eq(len(r7.params), 2, "pairs kept")
+    // fragment survives the strip
+    r8 := curl_ok("curl 'http://ex.test/fr?x=1#frag'")
+    testing.expect_streq(r8.url, "http://ex.test/fr#frag", "fragment kept")
+    testing.expect_eq(len(r8.params), 1, "param row")
+}
+
+fn test_curl_import_shell_words() {
+    // comments only start at a word boundary — a '#' mid-word (or
+    // quoted) stays part of the word (URL fragments work).
+    r := curl_ok("curl http://ex.test/a # -X DELETE")
+    testing.expect_streq(r.url, "http://ex.test/a", "comment ignored")
+    testing.expect_streq(r.method, "", "comment args not applied")
+    r2 := curl_ok("curl http://ex.test/a#frag")
+    testing.expect_streq(r2.url, "http://ex.test/a#frag", "fragment kept")
+    // quoted words resume tokenizing at the closing quote — args
+    // after them are not dropped.
+    r4 := curl_ok("curl -H \"Accept: text/plain\" http://ex.test/q")
+    testing.expect_streq(r4.url, "http://ex.test/q", "url after \"..\"")
+    testing.expect_streq(r4.headers[0].value, "text/plain", "header value")
+    r5 := curl_ok("curl -d $'a\\nb' http://ex.test/d")
+    testing.expect_streq(r5.url, "http://ex.test/d", "url after $'..'")
+    testing.expect_streq(r5.body.content, "a\nb", "ansi-c escape")
+}
+
+fn test_curl_import_insecure_toggle() {
+    r := curl_ok("curl -k https://ex.test/k")
+    testing.expect(!r.options.verify_ssl, "-k clears verify")
+    testing.expect_eq(r.options.set_mask & 2, 2, "verify mask set")
+    // the last of -k / --no-insecure wins
+    r2 := curl_ok("curl -k --no-insecure https://ex.test/k2")
+    testing.expect(r2.options.verify_ssl, "--no-insecure restores")
+    testing.expect_eq(r2.options.set_mask & 2, 0, "no explicit disable")
+    r3 := curl_ok("curl --no-insecure -k https://ex.test/k3")
+    testing.expect(!r3.options.verify_ssl, "last flag wins again")
+}
+
+fn test_curl_import_data() {
+    // form-looking data lands as form rows
+    r := curl_ok("curl http://ex.test/f -d a=1 -d b=2")
+    testing.expect_streq(r.method, "POST", "data → POST")
+    testing.expect(r.body.has_form_data, "form body")
+    testing.expect_eq(len(r.body.form_data), 2, "two form rows")
+    testing.expect_streq(r.body.content_type, "application/x-www-form-urlencoded", "form ct")
+    // plain data stays a content body
+    r2 := curl_ok("curl http://ex.test/p -d 'plain text'")
+    testing.expect(r2.body.has_content, "content body")
+    testing.expect_streq(r2.body.content, "plain text", "content")
+    testing.expect_streq(r2.body.content_type, "text/plain", "plain ct")
+    // explicit content-type wins
+    r3 := curl_ok("curl http://ex.test/x -H 'Content-Type: text/csv' -d a,b")
+    testing.expect_streq(r3.body.content_type, "text/csv", "explicit ct")
+    // --data-urlencode encodes the value side
+    r4 := curl_ok("curl http://ex.test/u --data-urlencode 'q=a b&c'")
+    testing.expect(r4.body.has_form_data, "urlencoded form")
+    // the encoded value stays one pair — "&" inside did not split —
+    // and form rows carry the decoded value
+    testing.expect_eq(len(r4.body.form_data), 1, "one row, no & split")
+    testing.expect_streq(r4.body.form_data[0].name, "q", "row name")
+    testing.expect_streq(r4.body.form_data[0].value, "a b&c", "decoded value")
+    // literal values may contain '@' — only the file form rejects
+    r5 := curl_ok("curl http://ex.test/u5 --data-urlencode 'name=a@b'")
+    testing.expect(r5.body.has_form_data, "literal @ stays")
+}
+
+fn test_curl_import_json() {
+    r := curl_ok("curl http://ex.test/j --json '{\"k\": 1}'")
+    testing.expect_streq(r.method, "POST", "json → POST")
+    testing.expect(r.body.has_content, "json content")
+    testing.expect_streq(r.body.content, "{\"k\": 1}", "json body")
+    testing.expect_streq(r.body.content_type, "application/json", "json ct")
+    // --json synthesizes Content-Type + Accept when absent
+    saw_ct := false
+    saw_acc := false
+    i := 0
+    for i < len(r.headers) {
+        if ascii_eq(r.headers[i].name, "Content-Type") {
+            saw_ct = true
+        }
+        if ascii_eq(r.headers[i].name, "Accept") {
+            saw_acc = true
+        }
+        i = i + 1
+    }
+    testing.expect(saw_ct && saw_acc, "json headers synthesized")
+    // json-looking -d also picks up the json content type
+    r2 := curl_ok("curl http://ex.test/j2 -d '{\"a\": 2}'")
+    testing.expect_streq(r2.body.content_type, "application/json", "detected json ct")
+}
+
+fn test_curl_import_form() {
+    r := curl_ok("curl http://ex.test/m -F name=ada -F age=30")
+    testing.expect_streq(r.method, "POST", "form → POST")
+    testing.expect(r.body.has_multipart, "multipart body")
+    testing.expect_eq(len(r.body.multipart), 2, "two parts")
+    testing.expect_streq(r.body.multipart[0].name, "name", "part name")
+    testing.expect_streq(r.body.multipart[0].value, "ada", "part value")
+    // @file part carries the path + is_file
+    r2 := curl_ok("curl http://ex.test/up -F 'f=@/tmp/pic.png;type=image/png'")
+    testing.expect_eq(len(r2.body.multipart), 1, "file part")
+    testing.expect(r2.body.multipart[0].is_file, "file flag")
+    testing.expect_streq(r2.body.multipart[0].file, "/tmp/pic.png", "file path")
+    testing.expect_streq(r2.body.multipart[0].content_type, "image/png", "type suffix")
+}
+
+fn test_curl_import_auth() {
+    // -u lands a basic auth block
+    r := curl_ok("curl http://ex.test/a -u alice:s3cret")
+    testing.expect(r.auth != nil, "auth block")
+    testing.expect_streq(r.auth.type, "basic", "basic type")
+    testing.expect_streq(r.auth.basic.username, "alice", "basic user")
+    testing.expect_streq(r.auth.basic.password, "s3cret", "basic pass")
+    // --digest flips the same -u into a digest block
+    r2 := curl_ok("curl --digest http://ex.test/d -u bob:p4ss")
+    testing.expect_streq(r2.auth.type, "digest", "digest type")
+    testing.expect_streq(r2.auth.digest.username, "bob", "digest user")
+    // --oauth2-bearer lands a bearer block
+    r3 := curl_ok("curl http://ex.test/b --oauth2-bearer tok-1")
+    testing.expect_streq(r3.auth.type, "bearer_token", "bearer type")
+    testing.expect_streq(r3.auth.bearer_token.token, "tok-1", "bearer token")
+    // an Authorization header upgrades to the auth block, header row gone
+    r4 := curl_ok("curl http://ex.test/h -H 'Authorization: Bearer" + " abc'")
+    testing.expect_streq(r4.auth.type, "bearer_token", "header → bearer")
+    testing.expect_streq(r4.auth.bearer_token.token, "abc", "bearer creds")
+    testing.expect_eq(len(r4.headers), 0, "auth header consumed")
+    // an explicit Authorization header beats --user (curl precedence)
+    r5 := curl_ok("curl -H 'Authorization: Bearer" + " tk' -u demo:pass http://ex.test/h2")
+    testing.expect_streq(r5.auth.type, "bearer_token", "explicit header wins")
+    testing.expect_streq(r5.auth.bearer_token.token, "tk", "bearer kept")
+}
+
+fn test_curl_import_flags() {
+    // -k relaxes verify; -L is already the default follow
+    r := curl_ok("curl -k https://ex.test/k")
+    testing.expect(!r.options.verify_ssl, "insecure clears verify")
+    r2 := curl_ok("curl http://ex.test/l")
+    testing.expect(r2.options.follow_redirects, "follow default on")
+    // --max-time lands on options.timeout
+    r3 := curl_ok("curl -m 7 http://ex.test/t")
+    testing.expect(r3.options.timeout == 7.0, "max-time → timeout")
+    // -x proxy lands on options.proxy_url
+    r4 := curl_ok("curl -x http://proxy:8080 http://ex.test/p")
+    testing.expect_streq(r4.options.proxy_url, "http://proxy:8080", "proxy")
+    // -b cookies join onto a Cookie header
+    r5 := curl_ok("curl http://ex.test/c -b a=1 -b b=2")
+    testing.expect_eq(len(r5.headers), 1, "cookie header")
+    testing.expect_streq(r5.headers[0].name, "Cookie", "cookie name")
+    testing.expect_streq(r5.headers[0].value, "a=1; b=2", "cookies joined")
+    // -A/-e land as their headers
+    r6 := curl_ok("curl http://ex.test/u -A agent/1 -e http://ref.test")
+    testing.expect_streq(r6.headers[0].name, "User-Agent", "UA header")
+    testing.expect_streq(r6.headers[1].value, "http://ref.test", "referer value")
+}
+
+fn test_curl_import_json_file() {
+    // a file-backed --json still claims the JSON defaults
+    r := curl_ok("curl http://ex.test/jf --json @payload.json")
+    testing.expect(r.body.has_file, "file body")
+    testing.expect_streq(r.body.file, "payload.json", "file path")
+    testing.expect_streq(r.body.content_type, "application/json", "json ct default")
+    saw_ct := false
+    saw_acc := false
+    i := 0
+    for i < len(r.headers) {
+        if ascii_eq(r.headers[i].name, "Content-Type") {
+            saw_ct = true
+        }
+        if ascii_eq(r.headers[i].name, "Accept") {
+            saw_acc = true
+        }
+        i = i + 1
+    }
+    testing.expect(saw_ct && saw_acc, "json defaults synthesized")
+    // explicit Content-Type survives
+    r2 := curl_ok("curl http://ex.test/jf2 -H 'Content-Type: text/x' --json @p.json")
+    testing.expect_streq(r2.body.content_type, "text/x", "explicit ct kept")
+    // a non-json file body keeps the form-urlencoded default
+    r3 := curl_ok("curl http://ex.test/bf --data-binary @bin.dat")
+    testing.expect_streq(r3.body.content_type, "application/x-www-form-urlencoded", "non-json default")
+}
+
+fn test_curl_import_errors() {
+    curl_err("wget http://x", "not a curl command")
+    curl_err("curl", "no URL")
+    curl_err("curl 'unterminated", "unterminated")
+    curl_err("curl http://x -d @file.txt", "not supported")
+    curl_err("curl http://x --data-urlencode name@payload.txt", "not supported")
+    curl_err("curl http://x --data-urlencode @payload.txt", "not supported")
+    curl_err("curl http://x -F noequals", "name=value")
+    curl_err("curl http://x -T whole.bin", "--data-binary")
+    curl_err("curl http://x -F f=@- ", "regular file path")
+    curl_err("curl -X NOPE http://x", "unsupported method")
+    curl_err("curl http://x -d a=1 -F n=v", "cannot combine")
+}
+
+fn test_curl_apply_replaces_draft() {
+    a := new_app()
+    apply_curl(a, "curl -X PATCH http://ex.test/z -d k=v")
+    t := a.tabs[a.cur_tab]
+    testing.expect_streq(t.draft.method, "PATCH", "draft method replaced")
+    testing.expect_streq(t.draft.url.text, "http://ex.test/z", "draft url replaced")
+    saw := false
+    i := 0
+    for i < len(a.toasts) {
+        if find(a.toasts[i].msg, "curl imported") >= 0 {
+            saw = true
+        }
+        i = i + 1
+    }
+    testing.expect(saw, "import toast")
+    // a bad command toasts the error and leaves the draft alone
+    a2 := new_app()
+    apply_curl(a2, "curl")
+    testing.expect_eq(len(a2.toasts), 1, "error toast")
+    testing.expect_eq(a2.toasts[0].level, 2, "error level")
+    testing.expect_streq(a2.tabs[0].draft.url.text, "", "draft untouched")
+}
+
+// ---------- review-round-2 regressions ----------
+
+fn test_rebind_preserves_uppercase_rune() {
+    // "G" must stay "G" through keymap parsing — lowercasing it
+    // would bind plain g and lose the shift requirement.
+    a := new_app()
+    st := config.defaults()
+    st.load_user_themes = false
+    st.keymap = push(st.keymap, model.KV{name: "toggle-collection", value: "G", enabled: true})
+    apply_settings(a, st)
+    specs := reb_specs_for(a, "toggle-collection")
+    testing.expect_eq(len(specs), 1, "one spec bound")
+    testing.expect_streq(specs[0], "G", "case preserved")
+    bs := global_bindings(a)
+    saw := false
+    i := 0
+    for i < len(bs) {
+        if bs[i].action == "toggle-collection" && bs[i].pat.ch == "g" && bs[i].pat.shift {
+            saw = true
+        }
+        i = i + 1
+    }
+    testing.expect(saw, "shift+g bound")
+    testing.expect(a.sidebar_on, "sidebar starts on")
+    // leave the url bar — a bare rune there is text, not a key
+    a.focus = FReqTabs
+    dispatch(a, kev("g", false, false, false))
+    testing.expect(a.sidebar_on, "plain g does not toggle")
+    dispatch(a, kev("g", false, false, true))
+    testing.expect(!a.sidebar_on, "shift+g toggles")
+}
+
+fn test_vsug_stale_anchor_invalidated() {
+    // ctrl+u removes the activating '$' — the suggestion state must
+    // not survive to rewrite unrelated text on Enter.
+    a := new_app()
+    a.focus = FUrl
+    session_set(a, "BASE", "http://x")
+    a.url.text = "$"
+    a.url.cur = 1
+    vsug_start(a)
+    testing.expect(a.vsug_on, "list open on $")
+    // the edit that deletes '$' (ctrl+u / del_to_start) leaves
+    // vsug_pos pointing at non-'$' text once new text is typed.
+    a.url.text = "AB"
+    a.url.cur = 2
+    vsug_maybe_open(a)
+    testing.expect(!a.vsug_on, "stale anchor closed the list")
+    // even with state forced back on, dispatch must not consume or
+    // apply the suggestion.
+    a.vsug_on = true
+    a.vsug_pos = 0
+    testing.expect(!vsug_dispatch(a, knamed(term.KeyEnter)), "enter passes through")
+    testing.expect(!a.vsug_on, "state cleared")
+    testing.expect_streq(a.url.text, "AB", "text untouched")
+}
+
+fn test_history_session_id_propagates() {
+    scratch_coll()
+    a := new_app()
+    a.coll_dir = COLL_SCRATCH + "-sid"
+    a.data_dir = DATA_SCRATCH
+    // an older identical disk row must survive deleting the newer
+    // session entry — same method/url/status, different title.
+    hist_append(a, hist_test_ent("old", "http://x/same"))
+    // install_resp-style: session row pushed with id 0, then
+    // hist_append's assigned id + persisted flag land back on it.
+    he := hist_test_ent("new", "http://x/same")
+    a.history = push(a.history, he)
+    nid := hist_append(a, he)
+    testing.expect(nid != 0, "append returns the disk id")
+    a.history[len(a.history) - 1].id = nid
+    a.history[len(a.history) - 1].persisted = true
+    a.hist = new_list(len(a.history))
+    a.hist.sel = 0
+    hist_delete(a)
+    hl := hist_read(hist_file_of(a))
+    testing.expect_eq(len(hl.ents), 1, "one disk row survives")
+    testing.expect_streq(hl.ents[0].title, "old", "older identical row kept")
+}
+
+fn test_history_unpersisted_delete_keeps_disk() {
+    scratch_coll()
+    a := new_app()
+    a.coll_dir = COLL_SCRATCH + "-unsaved"
+    a.data_dir = DATA_SCRATCH
+    hist_append(a, hist_test_ent("old", "http://x/same"))
+    // a session row hist_append could not persist (lock busy /
+    // oversized) carries no disk identity — deleting it must leave
+    // the file alone even though an identical row exists.
+    a.history = push(a.history, HistEnt{id: 0, persisted: false,
+        title: "new", method: "GET", url: "http://x/same", status: 200,
+        reason: "OK", elapsed_ms: 1.0, size: 1, req_yaml: "",
+        resp_text: "", resp_hdr_rows: nil, resp_ck_rows: nil,
+        resp_tr_rows: nil})
+    a.hist = new_list(len(a.history))
+    a.hist.sel = 0
+    hist_delete(a)
+    hl := hist_read(hist_file_of(a))
+    testing.expect_eq(len(hl.ents), 1, "disk row untouched")
+    testing.expect_streq(hl.ents[0].title, "old", "older row survives")
+}
+
+fn test_curl_data_urlencode_at_with_equals_is_literal() {
+    // curl checks '=' before '@': 'user@domain=value' is a literal
+    // field, not a file reference.
+    r := curl_ok("curl http://ex.test/u --data-urlencode 'user@domain=value'")
+    testing.expect(r.body.has_form_data, "literal @ field imports")
+    testing.expect_eq(len(r.body.form_data), 1, "one row")
+    testing.expect_streq(r.body.form_data[0].name, "user@domain", "name keeps @")
+    testing.expect_streq(r.body.form_data[0].value, "value", "value side")
+    // the file-backed forms still reject
+    curl_err("curl http://x --data-urlencode name@payload.txt", "not supported")
+    curl_err("curl http://x --data-urlencode @payload.txt", "not supported")
+}
+
+fn test_req_tab_for_name_kind_scoped() {
+    // focus tab names resolve against the opened request's kind —
+    // tab sets differ per kind and "options" sits at a different
+    // index; unknown names fall back to the first tab.
+    testing.expect_eq(req_tab_for_name("options", KHttp), 6, "http options idx")
+    testing.expect_eq(req_tab_for_name("options", KGrpc), 4, "grpc options idx")
+    testing.expect_eq(req_tab_for_name("metadata", KGrpc), 0, "grpc metadata idx")
+    testing.expect_eq(req_tab_for_name("body", KGrpc), 0, "unknown name falls back")
+    testing.expect_eq(req_tab_for_name("headers", KWs), 1, "ws headers idx")
+    testing.expect_eq(req_tab_for_name("params", KGraphql), 1, "graphql params idx")
+}
+
+fn test_history_unpersisted_survives_reload() {
+    scratch_coll()
+    a := new_app()
+    a.coll_dir = COLL_SCRATCH + "-reload"
+    a.data_dir = DATA_SCRATCH
+    hist_append(a, hist_test_ent("disk", "http://x/disk"))
+    // a session row that never reached the file (busy lock or
+    // oversized at append time) stays persisted=false in memory.
+    a.history = push(a.history, hist_test_ent("mem-only", "http://x/mem"))
+    hist_load(a)
+    testing.expect_eq(len(a.history), 2, "disk + session rows kept")
+    testing.expect_streq(a.history[0].url, "http://x/disk", "disk row first")
+    testing.expect_streq(a.history[1].url, "http://x/mem", "unpersisted row survives")
+    testing.expect(!a.history[1].persisted, "still unpersisted")
+    // a second reload must not duplicate the carried row
+    hist_load(a)
+    testing.expect_eq(len(a.history), 2, "no duplication on re-reload")
+}
+
+fn test_env_memory_save_breaks_stale_lock_file() {
+    scratch_coll()
+    // older builds could leave a .lock FILE beside environments.json —
+    // hist_lock clears it so the save still lands.
+    os.mkdir_all(DATA_SCRATCH)
+    os.writefile_(DATA_SCRATCH + "/environments.json.lock", "")
+    a := app_in(COLL_SCRATCH)
+    push_modal(a, MEnvSwitch)
+    a.vars.sel = 1
+    env_pick(a)
+    testing.expect_streq(remember_recall(a), "dev", "save lands past stale lock")
+}
