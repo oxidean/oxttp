@@ -4,6 +4,9 @@ work_item_id: WI-0017
 run_id: run_1795820505640_618d77
 kind: clarification
 question: 'Ship gate: PR #20 is open and green; merging requires human approval per policy.yaml (production_deploy: human). Please review and approve/reject the ship.'
-status: pending
+status: answered
+answer: 'Approved; PR #20 merged as ec265959604bf20bddbbaba33d540f84d4f2c990.'
 created_by: ox-agent
+answered_by: JesseKoldewijn
 created_at: "2026-11-27T23:02:15Z"
+answered_at: "2026-11-28T05:19:00Z"
