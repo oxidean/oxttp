@@ -7,6 +7,7 @@ package http
 import "std/errors"
 
 import "std/testing"
+import "std/net"
 
 import "std/encoding/base64"
 
@@ -454,7 +455,14 @@ fn test_bad_and_https_urls() {
 }
 
 fn test_conn_refused() {
-    r := rq("GET", "http://127.0.0.1:1/")
+    // Port 1 is blackholed rather than rejected on some loopback
+    // virtualization layers (notably WSL). Allocate and close a real
+    // port so the refusal is deterministic without needing a timeout.
+    [l, le] = net.listen(0)
+    testing.expect(le == nil, "refusal probe listener")
+    port := l.port()
+    l.close()
+    r := rq("GET", "http://127.0.0.1:" + itoa(port) + "/")
     [_resp, e] = request(r)
     testing.expect(e != nil, "refused errors")
 }

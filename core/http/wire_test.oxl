@@ -240,6 +240,33 @@ fn test_read_chunked() {
     testing.expect(be4 != nil, "truncated trailer errors")
 }
 
+fn test_read_capped_sse() {
+    // WI-0020 ADR-0055: SSE body reads stop at the 64 MiB ceiling
+    // instead of draining an unbounded stream.
+    r := sreader("0123456789")
+    [cr, ce] = read_eof_capped(r, 4)
+    testing.expect(ce == nil, "capped eof clean")
+    testing.expect(cr.hit, "cap hit before eof")
+    testing.expect_streq(cr.data as str, "0123", "capped bytes")
+    r2 := sreader("short")
+    [cr2, ce2] = read_eof_capped(r2, 100)
+    testing.expect(ce2 == nil && !cr2.hit, "under cap no hit")
+    testing.expect_streq(cr2.data as str, "short", "under cap bytes")
+    r2e := sreader("abcd")
+    [cr2e, ce2e] = read_eof_capped(r2e, 4)
+    testing.expect(ce2e == nil && !cr2e.hit, "exact cap is not truncation")
+    testing.expect_streq(cr2e.data as str, "abcd", "exact cap bytes")
+
+    wire := "8\r\nabcdefgh\r\n8\r\nijklmnop\r\n0\r\n\r\n"
+    [cc, cce] = read_chunked_cap(sreader(wire), 10)
+    testing.expect(cce == nil, "capped chunk clean")
+    testing.expect(cc.hit, "chunk cap hit")
+    testing.expect_streq(cc.body.data as str, "abcdefghij", "chunk capped data")
+    [cc2, cce2] = read_chunked_cap(sreader(wire), 0)
+    testing.expect(cce2 == nil && !cc2.hit, "unbounded chunk")
+    testing.expect_streq(cc2.body.data as str, "abcdefghijklmnop", "full chunk data")
+}
+
 fn test_decode_body() {
     // python: gzip.compress(b"hello oxttp", mtime=0)
     gz := "1f8b08000000000002ffcb48cdc9c957c8af28292900007692580c0b000000"

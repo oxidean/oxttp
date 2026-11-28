@@ -1353,7 +1353,7 @@ fn run_exec(o: ref RunOpts, t: http.Transport) -> own RunRep {
         if len(sp.req.cert_pem) > 0 && resp.tls_ver == tls.V12 {
             rep.stderr = rep.stderr + "posting run: warning: " + n.rel + ": client certificate was not presented (TLS 1.2 sends an empty certificate list in this build)\n"
         }
-        if model.status_class(resp.status) == 2 {
+        if run_resp_failed(n.req.kind, resp) {
             // upstream runRequest: Error = TrimSpace(Code+" "+Text)
             // and the response still rides along in the report.
             serr := trim_space(itoa(resp.status) + " " + resp.reason)
@@ -1576,13 +1576,63 @@ fn resp_json(req: ref model.Req, resp: model.Resp, rts: int) -> str {
     if len(ct) > 0 {
         extra = extra + ",\"contentType\":" + jesc(ct)
     }
+    if len(resp.stream_error) > 0 {
+        extra = extra + ",\"streamError\":" + jesc(resp.stream_error)
+    }
     extra = extra + ",\"receivedAt\":" + itoa(rts)
     head := "{\"method\":" + jesc(req.method) + ",\"url\":" + jesc(req.url) + ",\"status\":" + jesc(itoa(resp.status) + " " + resp.reason) + ",\"statusCode\":" + itoa(resp.status) + extra + ",\"headers\":[" + h + "],"
-    tail := "\"size\":" + itoa(len(resp.body)) + ",\"elapsedMs\":" + ftoa(resp.elapsed_ms) + "}"
+    evs := ""
+    if resp.events != nil {
+        evs = events_json(resp.events)
+    }
+    tail := "\"size\":" + itoa(len(resp.body)) + ",\"elapsedMs\":" + ftoa(resp.elapsed_ms)
+    if len(evs) > 0 {
+        tail = tail + ",\"events\":" + evs
+    }
+    tail = tail + "}"
     if !is_utf8(resp.body) {
         return head + "\"bodyBase64\":" + jesc(base64.encode(resp.body)) + "," + tail
     }
     return head + "\"body\":" + jesc(resp.body as str) + "," + tail
+}
+
+fn run_resp_failed(kind: str, resp: model.Resp) -> bool {
+    // Headless runs fail on transport/status/capture outcomes only:
+    // corpus §1.4 explicitly keeps GraphQL/gRPC payload "error" states
+    // passing unless a declared capture fails.
+    return model.status_class(resp.status) == 2
+}
+
+fn events_json(evs: own []model.StreamEvent) -> str {
+    out := "["
+    i := 0
+    first := true
+    for i < len(evs) {
+        ev := evs[i]
+        if !first {
+            out = out + ","
+        }
+        first = false
+        out = out + "{\"at\":" + itoa(ev.at_ms) + ",\"kind\":" + itoa(ev.kind)
+        if len(ev.title) > 0 {
+            out = out + ",\"title\":" + jesc(ev.title)
+        }
+        // upstream []byte marshals base64 — keep that wire shape even
+        // for a legal empty event payload.
+        out = out + ",\"body\":" + jesc(base64.encode(ev.body))
+        if len(ev.content_type) > 0 {
+            out = out + ",\"contentType\":" + jesc(ev.content_type)
+        }
+        if len(ev.event) > 0 {
+            out = out + ",\"event\":" + jesc(ev.event)
+        }
+        if len(ev.id) > 0 {
+            out = out + ",\"id\":" + jesc(ev.id)
+        }
+        out = out + "}"
+        i = i + 1
+    }
+    return out + "]"
 }
 
 fn is_utf8(b: []byte) -> bool {

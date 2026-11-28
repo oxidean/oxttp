@@ -99,9 +99,18 @@ struct RDraft {
     headers: KVTable,
     query_kv: KVTable,
     path_kv: KVTable,
-    body: TextView,
+    body: TextView, // active text buffer — gql Query/Variables edit through it (sync on tab switch)
+    gql_query: TextView, // graphql document storage (kind graphql only)
+    gql_vars: TextView,  // graphql variables JSON storage
+    gql_op: LineEdit,    // graphql operationName
+    gql_op_on: bool,     // operation-name edit focus on the Query tab
     resp_view: TextView,
     resp_rows: ListCur,
+    resp_events: own []model.StreamEvent, // SSE stream log; nil for unary
+    resp_is_sse: bool,   // response CT was text/event-stream → "Events" label
+    msg_detail: int,     // >=0 = inspecting that event's body
+    msg_following: bool,
+    msg_rows: []str,     // formatted Messages/Events rows (install-time)
     resp_body: str,  // received body text (resp_view may re-indent it)
     resp_hdr_rows: []str,
     resp_ck_rows: []str,
@@ -260,6 +269,10 @@ struct App {
     path_kv: KVTable,
     body: TextView,      // editable-ish area is simplified to view+append
     body_edit: bool,
+    gql_query: TextView,
+    gql_vars: TextView,
+    gql_op: LineEdit,
+    gql_op_on: bool,
     body_ct: int,        // 0 json 1 text 2 xml 3 html
     resp_view: TextView,
     resp_rows: ListCur,
@@ -267,6 +280,11 @@ struct App {
     resp_hdr_rows: []str,
     resp_ck_rows: []str,
     resp_tr_rows: []str,
+    resp_events: own []model.StreamEvent,
+    resp_is_sse: bool,
+    msg_detail: int,
+    msg_following: bool,
+    msg_rows: []str,
     resp_title: str,
     resp_class: int,
     path: str,           // live draft backing file (mirrors RDraft.path)

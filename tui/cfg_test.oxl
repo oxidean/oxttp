@@ -1017,7 +1017,28 @@ fn test_req_tab_for_name_kind_scoped() {
     testing.expect_eq(req_tab_for_name("metadata", KGrpc), 0, "grpc metadata idx")
     testing.expect_eq(req_tab_for_name("body", KGrpc), 0, "unknown name falls back")
     testing.expect_eq(req_tab_for_name("headers", KWs), 1, "ws headers idx")
-    testing.expect_eq(req_tab_for_name("params", KGraphql), 1, "graphql params idx")
+    testing.expect_eq(req_tab_for_name("params", KGraphql), 4, "graphql params idx")
+}
+
+fn test_graphql_external_edit_targets_payload_buffer() {
+    a := new_app()
+    a.kind = KGraphql
+    a.focus = FReqPane
+    a.req_tab = 0 // Query
+    a.gql_query = new_text_view("query Q { x }")
+    a.gql_vars = new_text_view("{\"id\":1}")
+    testing.expect_streq(body_text_for(a), "query Q { x }", "pager source is query document")
+    f := "/tmp/oxttp-gql-ext-edit.txt"
+    os.writefile_(f, "query Q { y }")
+    ext_apply_edit(a, f, a.cur_tab)
+    testing.expect_streq(join_lines(a.gql_query.lines), "query Q { y }", "editor writes query buffer")
+    testing.expect_streq(join_lines(a.body.lines), "", "http body untouched")
+    a.req_tab = 1 // Variables
+    testing.expect_streq(body_text_for(a), "{\"id\":1}", "pager source is variables")
+    os.writefile_(f, "{\"id\":2}")
+    ext_apply_edit(a, f, a.cur_tab)
+    testing.expect_streq(join_lines(a.gql_vars.lines), "{\"id\":2}", "editor writes variables buffer")
+    os.remove(f)
 }
 
 fn test_history_unpersisted_survives_reload() {

@@ -183,7 +183,7 @@ fn test_graphql_bodies_import_as_graphql() {
     testing.expect(res.requests[0].req.graphql != nil, "graphql payload")
     if res.requests[0].req.graphql != nil {
         testing.expect(contains(res.requests[0].req.graphql.query, "query User"), "query text")
-        testing.expect(res.requests[0].req.graphql.variables != nil, "variables json")
+        testing.expect(len(res.requests[0].req.graphql.variables) > 0, "variables json")
     }
     testing.expect_streq(res.requests[0].req.url, "${base}/graphql", "url")
     testing.expect(res.requests[0].req.auth != nil && res.requests[0].req.auth.type == "bearer_token", "bearer auth")

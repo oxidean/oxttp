@@ -110,6 +110,20 @@ struct Trace {
 
 // Resp is one received response. body is raw bytes (latin1/UTF-8
 // display handling is the printer's concern).
+// StreamEvent is one entry in a streaming exchange's log (corpus
+// §4.15 Messages log / upstream model.MessageEvent). kind: 0 sent,
+// 1 received, 2 info, 3 error. at_ms is unix-ms local observation
+// time; event/id carry SSE metadata (empty for other protocols).
+struct StreamEvent {
+    at_ms: int,
+    kind: int,
+    title: str,
+    body: []byte,
+    content_type: str,
+    event: str,
+    id: str,
+}
+
 struct Resp {
     status: int,
     reason: str,
@@ -122,6 +136,8 @@ struct Resp {
     hops: own []Hop, // redirect-chain exchanges before this response
     trace: own Trace,
     tls_ver: int, // negotiated TLS version (tls.V12/V13); 0 = cleartext
+    events: own []StreamEvent, // SSE/stream log; nil for unary responses
+    stream_error: str, // interrupted-stream explanation; "" when clean
 }
 
 // status_class: <300 success(0), <400 redirect(1), else error(2) —

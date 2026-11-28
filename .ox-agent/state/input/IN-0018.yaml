@@ -1,0 +1,9 @@
+schema_version: 1
+request_id: IN-0018
+work_item_id: WI-0020
+run_id: run_1795852420640_4742aa
+kind: clarification
+question: human merge approval required for WI-0020 after its PR is green and review-complete
+status: pending
+created_by: ox-agent
+created_at: "2026-11-28T07:53:55Z"

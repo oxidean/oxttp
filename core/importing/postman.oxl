@@ -1109,7 +1109,9 @@ fn pconvert_body(p: ref PParser, req: ref collection.PRequest, b: ref json.Json,
             }
         }
         vt := ptemplate(p, varv, scp, where)
-        g.variables = json.jparse(vt)
+        if json.jparse(vt) != nil {
+            g.variables = vt
+        }
         req.graphql = g
         req.kind = "graphql"
         return ""

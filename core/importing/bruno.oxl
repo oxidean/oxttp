@@ -4,7 +4,7 @@ package importing
 // (posting @32c4566): scope layering, expansion, convert,
 // environments, diagnostics. Deviations (ADR-0065): vars/auth
 // fields are ordered KV lists standing in for Go maps (last wins);
-// graphql.variables must already be JSON for PGraphQL.
+// graphql.variables is stored as raw JSON text (validated on import).
 import "std/encoding/json"
 import "std/errors"
 import "std/math"
@@ -981,11 +981,10 @@ fn convert(d: []BBlock, parent: ref BScope, res: ref Result) -> [own collection.
         gvars := dtext(d, "body:graphql:vars")
         vt := bexpand(e, res, gvars, mkslice(str, 0), true)
         if len(btrim(vt)) > 0 {
-            jv := json.jparse(vt)
-            if jv == nil {
+            if json.jparse(vt) == nil {
                 bwarn(res, "GraphQL variables are not valid JSON after expansion; variables omitted")
             } else {
-                g.variables = jv
+                g.variables = vt
             }
         }
         req.graphql = g

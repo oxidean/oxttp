@@ -683,13 +683,13 @@ fn hdr_value_out(v: str, f: ref Fmt) -> str {
         return sgr_wrap("header_value", v, f)
     }
     disp := hdr_latin1(v, f.out_tty)
-    if utf8_valid(v) != 0 {
+    if fmt_utf8_valid(v) != 0 {
         return sgr_wrap("error", disp, f) + sgr_wrap("default", " (UTF-8: ", f) + sgr_wrap("header_value", v, f) + sgr_wrap("default", ")", f)
     }
     return sgr_wrap("error", disp, f)
 }
 
-fn utf8_valid(s: str) -> int {
+fn fmt_utf8_valid(s: str) -> int {
     i := 0
     for i < len(s) {
         fr := u8_dec(s, i)

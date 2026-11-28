@@ -593,3 +593,41 @@ fn test_run_ssl_password_and_tls12_warn() {
     testing.expect(find(rep.stderr, "encrypted private keys") < 0, "no cert → no password warning")
     os.remove_all(dir)
 }
+
+
+fn test_resp_json_stream_error_and_events() {
+    r := fake_resp(200, "text/event-stream", "data: x\n\n", nil)
+    r.stream_error = "SSE response exceeded 64.00 MB"
+    evs := mkslice(model.StreamEvent, 0)
+    evs = push(evs, model.StreamEvent{at_ms: 1234, kind: 1, title: "", body: "hi" as []byte, content_type: "text/plain", event: "tick", id: "7"})
+    evs = push(evs, model.StreamEvent{at_ms: 1235, kind: 1, title: "", body: mkslice(byte, 0), content_type: "text/plain", event: "empty", id: ""})
+    r.events = new(evs)
+    rq := new(model.Req)
+    rq.method = "GET"
+    rq.url = "http://x.test/sse"
+    j := resp_json(rq, r, 1700000000000)
+    testing.expect(find(j, "\"streamError\":\"SSE response exceeded 64.00 MB\"") >= 0, "streamError emitted")
+    testing.expect(find(j, "\"events\":[") >= 0, "events emitted")
+    testing.expect(find(j, "\"at\":1234") >= 0, "event at")
+    testing.expect(find(j, "\"body\":\"aGk=\"") >= 0, "event body base64")
+    testing.expect(find(j, "\"body\":\"\"") >= 0, "empty event body still emitted")
+    testing.expect(find(j, "\"event\":\"tick\"") >= 0, "event name")
+    testing.expect(find(j, "\"id\":\"7\"") >= 0, "event id")
+}
+
+fn test_run_graphql_payload_errors_pass() {
+    // corpus §1.4: GraphQL payload-level errors are data, not transport
+    // failure. Headless runs pass unless a declared capture fails.
+    dir := "/tmp/oxttp-run-gqlwarn"
+    os.remove_all(dir)
+    os.mkdir_all(dir)
+    os.writefile_(dir + "/q.posting.yaml", "name: q\nkind: graphql\nurl: http://x.test/graphql\ngraphql:\n  query: '{ q }'\n")
+    o := new(RunOpts)
+    o.target = dir
+    fx := FakeSend{resp: fake_resp(200, "application/json", "{\"errors\":[{\"message\":\"bad\"}]}", nil), fail: "", expect_path: ""}
+    rep := run_exec(o, fx)
+    testing.expect(len(rep.err) == 0, "err: " + rep.err)
+    testing.expect(rep.code == 0, "graphql payload errors pass run")
+    testing.expect(find(rep.lines[0], "PASSED q.posting.yaml") == 0, "passed line")
+    os.remove_all(dir)
+}
