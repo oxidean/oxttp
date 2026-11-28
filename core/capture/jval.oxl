@@ -207,7 +207,25 @@ fn jparse_str(p: mut JCur) -> str {
             p.err = 1
             return ""
         }
-        out = push(out, c)
+        if c >= 128 {
+            d := utf8.decode(p.src, p.pos)
+            if d.r == 65533 && d.n == 1 {
+                // Go's decoder replaces each malformed byte with
+                // U+FFFD rather than preserving invalid UTF-8.
+                out = push(out, 239)
+                out = push(out, 191)
+                out = push(out, 189)
+            } else {
+                j := 0
+                for j < d.n {
+                    out = push(out, byteat(p.src, p.pos + j))
+                    j = j + 1
+                }
+                p.pos = p.pos + d.n - 1
+            }
+        } else {
+            out = push(out, c)
+        }
         p.pos = p.pos + 1
     }
     p.err = 1

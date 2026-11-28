@@ -22,7 +22,14 @@ import "github.com/oxidean/oxttp/core/model"
 // ---------- path-encoded matches ----------
 
 struct JStep { is_idx: bool, name: str, idx: int }
-struct JPath { steps: []JStep }
+struct JPath {
+    steps: []JStep,
+    // Evaluation-local borrowed cursor annotation (single-element
+    // slice because heap objects cannot store a bare ref in v0). It
+    // is never authoritative for equality; absent means fall back to
+    // the original root-relative walk.
+    node: []ref JVal,
+}
 
 fn jpath_push(p: JPath, st: JStep) -> JPath {
     // copy steps — push() may write into shared backing, and sibling
@@ -34,7 +41,13 @@ fn jpath_push(p: JPath, st: JStep) -> JPath {
         i = i + 1
     }
     ns = push(ns, st)
-    return JPath{steps: ns}
+    return JPath{steps: ns, node: nil}
+}
+
+fn jpath_root(root: ref JVal) -> JPath {
+    let ns: []ref JVal = nil
+    ns = push(ns, root)
+    return JPath{steps: nil, node: ns}
 }
 
 fn jpath_eq(a: JPath, b: JPath) -> bool {
@@ -55,6 +68,9 @@ fn jpath_eq(a: JPath, b: JPath) -> bool {
 
 // jwalk moves a borrowed cursor along p; returns the node kind or -1.
 fn jwalk(root: ref JVal, p: JPath) -> int {
+    if len(p.node) > 0 {
+        return p.node[0].kind
+    }
     cur := root
     i := 0
     for i < len(p.steps) {
@@ -101,40 +117,46 @@ fn jchild_paths(root: ref JVal, p: JPath) -> []JPath {
     if kind != 4 && kind != 5 {
         return out
     }
-    // re-walk to reach the node for child iteration
+    // Annotated paths already point at their node; unannotated paths
+    // keep the original root-relative fallback walk.
     cur := root
-    i := 0
-    for i < len(p.steps) {
-        st := p.steps[i]
-        nxt := new(JVal)
-        if st.is_idx {
-            n := 0
-            m := cur.child
-            for m != nil {
-                if n == st.idx {
-                    nxt = m
-                    break
+    if len(p.node) > 0 {
+        cur = p.node[0]
+    } else {
+        i := 0
+        for i < len(p.steps) {
+            st := p.steps[i]
+            nxt := new(JVal)
+            if st.is_idx {
+                n := 0
+                m := cur.child
+                for m != nil {
+                    if n == st.idx {
+                        nxt = m
+                        break
+                    }
+                    n = n + 1
+                    m = m.next
                 }
-                n = n + 1
-                m = m.next
-            }
-        } else {
-            m := cur.child
-            for m != nil {
-                if m.key == st.name {
-                    nxt = m
+            } else {
+                m := cur.child
+                for m != nil {
+                    if m.key == st.name {
+                        nxt = m
+                    }
+                    m = m.next
                 }
-                m = m.next
             }
+            cur = nxt
+            i = i + 1
         }
-        cur = nxt
-        i = i + 1
     }
     if kind == 5 {
         n := 0
         m := cur.child
         for m != nil {
             cp := jpath_push(p, JStep{is_idx: true, name: "", idx: n})
+            cp.node = push(cp.node, m)
             out = push(out, cp)
             n = n + 1
             m = m.next
@@ -158,6 +180,7 @@ fn jchild_paths(root: ref JVal, p: JPath) -> []JPath {
         [last, le] = collections.map_get(seen, m.key)
         if le == nil && last == pos {
             cp := jpath_push(p, JStep{is_idx: false, name: m.key, idx: 0})
+            cp.node = push(cp.node, m)
             out = push(out, cp)
         }
         pos = pos + 1
@@ -188,6 +211,12 @@ fn jdesc_paths(root: ref JVal, p: JPath) -> []JPath {
 
 // scalar accessors — kind-checked reads at a path.
 fn jstr_at(root: ref JVal, p: JPath) -> str {
+    if len(p.node) > 0 {
+        if p.node[0].kind == 3 {
+            return p.node[0].s
+        }
+        return ""
+    }
     cur := root
     i := 0
     for i < len(p.steps) {
@@ -230,6 +259,12 @@ fn jstr_at(root: ref JVal, p: JPath) -> str {
 
 fn jnum_at(root: ref JVal, p: JPath) -> str {
     // same walk, returns raw lexeme for kind 2
+    if len(p.node) > 0 {
+        if p.node[0].kind == 2 {
+            return p.node[0].s
+        }
+        return ""
+    }
     cur := root
     i := 0
     for i < len(p.steps) {
@@ -272,6 +307,15 @@ fn jnum_at(root: ref JVal, p: JPath) -> str {
 
 fn jbool_at(root: ref JVal, p: JPath) -> int {
     // 1 true, 0 false, -1 not-a-bool/missing
+    if len(p.node) > 0 {
+        if p.node[0].kind == 1 {
+            if p.node[0].b {
+                return 1
+            }
+            return 0
+        }
+        return -1
+    }
     cur := root
     i := 0
     for i < len(p.steps) {
@@ -502,13 +546,23 @@ fn pij_path_int(tok: str, p: mut PCur) -> int {
         pperr(p, "invalid integer path value \"-0\"")
         return 0
     }
+    // Validate the decimal lexeme before conversion: oxl integers
+    // wrap on overflow, so atoi alone can alias huge indexes back
+    // into range (for example 2^64 -> 0). Leading-zero tokens are
+    // already rejected by the scanner, making length + lexicographic
+    // comparison exact here.
+    digits := tok
+    if len(digits) > 0 && byteat(digits, 0) == 45 {
+        digits = substr(digits, 1, len(digits))
+    }
+    bound := "9007199254740991"
+    if len(digits) > len(bound) || len(digits) == len(bound) && digits > bound {
+        pperr(p, "integer path value out of range")
+        return 0
+    }
     [v, e] = strconv.atoi(tok)
     if e != nil {
         pperr(p, "cannot parse integer")
-        return 0
-    }
-    if v > 9007199254740991 || v < -9007199254740991 {
-        pperr(p, "integer path value out of range")
         return 0
     }
     return v
@@ -1251,7 +1305,6 @@ fn pij_parse_singular_query(p: mut PCur, root: bool) -> [own JPQuery, err] {
         c := pij_peek(p, 0)
         if c == 91 { // '['
             p.pos = p.pos + 1
-            pij_skip(p)
             c2 := pij_peek(p, 0)
             sel := new(JPSel)
             if c2 == 34 || c2 == 39 {
@@ -1271,7 +1324,6 @@ fn pij_parse_singular_query(p: mut PCur, root: bool) -> [own JPQuery, err] {
                 pperr(p, "expected name or index")
                 return nil, errors.new("jsonpath: expected name or index")
             }
-            pij_skip(p)
             if pij_peek(p, 0) != 93 {
                 pperr(p, "expected ]")
                 return nil, errors.new("jsonpath: expected ]")
@@ -1626,11 +1678,11 @@ struct PVal {
 }
 
 fn pv_missing() -> PVal {
-    return PVal{kind: 3, paths: nil, vpath: JPath{steps: nil}, vis_lit: false, vkind: -1, ls: "", lb: false, log: false}
+    return PVal{kind: 3, paths: nil, vpath: JPath{steps: nil, node: nil}, vis_lit: false, vkind: -1, ls: "", lb: false, log: false}
 }
 
 fn pv_nodes(paths: []JPath) -> PVal {
-    return PVal{kind: 0, paths: paths, vpath: JPath{steps: nil}, vis_lit: false, vkind: -1, ls: "", lb: false, log: false}
+    return PVal{kind: 0, paths: paths, vpath: JPath{steps: nil, node: nil}, vis_lit: false, vkind: -1, ls: "", lb: false, log: false}
 }
 
 fn pv_value_path(p: JPath) -> PVal {
@@ -1638,11 +1690,11 @@ fn pv_value_path(p: JPath) -> PVal {
 }
 
 fn pv_value_lit(j: ref JVal) -> PVal {
-    return PVal{kind: 1, paths: nil, vpath: JPath{steps: nil}, vis_lit: true, vkind: j.kind, ls: j.s, lb: j.b, log: false}
+    return PVal{kind: 1, paths: nil, vpath: JPath{steps: nil, node: nil}, vis_lit: true, vkind: j.kind, ls: j.s, lb: j.b, log: false}
 }
 
 fn pv_logical(b: bool) -> PVal {
-    return PVal{kind: 2, paths: nil, vpath: JPath{steps: nil}, vis_lit: false, vkind: -1, ls: "", lb: false, log: b}
+    return PVal{kind: 2, paths: nil, vpath: JPath{steps: nil, node: nil}, vis_lit: false, vkind: -1, ls: "", lb: false, log: b}
 }
 
 // pv_jkind — JSON kind of a value operand (-1 missing/non-value).
@@ -1713,6 +1765,31 @@ fn jnum_f64(lex: str) -> F64 {
     if fe != nil || f != f {
         return F64{v: 0.0, ok: false}
     }
+    // strconv.parsefloat is syntax-only in oxl (strtod range errors
+    // are not surfaced). Treat overflow to ±Inf and underflow of a
+    // nonzero mantissa to zero as non-numeric, matching Go's
+    // json.Number.Float64 ErrRange semantics used upstream.
+    [infv, _ife] = strconv.parsefloat("1e999")
+    if f >= infv || f <= -infv {
+        return F64{v: 0.0, ok: false}
+    }
+    if f == 0.0 {
+        nonzero := false
+        i := 0
+        for i < len(lex) {
+            c := byteat(lex, i)
+            if c == 101 || c == 69 {
+                break
+            }
+            if c >= 49 && c <= 57 {
+                nonzero = true
+            }
+            i = i + 1
+        }
+        if nonzero {
+            return F64{v: 0.0, ok: false}
+        }
+    }
     return F64{v: f, ok: true}
 }
 
@@ -1728,7 +1805,11 @@ fn pv_f64(pv: PVal, root: ref JVal) -> F64 {
 // selection stays linear in object size rather than quadratic.
 fn jhas_member(root: ref JVal, p: JPath, name: str) -> bool {
     cur := root
+    if len(p.node) > 0 {
+        cur = p.node[0]
+    }
     i := 0
+    if len(p.node) == 0 {
     for i < len(p.steps) {
         st := p.steps[i]
         nxt := new(JVal)
@@ -1761,6 +1842,7 @@ fn jhas_member(root: ref JVal, p: JPath, name: str) -> bool {
         cur = nxt
         i = i + 1
     }
+    }
     if cur.kind != 4 {
         return false
     }
@@ -1781,7 +1863,7 @@ fn jhas_member(root: ref JVal, p: JPath, name: str) -> bool {
 fn jq_eval(q: ref JPQuery, cur: JPath, root: ref JVal) -> []JPath {
     start := cur
     if q.root {
-        start = JPath{steps: nil}
+        start = jpath_root(root)
     }
     paths := mkslice(JPath, 0)
     paths = push(paths, start)
@@ -1823,6 +1905,28 @@ fn jsel_union_eval(sels: ref JPSel, ip: JPath, out: []JPath, root: ref JVal) -> 
 
 fn jsel_apply(sel: ref JPSel, ip: JPath, out: []JPath, root: ref JVal) -> []JPath {
     if sel.kind == SK_NAME {
+        if len(ip.node) > 0 {
+            par := ip.node[0]
+            if par.kind != 4 {
+                return out
+            }
+            nxt := new(JVal)
+            found := false
+            m := par.child
+            for m != nil {
+                if m.key == sel.name {
+                    nxt = m
+                    found = true
+                }
+                m = m.next
+            }
+            if !found {
+                return out
+            }
+            np := jpath_push(ip, JStep{is_idx: false, name: sel.name, idx: 0})
+            np.node = push(np.node, nxt)
+            return push(out, np)
+        }
         if jhas_member(root, ip, sel.name) {
             return push(out, jpath_push(ip, JStep{is_idx: false, name: sel.name, idx: 0}))
         }
@@ -2173,6 +2277,26 @@ fn regex_dot_rewrite(pat: str) -> str {
             i = i + 1
             continue
         }
+        if c == 92 && i + 1 < len(pat) && byteat(pat, i + 1) == 81 {
+            // \Q...\E quotes a literal region in RE2/Go regexp.
+            // Copy it verbatim — dots inside are already literal and
+            // must not be rewritten.
+            out = push(out, 92)
+            out = push(out, 81)
+            i = i + 2
+            for i < len(pat) {
+                qc := byteat(pat, i)
+                if qc == 92 && i + 1 < len(pat) && byteat(pat, i + 1) == 69 {
+                    out = push(out, 92)
+                    out = push(out, 69)
+                    i = i + 2
+                    break
+                }
+                out = push(out, qc)
+                i = i + 1
+            }
+            continue
+        }
         if c == 92 {
             esc = true
             i = i + 1
@@ -2474,7 +2598,7 @@ fn capture_values(captures: []model.KV, body: []byte) -> [[]model.KV, err] {
         if qe != nil {
             return nil, errors.new("capture " + c.name + ": " + errors.msg(qe))
         }
-        matches := jq_eval(q, JPath{steps: nil}, doc)
+        matches := jq_eval(q, jpath_root(doc), doc)
         if len(matches) != 1 {
             return nil, errors.new("capture " + c.name + ": path \"" + c.value + "\" matched " + itoa(len(matches)) + " values; expected exactly one")
         }
@@ -2611,6 +2735,9 @@ fn jemit_node(cur: ref JVal, b: []byte) -> []byte {
 // directly. Missing trailing/intermediate nodes emit null, preserving
 // jemit_path's existing capture contract.
 fn jemit_path_rec(cur: ref JVal, p: JPath, off: int, b: []byte) -> []byte {
+    if off == 0 && len(p.node) > 0 {
+        return jemit_node(p.node[0], b)
+    }
     if off >= len(p.steps) {
         return jemit_node(cur, b)
     }

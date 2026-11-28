@@ -427,3 +427,60 @@ fn test_capture_extra_upstream_edges() {
     expect_val("{\"items\":[{\"id\":1,\"x\":2}]}", "$.items[?(@.x)].id", "1")
     expect_val("{\"items\":[{\"id\":1,\"s\":\"abc\"}]}", "$.items[?(@.s < \"b\")].id", "1")
 }
+
+fn test_capture_review_range_and_regex_edges() {
+    // Float range failures are non-numeric for ordering; equal lexemes
+    // still compare equal through the raw-text fallback.
+    expect_err("[{\"id\":1,\"n\":1e400}]", "$[?@.n > 5].id")
+    expect_err("[{\"id\":1,\"n\":-1e400}]", "$[?@.n < 5].id")
+    expect_val("[{\"id\":1,\"n\":1e400}]", "$[?@.n == 1e400].id", "1")
+    expect_err("[{\"id\":1,\"n\":1e400}]", "$[?@.n == 1e999].id")
+    expect_err("[{\"id\":1,\"n\":1e-999}]", "$[?@.n == 0].id")
+    testing.expect_streq(regex_dot_rewrite("\\Q.\\E"), "\\Q.\\E", "quoted literal dot preserved")
+    expect_val("{\"items\":[{\"n\":\".\"},{\"n\":\"a\"}]}", "$.items[?(match(@.n, \"\\\\Q.\\\\E\"))].n", ".")
+    expect_err("[{\"a\":[9],\"id\":1}]", "$[?@[ 0] == 9].id")
+    expect_err("[{\"a\":[9],\"id\":1}]", "$[?@[0 ] == 9].id")
+}
+
+fn test_jsonpath_integer_range_no_wraparound() {
+    [_, e] = capture_path("$[18446744073709551616]")
+    testing.expect(e != nil, "2^64 index rejected")
+    [_, e2] = capture_path("$[18446744073709551617]")
+    testing.expect(e2 != nil, "2^64+1 index rejected")
+    [_, e3] = capture_path("$[-9007199254740992]")
+    testing.expect(e3 != nil, "negative range rejected")
+    expect_val("[7,8]", "$[-2]", "7")
+}
+
+fn test_json_invalid_utf8_replaced() {
+    body := mkslice(byte, 0)
+    body = bpush(body, "{\"x\":\"a")
+    body = push(body, 255)
+    body = bpush(body, "b\"}")
+    caps := mkcaps()
+    caps = push(caps, cap1("X", "$.x"))
+    [out, e] = capture_values(caps, body)
+    testing.expect(e == nil, "invalid utf8 decodes like upstream")
+    testing.expect_streq(out[0].value, "a�b", "malformed byte replaced")
+}
+
+fn test_wide_array_filter_and_descendant_complete() {
+    ib := mkslice(byte, 0)
+    ib = bpush(ib, "{\"items\":[")
+    i := 0
+    for i < 3000 {
+        if i > 0 {
+            ib = push(ib, 44)
+        }
+        ib = bpush(ib, "{\"id\":" + itoa(i) + "}")
+        i = i + 1
+    }
+    ib = bpush(ib, "]}")
+    caps := mkcaps()
+    caps = push(caps, cap1("W", "$.items[?(@.id >= 0)].id"))
+    [_, e] = capture_values(caps, ib)
+    testing.expect(e != nil, "multi-match filter completes")
+    caps[0].value = "$..id"
+    [_, e2] = capture_values(caps, ib)
+    testing.expect(e2 != nil, "multi-match descendant completes")
+}
