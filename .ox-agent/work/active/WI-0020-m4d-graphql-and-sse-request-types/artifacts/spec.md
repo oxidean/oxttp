@@ -50,8 +50,9 @@ sse-semantics.md`.
 - After options parse (need `subbody`), build the document:
   - `gql_document(query, variables, operation_name) -> str` —
     `{"query":` + `json.tojson(json.jstr(query))` + optional
-    `,"variables":` + (trimspace-empty omitted; `json.jparse` success →
-    `json.tojson` compact; parse failure → raw spliced) + optional
+    `,"variables":` + (trimspace-empty omitted; valid JSON →
+    whitespace-only compact preserving token lexemes like upstream
+    `json.Compact`; parse failure → raw spliced) + optional
     `,"operationName":` + `json.tojson(json.jstr(op))` + `}`.
     `json.tojson` does not HTML-escape — matches upstream
     `jsonString` (`SetEscapeHTML(false)`).
@@ -76,9 +77,8 @@ sse-semantics.md`.
   content_type: str, event: str, id: str }` — kind: 0 sent, 1
   received, 2 info, 3 error (upstream MessageEventKind order differs;
   document ours). `at_ms` = `time.unix_ms()`; display formats
-  `HH:MM:SS.mmm` local — implement `tui`-side or model-side formatter
-  from unix_ms (civil-from-days algorithm; no std local-time helper —
-  verify `std/time` during impl, else small formatter + test).
+  `HH:MM:SS.mmm`; implementation uses UTC because oxl std/time exposes
+  unix timestamps but no local-zone conversion — recorded deviation D8.
 - `Resp` gains `events: own []StreamEvent` and `stream_error: str`
   (nil/"" for unary — `omitempty` parity).
 - Warning status: `status_class` stays 0/1/2; add
@@ -217,7 +217,10 @@ sse-semantics.md`.
 - `install_resp`: compute warning — needs request kind: use
   `a.pending_preq.kind` (still set at install time? `install_resp`
   runs before `a.pending_preq = nil` — yes, capture kind early) or
-  stash `a.last_kind`. `resp_class` 3 path + title suffix.
+  stash `a.last_kind`. `resp_class` 3 path + title suffix. Any
+  non-empty `stream_error` likewise forces warning class unless the
+  transport status is already error, matching upstream `StatusOf`,
+  and adds a `Stream interrupted` title suffix.
 - `send_failed` unchanged.
 
 ## S7 — TUI: Messages/Events response tab (SSE)
@@ -315,8 +318,8 @@ sse-semantics.md`.
 6. h2 SSE keeps request deadline (no post-header lift) unless impl
    shows the shared cell reaches h2 cheaply (D6).
 7. Message rows monochrome (glyph-only kind distinction) (D7).
-8. `variables:` map form now rejected (upstream-faithful tightening,
-   not a deviation — call out in spec notes).
+8. Message-row timestamps render UTC, not local time; std/time has no
+   local-zone conversion surface in oxl 0.26.x (D8).
 9. `run --json` emits an `events` array upstream's `remote.Response`
    does not carry (upstream emits `streamError` only; verified
    `internal/remote/protocol.go` @ 32c4566). Additive extension —
@@ -325,6 +328,9 @@ sse-semantics.md`.
    Event wire shape is ours: `at` unix-ms int, `kind` int
    (0 sent/1 received/2 info/3 error), `body` base64 (matches
    upstream `[]byte` JSON marshaling).
+
+`variables:` map form is now rejected. That is upstream-faithful
+tightening (`yamlString` is scalar-only), not a deviation.
 
 ## Test plan (per leaf package, `oxl test`)
 
