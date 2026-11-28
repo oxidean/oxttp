@@ -287,3 +287,119 @@ fn test_wide_object_capture_completes() {
     testing.expect(e == nil, "wide object captures")
     testing.expect_eq(len(out), 1, "wide object count")
 }
+
+
+fn test_capture_values_upstream_map() {
+    body := ("{\"data\":{\"id\":9007199254740993,\"items\":[{\"id\":\"first\"},{\"id\":\"${literal}$cash\"}],\"empty\":\"\",\"enabled\":false,\"nothing\":null,\"a.b\":{\"quote\\\"key\":[7,8]}}}") as []byte
+    caps := mkcaps()
+    caps = push(caps, cap1("ID", "data.id"))
+    caps = push(caps, cap1("ITEM", "$.data.items[1].id"))
+    caps = push(caps, cap1("EMPTY", "data.empty"))
+    caps = push(caps, cap1("BOOL", "data.enabled"))
+    caps = push(caps, cap1("NULL", "data.nothing"))
+    caps = push(caps, cap1("ARRAY", "data[\"a.b\"][\"quote\\\"key\"]"))
+    caps = push(caps, cap1("OBJECT", "data.items[0]"))
+    [out, e] = capture_values(caps, body)
+    testing.expect(e == nil, "upstream capture map")
+    testing.expect_eq(len(out), 7, "upstream capture count")
+    i := 0
+    for i < len(out) {
+        if out[i].name == "ID" { testing.expect_streq(out[i].value, "9007199254740993", "ID") }
+        if out[i].name == "ITEM" { testing.expect_streq(out[i].value, "${literal}$cash", "ITEM") }
+        if out[i].name == "EMPTY" { testing.expect_streq(out[i].value, "", "EMPTY") }
+        if out[i].name == "BOOL" { testing.expect_streq(out[i].value, "false", "BOOL") }
+        if out[i].name == "NULL" { testing.expect_streq(out[i].value, "null", "NULL") }
+        if out[i].name == "ARRAY" { testing.expect_streq(out[i].value, "[7,8]", "ARRAY") }
+        if out[i].name == "OBJECT" { testing.expect_streq(out[i].value, "{\"id\":\"first\"}", "OBJECT") }
+        i = i + 1
+    }
+    expect_val("[{\"id\":1},{\"id\":2}]", "[1].id", "2")
+    expect_val("[{\"id\":1},{\"id\":2}]", "$[1].id", "2")
+    expect_val("\"root\"", "$", "root")
+}
+
+fn test_capture_jsonpath_upstream_table() {
+    body := "{\"data\":{\"users\":[{\"id\":12,\"role\":\"member\",\"active\":false},{\"id\":9007199254740993,\"role\":\"admin\",\"active\":true},{\"id\":27}]},\"nested\":{\"session\":{\"token\":\"secret\"}},\"one\":{\"item\":[7,8]},\"unusual.key\":{\"\":\"empty key\"},\"日本語\":{\"id\":\"unicode\"},\"numbers\":[12345678901234567890,1.234567890123456789,1e400]}"
+    expect_val(body, "data.users[?(@.role == \"admin\")].id", "9007199254740993")
+    expect_val(body, "$.data.users[?(@.active == true && @.id > 20)].id", "9007199254740993")
+    expect_val(body, "data.users[?(match(@.role, \"admin\"))].id", "9007199254740993")
+    expect_val(body, "data.users[?(@.id == 12)].id", "12")
+    expect_val(body, "data.users[-1].id", "27")
+    expect_val(body, "data.users[1:2].id", "9007199254740993")
+    expect_val(body, "$..token", "secret")
+    expect_val(body, "nested..token", "secret")
+    expect_val(body, "one.*", "[7,8]")
+    expect_val(body, "[\"unusual.key\"]['']", "empty key")
+    expect_val(body, "日本語.id", "unicode")
+    expect_val(body, "  $.日本語.id  ", "unicode")
+    expect_val(body, "numbers", "[12345678901234567890,1.234567890123456789,1e400]")
+}
+
+fn capture_pair_fails(body: str, path: str) {
+    caps := mkcaps()
+    caps = push(caps, cap1("A_FIRST", "data.id"))
+    caps = push(caps, cap1("Z_LAST", path))
+    [out, e] = capture_values(caps, body as []byte)
+    testing.expect(e != nil, "path must fail: " + path)
+    testing.expect_eq(len(out), 0, "no partial values: " + path)
+}
+
+fn test_capture_failure_upstream_table() {
+    capture_pair_fails("{\"data\":{\"id\":1}}", "data.missing")
+    capture_pair_fails("{\"data\":{\"id\":1}}", "data.id.nested")
+    capture_pair_fails("{\"data\":{\"id\":1},\"items\":[0,1]}", "items[2]")
+    capture_pair_fails("{\"data\":{\"id\":1},\"items\":{}}", "items[0]")
+    capture_pair_fails("{\"data\":{\"id\":1},\"items\":[{\"id\":2},{\"id\":3}]}", "items[*].id")
+    capture_pair_fails("{\"data\":{\"id\":1},\"items\":[{\"id\":2},{\"id\":3}]}", "items[?(@.id > 3)].id")
+    capture_pair_fails("{\"data\":{\"id\":1}}", "data['id','id']")
+    capture_pair_fails("{\"data\":{\"id\":1}} {}", "data.id")
+    capture_pair_fails("<html>not JSON</html>", "data.id")
+    capture_pair_fails("", "data.id")
+    [out2, e2] = capture_values(nil, "not JSON" as []byte)
+    testing.expect(e2 == nil, "nil captures accept non-JSON")
+    testing.expect_eq(len(out2), 0, "nil captures empty")
+}
+
+fn validate_bad_path(path: str) {
+    caps := mkcaps()
+    caps = push(caps, cap1("ID", path))
+    testing.expect(validate(caps) != nil, "bad path accepted: " + path)
+}
+
+fn test_capture_validation_upstream_table() {
+    validate_bad_path("")
+    validate_bad_path(" ")
+    validate_bad_path("data.")
+    validate_bad_path("data.[0]")
+    validate_bad_path("data[0]id")
+    validate_bad_path("$data")
+    validate_bad_path("$.data[")
+    validate_bad_path("data[01]")
+    validate_bad_path("data[?(@.id ==)]")
+    validate_bad_path(".data")
+    validate_bad_path("..id")
+    validate_bad_path("@.id")
+    validate_bad_path("*")
+    validate_bad_path("1id")
+    validate_bad_path("data[\"bad\\x\"]")
+    validate_bad_path("data[99999999999999999999999999]")
+    bad1 := mkcaps()
+    bad1 = push(bad1, cap1("", "data.id"))
+    testing.expect(validate(bad1) != nil, "empty name")
+    bad2 := mkcaps()
+    bad2 = push(bad2, cap1("1ID", "data.id"))
+    testing.expect(validate(bad2) != nil, "digit name")
+    bad3 := mkcaps()
+    bad3 = push(bad3, cap1("bad-name", "data.id"))
+    testing.expect(validate(bad3) != nil, "hyphen name")
+    bad4 := mkcaps()
+    bad4 = push(bad4, cap1("$uuid", "data.id"))
+    testing.expect(validate(bad4) != nil, "dollar name")
+}
+
+fn test_capture_extra_upstream_edges() {
+    expect_val("[10,20]", "$[2:0:-1]", "20")
+    expect_val("[10]", "$[::-1]", "10")
+    expect_val("{\"items\":[{\"id\":1,\"x\":2}]}", "$.items[?(@.x)].id", "1")
+    expect_val("{\"items\":[{\"id\":1,\"s\":\"abc\"}]}", "$.items[?(@.s < \"b\")].id", "1")
+}

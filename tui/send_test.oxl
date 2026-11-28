@@ -426,3 +426,47 @@ fn test_exec_send_captures_all_or_nothing() {
     exec_send_t(a, f)
     testing.expect_eq(len(a.session_vars), 0, "partial capture not published")
 }
+
+
+fn test_exec_send_captures_publish_non_2xx() {
+    a := new_app()
+    stage_send(a, "http://x/users")
+    a.pending_preq.captures = push(a.pending_preq.captures,
+        model.KV{name: "UID", value: "$.data.id", enabled: true})
+    r := fake_resp(500, "application/json", "{\"data\":{\"id\":\"u-500\"}}", nil)
+    f := FakeSend{resp: r, fail: "", expect_path: ""}
+    exec_send_t(a, f)
+    lr := a.env.lookup("UID")
+    testing.expect(lr.ok, "capture published on error status")
+    testing.expect_streq(lr.value, "u-500", "non-2xx captured value")
+}
+
+fn test_exec_send_captures_non_json_body() {
+    a := new_app()
+    stage_send(a, "http://x/users")
+    a.pending_preq.captures = push(a.pending_preq.captures,
+        model.KV{name: "UID", value: "$.data.id", enabled: true})
+    r := fake_resp(200, "text/plain", "not json", nil)
+    f := FakeSend{resp: r, fail: "", expect_path: ""}
+    exec_send_t(a, f)
+    found := false
+    i := 0
+    for i < len(a.toasts) {
+        if a.toasts[i].level == 2 && str_contains(a.toasts[i].msg, "Couldn't capture response") {
+            found = true
+        }
+        i = i + 1
+    }
+    testing.expect(found, "non-json capture failure toast")
+    testing.expect_eq(len(a.session_vars), 0, "non-json publishes nothing")
+}
+
+fn test_exec_send_captures_transport_failure() {
+    a := new_app()
+    stage_send(a, "http://x/users")
+    a.pending_preq.captures = push(a.pending_preq.captures,
+        model.KV{name: "UID", value: "$.data.id", enabled: true})
+    f := FakeSend{resp: fake_resp(200, "application/json", "{\"data\":{\"id\":\"u-42\"}}", nil), fail: "boom", expect_path: ""}
+    exec_send_t(a, f)
+    testing.expect_eq(len(a.session_vars), 0, "transport failure publishes nothing")
+}
