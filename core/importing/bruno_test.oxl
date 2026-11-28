@@ -12,7 +12,10 @@ import "github.com/oxidean/oxttp/core/yaml"
 let BRUNO_SAMPLE = "meta {\n  name: Send event\n  type: http\n}\npost {\n  url: {{base}}/events/:id?repeat=1&repeat=2#top\n  body: json\n  auth: basic\n}\nheaders {\n  \"x:quoted\": yes\n  ~\"disabled:key\": retained\n  X-Token: {{token}}\n}\nparams:query {\n  ~off: disabled\n}\nparams:path {\n  id: {{id}}\n}\nauth:basic {\n  username: user\n  password: $literal\n}\nvars:pre-request {\n  base: https://example.test\n  id: 42\n}\nbody:json {\n  {\n    \"name\": \"{{name}}\",\n    \"value\": \"$literal\"\n  }\n}\ndocs {\n  Request documentation.\n}\n"
 
 fn roundtrip(r: ref collection.PRequest) -> [own collection.PRequest, err] {
-    data := collection.marshal(r)
+    [data, me] = collection.marshal(r)
+    if me != nil {
+        return nil, me
+    }
     [yn, ye] = yaml.parse(data)
     if ye != nil {
         return nil, ye

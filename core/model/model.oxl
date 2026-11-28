@@ -67,6 +67,13 @@ struct Req {
     proxies: []str, // verbatim --proxy "PROTO:URL" entries ("" list = use env)
     proxy_env: []str, // captured "NAME=value" env proxy vars (empty when --proxy given)
     no_proxy: str, // NO_PROXY/no_proxy comma list text
+    // WI-0017 review fix: proxy_go selects Go httpproxy semantics for
+    // the env/no_proxy path (TUI/posting plan_req); false keeps the
+    // reqwest/std port the xh CLI feeds. cgi records a raw non-empty
+    // REQUEST_METHOD — under proxy_go an http:// hop with a usable
+    // HTTP_PROXY env value errors at send time (Go CGI guard).
+    proxy_go: bool,
+    cgi: bool,
 }
 
 // ReqHead is what the wire emitted for one request — kept verbatim

@@ -125,6 +125,7 @@ import "std/os"
 import "std/strconv"
 import "std/strings"
 import "std/net/url"
+import "github.com/oxidean/oxttp/core/capture"
 import "github.com/oxidean/oxttp/core/env"
 import "github.com/oxidean/oxttp/core/yaml"
 import "github.com/oxidean/oxttp/shared/version"
@@ -147,6 +148,18 @@ struct SendPlan {
     req: own model.Req,
     warns: []str,
     err: str,
+}
+
+// ProxyPick is plan_req's proxy resolution result — the model.Req
+// fields proxy_pick computes (ADR-0044/0046/0047). proxy_go selects
+// the transport's Go httpproxy resolver; cgi records a raw non-empty
+// REQUEST_METHOD for its send-time HTTP_PROXY error.
+struct ProxyPick {
+    proxies: []str,
+    env: []str,
+    no_proxy: str,
+    proxy_go: bool,
+    cgi: bool,
 }
 
 // --- decode helpers ---
@@ -1064,6 +1077,12 @@ fn decode(n: ref yaml.YNode) -> [own PRequest, err] {
             if re3 != nil {
                 return nil, re3
             }
+            // upstream ParseRequest → ValidateCaptures: bad var
+            // names / JSONPath reject the file at load.
+            ve3 := capture.validate(rows3)
+            if ve3 != nil {
+                return nil, cerr(errors.msg(ve3))
+            }
             r.captures = rows3
         } else if k == "variable_scope" {
             [vs, ve] = varscope_dec(v)
@@ -1232,7 +1251,11 @@ fn jnode(j: ref json.Json) -> own yaml.YNode {
 
 // encode renders a PRequest into a YNode DOM — corpus key order,
 // omitempty throughout (only non-defaults written).
-fn encode(r: ref PRequest) -> own yaml.YNode {
+fn encode(r: ref PRequest) -> [own yaml.YNode, err] {
+    ve0 := capture.validate(r.captures)
+    if ve0 != nil {
+        return nil, ve0
+    }
     root := new(yaml.YNode)
     root.kind = 1
     if len(r.name) > 0 {
@@ -1465,12 +1488,16 @@ fn encode(r: ref PRequest) -> own yaml.YNode {
         yput(vm, "variables", inner)
         yput(root, "variable_scope", vm)
     }
-    return root
+    return root, nil
 }
 
 // marshal renders a request to .posting.yaml text.
-fn marshal(r: ref PRequest) -> str {
-    return yaml.emit(encode(r))
+fn marshal(r: ref PRequest) -> [str, err] {
+    [n, e] = encode(r)
+    if e != nil {
+        return "", e
+    }
+    return yaml.emit(n), nil
 }
 
 // --- file IO + tree scan (§5.1) ---
@@ -1511,7 +1538,11 @@ fn save_file(path: str, r: ref PRequest) -> err {
             return me
         }
     }
-    if os.writefile_(path, marshal(r)) < 0 {
+    [text, merr] = marshal(r)
+    if merr != nil {
+        return cerr(errors.msg(merr))
+    }
+    if os.writefile_(path, text) < 0 {
         return cerr("cannot write " + path)
     }
     return nil
@@ -1806,9 +1837,167 @@ fn bad_wire(s: str) -> bool {
     return find(s, "\r") >= 0 || find(s, "\n") >= 0
 }
 
+// --- proxy surface (WI-0017, ADR-0044/0046) ----------------------
+// Corpus §7.1: "Proxy: proxy_url else env HTTP(S)_PROXY/NO_PROXY."
+// proxy_pick is pure over "NAME=value" pairs so tests need no real
+// env; collect_proxy_env is the one getenv seam.
+
+// px_trim strips surrounding whitespace — yaml scalars and env values
+// can carry it; pick_proxy trims env values again downstream.
+fn px_trim(s: str) -> str {
+    lo := 0
+    for lo < len(s) && byteat(s, lo) <= 32 {
+        lo = lo + 1
+    }
+    hi := len(s)
+    for hi > lo && byteat(s, hi - 1) <= 32 {
+        hi = hi - 1
+    }
+    return substr(s, lo, hi)
+}
+
+// px_find returns the whole "NAME=value" pair for an exact name match
+// whose raw value is non-empty, "" otherwise. Exact case — collect_proxy_env
+// emits canonical names only. Go getEnvAny does not trim: whitespace-only
+// values still occupy the higher-precedence slot and are dropped later by
+// parseProxy if unusable.
+fn px_find(pairs: []str, name: str) -> str {
+    i := 0
+    for i < len(pairs) {
+        p := pairs[i]
+        i = i + 1
+        eq := find(p, "=")
+        if eq <= 0 {
+            continue
+        }
+        if substr(p, 0, eq) == name {
+            if len(substr(p, eq + 1, len(p))) > 0 {
+                return p
+            }
+        }
+    }
+    return ""
+}
+
+// px_pair_named returns the whole "NAME=value" pair for an exact
+// name match regardless of value (unlike px_find, which requires a
+// non-empty trimmed value) — the CGI guard needs the RAW value:
+// Go treats any non-empty REQUEST_METHOD, whitespace included, as
+// CGI (httpproxy.FromEnvironment: os.Getenv != "").
+fn px_pair_named(pairs: []str, name: str) -> str {
+    i := 0
+    for i < len(pairs) {
+        p := pairs[i]
+        i = i + 1
+        eq := find(p, "=")
+        if eq <= 0 {
+            continue
+        }
+        if substr(p, 0, eq) == name {
+            return p
+        }
+    }
+    return ""
+}
+
+// px_pair_val returns the raw value of a "NAME=value" pair. Env proxy
+// values deliberately stay raw until the transport's parseProxy port;
+// trimming or scheme-normalizing here would not be Go-compatible.
+fn px_pair_val(p: str) -> str {
+    eq := find(p, "=")
+    return substr(p, eq + 1, len(p))
+}
+
+// px_find_any is getEnvAny: uppercase name wins when both cases are
+// present and non-empty; lowercase only when uppercase is unset or
+// empty (Go httpproxy.FromEnvironment order).
+fn px_find_any(pairs: []str, lc: str, uc: str) -> str {
+    p := px_find(pairs, uc)
+    if len(p) > 0 {
+        return p
+    }
+    return px_find(pairs, lc)
+}
+
+// px_val_any applies getEnvAny uppercase-first precedence.
+fn px_val_any(pairs: []str, lc: str, uc: str) -> str {
+    p := px_find_any(pairs, lc, uc)
+    if len(p) == 0 {
+        return ""
+    }
+    return px_pair_val(p)
+}
+
+// proxy_pick resolves the request's proxy fields under Go
+// httpproxy semantics (posting corpus §7.1 — posting is a Go app;
+// ADR-0047). An explicit proxy_url becomes a single "all:"-scoped
+// Req.proxies entry (the transport splits PROTO:URL on the first
+// colon — a bare URL would misparses) and the env set is not
+// consulted (corpus "else"). Otherwise env vars supply
+// proxy_env/no_proxy with getEnvAny uppercase-first precedence:
+// https_proxy/HTTPS_PROXY and http_proxy/HTTP_PROXY only — Go has
+// NO ALL_PROXY. Values stay raw; the transport performs Go's one
+// schemeless→http:// parseProxy retry. The CGI flag records a raw
+// non-empty REQUEST_METHOD; the transport turns
+// a usable http_proxy into a send-time error on http:// hops
+// (Go proxyForURL), NOT a silent skip. NO_PROXY/no_proxy is
+// uppercase-first, first non-empty.
+fn proxy_pick(proxy_url: str, pairs: []str) -> ProxyPick {
+    pk := ProxyPick{proxies: nil, env: nil, no_proxy: "", proxy_go: true, cgi: false}
+    u := px_trim(proxy_url)
+    if len(u) > 0 {
+        pk.proxies = push(pk.proxies, "all:" + u)
+        return pk
+    }
+    rm := px_pair_named(pairs, "REQUEST_METHOD")
+    if len(rm) > 0 {
+        eq := find(rm, "=")
+        if len(substr(rm, eq + 1, len(rm))) > 0 {
+            pk.cgi = true
+        }
+    }
+    e := px_find_any(pairs, "https_proxy", "HTTPS_PROXY")
+    if len(e) > 0 {
+        pk.env = push(pk.env, "https_proxy=" + px_pair_val(e))
+    }
+    e = px_find_any(pairs, "http_proxy", "HTTP_PROXY")
+    if len(e) > 0 {
+        pk.env = push(pk.env, "http_proxy=" + px_pair_val(e))
+    }
+    pk.no_proxy = px_val_any(pairs, "no_proxy", "NO_PROXY")
+    return pk
+}
+
+// collect_proxy_env reads the canonical proxy env names into
+// "NAME=value" pairs — the os.getenv seam (no environ iteration in
+// std/os; unset and empty are indistinguishable, empty omitted per
+// cli/main.oxl os_envpairs convention). Go reads uppercase-first
+// via getEnvAny — both cases are collected and proxy_pick applies
+// the precedence. No ALL_PROXY: Go has no such variable.
+fn collect_proxy_env() -> []str {
+    names := mkslice(str, 0)
+    names = push(names, "REQUEST_METHOD")
+    names = push(names, "https_proxy")
+    names = push(names, "HTTPS_PROXY")
+    names = push(names, "http_proxy")
+    names = push(names, "HTTP_PROXY")
+    names = push(names, "no_proxy")
+    names = push(names, "NO_PROXY")
+    out := mkslice(str, 0)
+    i := 0
+    for i < len(names) {
+        v := os.getenv(names[i])
+        if len(v) > 0 {
+            out = push(out, names[i] + "=" + v)
+        }
+        i = i + 1
+    }
+    return out
+}
+
 // plan_req maps a decoded request + environment + cookie jar into a
 // wire model.Req — corpus §7.1. err set → caller toasts; warns → info
-// toasts (proxy etc.).
+// toasts (env-layer warnings etc.).
 fn plan_req(r: ref PRequest, envset: ref env.EnvSet, jar: []str, coll_dir: str) -> SendPlan {
     sp := SendPlan{req: nil, warns: nil, err: ""}
     if len(r.kind) > 0 {
@@ -1909,6 +2098,16 @@ fn plan_req(r: ref PRequest, envset: ref env.EnvSet, jar: []str, coll_dir: str) 
         subbody = o.substitute_body_variables
         timeout = o.timeout
         proxy = o.proxy_url
+    }
+    // corpus §6.2/Posting 2: proxy_url substitutes scoped env vars
+    // like URL/headers/auth — errors propagate to the plan err.
+    if len(proxy) > 0 {
+        [pxs, pxe] = env.substitute(proxy, es, false)
+        if pxe != nil {
+            sp.err = errors.msg(pxe)
+            return sp
+        }
+        proxy = pxs
     }
     // body
     b := model.Body.Empty
@@ -2093,9 +2292,14 @@ fn plan_req(r: ref PRequest, envset: ref env.EnvSet, jar: []str, coll_dir: str) 
     } else {
         rq.verify = "no"
     }
-    if len(proxy) > 0 {
-        sp.warns = push(sp.warns, "proxy unsupported in this build — sending direct")
-    }
+    // WI-0017 (ADR-0044/0047): options.proxy_url → "all:"-scoped
+    // proxies; absent → Go httpproxy env capture per send.
+    pk := proxy_pick(proxy, collect_proxy_env())
+    rq.proxies = pk.proxies
+    rq.proxy_env = pk.env
+    rq.no_proxy = pk.no_proxy
+    rq.proxy_go = pk.proxy_go
+    rq.cgi = pk.cgi
     // User-Agent synth tail — corpus §7.1: posting/<ver> unless set
     if !hdr_named(hdrs, "User-Agent") {
         rq.synth = push(rq.synth, model.Header{name: "User-Agent", value: "posting/" + version.get()})

@@ -7,10 +7,12 @@ package main
 
 import "std/os"
 import "std/errors"
+import "std/net/tls"
 import "std/time"
 import "std/encoding/json"
 import "std/encoding/base64"
 import "std/unicode/utf8"
+import "github.com/oxidean/oxttp/core/capture"
 import "github.com/oxidean/oxttp/core/collection"
 import "github.com/oxidean/oxttp/core/config"
 import "github.com/oxidean/oxttp/core/env"
@@ -743,6 +745,7 @@ struct RunOpts {
     envs: []str,
     fail_fast: bool,
     json: bool,
+    cfg_file: str, // test seam — "" = default config resolution
 }
 
 struct RunRep {
@@ -1031,7 +1034,7 @@ fn run_exec(o: ref RunOpts, t: http.Transport) -> own RunRep {
     }
     coll_dir := root
     // settings: warnings are fatal unattended (upstream run.go).
-    cr := config.load("", config.posting_env_pairs())
+    cr := config.load(o.cfg_file, config.posting_env_pairs())
     if len(cr.warns) > 0 {
         rep.err = join(cr.warns)
         rep.code = 1
@@ -1041,6 +1044,11 @@ fn run_exec(o: ref RunOpts, t: http.Transport) -> own RunRep {
     // on stderr like the TUI's toast (spec §run env).
     if cr.s.use_host_environment {
         rep.stderr = rep.stderr + "posting run: warning: use_host_environment is set but host environment variables are not merged in this build\n"
+    }
+    // WI-0017 (ADR-0045): ssl.password can't be honored — oxl 0.26.0
+    // rejects encrypted PEM; warn once per run, not per request.
+    if len(cr.s.ssl_password) > 0 && len(cr.s.ssl_certificate_path) > 0 {
+        rep.stderr = rep.stderr + "posting run: warning: ssl.password is set but encrypted private keys are unsupported in this build\n"
     }
     // env stack (ADR-0047): no -e → the ROOT's posting.env+
     // posting.local.env only; any -e suppresses the implicit base and
@@ -1173,8 +1181,13 @@ fn run_exec(o: ref RunOpts, t: http.Transport) -> own RunRep {
         ord[sj + 1] = v
         oi2 = oi2 + 1
     }
-    // loop
+    // loop — captures accumulate into a run-scoped session layer
+    // (upstream run.go: model.Merge(variables, captureLayer) per
+    // request; last write wins on name collisions).
     let jar: []JarEnt = nil
+    let capvars: []model.KV = nil
+    sess_li := -1
+
     passed := 0
     failed := 0
     skipped := 0
@@ -1191,14 +1204,6 @@ fn run_exec(o: ref RunOpts, t: http.Transport) -> own RunRep {
             skipped = skipped + 1
             rep.lines = push(rep.lines, "SKIPPED " + nrel + "\n")
             jresults = jappend(jresults, first_j, "{\"file\":" + jesc(nrel) + ",\"name\":" + jesc(n.req.name) + ",\"outcome\":\"skipped\"}")
-            first_j = false
-            continue
-        }
-        if len(n.req.captures) > 0 {
-            rep.lines = push(rep.lines, "FAILED " + nrel + ": captures unsupported in this build — lands M4\n")
-            failed = failed + 1
-            if o.fail_fast { stop = true }
-            jresults = jappend(jresults, first_j, "{\"file\":" + jesc(nrel) + ",\"name\":" + jesc(n.req.name) + ",\"outcome\":\"failed\",\"error\":\"captures unsupported in this build\"}")
             first_j = false
             continue
         }
@@ -1232,11 +1237,17 @@ fn run_exec(o: ref RunOpts, t: http.Transport) -> own RunRep {
                 cert_err = "ssl.certificate_path: file not found"
             } else {
                 sp.req.cert_pem = os.readfile_(cr.s.ssl_certificate_path)
-                if len(cr.s.ssl_key_file) > 0 {
+                if len(sp.req.cert_pem) == 0 {
+                    cert_err = "ssl.certificate_path: file unreadable or empty"
+                }
+                if len(cert_err) == 0 && len(cr.s.ssl_key_file) > 0 {
                     if !os.exists(cr.s.ssl_key_file) {
                         cert_err = "ssl.key_file: file not found"
                     } else {
                         sp.req.key_pem = os.readfile_(cr.s.ssl_key_file)
+                        if len(sp.req.key_pem) == 0 {
+                            cert_err = "ssl.key_file: file unreadable or empty"
+                        }
                     }
                 }
             }
@@ -1262,6 +1273,12 @@ fn run_exec(o: ref RunOpts, t: http.Transport) -> own RunRep {
         }
         // carry cookies for this run only (upstream run.go).
         jar = jar_collect(jar, url_origin(sp.req.url), resp)
+        // WI-0017 (ADR-0045): client certs are TLS1.3-only — a 1.2
+        // negotiation presents an empty certificate_list; warn like
+        // the interactive toast (CLI W2 parity).
+        if len(sp.req.cert_pem) > 0 && resp.tls_ver == tls.V12 {
+            rep.stderr = rep.stderr + "posting run: warning: " + n.rel + ": client certificate was not presented (TLS 1.2 sends an empty certificate list in this build)\n"
+        }
         if model.status_class(resp.status) == 2 {
             // upstream runRequest: Error = TrimSpace(Code+" "+Text)
             // and the response still rides along in the report.
@@ -1272,6 +1289,33 @@ fn run_exec(o: ref RunOpts, t: http.Transport) -> own RunRep {
             jresults = jappend(jresults, first_j, "{\"file\":" + jesc(nrel) + ",\"name\":" + jesc(n.req.name) + ",\"outcome\":\"failed\",\"error\":" + jesc(serr) + ",\"response\":" + resp_json(sp.req, resp, rts) + "}")
             first_j = false
             continue
+        }
+        // captures run only after a passing status (upstream
+        // runRequest: Error/Warning class returns before
+        // CaptureValues); failure fails the request, success
+        // feeds later requests via the session layer.
+        [cvals, ce] = capture.capture_values(n.req.captures, resp.body)
+        if ce != nil {
+            cmsg := errors.msg(ce)
+            rep.lines = push(rep.lines, "FAILED " + nrel + ": " + cmsg + "\n")
+            failed = failed + 1
+            if o.fail_fast { stop = true }
+            jresults = jappend(jresults, first_j, "{\"file\":" + jesc(nrel) + ",\"name\":" + jesc(n.req.name) + ",\"outcome\":\"failed\",\"error\":" + jesc(cmsg) + ",\"response\":" + resp_json(sp.req, resp, rts) + "}")
+            first_j = false
+            continue
+        }
+        ci := 0
+        for ci < len(cvals) {
+            capvars = capvar_set(capvars, cvals[ci])
+            ci = ci + 1
+        }
+        if len(cvals) > 0 {
+            if sess_li < 0 {
+                es.layers = push(es.layers, env.EnvLayer{name: "session", source: "session", vars: capvars})
+                sess_li = len(es.layers) - 1
+            } else {
+                es.layers[sess_li].vars = capvars
+            }
         }
         rep.lines = push(rep.lines, "PASSED " + nrel + ": " + itoa(resp.status) + " " + resp.reason + " (" + ftoa(resp.elapsed_ms) + " ms)\n")
         passed = passed + 1
@@ -1476,4 +1520,19 @@ fn jar_collect(jar: []JarEnt, origin: str, resp: model.Resp) -> []JarEnt {
         }
     }
     return jar
+}
+
+// capvar_set upserts a captured value into the run-scoped session
+// layer — same name replaces (upstream maps.Copy order).
+fn capvar_set(vars: []model.KV, kv: model.KV) -> []model.KV {
+    i := 0
+    for i < len(vars) {
+        if vars[i].name == kv.name {
+            vars[i].value = kv.value
+            vars[i].enabled = true
+            return vars
+        }
+        i = i + 1
+    }
+    return push(vars, kv)
 }

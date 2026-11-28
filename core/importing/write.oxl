@@ -31,7 +31,10 @@ fn write(result: ref Result, dir: str) -> [own Written, err] {
         // trim .posting.yaml suffix then re-add via safe_path
         nm = trim_suffix(nm, ".posting.yaml")
         nm = safe_path(nm) + ".posting.yaml"
-        data := collection.marshal(rq.req)
+        [data, me] = collection.marshal(rq.req)
+        if me != nil {
+            return nil, errors.new("encode \"" + rq.req.name + "\": " + errors.msg(me))
+        }
         // verify round-trip before any file is created
         [yn, ye] = yaml.parse(data)
         if ye != nil {

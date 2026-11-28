@@ -41,14 +41,13 @@ jobs:
           /tmp/oxttp --version
           /tmp/oxttp-tui
 
-  # `oxl test` honors only its first package-dir arg and silently
-  # ignores the rest (oxidean/oxl#131), and a package-dir run also
-  # executes its workspace dependencies' tests — so the two app
-  # closures (./cli and ./tui both require core+shared) cover every
-  # package's tests except core/session, which nothing imports and
-  # therefore sits outside both closures; it gets an explicit suite.
-  # Suites run as parallel jobs: serially they exceeded the ~10min
-  # wall the runner enforced on this workflow.
+  # `oxl test <pkg>` compiles every `_test.oxl` in the package's whole
+  # dependency closure, not just the package's own tests. Running the
+  # two app closures therefore duplicates the suite and compounds the
+  # driver's memory peak (oxidean/oxl#232). Matrix each test-owning
+  # package instead, and strip every other package's test files from
+  # the checkout before compiling: each test still runs exactly once,
+  # while the compiler only carries the target package's test variants.
   test:
     name: oxl-test-$suite
     if: github.event.action != 'edited'
@@ -57,7 +56,20 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        suite: [cli, tui, core/session]
+        suite:
+          - cli
+          - core/capture
+          - core/collection
+          - core/config
+          - core/env
+          - core/http
+          - core/item
+          - core/model
+          - core/session
+          - core/term
+          - core/yaml
+          - shared/args
+          - tui
     steps:
       - uses: actions/checkout@v7
         with:
@@ -73,12 +85,13 @@ jobs:
           echo "/tmp/oxl-toolchain" >> "$GITHUB_PATH"
           /tmp/oxl-toolchain/oxl version
 
-      # `oxl test` peaks ~20GB RSS compiling the cli closure's test
-      # variants (oxidean/oxl#232) — over the runner's 16GB RAM, which
-      # OOM-kills the job. Swap carries the overflow until upstream
-      # fixes the driver's memory profile. The hosted image already
-      # ships an active /swapfile — writing to it fails ETXTBSY, so
-      # this one uses a unique path sized to available disk.
+      # Even with dependency tests stripped, the largest target suites
+      # peak near the hosted runner's memory ceiling while the driver
+      # retains compile state through test execution (oxidean/oxl#232).
+      # Swap carries transient overflow until upstream fixes the driver's
+      # memory profile. The hosted image already ships an active
+      # /swapfile — writing to it fails ETXTBSY, so this one uses a
+      # unique path sized to available disk.
       - name: add swap for oxl test memory peak
         run: |
           # The hosted image already ships an active /swapfile — writing
@@ -101,7 +114,15 @@ jobs:
           free -h
 
       - name: test ${{ matrix.suite }}
-        run: oxl test ./${{ matrix.suite }}
+        run: |
+          target='${{ matrix.suite }}'
+          while IFS= read -r f; do
+            d=$(dirname "$f")
+            if [ "$d" != "./$target" ]; then
+              rm -- "$f"
+            fi
+          done < <(find . -type f -name '*_test.oxl')
+          oxl test "./$target"
 
   # Commit-message gate (see scripts/commit-check.sh): SemVer-prefix
   # grammar on subjects + no-AI-attribution scan, on the PR's commit

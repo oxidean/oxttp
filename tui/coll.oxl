@@ -7,7 +7,9 @@ package main
 
 import "std/errors"
 import "std/os"
+import "std/net/tls"
 import "std/encoding/json"
+import "github.com/oxidean/oxttp/core/capture"
 import "github.com/oxidean/oxttp/core/collection"
 import "github.com/oxidean/oxttp/core/env"
 import "github.com/oxidean/oxttp/core/http"
@@ -1036,6 +1038,11 @@ fn begin_send_preq(a: mut App) -> int {
             return ENone
         }
         a.pending.cert_pem = os.readfile_(a.ssl_cert)
+        if len(a.pending.cert_pem) == 0 {
+            a.toast(2, "ssl.certificate_path: file unreadable or empty")
+            a.pending = nil
+            return ENone
+        }
         if len(a.ssl_key) > 0 {
             if !os.exists(a.ssl_key) {
                 a.toast(2, "ssl.key_file: file not found")
@@ -1043,9 +1050,16 @@ fn begin_send_preq(a: mut App) -> int {
                 return ENone
             }
             a.pending.key_pem = os.readfile_(a.ssl_key)
+            if len(a.pending.key_pem) == 0 {
+                a.toast(2, "ssl.key_file: file unreadable or empty")
+                a.pending = nil
+                return ENone
+            }
         }
         if len(a.ssl_pass) > 0 {
-            a.toast(2, "ssl.password unsupported — encrypted keys land with mTLS M4")
+            // WI-0017 (ADR-0045): oxl 0.26.0 can't decrypt PKCS#8 /
+            // legacy-encrypted PEM — explicit degrade, not silent.
+            a.toast(2, "ssl.password: encrypted private keys unsupported in this build")
         }
     }
     if len(a.pending_name) == 0 {
@@ -1068,6 +1082,7 @@ fn exec_send_t(a: mut App, t: http.Transport) {
         return
     }
     send_url := a.pending.url
+    had_cert := len(a.pending.cert_pem) > 0
     [resp, e] = t.send(a.pending)
     a.pending = nil
     if e != nil {
@@ -1075,6 +1090,11 @@ fn exec_send_t(a: mut App, t: http.Transport) {
         return
     }
     install_resp(a, resp, send_url)
+    // WI-0017 (ADR-0045): oxl client certs are TLS1.3-only — a 1.2
+    // negotiation sends an empty certificate_list. CLI W2 parity.
+    if had_cert && resp.tls_ver == tls.V12 {
+        a.toast(1, "client certificate was not presented: TLS 1.2 sends an empty certificate list in this build")
+    }
 }
 
 // send_failed installs the transport error as the response view —
@@ -1191,9 +1211,13 @@ fn install_resp(a: mut App, resp: model.Resp, req_url: str) {
             m = a.pending.method
             u = a.pending.url
         }
+        [req_yaml, rye] = collection.marshal(a.pending_preq)
+        if rye != nil {
+            req_yaml = ""
+        }
         he := HistEnt{id: 0, persisted: false, title: a.pending_name, method: m, url: u,
             status: resp.status, reason: resp.reason, elapsed_ms: resp.elapsed_ms,
-            size: a.resp_size, req_yaml: collection.marshal(a.pending_preq),
+            size: a.resp_size, req_yaml: req_yaml,
             resp_text: text, resp_hdr_rows: hs, resp_ck_rows: cks, resp_tr_rows: trs}
         a.history = push(a.history, he)
         if len(a.history) > 100 {
@@ -1208,6 +1232,39 @@ fn install_resp(a: mut App, resp: model.Resp, req_url: str) {
         if nid != 0 {
             a.history[len(a.history) - 1].id = nid
             a.history[len(a.history) - 1].persisted = true
+        }
+    }
+    // response captures (corpus §6.4 / upstream captureResponse):
+    // evaluated on every completed response — any HTTP status —
+    // against the request snapshot that produced it. All-or-
+    // nothing: a failure toasts a warning and publishes nothing;
+    // success upserts session vars (highest env layer).
+    if a.pending_preq != nil && len(a.pending_preq.captures) > 0 {
+        [cvals, ce] = capture.capture_values(a.pending_preq.captures, resp.body)
+        if ce != nil {
+            a.toast(0, "Couldn't capture response: " + errors.msg(ce))
+        } else {
+            ci := 0
+            for ci < len(cvals) {
+                hit := false
+                vi := 0
+                for vi < len(a.session_vars) {
+                    if a.session_vars[vi].name == cvals[ci].name {
+                        a.session_vars[vi].value = cvals[ci].value
+                        hit = true
+                        break
+                    }
+                    vi = vi + 1
+                }
+                if !hit {
+                    a.session_vars = push(a.session_vars, model.KV{name: cvals[ci].name, value: cvals[ci].value, enabled: true})
+                }
+                ci = ci + 1
+            }
+            if len(cvals) > 0 {
+                rebuild_env(a)
+                var_rows_build(a)
+            }
         }
     }
     a.pending_preq = nil
