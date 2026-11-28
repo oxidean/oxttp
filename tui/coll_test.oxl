@@ -733,6 +733,34 @@ fn test_oauth_editor_conditional_roundtrip_and_tabs() {
     testing.expect_streq(r2.auth.oauth2.redirect_uri, "http://127.0.0.1:0/cb", "redirect round-trips")
 }
 
+fn test_auth_type_switch_does_not_preserve_hidden_auth() {
+    a := new_app()
+    pr := oauth_preq()
+    oauth_seed(a, pr)
+    set_oauth_row(a, "type", "none")
+    oauth_rebuild(a)
+    r := draft_to_request(a)
+    testing.expect(r.auth == nil, "switching to none removes oauth auth")
+
+    a2 := new_app()
+    pr2 := oauth_preq()
+    oauth_seed(a2, pr2)
+    set_oauth_row(a2, "type", "basic")
+    oauth_rebuild(a2)
+    r2 := draft_to_request(a2)
+    testing.expect(r2.auth != nil, "basic auth emitted")
+    if r2.auth != nil {
+        testing.expect_streq(r2.auth.type, "basic", "type switches to basic")
+        testing.expect(r2.auth.oauth2 == nil, "old oauth block not hidden")
+    }
+
+    a3 := new_app()
+    pr3 := oauth_preq()
+    oauth_seed(a3, pr3)
+    r3 := draft_to_request(a3)
+    testing.expect(r3.auth != nil && r3.auth.type == "oauth2", "unchanged oauth remains")
+}
+
 fn test_oauth_auth_render_masking_and_file_seed() {
     scratch_coll()
     os.writefile_(COLL_SCRATCH + "/requests/oauth.posting.yaml",

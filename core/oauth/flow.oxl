@@ -113,7 +113,7 @@ fn (f OAuthBrowserFlow) run(cfg: Config, resource: ref model.Req, tr: http.Trans
         return browser_fail(BrowserCancelError, "browser_" + oc.kind)
     }
     xreq := code_exchange_request(c, resource, oc.code, actual, verifier)
-    return send_token_at(tr, xreq, now())
+    return send_token_at(tr, xreq, 0)
 }
 
 // production_browser_flow constructs the default argv opener flow.

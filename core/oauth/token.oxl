@@ -348,16 +348,22 @@ fn send_token_at(tr: http.Transport, req: ref model.Req, now_unix: int) -> Token
     }
     if pr.token.has_expires_in {
         tok.has_expiry = true
+        // Production expiry starts when the response has been received;
+        // nonzero now_unix remains the deterministic test seam.
+        base := now_unix
+        if base == 0 {
+            base = now()
+        }
         // Positive values saturate instead of overflowing int64.
-        if pr.token.expires_in > 9223372036854775807 - now_unix {
+        if pr.token.expires_in > 9223372036854775807 - base {
             tok.expiry_unix = 9223372036854775807
         } else {
-            tok.expiry_unix = now_unix + pr.token.expires_in
+            tok.expiry_unix = base + pr.token.expires_in
         }
     }
     return token_success_result(tok)
 }
 
 fn send_token(tr: http.Transport, req: ref model.Req) -> TokenResult {
-    return send_token_at(tr, req, now())
+    return send_token_at(tr, req, 0)
 }

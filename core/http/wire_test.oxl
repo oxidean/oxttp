@@ -274,6 +274,19 @@ fn test_decode_body() {
     testing.expect(e8 == nil && len(d8) == 0, "empty tolerated")
 }
 
+fn test_decode_body_cap_bounds_compressed_output() {
+    // python: gzip.compress(b"A" * 100000, mtime=0) — 133 wire bytes.
+    gz := "1f8b08000000000002ffedc13101000000c2a06ceb5fca1a1e4001000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000af06d79f8a05a0860100"
+    [_d, e] = decode_body_cap(hx_b(gz) as []byte, "gzip", 1024)
+    testing.expect(e != nil, "compressed plaintext cap errors")
+    if e != nil {
+        testing.expect(find(errors.msg(e), "response body exceeds") >= 0, "cap error text: " + errors.msg(e))
+    }
+    small := "1f8b08000000000002ffcb48cdc9c957c8af28292900007692580c0b000000"
+    [d2, e2] = decode_body_cap(hx_b(small) as []byte, "gzip", 1024)
+    testing.expect(e2 == nil && d2 as str == "hello oxttp", "small gzip still decodes")
+}
+
 fn test_redirect_helpers() {
     testing.expect(is_redirect(301) && is_redirect(302) && is_redirect(303), "301-303")
     testing.expect(is_redirect(307) && is_redirect(308), "307-308")

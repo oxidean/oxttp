@@ -646,7 +646,7 @@ fn finish_roundtrip(req: ref model.Req, br: own bufio.Reader, cap: mut model.Hop
     cap.body = body
     cap.elapsed_ms = itof(now_ms() - t0)
     tr.recv_body_ms = itof(now_ms() - c0)
-    [db, dbe] = decode_body(body, hdr_get(h.headers, "content-encoding"))
+    [db, dbe] = decode_body_cap(body, hdr_get(h.headers, "content-encoding"), req.max_body_bytes)
     if dbe != nil {
         return bad, dbe
     }
@@ -914,7 +914,7 @@ fn h2_exchange(req: ref model.Req, rw: io.ReadWriter, fd: int, hdrs: []model.Hea
     if le != nil {
         return bad, le
     }
-    [db, dbe] = decode_body(body, hdr_get(rh, "content-encoding"))
+    [db, dbe] = decode_body_cap(body, hdr_get(rh, "content-encoding"), req.max_body_bytes)
     if dbe != nil {
         return bad, dbe
     }

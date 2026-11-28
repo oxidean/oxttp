@@ -819,7 +819,8 @@ fn draft_to_request(a: ref App) -> own collection.PRequest {
             r.body = b
         }
     }
-    if lower_ascii(oauth_value(a, "type")) == "oauth2" || lower_ascii(oauth_value(a, "type")) == "oauth 2.0" {
+    atype := lower_ascii(oauth_value(a, "type"))
+    if atype == "oauth2" || atype == "oauth 2.0" {
         r.auth = new(collection.PAuth)
         r.auth.type = "oauth2"
         r.auth.oauth2 = new(collection.POAuth2)
@@ -831,13 +832,29 @@ fn draft_to_request(a: ref App) -> own collection.PRequest {
         r.auth.oauth2.scope = oauth_value(a, "scope")
         r.auth.oauth2.redirect_uri = oauth_value(a, "redirect_uri")
         r.auth.oauth2.client_auth = oauth_clientauth_yaml(oauth_value(a, "client_auth"))
+    } else if len(atype) > 0 && atype != "none" {
+        if a.preq != nil && a.preq.auth != nil && a.preq.auth.type == atype {
+            // Unchanged non-OAuth auth keeps its existing fields verbatim.
+            r.auth = a.preq.auth
+        } else if atype == "basic" || atype == "digest" || atype == "bearer_token" {
+            // The shared type control is authoritative: switching away from
+            // a prior auth block must not keep that hidden block alive. These
+            // non-OAuth kinds retain the pre-existing empty-field editing
+            // scope, but the YAML type itself is honest.
+            r.auth = new(collection.PAuth)
+            r.auth.type = atype
+            if atype == "basic" {
+                r.auth.basic = new(collection.PBasic)
+            } else if atype == "digest" {
+                r.auth.digest = new(collection.PBasic)
+            } else {
+                r.auth.bearer_token = new(collection.PBearer)
+            }
+        }
     }
     if a.preq != nil {
         r.name = a.preq.name
         r.description = a.preq.description
-        if r.auth == nil {
-            r.auth = a.preq.auth
-        }
         r.options = a.preq.options
         r.scripts = a.preq.scripts
         r.captures = a.preq.captures

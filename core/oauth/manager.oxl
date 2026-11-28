@@ -150,7 +150,11 @@ fn authorize(m: mut Manager, cfg: Config, ident: CacheIdentity, resource: ref mo
         // Client-credentials always performs a fresh grant on expiry, even
         // when a refresh_token happens to be present in the old response.
         rq := client_credentials_request(c, resource)
-        out := send_token_at(tr, rq, nowu)
+        req_now := 0
+        if m.now_unix != 0 {
+            req_now = nowu
+        }
+        out := send_token_at(tr, rq, req_now)
         if len(out.err) == 0 {
             manager_put(m, key, out.token)
         }
@@ -159,7 +163,11 @@ fn authorize(m: mut Manager, cfg: Config, ident: CacheIdentity, resource: ref mo
 
     if lookup.found && len(old.refresh_token) > 0 {
         rr := refresh_request(c, resource, old.refresh_token)
-        refreshed := send_token_at(tr, rr, nowu)
+        refresh_now := 0
+        if m.now_unix != 0 {
+            refresh_now = nowu
+        }
+        refreshed := send_token_at(tr, rr, refresh_now)
         if len(refreshed.err) == 0 {
             merged := rotate_refresh(old, refreshed.token)
             manager_put(m, key, merged)
