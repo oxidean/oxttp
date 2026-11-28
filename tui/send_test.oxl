@@ -19,11 +19,15 @@ import "github.com/oxidean/oxttp/core/term"
 struct FakeSend {
     resp: model.Resp,
     fail: str,
+    expect_path: str,
 }
 
 fn (f FakeSend) send(req: ref model.Req) -> [model.Resp, err] {
     if len(f.fail) > 0 {
         return f.resp, errors.new(f.fail)
+    }
+    if len(f.expect_path) > 0 && find(req.url, "/use/") >= 0 && find(req.url, f.expect_path) < 0 {
+        return f.resp, errors.new("expected path missing: " + req.url)
     }
     return f.resp, nil
 }
@@ -140,7 +144,7 @@ fn test_exec_send_installs_response() {
     hs := mkslice(model.Hop, 0)
     r := fake_resp(200, "application/json", "{\"a\":1}", new(hs))
     r.headers = push(r.headers, model.Header{name: "Set-Cookie", value: "sid=abc; Path=/"})
-    f := FakeSend{resp: r, fail: ""}
+    f := FakeSend{resp: r, fail: "", expect_path: ""}
     exec_send_t(a, f)
     testing.expect(a.pending == nil, "pending consumed")
     // body: JSON content-type re-indents 2sp
@@ -194,7 +198,7 @@ fn test_install_resp_hops_and_nojson() {
 fn test_exec_send_error_installs() {
     a := new_app()
     stage_send(a, "http://x")
-    f := FakeSend{resp: fake_resp(0, "", "", nil), fail: "dial tcp: refused"}
+    f := FakeSend{resp: fake_resp(0, "", "", nil), fail: "dial tcp: refused", expect_path: ""}
     exec_send_t(a, f)
     testing.expect_eq(len(a.resp_view.lines), 1, "error text installed")
     testing.expect(str_contains(a.resp_view.lines[0], "request failed"), "failed prefix")
@@ -235,12 +239,12 @@ fn test_history_open_and_delete() {
     load_collection(a)
     stage_send(a, "http://x/one")
     r := fake_resp(200, "application/json", "{\"k\":2}", new(mkslice(model.Hop, 0)))
-    f := FakeSend{resp: r, fail: ""}
+    f := FakeSend{resp: r, fail: "", expect_path: ""}
     exec_send_t(a, f)
     stage_send(a, "http://x/two")
     r2 := fake_resp(404, "text/plain", "nope", new(mkslice(model.Hop, 0)))
     r2.reason = "Not Found"
-    f2 := FakeSend{resp: r2, fail: ""}
+    f2 := FakeSend{resp: r2, fail: "", expect_path: ""}
     exec_send_t(a, f2)
     testing.expect_eq(len(a.history), 2, "two entries")
     // MHistory lists newest-first: sel 0 opens the LAST pushed entry
@@ -314,7 +318,7 @@ fn test_jar_origin_scoping() {
     stage_send(a, "http://b.test/y")
     r := fake_resp(200, "", "", nil)
     r.headers = push(r.headers, model.Header{name: "Set-Cookie", value: "sc=3; Path=/"})
-    f := FakeSend{resp: r, fail: ""}
+    f := FakeSend{resp: r, fail: "", expect_path: ""}
     exec_send_t(a, f)
     testing.expect_eq(len(a.jar), 3, "new cookie appended")
     testing.expect_streq(a.jar[2].origin, "http://b.test", "stored under b.test")
@@ -414,7 +418,7 @@ fn test_exec_send_tls12_cert_warn() {
     a.pending.cert_pem = "pem"
     r := fake_resp(200, "text/plain", "ok", new(mkslice(model.Hop, 0)))
     r.tls_ver = tls.V12
-    f := FakeSend{resp: r, fail: ""}
+    f := FakeSend{resp: r, fail: "", expect_path: ""}
     exec_send_t(a, f)
     found := false
     i := 0
@@ -432,7 +436,7 @@ fn test_exec_send_tls12_cert_warn() {
     a2.pending.cert_pem = "pem"
     r2 := fake_resp(200, "text/plain", "ok", new(mkslice(model.Hop, 0)))
     r2.tls_ver = tls.V13
-    exec_send_t(a2, FakeSend{resp: r2, fail: ""})
+    exec_send_t(a2, FakeSend{resp: r2, fail: "", expect_path: ""})
     i = 0
     for i < len(a2.toasts) {
         testing.expect(!str_contains(a2.toasts[i].msg, "certificate list"), "V13 silent")
@@ -444,7 +448,7 @@ fn test_exec_send_tls12_cert_warn() {
     a3.pending.cert_pem = "pem"
     r3 := fake_resp(200, "text/plain", "ok", new(mkslice(model.Hop, 0)))
     r3.tls_ver = 0
-    exec_send_t(a3, FakeSend{resp: r3, fail: ""})
+    exec_send_t(a3, FakeSend{resp: r3, fail: "", expect_path: ""})
     i = 0
     for i < len(a3.toasts) {
         testing.expect(!str_contains(a3.toasts[i].msg, "certificate list"), "cleartext silent")
@@ -455,10 +459,112 @@ fn test_exec_send_tls12_cert_warn() {
     stage_send(a4, "https://x")
     r4 := fake_resp(200, "text/plain", "ok", new(mkslice(model.Hop, 0)))
     r4.tls_ver = tls.V12
-    exec_send_t(a4, FakeSend{resp: r4, fail: ""})
+    exec_send_t(a4, FakeSend{resp: r4, fail: "", expect_path: ""})
     i = 0
     for i < len(a4.toasts) {
         testing.expect(!str_contains(a4.toasts[i].msg, "certificate list"), "no-cert silent")
         i = i + 1
     }
+}
+
+fn test_exec_send_captures_publish() {
+    a := new_app()
+    stage_send(a, "http://x/users")
+    a.pending_preq.captures = push(a.pending_preq.captures,
+        model.KV{name: "UID", value: "$.data.id", enabled: true})
+    r := fake_resp(200, "application/json", "{\"data\":{\"id\":\"u-42\"}}", nil)
+    f := FakeSend{resp: r, fail: "", expect_path: ""}
+    exec_send_t(a, f)
+    lr := a.env.lookup("UID")
+    testing.expect(lr.ok, "capture published to env")
+    testing.expect_streq(lr.value, "u-42", "captured value")
+    found := false
+    i := 0
+    for i < len(a.session_vars) {
+        if a.session_vars[i].name == "UID" {
+            found = true
+            testing.expect_streq(a.session_vars[i].value, "u-42", "session var")
+        }
+        i = i + 1
+    }
+    testing.expect(found, "session_vars row")
+}
+
+fn test_exec_send_captures_failure() {
+    a := new_app()
+    stage_send(a, "http://x/users")
+    a.pending_preq.captures = push(a.pending_preq.captures,
+        model.KV{name: "UID", value: "$.missing", enabled: true})
+    r := fake_resp(200, "application/json", "{\"data\":{\"id\":\"u-42\"}}", nil)
+    f := FakeSend{resp: r, fail: "", expect_path: ""}
+    exec_send_t(a, f)
+    // warning toast, nothing published — response still installs
+    found := false
+    i := 0
+    for i < len(a.toasts) {
+        if a.toasts[i].level == 0 && str_contains(a.toasts[i].msg, "Couldn't capture response") {
+            found = true
+        }
+        i = i + 1
+    }
+    testing.expect(found, "capture warning toast")
+    testing.expect_eq(len(a.session_vars), 0, "no session vars")
+    testing.expect_eq(a.resp_class, 0, "response still installed")
+}
+
+fn test_exec_send_captures_all_or_nothing() {
+    a := new_app()
+    stage_send(a, "http://x/users")
+    a.pending_preq.captures = push(a.pending_preq.captures,
+        model.KV{name: "GOOD", value: "$.data.id", enabled: true})
+    a.pending_preq.captures = push(a.pending_preq.captures,
+        model.KV{name: "BAD", value: "$.nope", enabled: true})
+    r := fake_resp(200, "application/json", "{\"data\":{\"id\":\"u-42\"}}", nil)
+    f := FakeSend{resp: r, fail: "", expect_path: ""}
+    exec_send_t(a, f)
+    testing.expect_eq(len(a.session_vars), 0, "partial capture not published")
+}
+
+
+fn test_exec_send_captures_publish_non_2xx() {
+    a := new_app()
+    stage_send(a, "http://x/users")
+    a.pending_preq.captures = push(a.pending_preq.captures,
+        model.KV{name: "UID", value: "$.data.id", enabled: true})
+    r := fake_resp(500, "application/json", "{\"data\":{\"id\":\"u-500\"}}", nil)
+    f := FakeSend{resp: r, fail: "", expect_path: ""}
+    exec_send_t(a, f)
+    lr := a.env.lookup("UID")
+    testing.expect(lr.ok, "capture published on error status")
+    testing.expect_streq(lr.value, "u-500", "non-2xx captured value")
+}
+
+fn test_exec_send_captures_non_json_body() {
+    a := new_app()
+    stage_send(a, "http://x/users")
+    a.pending_preq.captures = push(a.pending_preq.captures,
+        model.KV{name: "UID", value: "$.data.id", enabled: true})
+    r := fake_resp(200, "text/plain", "not json", nil)
+    f := FakeSend{resp: r, fail: "", expect_path: ""}
+    exec_send_t(a, f)
+    found := false
+    i := 0
+    for i < len(a.toasts) {
+        if a.toasts[i].level == 0 && str_contains(a.toasts[i].msg, "Couldn't capture response") {
+            found = true
+        }
+        i = i + 1
+    }
+    testing.expect(found, "non-json capture failure toast")
+    testing.expect_eq(len(a.session_vars), 0, "non-json publishes nothing")
+}
+
+fn test_exec_send_captures_transport_failure() {
+    a := new_app()
+    stage_send(a, "http://x/users")
+    a.pending_preq.captures = push(a.pending_preq.captures,
+        model.KV{name: "UID", value: "$.data.id", enabled: true})
+    f := FakeSend{resp: fake_resp(200, "application/json", "{\"data\":{\"id\":\"u-42\"}}", nil), fail: "boom", expect_path: ""}
+    exec_send_t(a, f)
+    testing.expect_eq(len(a.session_vars), 0, "transport failure publishes nothing")
 }

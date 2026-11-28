@@ -192,7 +192,7 @@ fn test_run_exec() {
     o := new(RunOpts)
     o.coll = dir
     o.target = dir
-    fx := FakeSend{resp: fake_resp(200, "text/plain", "hi", nil), fail: ""}
+    fx := FakeSend{resp: fake_resp(200, "text/plain", "hi", nil), fail: "", expect_path: ""}
     rep := run_exec(o, fx)
     // ADR-0038: a scripted request aborts the whole run BEFORE any
     // send — the valid request never reaches the transport.
@@ -240,7 +240,7 @@ fn test_run_exec_orders_by_rel() {
     os.writefile_(dir + "/z/b.posting.yaml", "name: b\nmethod: GET\nurl: http://x.test/b\n")
     o := new(RunOpts)
     o.target = dir
-    fx := FakeSend{resp: fake_resp(200, "text/plain", "hi", nil), fail: ""}
+    fx := FakeSend{resp: fake_resp(200, "text/plain", "hi", nil), fail: "", expect_path: ""}
     rep := run_exec(o, fx)
     testing.expect(len(rep.err) == 0, "err: " + rep.err)
     testing.expect(rep.code == 0, "clean run")
@@ -273,6 +273,45 @@ fn test_is_utf8_and_resp_json_binary() {
     testing.expect(find(j, "\"receivedAt\":1700000000000") >= 0, "receivedAt")
 }
 
+// captures feed later requests in the same run via the session
+// layer (upstream run.go model.Merge per request); a failed capture
+// fails that request; invalid captures reject the file at load.
+fn test_run_exec_captures() {
+    dir := "/tmp/oxttp-run-cap"
+    os.remove_all(dir)
+    os.mkdir_all(dir)
+    os.writefile_(dir + "/01.get.posting.yaml",
+        "name: get\nmethod: GET\nurl: http://x.test/a\ncaptures:\n  TOKEN: $.token\n")
+    os.writefile_(dir + "/02.use.posting.yaml",
+        "name: use\nmethod: GET\nurl: http://x.test/use/$TOKEN\n")
+    o := new(RunOpts)
+    o.target = dir
+    fx := FakeSend{resp: fake_resp(200, "application/json", "{\"token\":\"sekrit\"}", nil), fail: "", expect_path: "/use/sekrit"}
+    rep := run_exec(o, fx)
+    testing.expect(len(rep.err) == 0, "err: " + rep.err)
+    testing.expect(rep.code == 0, "clean run: " + rep.err + " / " + rep.lines[len(rep.lines) - 2])
+    testing.expect(len(rep.lines) == 3, "2 req + summary")
+    testing.expect(find(rep.lines[1], "PASSED") == 0, "second req passed — $TOKEN resolved")
+    // a capture that matches nothing fails the request
+    os.remove_all(dir)
+    os.mkdir_all(dir)
+    os.writefile_(dir + "/01.bad.posting.yaml",
+        "name: bad\nmethod: GET\nurl: http://x.test/a\ncaptures:\n  NOPE: $.missing\n")
+    rep = run_exec(o, fx)
+    testing.expect(rep.code == 1, "capture failure exits 1")
+    testing.expect(find(rep.lines[0], "FAILED") == 0, "failed line")
+    testing.expect(find(rep.lines[0], "matched 0 values") >= 0, "err text")
+    // invalid capture (bad var name) rejects the file before any send
+    os.remove_all(dir)
+    os.mkdir_all(dir)
+    os.writefile_(dir + "/01.badname.posting.yaml",
+        "name: bad\nmethod: GET\nurl: http://x.test/a\ncaptures:\n  1BAD: $.x\n")
+    rep = run_exec(o, fx)
+    testing.expect(rep.code == 1, "invalid capture aborts")
+    testing.expect(len(rep.lines) == 0, "nothing ran")
+    os.remove_all(dir)
+}
+
 
 fn test_run_empty_client_cert_aborts() {
     // WI-0017 review: a configured cert/key that exists but reads
@@ -292,7 +331,7 @@ fn test_run_empty_client_cert_aborts() {
     o.coll = dir
     o.target = dir
     o.cfg_file = cfg
-    fx := FakeSend{resp: fake_resp(200, "text/plain", "hi", nil), fail: ""}
+    fx := FakeSend{resp: fake_resp(200, "text/plain", "hi", nil), fail: "", expect_path: ""}
     rep := run_exec(o, fx)
     testing.expect(rep.code == 1, "empty cert fails the run")
     testing.expect(len(rep.err) > 0 || find(join(rep.lines), "unreadable or empty") >= 0, "failure names unreadable/empty")
@@ -321,7 +360,7 @@ fn test_run_ssl_password_and_tls12_warn() {
     o.cfg_file = cfg
     r := fake_resp(200, "text/plain", "hi", nil)
     r.tls_ver = tls.V12
-    fx := FakeSend{resp: r, fail: ""}
+    fx := FakeSend{resp: r, fail: "", expect_path: ""}
     rep := run_exec(o, fx)
     testing.expect(rep.code == 0, "run passes: " + rep.err)
     testing.expect(find(rep.stderr, "encrypted private keys are unsupported") >= 0, "password warning on stderr")
