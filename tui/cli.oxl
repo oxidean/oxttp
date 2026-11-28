@@ -96,6 +96,7 @@ fn cli_locate_args(args: []str) -> Out {
 struct RParse {
     cmd: str,
     ref: str,
+    has_ref: bool,
     curl: str,
     yaml: str,
     inst: str,
@@ -219,9 +220,10 @@ fn remote_parse(args: []str) -> own RParse {
         }
         if len(pos) == 1 {
             rp.ref = pos[0]
+            rp.has_ref = true
         }
         given := 0
-        if len(rp.ref) > 0 {
+        if rp.has_ref {
             given = given + 1
         }
         if len(rp.curl) > 0 {
@@ -741,11 +743,15 @@ fn imp_envs_line(output: str, envs: []importing.WEnv) -> str {
     }
     files := ""
     selected := ""
+    base_file := ""
     i := 0
     for i < len(envs) {
         f := imp_diag(envs[i].file)
         if envs[i].base {
             f = f + " (base)"
+            if envs[i].file != "posting.env" {
+                base_file = envs[i].file
+            }
         } else if selected == "" {
             selected = envs[i].name
         }
@@ -758,7 +764,11 @@ fn imp_envs_line(output: str, envs: []importing.WEnv) -> str {
     if selected == "" {
         selected = envs[0].name
     }
-    return "Environments: " + files + "\nOpen with: posting -c " + imp_quote(output) + " --env " + imp_quote(selected) + "\n"
+    base_arg := ""
+    if len(base_file) > 0 {
+        base_arg = " --env " + imp_quote(base_file)
+    }
+    return "Environments: " + files + "\nOpen with: posting -c " + imp_quote(output) + base_arg + " --env " + imp_quote(selected) + "\n"
 }
 
 fn imp_rep(s: str, old: str, repl: str) -> str {
@@ -798,7 +808,7 @@ fn imp_quote(s: str) -> str {
     if !need {
         return s
     }
-    return "'" + imp_rep(s, "'", "'\''") + "'"
+    return "'" + imp_rep(s, "'", "'\\''") + "'"
 }
 
 // ---------- run ----------
@@ -1458,6 +1468,15 @@ fn clean_path_lex(p: str) -> str {
 fn rel_to_root(root: str, path: str) -> str {
     pre := clean_path_lex(root)
     path = clean_path_lex(path)
+    if pre == "/" {
+        if len(path) > 1 && byteat(path, 0) == 47 {
+            return substr(path, 1, len(path))
+        }
+        if path == "/" {
+            return "."
+        }
+        return path
+    }
     if len(pre) > 1 && byteat(pre, len(pre) - 1) == 47 {
         pre = substr(pre, 0, len(pre) - 1)
     }

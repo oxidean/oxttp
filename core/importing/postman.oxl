@@ -935,11 +935,14 @@ fn pread_auth(p: ref PParser, req: ref collection.PRequest, raw: ref json.Json, 
         if len(model.find_variables(kv.name)) > 0 {
             pwarn(p, where, "API key name uses variables; existing-field override is based on imported defaults and should be reviewed if the name changes")
         }
-        // `in` resolved against collection defaults (upstream
-        // Substitute(transform(attrs["in"]), MapLookup(defaults)))
+        // `in` resolves against collection defaults plus the effective
+        // scoped environment, with scoped bindings last so folder/request
+        // overrides win even through default aliases (upstream
+        // scopedAliases + Substitute(transform(attrs["in"]), defaults)).
+        invalues := append_kv(append_kv(mkslice(model.KV, 0), p.defaults), scp)
         inbudget := mkslice(int, 1)
         inbudget[0] = 1024
-        inexpanded := pexpand(p, kv_get(attrs, "in"), p.defaults, mkslice(str, 0), where, inbudget)
+        inexpanded := pexpand(p, kv_get(attrs, "in"), invalues, mkslice(str, 0), where, inbudget)
         inres := substitute_kv(ptemplate(p, inexpanded, scp, where), p.defaults)
         if inres != "query" && inres != "header" {
             pwarn(p, where, "API key location \"" + inres + "\" is unresolved or unsupported; header used")

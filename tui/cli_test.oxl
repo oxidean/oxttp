@@ -7,6 +7,7 @@ import "std/testing"
 import "std/os"
 import "std/time"
 import "std/net/tls"
+import "github.com/oxidean/oxttp/core/importing"
 import "github.com/oxidean/oxttp/core/model"
 
 fn test_cli_version() {
@@ -260,8 +261,21 @@ fn test_cli_import_output_comes_from_first_parse() {
 fn test_cli_report_path_quote_and_missing_target_regressions() {
     testing.expect_streq(rel_to_root("/tmp/api/.", "/tmp/api/get.posting.yaml"), "get.posting.yaml", "normalized report path")
     testing.expect_streq(rel_to_root("/tmp/api", "/tmp/apisibling/get.posting.yaml"), "/tmp/apisibling/get.posting.yaml", "sibling not relative")
+    testing.expect_streq(rel_to_root("/", "/tmp/api/get.posting.yaml"), "tmp/api/get.posting.yaml", "filesystem root strips leading slash")
+    testing.expect_streq(rel_to_root("/", "/"), ".", "filesystem root itself relative")
     testing.expect_streq(imp_quote("qa&dev"), "'qa&dev'", "shell metachar quoted")
     testing.expect_streq(imp_quote(""), "''", "empty shell arg quoted")
+    testing.expect_streq(imp_quote("x';id;'y"), "'x'\\'';id;'\\''y'", "apostrophe shell encoding keeps backslash")
+    envs := mkslice(importing.WEnv, 0)
+    envs = push(envs, importing.WEnv{name: "posting-2", file: "posting-2.env", base: true})
+    envs = push(envs, importing.WEnv{name: "dev", file: "dev.env", base: false})
+    line := imp_envs_line("out", envs)
+    testing.expect(find(line, " --env posting-2.env --env dev") >= 0, "renamed imported base precedes selected env: " + line)
+    envs2 := mkslice(importing.WEnv, 0)
+    envs2 = push(envs2, importing.WEnv{name: "posting", file: "posting.env", base: true})
+    envs2 = push(envs2, importing.WEnv{name: "dev", file: "dev.env", base: false})
+    line2 := imp_envs_line("out", envs2)
+    testing.expect(find(line2, " --env dev") >= 0 && find(line2, "posting.env --env") < 0, "ordinary base not duplicated: " + line2)
     o := new(RunOpts)
     o.coll = "/tmp/definitely-missing-oxttp-coll"
     o.target = "missing.posting.yaml"

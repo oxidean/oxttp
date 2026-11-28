@@ -306,7 +306,7 @@ fn test_review_existing_base_keeps_template() {
     if len(bo.vars) == 4 {
         testing.expect_streq(bo.vars[1].name, "API", "api name")
         testing.expect_streq(bo.vars[1].value, "https://${HOST}/v1", "template retained")
-        testing.expect_streq(bo.vars[2].value, "${HOST}", "single-quoted literal retained")
+        testing.expect_streq(bo.vars[2].value, "$${HOST}", "single-quoted literal retained in template escape form")
         testing.expect_streq(bo.vars[3].value, "${MISSING}", "unresolved reference retained")
     }
     os.remove_all(dir)
@@ -368,6 +368,41 @@ fn test_review_postman_regressions() {
         if len(res.requests[ki].req.params) == 1 {
             testing.expect_streq(res.requests[ki].req.params[0].name, "X-Key", "api key name")
         }
+    }
+}
+
+fn test_review_environment_data_roundtrips_apostrophe_backslash() {
+    sq := chr1(39)
+    bs := chr1(92)
+    want := "can" + sq + "t" + bs + "back"
+    vars := mkslice(model.KV, 0)
+    vars = push(vars, model.KV{name: "VALUE", value: want, enabled: true})
+    [data, ee] = environment_data(vars)
+    testing.expect(ee == nil, "environment data encodes")
+    dir := review_scratch("dotenv-roundtrip")
+    os.mkdir_all(dir)
+    os.writefile_(dir + "/posting.env", data)
+    bo := existing_base(dir)
+    testing.expect_eq(len(bo.vars), 1, "roundtrip var count")
+    if len(bo.vars) == 1 {
+        testing.expect_streq(bo.vars[0].value, want, "apostrophe and backslash survive template reread")
+    }
+    os.remove_all(dir)
+}
+
+fn test_postman_apikey_folder_override_wins_before_defaults() {
+    src := "{\"info\":{\"name\":\"Scoped\",\"schema\":\"https://schema.getpostman.com/json/collection/v2.1.0/collection.json\"}," +
+        "\"variable\":[{\"key\":\"TARGET\",\"value\":\"header\"},{\"key\":\"PLACEMENT\",\"value\":\"{{TARGET}}\"}]," +
+        "\"item\":[{\"name\":\"folder\",\"variable\":[{\"key\":\"TARGET\",\"value\":\"query\"}],\"item\":[{\"name\":\"key\",\"request\":{\"method\":\"GET\",\"url\":\"https://example.test\",\"auth\":{\"type\":\"apikey\",\"apikey\":[{\"key\":\"key\",\"value\":\"X-Key\"},{\"key\":\"value\",\"value\":\"abc\"},{\"key\":\"in\",\"value\":\"{{PLACEMENT}}\"}]}}}]}]}"
+    [res, err] = pparse(src)
+    testing.expect(err == nil, "scoped postman parses")
+    if err != nil {
+        return
+    }
+    testing.expect_eq(len(res.requests), 1, "one request")
+    if len(res.requests) == 1 {
+        testing.expect_eq(len(res.requests[0].req.params), 1, "folder override routes api key to query")
+        testing.expect_eq(len(res.requests[0].req.headers), 0, "collection default does not pre-expand to header")
     }
 }
 

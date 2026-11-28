@@ -24,7 +24,7 @@ not `run`).
   (whichever exist), root = `-c` dir or target dir/file parent.
 - With `-e`: reuse `env_file_list`/`env_file_list_mode` semantics but
   with `dirs = [collection_root]` — named envs resolve in the root
-  only; file specs probe CWD-relative then root; any spec suppresses
+  only; file specs probe CWD-relative only; any spec suppresses
   the implicit base.
 - `settingsInEnvironmentFiles` port: each loaded env file is scanned
   for `POSTING_*` names → stderr

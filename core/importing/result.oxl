@@ -83,12 +83,11 @@ fn directory_name(name: str) -> str {
 }
 
 // safe_part — upstream safePart: control + <>:"/\|?* → '-', 120-byte
-// cap, trim " .\t", empty→"untitled", reserved device names '_'+name.
+// rune cap, trim " .\t", empty→"untitled", reserved device names '_'+name.
 fn safe_part(name: str) -> str {
     out := ""
     i := 0
-    n := 0 // rune count approximated by bytes; upstream caps runes —
-           // byte cap is stricter for multibyte, matching intent
+    n := 0 // upstream caps runes, not bytes
     for i < len(name) {
         c := byteat(name, i)
         // consume one UTF-8 sequence for the control/rune checks
@@ -105,11 +104,11 @@ fn safe_part(name: str) -> str {
         if bad {
             r = "-"
         }
-        if n + rl > 120 {
+        if n + 1 > 120 {
             break
         }
         out = out + r
-        n = n + rl
+        n = n + 1
         i = i + rl
     }
     // trim " .\t" both ends

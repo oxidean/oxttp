@@ -1312,7 +1312,7 @@ fn op_security(p: ref OParser, r: ref collection.PRequest, raw: ref json.Json, c
                 } else if in == "query" {
                     r.params = push(r.params, model.KV{name: key, value: value, enabled: true})
                 } else if in == "cookie" {
-                    o_append_cookie(p, r, key+"="+value)
+                    o_cookie(p, r, key, value)
                 }
             }
         }
