@@ -1,0 +1,1855 @@
+package importing
+
+// openapi.oxl — port of internal/importing/openapi/* (openapi.go,
+// budget.go, json.go, numbers.go, security.go, values.go) per
+// ADR-0044/0045. DOM is std/encoding/json Json; YAML input goes
+// through core/yaml's subset (ADR-0045 deviation 1) and numbers
+// approximate json.Number lexemes (deviation 2).
+import "std/encoding/json"
+import "std/encoding/hex"
+import "std/crypto/sha256"
+import "std/errors"
+import "std/net/url"
+import "std/sort"
+import "std/strconv"
+import "github.com/oxidean/oxttp/core/collection"
+import "github.com/oxidean/oxttp/core/model"
+import "github.com/oxidean/oxttp/core/yaml"
+
+let O_MAX_MATERIALIZED = 33554432 // 32 << 20
+
+// ---------- DOM helpers (upstream obj/array/str/boolean/scalar) ----------
+
+fn ois_obj(v: ref json.Json) -> bool { return v != nil && v.kind == 4 }
+fn ois_arr(v: ref json.Json) -> bool { return v != nil && v.kind == 5 }
+
+// ostr_ — upstream str(): string scalars only (numbers/bools → "").
+fn ostr_(v: ref json.Json) -> str {
+    if v != nil && v.kind == 3 {
+        return v.s
+    }
+    return ""
+}
+
+fn obool_(v: ref json.Json) -> bool {
+    return v != nil && v.kind == 1 && v.b
+}
+
+// okeys — sorted member keys of an object node.
+fn okeys(o: ref json.Json) -> []str {
+    out := mkslice(str, 0)
+    if o == nil || o.kind != 4 {
+        return out
+    }
+    m := o.child
+    for m != nil {
+        out = push(out, m.key)
+        m = m.next
+    }
+    sort.sort(out)
+    return out
+}
+
+// onum_text — scalar() number rendering: ints exact, floats
+// shortest round-trip (ADR-0045 deviation 2).
+fn onum_text(v: ref json.Json) -> str {
+    if v == nil {
+        return ""
+    }
+    if v.kind == 2 {
+        return itoa(v.i)
+    }
+    if v.kind == 6 {
+        return ftoa(v.f)
+    }
+    return ""
+}
+
+struct OSc { s: str, ok: bool }
+
+// oscalar — upstream scalar(): (text, ok). null → ("", true).
+fn oscalar(v: ref json.Json) -> own OSc {
+    o := new(OSc)
+    o.s = ""
+    o.ok = false
+    if v == nil {
+        return o
+    }
+    if v.kind == 3 {
+        o.s = v.s
+        o.ok = true
+        return o
+    }
+    if v.kind == 0 {
+        o.ok = true
+        return o
+    }
+    if v.kind == 1 {
+        if v.b {
+            o.s = "true"
+        } else {
+            o.s = "false"
+        }
+        o.ok = true
+        return o
+    }
+    if v.kind == 2 || v.kind == 6 {
+        o.s = onum_text(v)
+        o.ok = true
+        return o
+    }
+    return o
+}
+
+// ogetm — object member or nil (jgetk clone; read-only use).
+fn ogetm(o: ref json.Json, key: str) -> own json.Json {
+    return jgetk(o, key)
+}
+
+// literal — upstream literal(): escape $ for Posting templates.
+fn oliteral(s: str) -> str { return replace_all(s, "$", "$$") }
+
+fn omediatype(s: str) -> str {
+    i := find(s, ";")
+    t := s
+    if i >= 0 {
+        t = substr(s, 0, i)
+    }
+    return lower_ascii3(trim_space2(t))
+}
+
+fn ois_json(s: str) -> bool {
+    m := omediatype(s)
+    return m == "application/json" || (len(m) > 5 && substr(m, len(m) - 5, len(m)) == "+json")
+}
+
+// ---------- parser ----------
+
+struct OParser {
+    root: own json.Json,
+    res: own Result,
+    err: str,
+    seen_warns: []str,
+    var_names: []str,
+    budget: int,
+    out_bytes: int,
+}
+
+fn owarn(p: ref OParser, msg: str) {
+    i := 0
+    for i < len(p.seen_warns) {
+        if p.seen_warns[i] == msg {
+            return
+        }
+        i = i + 1
+    }
+    p.seen_warns = push(p.seen_warns, msg)
+    p.res.warns = push(p.res.warns, msg)
+}
+
+fn owarnf(p: ref OParser, msg: str) { owarn(p, msg) }
+
+fn ofail(p: ref OParser, msg: str) {
+    if len(p.err) == 0 {
+        p.err = msg
+    }
+}
+
+// oparse — Parse(data): one JSON or YAML document → Result.
+fn oparse(data: str) -> [own Result, err] {
+    if len(data) > O_MAX_MATERIALIZED {
+        return nil, errors.new("OpenAPI document exceeds 32 MiB")
+    }
+    trimmed := trim_space2(data)
+    first := ""
+    if len(trimmed) > 0 {
+        first = substr(trimmed, 0, 1)
+    }
+    root := json.jnull()
+    if first == "{" || first == "[" {
+        root = json.jparse(data)
+        if root == nil || root.kind == 0 {
+            return nil, errors.new("decode OpenAPI JSON: malformed document")
+        }
+    } else {
+        [yn, ye] = yaml.parse(data)
+        if ye != nil {
+            return nil, errors.new("decode OpenAPI: " + errors.msg(ye))
+        }
+        root = yn2j(yn)
+    }
+    if !ois_obj(root) {
+        return nil, errors.new("OpenAPI document must be an object")
+    }
+    version := ostr_(ogetm(root, "openapi"))
+    if !o_version_ok(version) {
+        return nil, errors.new("unsupported OpenAPI version \"" + version + "\" (supported: 3.0.x and 3.1.x; Swagger 2 is not supported)")
+    }
+    p := new(OParser)
+    p.root = json.jclone(root)
+    p.res = new(Result)
+    p.res.name = ostr_(ogetm(ogetm(root, "info"), "title"))
+    if len(p.res.name) == 0 {
+        p.res.name = "OpenAPI"
+    }
+    p.res.requests = mkslice(ImpRequest, 0)
+    p.res.variables = mkslice(model.KV, 0)
+    p.res.envs = mkslice(Env, 0)
+    p.seen_warns = mkslice(str, 0)
+    p.var_names = mkslice(str, 0)
+    p.budget = 10000
+    p.out_bytes = len(p.res.name)
+    o_scan(p, root)
+    paths := ogetm(root, "paths")
+    if !ois_obj(paths) {
+        return nil, errors.new("OpenAPI paths must be an object")
+    }
+    pkeys := okeys(paths)
+    pi := 0
+    for pi < len(pkeys) {
+        path := pkeys[pi]
+        pi = pi + 1
+        if len(path) > 2 && substr(path, 0, 2) == "x-" {
+            continue
+        }
+        if len(path) == 0 || byteat(path, 0) != 47 {
+            return nil, errors.new("OpenAPI path \"" + path + "\" must start with /")
+        }
+        item := o_resolve(p, ogetm(paths, path), "path " + path)
+        if len(p.err) > 0 {
+            return nil, errors.new(p.err)
+        }
+        ms := omethods()
+        mi := 0
+        for mi < len(ms) {
+            method := ms[mi]
+            mi = mi + 1
+            rawop := ogetm(item, method)
+            if rawop == nil {
+                continue
+            }
+            if method == "trace" {
+                owarnf(p, path + ": TRACE is not supported by Posting; operation skipped")
+                continue
+            }
+            if !ois_obj(rawop) {
+                ofail(p, upper_ascii2(method) + " " + path + ": operation must be an object")
+                continue
+            }
+            op_operation(p, path, method, item, rawop)
+            if len(p.err) > 0 {
+                return nil, errors.new(p.err)
+            }
+        }
+    }
+    if len(p.err) > 0 {
+        return nil, errors.new(p.err)
+    }
+    return p.res, nil
+}
+
+fn omethods() -> []str {
+    m := mkslice(str, 0)
+    m = push(m, "get"); m = push(m, "post"); m = push(m, "put")
+    m = push(m, "patch"); m = push(m, "delete"); m = push(m, "head")
+    m = push(m, "options"); m = push(m, "trace")
+    return m
+}
+
+// o_version_ok — ^3\.[01]\.[0-9]+$ hand-rolled.
+fn o_version_ok(v: str) -> bool {
+    if len(v) < 4 {
+        return false
+    }
+    if substr(v, 0, 3) != "3." {
+        return false
+    }
+    i := 3
+    if byteat(v, i) != 48 && byteat(v, i) != 49 {
+        return false
+    }
+    i = i + 1
+    if byteat(v, i) != 46 {
+        return false
+    }
+    i = i + 1
+    if i >= len(v) {
+        return false
+    }
+    for i < len(v) {
+        c := byteat(v, i)
+        if c < 48 || c > 57 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// yn2j — yaml.YNode → json.Json (scalars coerce like collection.yjson).
+fn yn2j(v: ref yaml.YNode) -> own json.Json {
+    if v == nil {
+        return json.jnull()
+    }
+    if v.kind == 1 {
+        o := json.jobj()
+        i := 0
+        for i < len(v.pairs) {
+            json.jadd(o, v.pairs[i].key, yn2j(v.pairs[i].val))
+            i = i + 1
+        }
+        return o
+    }
+    if v.kind == 2 {
+        b := json.jarrb()
+        i := 0
+        for i < len(v.items) {
+            json.jarrb_add(b, yn2j(v.items[i]))
+            i = i + 1
+        }
+        return json.jarrb_arr(b)
+    }
+    s := v.s
+    if !v.plain {
+        return json.jstr(s)
+    }
+    if olooks_bool(s) {
+        return json.jbool(s == "true" || s == "True" || s == "TRUE")
+    }
+    if olooks_null(s) {
+        return json.jnull()
+    }
+    [iv, ie] = strconv.atoi(s)
+    if ie == nil {
+        return json.jint(iv)
+    }
+    [fv, fe] = strconv.parsefloat(s)
+    if fe == nil {
+        return json.jfloat(fv)
+    }
+    return json.jstr(s)
+}
+
+fn olooks_bool(s: str) -> bool {
+    return s == "true" || s == "false" || s == "True" || s == "False" || s == "TRUE" || s == "FALSE"
+}
+
+fn olooks_null(s: str) -> bool {
+    return s == "null" || s == "Null" || s == "NULL" || s == "~"
+}
+
+// ---------- request construction ----------
+
+// operation — one path-item operation → ImpRequest.
+fn op_operation(p: ref OParser, path: str, method: str, item: ref json.Json, op: ref json.Json) {
+    context := upper_ascii2(method) + " " + path
+    req := new(collection.PRequest)
+    req.method = upper_ascii2(method)
+    req.kind = ""
+    req.name = ostr_(ogetm(op, "summary"))
+    if len(req.name) == 0 {
+        req.name = ostr_(ogetm(op, "operationId"))
+    }
+    if len(req.name) == 0 {
+        req.name = context
+    }
+    req.description = ostr_(ogetm(op, "description"))
+    if len(req.description) == 0 {
+        req.description = ostr_(ogetm(item, "description"))
+    }
+    rfile := req.name + ".posting.yaml"
+    tags := ogetm(op, "tags")
+    if ois_arr(tags) && tags.child != nil {
+        t0 := ostr_(tags.child)
+        if len(t0) > 0 {
+            rfile = t0 + "/" + rfile
+        }
+    }
+    servers := ogetm(op, "servers")
+    if servers == nil {
+        servers = ogetm(item, "servers")
+    }
+    if servers == nil {
+        servers = ogetm(p.root, "servers")
+    }
+    base := op_server(p, servers, context)
+    req.url = oliteral(o_trimrs(op_replace(op_replace(base, "/:", "/::"), "", ""))) + oescape_path(path)
+    // BASE_URL is introduced by the importer, not a literal source string.
+    if len(base) >= 10 && substr(base, 0, 10) == "${BASE_URL}" {
+        rest := oliteral(o_trimrs(op_replace(op_replace(substr(base, 10, len(base)), "/:", "/::"), "", "")))
+        req.url = "${BASE_URL}" + rest + oescape_path(path)
+    }
+    params := op_parameters(p, ogetm(item, "parameters"), context)
+    override := op_parameters(p, ogetm(op, "parameters"), context)
+    // merge: override replaces first same (name,in) slot in place;
+    // unmatched overrides append (upstream parameters() merge).
+    merged := json.jarrb()
+    used := mkslice(int, 0)
+    pm := params.child
+    for pm != nil {
+        pname := ostr_(ogetm(pm, "name"))
+        pin := ostr_(ogetm(pm, "in"))
+        midx := -1
+        om := override.child
+        oi := 0
+        for om != nil {
+            if ostr_(ogetm(om, "name")) == pname && ostr_(ogetm(om, "in")) == pin {
+                midx = oi
+            }
+            om = om.next
+            oi = oi + 1
+        }
+        if midx >= 0 {
+            om2 := override.child
+            oj := 0
+            for oj < midx {
+                om2 = om2.next
+                oj = oj + 1
+            }
+            json.jarrb_add(merged, json.jclone(om2))
+            used = push(used, midx)
+        } else {
+            json.jarrb_add(merged, json.jclone(pm))
+        }
+        pm = pm.next
+    }
+    om3 := override.child
+    oi3 := 0
+    for om3 != nil {
+        u := false
+        uj := 0
+        for uj < len(used) {
+            if used[uj] == oi3 {
+                u = true
+            }
+            uj = uj + 1
+        }
+        if !u {
+            json.jarrb_add(merged, json.jclone(om3))
+        }
+        om3 = om3.next
+        oi3 = oi3 + 1
+    }
+    params = json.jarrb_arr(merged)
+    pm2 := params.child
+    for pm2 != nil {
+        op_parameter(p, req, pm2, context)
+        pm2 = pm2.next
+        if len(p.err) > 0 || !ocheck_request_budget(p, req) {
+            return
+        }
+    }
+    urlnames := model.path_param_names(req.url)
+    ni := 0
+    for ni < len(urlnames) {
+        name := urlnames[ni]
+        ni = ni + 1
+        found := false
+        fi := 0
+        for fi < len(req.path_params) {
+            if req.path_params[fi].name == name {
+                found = true
+            }
+            fi = fi + 1
+        }
+        if !found {
+            owarnf(p, context + ": path parameter \"" + name + "\" has no supported definition; value needs editing")
+        }
+    }
+    lb := find(req.url, "{")
+    rb := find(req.url, "}")
+    if lb >= 0 && rb >= 0 {
+        // Posting's path slots work only when a placeholder occupies a segment.
+        segs := osplit(path, "/")
+        si := 0
+        for si < len(segs) {
+            seg := segs[si]
+            si = si + 1
+            if find(seg, "{") >= 0 {
+                whole := len(seg) > 2 && byteat(seg, 0) == 123 && byteat(seg, len(seg) - 1) == 125 && osingle_brace(seg)
+                if !whole {
+                    owarnf(p, context + ": embedded path template \"" + seg + "\" needs manual editing")
+                }
+            }
+        }
+    }
+    bodyraw := ogetm(op, "requestBody")
+    if bodyraw != nil {
+        op_body(p, req, o_resolve(p, bodyraw, context+" requestBody"), context)
+    }
+    security := ogetm(op, "security")
+    if security == nil {
+        security = ogetm(p.root, "security")
+    }
+    if len(p.err) > 0 || !ocheck_request_budget(p, req) {
+        return
+    }
+    op_security(p, req, security, context)
+    if ois_obj(ogetm(op, "callbacks")) && ogetm(op, "callbacks").child != nil {
+        owarnf(p, context + ": callbacks are not imported")
+    }
+    if len(p.err) > 0 || !ocheck_request_budget(p, req) {
+        return
+    }
+    p.out_bytes = p.out_bytes + orequest_bytes(req)
+    ir := ImpRequest{file: rfile, req: req}
+    p.res.requests = push(p.res.requests, ir)
+}
+
+fn o_trimrs(s: str) -> str {
+    i := len(s)
+    for i > 0 {
+        c := byteat(s, i - 1)
+        if c == 47 {
+            i = i - 1
+        } else {
+            break
+        }
+    }
+    return substr(s, 0, i)
+}
+
+fn op_replace(s: str, old: str, new: str) -> str { return replace_all(s, old, new) }
+
+fn osingle_brace(seg: str) -> bool {
+    n := 0
+    i := 0
+    for i < len(seg) {
+        if byteat(seg, i) == 123 {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n == 1
+}
+
+fn osplit(s: str, sep: str) -> []str {
+    out := mkslice(str, 0)
+    start := 0
+    i := 0
+    for i + len(sep) <= len(s) {
+        if substr(s, i, i + len(sep)) == sep {
+            out = push(out, substr(s, start, i))
+            i = i + len(sep)
+            start = i
+        } else {
+            i = i + 1
+        }
+    }
+    out = push(out, substr(s, start, len(s)))
+    return out
+}
+
+// oescape_path — upstream escapePath: literal(path) split on '/',
+// ':'-prefixed segments get an extra ':' (verbatim upstream),
+// whole-segment {x} becomes :x.
+fn oescape_path(path: str) -> str {
+    segs := osplit(oliteral(path), "/")
+    i := 0
+    for i < len(segs) {
+        s := segs[i]
+        if len(s) > 0 && byteat(s, 0) == 58 {
+            segs[i] = ":" + s
+        }
+        if len(s) > 2 && byteat(s, 0) == 123 && byteat(s, len(s) - 1) == 125 && osingle_brace(s) {
+            segs[i] = ":" + substr(s, 1, len(s) - 1)
+        }
+        i = i + 1
+    }
+    return str_join(segs, "/")
+}
+
+// ---------- servers ----------
+
+fn op_server(p: ref OParser, raw: ref json.Json, context: str) -> str {
+    servers := raw
+    if raw != nil && !ois_arr(raw) {
+        ofail(p, context + ": servers must be an array")
+        return ""
+    }
+    nservers := 0
+    firstsrv := json.jnull()
+    have_first := false
+    if ois_arr(servers) {
+        m := servers.child
+        for m != nil {
+            nservers = nservers + 1
+            if !have_first {
+                firstsrv = json.jclone(m)
+                have_first = true
+            }
+            m = m.next
+        }
+    }
+    if nservers == 0 {
+        o_add_variable(p, "BASE_URL", "")
+        owarnf(p, "relative server URLs require setting BASE_URL to the API origin before sending")
+        return "${BASE_URL}"
+    }
+    if nservers > 1 {
+        owarnf(p, context + ": selected first of " + itoa(nservers) + " servers")
+    }
+    server := firstsrv
+    if !ois_obj(server) {
+        ofail(p, context + ": server must be an object")
+        return ""
+    }
+    value := ostr_(ogetm(server, "url"))
+    if len(value) == 0 {
+        ofail(p, context + ": server URL is required")
+        return ""
+    }
+    variables := ogetm(server, "variables")
+    // {var} template substitution with variables.<name>.default
+    out := ""
+    i := 0
+    for i < len(value) {
+        c := byteat(value, i)
+        if c == 123 {
+            j := i + 1
+            ok := true
+            for j < len(value) && byteat(value, j) != 125 {
+                cj := byteat(value, j)
+                if cj == 123 || cj == 125 {
+                    ok = false
+                }
+                j = j + 1
+            }
+            if ok && j < len(value) {
+                name := substr(value, i + 1, j)
+                if len(name) > 0 {
+                    def := ogetm(variables, name)
+                    dv := ogetm(def, "default")
+                    if dv == nil {
+                        ofail(p, context + ": server variable \"" + name + "\" has no default")
+                        out = out + "{" + name + "}"
+                    } else {
+                        ds := ostr_(dv)
+                        if dv.kind != 3 {
+                            ofail(p, context + ": server variable \"" + name + "\" default must be a string")
+                        }
+                        out = out + ds
+                    }
+                    i = j + 1
+                    continue
+                }
+            }
+        }
+        out = out + substr(value, i, i + 1)
+        i = i + 1
+    }
+    value = out
+    if find(value, "?") >= 0 || find(value, "#") >= 0 {
+        ofail(p, context + ": server URLs containing query strings or fragments are not supported")
+    }
+    [pu, pe] = url.parse(value)
+    if pe != nil {
+        ofail(p, context + ": invalid server URL: " + errors.msg(pe))
+        return value
+    }
+    if len(pu.scheme) == 0 {
+        if len(pu.host) > 0 {
+            ofail(p, context + ": scheme-relative server URL requires choosing an explicit scheme")
+            return value
+        }
+        o_add_variable(p, "BASE_URL", "")
+        owarnf(p, "relative server URLs require setting BASE_URL to the API origin before sending")
+        return "${BASE_URL}/" + o_trimleft(value, "/")
+    }
+    if pu.scheme != "http" && pu.scheme != "https" {
+        ofail(p, context + ": server scheme \"" + pu.scheme + "\" is not supported")
+    }
+    if len(pu.host) == 0 {
+        ofail(p, context + ": server URL has no host")
+    }
+    return value
+}
+
+fn o_trimleft(s: str, cutset: str) -> str {
+    i := 0
+    for i < len(s) {
+        c := byteat(s, i)
+        found := false
+        k := 0
+        for k < len(cutset) {
+            if byteat(cutset, k) == c {
+                found = true
+            }
+            k = k + 1
+        }
+        if found {
+            i = i + 1
+        } else {
+            break
+        }
+    }
+    return substr(s, i, len(s))
+}
+
+// ---------- parameters ----------
+
+// op_parameters — upstream parameters(): validated, deduped, resolved.
+// Returns a Json array node (kind 5); absent/invalid → empty array.
+fn op_parameters(p: ref OParser, raw: ref json.Json, context: str) -> own json.Json {
+    b := json.jarrb()
+    if raw == nil {
+        return json.jarrb_arr(b)
+    }
+    if !ois_arr(raw) {
+        ofail(p, context + ": parameters must be an array")
+        return json.jarrb_arr(b)
+    }
+    seen := mkslice(str, 0)
+    m := raw.child
+    for m != nil {
+        v := o_resolve(p, m, context+" parameter")
+        if len(p.err) > 0 {
+            return json.jarrb_arr(b)
+        }
+        name := ostr_(ogetm(v, "name"))
+        in := ostr_(ogetm(v, "in"))
+        if len(name) == 0 || len(in) == 0 {
+            ofail(p, context + ": parameter name and in are required")
+            m = m.next
+            continue
+        }
+        key := in + "\x00" + name
+        dup := false
+        si := 0
+        for si < len(seen) {
+            if seen[si] == key {
+                dup = true
+            }
+            si = si + 1
+        }
+        if dup {
+            ofail(p, context + ": duplicate " + in + " parameter \"" + name + "\"")
+        }
+        seen = push(seen, key)
+        json.jarrb_add(b, v)
+        m = m.next
+    }
+    return json.jarrb_arr(b)
+}
+
+// op_parameter — one resolved parameter → r.Query/Headers/PathParams/cookie.
+fn op_parameter(p: ref OParser, r: ref collection.PRequest, parameter: ref json.Json, context: str) {
+    name := ostr_(ogetm(parameter, "name"))
+    in := ostr_(ogetm(parameter, "in"))
+    context = context + " parameter " + name
+    if in == "header" {
+        ln := lower_ascii3(name)
+        if ln == "accept" || ln == "content-type" || ln == "authorization" {
+            return
+        }
+    }
+    style := ostr_(ogetm(parameter, "style"))
+    if len(style) == 0 {
+        if in == "query" || in == "cookie" {
+            style = "form"
+        } else {
+            style = "simple"
+        }
+    }
+    explode := style == "form"
+    ev := ogetm(parameter, "explode")
+    if ev != nil && ev.kind == 1 {
+        explode = ev.b
+    }
+    if obool_(ogetm(parameter, "allowReserved")) {
+        owarnf(p, context + ": allowReserved cannot be preserved; parameter omitted")
+        return
+    }
+    value := json.jnull()
+    present := false
+    content := ogetm(parameter, "content")
+    if ois_obj(content) && content.child != nil {
+        ckeys := okeys(content)
+        if len(ckeys) != 1 {
+            ofail(p, context + ": content must have exactly one media type")
+            return
+        }
+        media := ckeys[0]
+        ex := o_example(p, ogetm(content, media), context)
+        if !ex.ok {
+            owarnf(p, context + ": content parameter has no usable example; omitted")
+            return
+        }
+        value = ex.v
+        present = true
+        if ois_json(media) {
+            enc := o_encode_json(p, value, false)
+            if !enc.ok {
+                return
+            }
+            nv := json.jstr(enc.s)
+            value = nv
+        } else {
+            scA := oscalar(value)
+            sv := scA.s
+            sok := scA.ok
+            if !sok || value.kind == 4 || value.kind == 5 {
+                owarnf(p, context + ": unsupported content parameter encoding; omitted")
+                return
+            }
+            nv2 := json.jstr(sv)
+            value = nv2
+        }
+    } else {
+        ex2 := o_example(p, parameter, context)
+        value = ex2.v
+        present = ex2.ok
+    }
+    if !present {
+        value = json.jstr("")
+        owarnf(p, context + ": no example or default; value needs editing")
+    }
+    if in == "query" {
+        values := op_parameter_values(name, value, style, explode)
+        if !values.ok {
+            owarnf(p, context + ": unsupported " + style + " serialization; parameter omitted")
+            return
+        }
+        i := 0
+        for i < len(values.list) {
+            kv := values.list[i]
+            i = i + 1
+            kv.name = oliteral(kv.name)
+            kv.value = oliteral(kv.value)
+            kv.enabled = present || obool_(ogetm(parameter, "required"))
+            r.params = push(r.params, kv)
+        }
+        return
+    }
+    if in == "header" {
+        if style != "simple" {
+            owarnf(p, context + ": unsupported header style " + style + "; omitted")
+            return
+        }
+        scB := oscalar(value)
+        s := scB.s
+        sok := scB.ok
+        if !sok {
+            owarnf(p, context + ": complex header serialization is not supported; omitted")
+            return
+        }
+        kv := model.KV{name: oliteral(name), value: oliteral(s), enabled: present || obool_(ogetm(parameter, "required"))}
+        r.headers = push(r.headers, kv)
+        return
+    }
+    if in == "path" {
+        if style != "simple" {
+            owarnf(p, context + ": unsupported path style " + style + "; value needs editing")
+            return
+        }
+        scB := oscalar(value)
+        s := scB.s
+        sok := scB.ok
+        if !sok {
+            owarnf(p, context + ": complex path serialization is not supported; value needs editing")
+            return
+        }
+        r.path_params = push(r.path_params, collection.PathParam{name: name, value: oliteral(s)})
+        return
+    }
+    if in == "cookie" {
+        scB := oscalar(value)
+        s := scB.s
+        sok := scB.ok
+        if !sok || style != "form" {
+            owarnf(p, context + ": complex cookie serialization is not supported; omitted")
+            return
+        }
+        if present || obool_(ogetm(parameter, "required")) {
+            o_cookie(p, r, name, s)
+        }
+        return
+    }
+    ofail(p, context + ": unsupported parameter location \"" + in + "\"")
+}
+
+struct OValues { list: []model.KV, ok: bool }
+
+// op_parameter_values — supported serialization subset (verbatim).
+fn op_parameter_values(name: str, value: ref json.Json, style: str, explode: bool) -> own OValues {
+    o := new(OValues)
+    o.list = mkslice(model.KV, 0)
+    o.ok = false
+    if value == nil {
+        return o
+    }
+    scC := oscalar(value)
+    sv := scC.s
+    isscalar := scC.ok
+    if isscalar {
+        if style != "form" {
+            return o
+        }
+        o.list = push(o.list, model.KV{name: name, value: sv, enabled: true})
+        o.ok = true
+        return o
+    }
+    if ois_arr(value) {
+        if style != "form" || !explode {
+            return o
+        }
+        m := value.child
+        for m != nil {
+            scD := oscalar(m)
+            s2 := scD.s
+            ok2 := scD.ok
+            if !ok2 {
+                o.list = mkslice(model.KV, 0)
+                return o
+            }
+            o.list = push(o.list, model.KV{name: name, value: s2, enabled: true})
+            m = m.next
+        }
+        o.ok = true
+        return o
+    }
+    if ois_obj(value) {
+        if !(style == "form" && explode) && style != "deepObject" {
+            return o
+        }
+        ks := okeys(value)
+        ki := 0
+        for ki < len(ks) {
+            k := ks[ki]
+            ki = ki + 1
+            fv := ogetm(value, k)
+            scE := oscalar(fv)
+            s2 := scE.s
+            ok2 := scE.ok
+            if !ok2 {
+                o.list = mkslice(model.KV, 0)
+                return o
+            }
+            field := k
+            if style == "deepObject" {
+                field = name + "[" + k + "]"
+            }
+            o.list = push(o.list, model.KV{name: field, value: s2, enabled: true})
+        }
+        o.ok = true
+        return o
+    }
+    return o
+}
+
+// ---------- request body ----------
+
+fn op_body(p: ref OParser, r: ref collection.PRequest, body: ref json.Json, context: str) {
+    content := ogetm(body, "content")
+    if !ois_obj(content) || content.child == nil {
+        owarnf(p, context + ": request body has no supported content")
+        return
+    }
+    ckeys := okeys(content)
+    media := ckeys[0]
+    // Favor a concrete, common representation when alternatives exist.
+    ki := 0
+    for ki < len(ckeys) {
+        if ois_json(ckeys[ki]) {
+            media = ckeys[ki]
+            ki = len(ckeys)
+        } else {
+            ki = ki + 1
+        }
+    }
+    jkey := ogetm(content, "application/json")
+    if jkey != nil {
+        media = "application/json"
+    } else if !ois_json(media) {
+        ukey := ogetm(content, "application/x-www-form-urlencoded")
+        if ukey != nil {
+            media = "application/x-www-form-urlencoded"
+        }
+    }
+    if len(ckeys) > 1 {
+        owarnf(p, context + ": selected " + media + " from " + itoa(len(ckeys)) + " request body media types")
+    }
+    definition := ogetm(content, media)
+    exb := o_example(p, definition, context+" body")
+    value := exb.v
+    present := exb.ok
+    if len(media) >= 10 && substr(media, 0, 10) == "multipart/" {
+        owarnf(p, context + ": multipart bodies are not supported; body omitted")
+        return
+    }
+    if !present {
+        owarnf(p, context + ": request body has no usable example or default; body needs editing")
+    }
+    // Examples contain literal source bytes, including '$'.
+    r.options = new(collection.POptions{follow_redirects: true, verify_ssl: true, attach_cookies: true, substitute_body_variables: false, proxy_url: "", timeout: 5.0, set_mask: 8})
+    if omediatype(media) == "application/x-www-form-urlencoded" {
+        if !ois_obj(value) {
+            owarnf(p, context + ": form body example must be an object; body omitted")
+            return
+        }
+        b := new(collection.PBody)
+        b.has_form_data = true
+        b.content_type = "application/x-www-form-urlencoded"
+        if media != b.content_type {
+            r.headers = push(r.headers, model.KV{name: "Content-Type", value: oliteral(media), enabled: true})
+        }
+        encoding := ogetm(definition, "encoding")
+        vks := okeys(value)
+        vi := 0
+        for vi < len(vks) {
+            vname := vks[vi]
+            vi = vi + 1
+            enc := ogetm(encoding, vname)
+            fres := op_form_values(p, vname, ogetm(value, vname), enc)
+            fields := fres.list
+            fok := fres.ok
+            if !fok {
+                owarnf(p, context + ": form field " + vname + " has unsupported serialization; omitted")
+                continue
+            }
+            fi := 0
+            for fi < len(fields) {
+                b.form_data = push(b.form_data, fields[fi])
+                fi = fi + 1
+            }
+            if len(p.err) > 0 || !ocheck_request_budget(p, r) {
+                r.body = b
+                return
+            }
+        }
+        r.body = b
+        return
+    }
+    raw := ""
+    if present {
+        if ois_json(media) {
+            enc2 := o_encode_json(p, value, true)
+            if !enc2.ok {
+                return
+            }
+            raw = enc2.s
+        } else {
+            scF := oscalar(value)
+            s3 := scF.s
+            sok3 := scF.ok
+            if !sok3 || value.kind == 4 || value.kind == 5 {
+                owarnf(p, context + ": " + media + " body requires a string example; body omitted")
+                return
+            }
+            raw = s3
+        }
+    }
+    if find(media, "*") >= 0 {
+        owarnf(p, context + ": wildcard body media type " + media + " needs manual selection")
+    }
+    b2 := new(collection.PBody)
+    b2.has_content = true
+    b2.content = raw
+    b2.content_type = media
+    r.body = b2
+}
+
+// op_form_values — form field serialization (style/explode/contentType).
+fn op_form_values(p: ref OParser, name: str, value: ref json.Json, encoding: ref json.Json) -> own OValues {
+    res := new(OValues)
+    res.list = mkslice(model.KV, 0)
+    res.ok = false
+    empty := res.list
+    if encoding != nil && ois_obj(encoding) {
+        has_style := ogetm(encoding, "style") != nil
+        has_explode := ogetm(encoding, "explode") != nil
+        has_reserved := ogetm(encoding, "allowReserved") != nil
+        if has_style || has_explode || has_reserved {
+            if obool_(ogetm(encoding, "allowReserved")) {
+                return res
+            }
+            style := ostr_(ogetm(encoding, "style"))
+            if len(style) == 0 {
+                style = "form"
+            }
+            explode := style == "form"
+            ev := ogetm(encoding, "explode")
+            if ev != nil && ev.kind == 1 {
+                explode = ev.b
+            }
+            return op_parameter_values(name, value, style, explode)
+        }
+    }
+    vb := json.jarrb()
+    enc_obj := ois_obj(encoding)
+    if value != nil && ois_arr(value) {
+        m := value.child
+        for m != nil {
+            json.jarrb_add(vb, json.jclone(m))
+            m = m.next
+        }
+    } else if value != nil {
+        json.jarrb_add(vb, json.jclone(value))
+    }
+    values := json.jarrb_arr(vb)
+    vm := values.child
+    for vm != nil {
+        item := vm
+        vm = vm.next
+        content_type := ""
+        if enc_obj {
+            content_type = ostr_(ogetm(encoding, "contentType"))
+        }
+        is_obj_val := item != nil && item.kind == 4
+        if len(content_type) == 0 && is_obj_val {
+            content_type = "application/json"
+        }
+        text := ""
+        if ois_json(content_type) {
+            enc3 := o_encode_json(p, item, false)
+            if !enc3.ok {
+                return res
+            }
+            text = enc3.s
+        } else {
+            if len(content_type) > 0 && omediatype(content_type) != "text/plain" {
+                return res
+            }
+            scG := oscalar(item)
+            s4 := scG.s
+            ok4 := scG.ok
+            if !ok4 {
+                return res
+            }
+            text = s4
+        }
+        res.list = push(res.list, model.KV{name: name, value: text, enabled: true})
+    }
+    res.ok = true
+    return res
+}
+
+// ---------- security ----------
+
+// op_security — choose a complete representable OR alternative.
+fn op_security(p: ref OParser, r: ref collection.PRequest, raw: ref json.Json, context: str) {
+    if raw == nil {
+        return
+    }
+    if !ois_arr(raw) {
+        ofail(p, context + ": security must be an array")
+        return
+    }
+    nreq := 0
+    m := raw.child
+    for m != nil {
+        nreq = nreq + 1
+        m = m.next
+    }
+    if nreq == 0 {
+        return
+    }
+    // anonymous {} alternative → return silently unless >1 reqs
+    m = raw.child
+    idx := 0
+    for m != nil {
+        if ois_obj(m) && m.child == nil {
+            if nreq > 1 {
+                owarnf(p, context + ": selected anonymous access from security alternatives")
+            }
+            return
+        }
+        idx = idx + 1
+        m = m.next
+    }
+    schemes2 := ogetm(ogetm(p.root, "components"), "securitySchemes")
+    // iterate requirement objects directly (cursor); index for messages
+    m = raw.child
+    ri := 0
+    for m != nil {
+        ri = ri + 1
+        if !ois_obj(m) {
+            ofail(p, context + ": security requirement must be an object")
+            return
+        }
+        rnames := mkslice(str, 0)
+        supported := true
+        authcount := 0
+        ks := okeys(m)
+        ki := 0
+        for ki < len(ks) {
+            sname := ks[ki]
+            ki = ki + 1
+            scheme := o_resolve(p, ogetm(schemes2, sname), context+" security scheme "+sname)
+            if len(p.err) > 0 {
+                return
+            }
+            rnames = push(rnames, sname)
+            stype := ostr_(ogetm(scheme, "type"))
+            if stype == "http" {
+                sch := lower_ascii3(ostr_(ogetm(scheme, "scheme")))
+                if sch != "basic" && sch != "bearer" && sch != "digest" {
+                    supported = false
+                }
+                authcount = authcount + 1
+            } else if stype == "apiKey" {
+                in := ostr_(ogetm(scheme, "in"))
+                nm := ostr_(ogetm(scheme, "name"))
+                if len(nm) == 0 || (in != "header" && in != "query" && in != "cookie") {
+                    supported = false
+                }
+                if in == "header" && case_eq_fold(nm, "Authorization") {
+                    authcount = authcount + 1
+                }
+            } else {
+                supported = false
+            }
+        }
+        if authcount > 1 {
+            supported = false
+        }
+        if !supported {
+            m = m.next
+            continue
+        }
+        if nreq > 1 {
+            owarnf(p, context + ": selected security alternative " + itoa(ri) + " of " + itoa(nreq))
+        }
+        ai := 0
+        for ai < len(rnames) {
+            sname := rnames[ai]
+            ai = ai + 1
+            scheme := o_resolve(p, ogetm(schemes2, sname), context+" security scheme "+sname)
+            if len(p.err) > 0 {
+                return
+            }
+            prefix := o_auth_prefix(sname)
+            stype := ostr_(ogetm(scheme, "type"))
+            if stype == "http" {
+                sch := lower_ascii3(ostr_(ogetm(scheme, "scheme")))
+                if sch == "basic" || sch == "digest" {
+                    at := "basic"
+                    if sch == "digest" {
+                        at = "digest"
+                    }
+                    auth := new(collection.PAuth)
+                    auth.type = at
+                    bb := new(collection.PBasic)
+                    bb.username = o_placeholder(p, prefix+"_USERNAME")
+                    bb.password = o_placeholder(p, prefix+"_PASSWORD")
+                    if at == "digest" {
+                        auth.digest = bb
+                    } else {
+                        auth.basic = bb
+                    }
+                    r.auth = auth
+                } else {
+                    auth2 := new(collection.PAuth)
+                    auth2.type = "bearer_token"
+                    bt := new(collection.PBearer)
+                    bt.token = o_placeholder(p, prefix+"_TOKEN")
+                    auth2.bearer_token = bt
+                    r.auth = auth2
+                }
+            } else {
+                value := o_placeholder(p, prefix+"_KEY")
+                key := oliteral(ostr_(ogetm(scheme, "name")))
+                in := ostr_(ogetm(scheme, "in"))
+                if in == "header" {
+                    r.headers = push(r.headers, model.KV{name: key, value: value, enabled: true})
+                } else if in == "query" {
+                    r.params = push(r.params, model.KV{name: key, value: value, enabled: true})
+                } else if in == "cookie" {
+                    o_append_cookie(p, r, key+"="+value)
+                }
+            }
+        }
+        owarnf(p, context + ": authentication credentials are empty placeholders; configure imported variables before sending")
+        return
+    }
+    owarnf(p, context + ": security requirements cannot be represented (OAuth/OpenID/mTLS or incompatible schemes); authentication needs manual configuration")
+}
+
+// o_auth_prefix — OPENAPI_<LABEL>_<8 hex of sha256(name)[:4]>.
+fn o_auth_prefix(name: str) -> str {
+    up := upper_ascii2(name)
+    b := mkslice(byte, 0)
+    i := 0
+    for i < len(up) {
+        c := byteat(up, i)
+        if (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 95 {
+            b = push(b, c)
+        } else {
+            b = push(b, 95)
+        }
+        i = i + 1
+    }
+    label := b as str
+    if len(label) > 48 {
+        label = substr(label, 0, 48)
+    }
+    h := sha256.new()
+    nb := name as []byte
+    [_, _we] = h.write(nb)
+    dig := h.sum(mkslice(byte, 0))
+    hx := hex.encode(dig)
+    if len(hx) > 8 {
+        hx = substr(hx, 0, 8)
+    }
+    return "OPENAPI_" + label + "_" + hx
+}
+
+// ---------- variables / cookies ----------
+
+fn o_add_variable(p: ref OParser, name: str, value: str) {
+    i := 0
+    for i < len(p.var_names) {
+        if p.var_names[i] == name {
+            return
+        }
+        i = i + 1
+    }
+    p.out_bytes = p.out_bytes + len(name) + len(value) + 8
+    if p.out_bytes > O_MAX_MATERIALIZED {
+        ofail(p, "OpenAPI materialized request data exceeds 32 MiB")
+        return
+    }
+    p.var_names = push(p.var_names, name)
+    p.res.variables = push(p.res.variables, model.KV{name: name, value: oliteral(value), enabled: true})
+}
+
+fn o_placeholder(p: ref OParser, name: str) -> str {
+    o_add_variable(p, name, "")
+    return "${" + name + "}"
+}
+
+fn o_cookie(p: ref OParser, r: ref collection.PRequest, name: str, value: str) {
+    o_append_cookie(p, r, oliteral(url.queryescape(name)+"="+url.queryescape(value)))
+}
+
+fn o_append_cookie(p: ref OParser, r: ref collection.PRequest, value: str) {
+    i := 0
+    for i < len(r.headers) {
+        if case_eq_fold(r.headers[i].name, "Cookie") && r.headers[i].enabled {
+            r.headers[i].value = r.headers[i].value + "; " + value
+            return
+        }
+        i = i + 1
+    }
+    r.headers = push(r.headers, model.KV{name: "Cookie", value: value, enabled: true})
+}
+
+// ---------- $ref resolution ----------
+
+// o_resolve — JSON-pointer refs within the document (verbatim rules).
+fn o_resolve(p: ref OParser, raw: ref json.Json, context: str) -> own json.Json {
+    return o_resolve_object(p, raw, context, false)
+}
+
+fn o_resolve_schema(p: ref OParser, raw: ref json.Json, context: str) -> own json.Json {
+    return o_resolve_object(p, raw, context, true)
+}
+
+fn o_resolve_object(p: ref OParser, raw: ref json.Json, context: str, allow_bool: bool) -> own json.Json {
+    seen := mkslice(str, 0)
+    cur := json.jnull()
+    if raw != nil {
+        cur = json.jclone(raw)
+    }
+    depth := 0
+    for depth < 64 {
+        if cur != nil && cur.kind == 1 && allow_bool {
+            return nil
+        }
+        if !ois_obj(cur) {
+            ofail(p, context + ": expected an object")
+            return nil
+        }
+        refv := ogetm(cur, "$ref")
+        if refv == nil {
+            return cur
+        }
+        if refv.kind != 3 {
+            ofail(p, context + ": $ref must be a string")
+            return nil
+        }
+        ref := refv.s
+        sdup := false
+        si := 0
+        for si < len(seen) {
+            if seen[si] == ref {
+                sdup = true
+            }
+            si = si + 1
+        }
+        if sdup {
+            ofail(p, context + ": cyclic reference \"" + ref + "\"")
+            return nil
+        }
+        seen = push(seen, ref)
+        rks := okeys(cur)
+        ki := 0
+        for ki < len(rks) {
+            if rks[ki] != "$ref" {
+                owarnf(p, context + ": sibling \"" + rks[ki] + "\" beside $ref is not applied")
+            }
+            ki = ki + 1
+        }
+        if len(ref) == 0 || byteat(ref, 0) != 35 {
+            ofail(p, context + ": external reference \"" + ref + "\" is unsupported; bundle the document first")
+            return nil
+        }
+        pointer := o_path_unescape(substr(ref, 1, len(ref)))
+        if len(pointer) > 0 && byteat(pointer, 0) != 47 {
+            ofail(p, context + ": reference \"" + ref + "\" is not a JSON pointer; anchors are unsupported")
+            return nil
+        }
+        target := json.jclone(p.root)
+        if len(pointer) > 0 {
+            parts := osplit(substr(pointer, 1, len(pointer)), "/")
+            pi := 0
+            bad := false
+            for pi < len(parts) && !bad {
+                part := parts[pi]
+                pi = pi + 1
+                if o_invalid_escape(part) {
+                    ofail(p, context + ": invalid JSON pointer escape in \"" + ref + "\"")
+                    return nil
+                }
+                part = replace_all(replace_all(part, "~1", "/"), "~0", "~")
+                if ois_obj(target) {
+                    tv := ogetm(target, part)
+                    if tv == nil {
+                        ofail(p, context + ": unresolved reference \"" + ref + "\"")
+                        return nil
+                    }
+                    target = tv
+                } else if ois_arr(target) {
+                    idx := o_atoi_strict(part)
+                    if idx < 0 {
+                        ofail(p, context + ": invalid array reference \"" + ref + "\"")
+                        return nil
+                    }
+                    ci := 0
+                    cm := target.child
+                    for ci < idx && cm != nil {
+                        ci = ci + 1
+                        cm = cm.next
+                    }
+                    if cm == nil {
+                        ofail(p, context + ": invalid array reference \"" + ref + "\"")
+                        return nil
+                    }
+                    target = json.jclone(cm)
+                } else {
+                    ofail(p, context + ": unresolved reference \"" + ref + "\"")
+                    return nil
+                }
+            }
+        }
+        cur = target
+        depth = depth + 1
+    }
+    ofail(p, context + ": reference chain exceeds 64 levels")
+    return nil
+}
+
+fn o_atoi_strict(s: str) -> int {
+    if len(s) == 0 {
+        return -1
+    }
+    i := 0
+    for i < len(s) {
+        c := byteat(s, i)
+        if c < 48 || c > 57 {
+            return -1
+        }
+        i = i + 1
+    }
+    if len(s) > 1 && byteat(s, 0) == 48 {
+        return -1
+    }
+    [v, e] = strconv.atoi(s)
+    if e != nil || v < 0 {
+        return -1
+    }
+    return v
+}
+
+fn o_invalid_escape(s: str) -> bool {
+    i := 0
+    for i < len(s) {
+        if byteat(s, i) == 126 {
+            if i + 1 >= len(s) || (byteat(s, i + 1) != 48 && byteat(s, i + 1) != 49) {
+                return true
+            }
+            i = i + 1
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// o_path_unescape — url.PathUnescape approximation (%XX only).
+fn o_path_unescape(s: str) -> str {
+    [v, e] = url.pathunescape(s)
+    if e != nil {
+        return s
+    }
+    return v
+}
+
+// ---------- scan / example / sample ----------
+
+fn o_scan(p: ref OParser, raw: ref json.Json) {
+    if ois_obj(raw) {
+        refv := ogetm(raw, "$ref")
+        if refv != nil && refv.kind == 3 && len(refv.s) > 0 && byteat(refv.s, 0) != 35 {
+            owarnf(p, "external reference \"" + refv.s + "\" is not fetched; bundle it locally before importing affected operations")
+        }
+        if ogetm(raw, "$id") != nil {
+            owarnf(p, "JSON Schema $id resource scopes are not supported")
+        }
+        if ogetm(raw, "$dynamicRef") != nil {
+            owarnf(p, "JSON Schema $dynamicRef is not supported")
+        }
+        ks := okeys(raw)
+        i := 0
+        for i < len(ks) {
+            o_scan(p, ogetm(raw, ks[i]))
+            i = i + 1
+        }
+        return
+    }
+    if ois_arr(raw) {
+        m := raw.child
+        for m != nil {
+            o_scan(p, m)
+            m = m.next
+        }
+    }
+}
+
+struct OEx { v: own json.Json, ok: bool }
+
+// o_example — explicit example/examples then schema sample.
+fn o_example(p: ref OParser, def: ref json.Json, context: str) -> own OEx {
+    o := new(OEx)
+    o.v = nil
+    o.ok = false
+    if def == nil {
+        return o
+    }
+    ev := ogetm(def, "example")
+    if ev != nil {
+        o.v = ev
+        o.ok = true
+        return o
+    }
+    examples := ogetm(def, "examples")
+    if ois_obj(examples) && examples.child != nil {
+        eks := okeys(examples)
+        ename := eks[0]
+        if len(eks) > 1 {
+            owarnf(p, context + ": selected first example \"" + ename + "\" alphabetically")
+        }
+        example := o_resolve(p, ogetm(examples, ename), context+" example "+ename)
+        if len(p.err) > 0 {
+            return o
+        }
+        vv := ogetm(example, "value")
+        if vv != nil {
+            o.v = vv
+            o.ok = true
+            return o
+        }
+        if ogetm(example, "externalValue") != nil {
+            owarnf(p, context + ": external example is not fetched")
+        }
+    }
+    schema := ogetm(def, "schema")
+    if schema != nil {
+        return o_sample(p, schema, context, 0)
+    }
+    return o
+}
+
+// o_sample — editable scaffold from schema (bounded synthesis).
+fn o_sample(p: ref OParser, raw: ref json.Json, context: str, depth: int) -> own OEx {
+    o := new(OEx)
+    o.v = nil
+    o.ok = false
+    if raw != nil && raw.kind == 1 {
+        return o
+    }
+    schema := o_resolve_schema(p, raw, context+" schema")
+    if len(p.err) > 0 {
+        return o
+    }
+    ek := mkslice(str, 0)
+    ek = push(ek, "example"); ek = push(ek, "default"); ek = push(ek, "const")
+    ki := 0
+    for ki < len(ek) {
+        v := ogetm(schema, ek[ki])
+        ki = ki + 1
+        if v != nil {
+            o.v = v
+            o.ok = true
+            return o
+        }
+    }
+    exs := ogetm(schema, "examples")
+    if ois_arr(exs) && exs.child != nil {
+        o.v = json.jclone(exs.child)
+        o.ok = true
+        return o
+    }
+    en := ogetm(schema, "enum")
+    if ois_arr(en) && en.child != nil {
+        o.v = json.jclone(en.child)
+        o.ok = true
+        return o
+    }
+    p.budget = p.budget - 1
+    if depth > 16 || p.budget < 0 {
+        owarnf(p, context + ": recursive or oversized schema stopped while generating an example")
+        return o
+    }
+    badkeys := mkslice(str, 0)
+    badkeys = push(badkeys, "allOf"); badkeys = push(badkeys, "oneOf")
+    badkeys = push(badkeys, "anyOf"); badkeys = push(badkeys, "$dynamicRef")
+    badkeys = push(badkeys, "$id")
+    bi := 0
+    for bi < len(badkeys) {
+        if ogetm(schema, badkeys[bi]) != nil {
+            owarnf(p, context + ": schema " + badkeys[bi] + " requires an explicit example; no value synthesized")
+            return o
+        }
+        bi = bi + 1
+    }
+    typ := ostr_(ogetm(schema, "type"))
+    tarr := ogetm(schema, "type")
+    if len(typ) == 0 && ois_arr(tarr) {
+        m := tarr.child
+        for m != nil {
+            cs := ostr_(m)
+            if cs != "null" && len(typ) == 0 {
+                typ = cs
+            }
+            m = m.next
+        }
+    }
+    props := ogetm(schema, "properties")
+    if typ == "object" || props != nil {
+        out := json.jobj()
+        pks := okeys(props)
+        ki := 0
+        for ki < len(pks) {
+            pname := pks[ki]
+            ki = ki + 1
+            pv := ogetm(props, pname)
+            if pv != nil && pv.kind == 1 {
+                continue
+            }
+            property := o_resolve_schema(p, pv, context+" property "+pname)
+            if len(p.err) > 0 {
+                return o
+            }
+            if obool_(ogetm(property, "readOnly")) {
+                continue
+            }
+            sub := o_sample(p, pv, context, depth+1)
+            if sub.ok {
+                json.jadd(out, pname, sub.v)
+            }
+        }
+        owarnf(p, context + ": generated a body/parameter scaffold from schema; review values and constraints")
+        o.v = out
+        o.ok = true
+        return o
+    }
+    if typ == "array" {
+        items := ogetm(schema, "items")
+        if items == nil {
+            return o
+        }
+        sub := o_sample(p, items, context, depth+1)
+        b := json.jarrb()
+        if sub.ok {
+            json.jarrb_add(b, sub.v)
+        }
+        owarnf(p, context + ": generated a body/parameter scaffold from schema; review values and constraints")
+        o.v = json.jarrb_arr(b)
+        o.ok = true
+        return o
+    }
+    return o
+}
+
+// ---------- budget / encoding ----------
+
+fn orequest_bytes(r: ref collection.PRequest) -> int {
+    size := len(r.name) + len(r.description) + len(r.url)
+    if r.body != nil {
+        size = size + len(r.body.content) + len(r.body.content_type)
+    }
+    if r.auth != nil {
+        if r.auth.basic != nil {
+            size = size + len(r.auth.basic.username) + len(r.auth.basic.password)
+        }
+        if r.auth.digest != nil {
+            size = size + len(r.auth.digest.username) + len(r.auth.digest.password)
+        }
+        if r.auth.bearer_token != nil {
+            size = size + len(r.auth.bearer_token.token)
+        }
+    }
+    i := 0
+    for i < len(r.params) {
+        size = size + len(r.params[i].name) + len(r.params[i].value)
+        i = i + 1
+    }
+    i = 0
+    for i < len(r.headers) {
+        size = size + len(r.headers[i].name) + len(r.headers[i].value)
+        i = i + 1
+    }
+    i = 0
+    for i < len(r.path_params) {
+        size = size + len(r.path_params[i].name) + len(r.path_params[i].value)
+        i = i + 1
+    }
+    if r.body != nil {
+        i = 0
+        for i < len(r.body.form_data) {
+            size = size + len(r.body.form_data[i].name) + len(r.body.form_data[i].value)
+            i = i + 1
+        }
+    }
+    return size
+}
+
+fn ocheck_request_budget(p: ref OParser, r: ref collection.PRequest) -> bool {
+    size := orequest_bytes(r)
+    rem := O_MAX_MATERIALIZED - p.out_bytes
+    if size > rem {
+        ofail(p, "OpenAPI materialized request data exceeds 32 MiB")
+        return false
+    }
+    return true
+}
+
+// o_encode_json — bounded JSON encode (compact, or pretty when small).
+struct OEnc { s: str, ok: bool }
+
+fn o_encode_json(p: ref OParser, value: ref json.Json, pretty: bool) -> own OEnc {
+    remaining := O_MAX_MATERIALIZED - p.out_bytes
+    eb := mkslice(int, 1)
+    eb[0] = remaining
+    o := new(OEnc)
+    o.s = ""
+    o.ok = false
+    if !ojson_fits(value, eb) {
+        ofail(p, "OpenAPI materialized request data exceeds 32 MiB")
+        return o
+    }
+    encoded := json.tojson(value)
+    if len(encoded) > remaining {
+        ofail(p, "OpenAPI materialized request data exceeds 32 MiB")
+        return o
+    }
+    if pretty && len(encoded) <= remaining/202 {
+        encoded = ojpretty(value)
+    }
+    o.s = encoded
+    o.ok = true
+    return o
+}
+
+// ojson_fits — lower-bound size walk (verbatim budget semantics).
+fn ojson_fits(v: ref json.Json, b: []int) -> bool {
+    if b[0] < 0 {
+        return false
+    }
+    if v == nil {
+        b[0] = b[0] - 4
+        return b[0] >= 0
+    }
+    if v.kind == 4 {
+        b[0] = b[0] - 2
+        m := v.child
+        for m != nil {
+            b[0] = b[0] - len(m.key) - 4
+            if !ojson_fits(m, b) {
+                return false
+            }
+            m = m.next
+        }
+    } else if v.kind == 5 {
+        b[0] = b[0] - 2
+        m := v.child
+        for m != nil {
+            b[0] = b[0] - 1
+            if !ojson_fits(m, b) {
+                return false
+            }
+            m = m.next
+        }
+    } else if v.kind == 3 {
+        b[0] = b[0] - len(v.s) - 2
+    } else if v.kind == 2 || v.kind == 6 {
+        b[0] = b[0] - len(onum_text(v))
+    } else {
+        b[0] = b[0] - 4
+    }
+    return b[0] >= 0
+}
+
+// ojpretty — Go json.MarshalIndent(v, "", "  ") approximation.
+fn ojpretty(j: ref json.Json) -> str {
+    return ojpretty_i(j, 0)
+}
+
+fn ojpretty_i(j: ref json.Json, lvl: int) -> str {
+    if j == nil || j.kind == 0 || j.kind == 1 || j.kind == 2 || j.kind == 3 || j.kind == 6 {
+        return json.tojson(j)
+    }
+    ind := ""
+    k := 0
+    for k < lvl {
+        ind = ind + "  "
+        k = k + 1
+    }
+    childind := ind + "  "
+    if j.kind == 4 {
+        out := "{\n"
+        first := true
+        m := j.child
+        for m != nil {
+            if !first {
+                out = out + ",\n"
+            }
+            first = false
+            kq := json.tojson(json.jstr(m.key))
+            out = out + childind + kq + ": " + ojpretty_i(m, lvl + 1)
+            m = m.next
+        }
+        if !first {
+            out = out + "\n"
+        }
+        return out + ind + "}"
+    }
+    if j.kind == 5 {
+        out := "[\n"
+        first := true
+        m := j.child
+        for m != nil {
+            if !first {
+                out = out + ",\n"
+            }
+            first = false
+            out = out + childind + ojpretty_i(m, lvl + 1)
+            m = m.next
+        }
+        if !first {
+            out = out + "\n"
+        }
+        return out + ind + "]"
+    }
+    return json.tojson(j)
+}

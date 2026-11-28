@@ -1,0 +1,609 @@
+package importing
+
+// bruno_syntax.oxl — port of internal/importing/bruno/syntax.go
+// (posting @32c4566). .bru text blocks, pairs, lists.
+// Deviations (ADR-0045): utf8.Valid hand-rolled; rune scans via
+// next_rune instead of Go range.
+import "std/errors"
+import "github.com/oxidean/oxttp/core/model"
+
+let BMAX_FILE = 16777216 // 16 << 20
+
+struct BBlock { name: str, text: str }
+
+// ---------- small helpers ----------
+
+fn trim_prefix(s: str, pre: str) -> str {
+    if startswith(s, pre) {
+        return substr(s, len(pre), len(s))
+    }
+    return s
+}
+
+fn trim_suffix2(s: str, suf: str) -> str {
+    if endswith(s, suf) {
+        return substr(s, 0, len(s) - len(suf))
+    }
+    return s
+}
+
+fn startswith(s: str, pre: str) -> bool {
+    if len(pre) > len(s) {
+        return false
+    }
+    i := 0
+    for i < len(pre) {
+        if byteat(s, i) != byteat(pre, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn endswith(s: str, suf: str) -> bool {
+    if len(suf) > len(s) {
+        return false
+    }
+    off := len(s) - len(suf)
+    i := 0
+    for i < len(suf) {
+        if byteat(s, off + i) != byteat(suf, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn contains(s: str, sub: str) -> bool {
+    return find(s, sub) >= 0
+}
+
+fn is_space(c: int) -> bool {
+    return c == 32 || c == 9 || c == 10 || c == 13 || c == 11 || c == 12
+}
+
+// btrim — ASCII TrimSpace approximation.
+fn btrim(s: str) -> str {
+    a := 0
+    for a < len(s) && is_space(byteat(s, a)) {
+        a = a + 1
+    }
+    b := len(s)
+    for b > a && is_space(byteat(s, b - 1)) {
+        b = b - 1
+    }
+    return substr(s, a, b)
+}
+
+// btrim_left — trim leading bytes in cutset.
+fn btrim_left(s: str, cutset: str) -> str {
+    a := 0
+    for a < len(s) {
+        c := byteat(s, a)
+        found := false
+        ci := 0
+        for ci < len(cutset) {
+            if byteat(cutset, ci) == c {
+                found = true
+            }
+            ci = ci + 1
+        }
+        if !found {
+            break
+        }
+        a = a + 1
+    }
+    return substr(s, a, len(s))
+}
+
+// bsplit — strings.Split equivalent returning a plain slice.
+fn bsplit(s: str, sep: str) -> []str {
+    out := mkslice(str, 0)
+    if len(sep) == 0 {
+        return push(out, s)
+    }
+    pos := 0
+    for pos <= len(s) {
+        i := find(substr(s, pos, len(s)), sep)
+        if i < 0 {
+            out = push(out, substr(s, pos, len(s)))
+            break
+        }
+        out = push(out, substr(s, pos, pos + i))
+        pos = pos + i + len(sep)
+    }
+    return out
+}
+
+fn rune_len_at(s: str, i: int) -> int {
+    c := byteat(s, i)
+    if c < 128 {
+        return 1
+    }
+    if c >= 240 {
+        return 4
+    }
+    if c >= 224 {
+        return 3
+    }
+    return 2
+}
+
+fn valid_utf8(s: str) -> bool {
+    i := 0
+    for i < len(s) {
+        c := byteat(s, i)
+        if c < 128 {
+            i = i + 1
+            continue
+        }
+        if c >= 194 && c <= 223 {
+            if i + 1 >= len(s) || byteat(s, i + 1) < 128 || byteat(s, i + 1) > 191 {
+                return false
+            }
+            i = i + 2
+            continue
+        }
+        if c >= 224 && c <= 239 {
+            if i + 2 >= len(s) || byteat(s, i + 1) < 128 || byteat(s, i + 1) > 191 || byteat(s, i + 2) < 128 || byteat(s, i + 2) > 191 {
+                return false
+            }
+            i = i + 3
+            continue
+        }
+        if c >= 240 && c <= 244 {
+            if i + 3 >= len(s) || byteat(s, i + 1) < 128 || byteat(s, i + 1) > 191 || byteat(s, i + 2) < 128 || byteat(s, i + 2) > 191 || byteat(s, i + 3) < 128 || byteat(s, i + 3) > 191 {
+                return false
+            }
+            i = i + 4
+            continue
+        }
+        return false
+    }
+    return true
+}
+
+// bvalue — values(rows): last enabled row's value for name ("" absent).
+fn bvalue(rows: []model.KV, name: str) -> str {
+    i := len(rows) - 1
+    for i >= 0 {
+        if rows[i].name == name && rows[i].enabled {
+            return rows[i].value
+        }
+        i = i - 1
+    }
+    return ""
+}
+
+// ---------- document ----------
+
+// parseDocument — Bru text blocks end at a column-zero closing brace,
+// even when their content contains JSON or JavaScript braces.
+fn parse_document(data: str) -> [[]BBlock, err] {
+    if len(data) > BMAX_FILE {
+        return nil, errors.new("Bruno file exceeds 16 MiB")
+    }
+    if !valid_utf8(data) {
+        return nil, errors.new("Bruno file is not valid UTF-8")
+    }
+    s := data
+    if len(s) >= 3 && byteat(s, 0) == 239 && byteat(s, 1) == 187 && byteat(s, 2) == 191 {
+        s = substr(s, 3, len(s))
+    }
+    s = replace_all(s, "\r\n", "\n")
+    lines := bsplit(s, "\n")
+    d := mkslice(BBlock, 0)
+    i := 0
+    for i < len(lines) {
+        line := btrim_left(lines[i], " \t")
+        if btrim(line) == "" {
+            i = i + 1
+            continue
+        }
+        if len(d) >= 10000 {
+            return nil, errors.new("Bruno file exceeds 10000 blocks")
+        }
+        if startswith(line, "color:") {
+            v := substr(line, 6, len(line))
+            d = push(d, BBlock{name: "color", text: btrim(v)})
+            i = i + 1
+            continue
+        }
+        p := find(line, "{")
+        closing := "}"
+        b := find(line, "[")
+        if b >= 0 && (p < 0 || b < p) {
+            p = b
+            closing = "]"
+        }
+        if p < 1 {
+            return nil, errors.new("line " + itoa(i + 1) + ": expected a Bruno block opening")
+        }
+        nm := btrim(substr(line, 0, p))
+        ni := 0
+        for ni < len(nm) {
+            c := byteat(nm, ni)
+            if !((c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 58 || c == 45) {
+                return nil, errors.new("line " + itoa(i + 1) + ": invalid block name")
+            }
+            ni = ni + 1
+        }
+        if closing == "]" {
+            content := ""
+            part := substr(line, p + 1, len(line))
+            closed := false
+            for !closed {
+                end := find(part, "]")
+                if end >= 0 {
+                    tail := substr(part, end + 1, len(part))
+                    if btrim(tail) != "" {
+                        return nil, errors.new("line " + itoa(i + 1) + ": unexpected text after block")
+                    }
+                    content = content + substr(part, 0, end)
+                    closed = true
+                    break
+                }
+                content = content + part + "\n"
+                i = i + 1
+                if i == len(lines) {
+                    return nil, errors.new("unclosed " + nm + " block")
+                }
+                part = lines[i]
+            }
+            i = i + 1
+            if !closed {
+                return nil, errors.new("unclosed " + nm + " block")
+            }
+            d = push(d, BBlock{name: nm, text: content})
+            continue
+        }
+        start := i + 1
+        i = i + 1
+        textblock := is_text_block(nm)
+        triple := false
+        if !textblock {
+            triple = opens_multiline(substr(line, p + 1, len(line)))
+        }
+        for i < len(lines) {
+            if !triple && startswith(lines[i], closing) {
+                if btrim(lines[i]) != closing {
+                    return nil, errors.new("line " + itoa(i + 1) + ": unexpected text after block")
+                }
+                break
+            }
+            if !textblock {
+                if triple {
+                    if contains(lines[i], "'''") {
+                        triple = false
+                    }
+                } else {
+                    triple = opens_multiline(lines[i])
+                }
+            }
+            i = i + 1
+        }
+        if i == len(lines) {
+            return nil, errors.new("unclosed " + nm + " block")
+        }
+        content := ""
+        k := start
+        for k < i {
+            if k > start {
+                content = content + "\n"
+            }
+            content = content + lines[k]
+            k = k + 1
+        }
+        inline := substr(line, p + 1, len(line))
+        if btrim(inline) != "" {
+            if start < i {
+                content = inline + "\n" + content
+            } else {
+                content = inline
+            }
+        }
+        i = i + 1
+        d = push(d, BBlock{name: nm, text: content})
+    }
+    return d, nil
+}
+
+// opensMultiline — only a value beginning with ''' opens a literal.
+fn opens_multiline(line: str) -> bool {
+    line = btrim(line)
+    value := ""
+    if annotation_line(line) {
+        c := find(line, "(")
+        if c >= 0 {
+            value = substr(line, c + 1, len(line))
+        } else {
+            value = ""
+        }
+    } else {
+        line = trim_prefix(line, "~")
+        quoted := startswith(line, "\"")
+        i := 0
+        for i < len(line) {
+            if quoted {
+                if i == 0 {
+                    i = i + 1
+                    continue
+                }
+                if byteat(line, i) == 92 && i + 1 < len(line) && byteat(line, i + 1) == 34 {
+                    i = i + 2
+                    continue
+                }
+                if byteat(line, i) == 34 {
+                    quoted = false
+                }
+            } else if byteat(line, i) == 58 {
+                value = substr(line, i + 1, len(line))
+                break
+            }
+            i = i + 1
+        }
+    }
+    value = btrim(value)
+    return startswith(value, "'''") && !contains(substr(value, 3, len(value)), "'''")
+}
+
+fn is_text_block(nm: str) -> bool {
+    if nm == "body" || nm == "docs" || nm == "tests" || nm == "example" || startswith(nm, "script:") {
+        return true
+    }
+    if startswith(nm, "body:") && nm != "body:form-urlencoded" && nm != "body:multipart-form" && nm != "body:file" && nm != "body:grpc" && nm != "body:ws" {
+        return true
+    }
+    return false
+}
+
+fn outdent(s: str) -> str {
+    s = trim_prefix(s, "\n")
+    lines := bsplit(s, "\n")
+    i := 0
+    for i < len(lines) {
+        lines[i] = trim_prefix(lines[i], "  ")
+        i = i + 1
+    }
+    return str_join(lines, "\n")
+}
+
+// dtext — last block named `name`, outdented ("" when absent).
+fn dtext(d: []BBlock, name: str) -> str {
+    s := ""
+    i := 0
+    for i < len(d) {
+        if d[i].name == name {
+            s = d[i].text
+        }
+        i = i + 1
+    }
+    return outdent(s)
+}
+
+fn dhas(d: []BBlock, name: str) -> bool {
+    i := 0
+    for i < len(d) {
+        if d[i].name == name {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// dpairs — parsePairs over every block named `name`, concatenated.
+fn dpairs(d: []BBlock, name: str) -> [[]model.KV, err] {
+    result := mkslice(model.KV, 0)
+    i := 0
+    for i < len(d) {
+        if d[i].name != name {
+            i = i + 1
+            continue
+        }
+        [rows, perr] = parse_pairs(d[i].text)
+        if perr != nil {
+            return nil, errors.new(name + ": " + errors.msg(perr))
+        }
+        result = append_kv(result, rows)
+        i = i + 1
+    }
+    return result, nil
+}
+
+// dlist — enabled items of a list block (comma or line separated).
+fn dlist(d: []BBlock, name: str) -> []str {
+    items := mkslice(str, 0)
+    i := 0
+    for i < len(d) {
+        if d[i].name != name {
+            i = i + 1
+            continue
+        }
+        parts := bsplit(d[i].text, ",")
+        j := 0
+        for j < len(parts) {
+            seg := parts[j]
+            // split also on newlines inside each comma part
+            nl := bsplit(seg, "\n")
+            k := 0
+            for k < len(nl) {
+                item := btrim(nl[k])
+                if len(item) > 0 && !startswith(item, "~") {
+                    items = push(items, item)
+                }
+                k = k + 1
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return items
+}
+
+// annotationLine — ^@[A-Za-z_][A-Za-z0-9_-]*(\(|$)
+fn annotation_line(line: str) -> bool {
+    if len(line) == 0 || byteat(line, 0) != 64 {
+        return false
+    }
+    if len(line) == 1 {
+        return false
+    }
+    c := byteat(line, 1)
+    if !((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95) {
+        return false
+    }
+    i := 2
+    for i < len(line) {
+        c = byteat(line, i)
+        if !((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 95 || c == 45) {
+            break
+        }
+        i = i + 1
+    }
+    if i == len(line) {
+        return true
+    }
+    return byteat(line, i) == 40 // '('
+}
+
+// parsePairs — key: value rows; ''' multiline and [ ] empty-list values.
+fn parse_pairs(s: str) -> [[]model.KV, err] {
+    lines := bsplit(s, "\n")
+    rows := mkslice(model.KV, 0)
+    i := 0
+    for i < len(lines) {
+        line := btrim(lines[i])
+        if line == "" {
+            i = i + 1
+            continue
+        }
+        if annotation_line(line) {
+            if opens_multiline(line) {
+                i = i + 1
+                for i < len(lines) && !contains(lines[i], "'''") {
+                    i = i + 1
+                }
+                if i == len(lines) {
+                    return nil, errors.new("unclosed annotation")
+                }
+            }
+            i = i + 1
+            continue
+        }
+        enabled := true
+        if startswith(line, "~") {
+            enabled = false
+            line = substr(line, 1, len(line))
+        }
+        key := ""
+        value := ""
+        if startswith(line, "\"") {
+            b := ""
+            j := 1
+            closed := false
+            for j < len(line) {
+                if byteat(line, j) == 92 && j + 1 < len(line) && byteat(line, j + 1) == 34 {
+                    b = b + chr1m(34)
+                    j = j + 2
+                    continue
+                }
+                if byteat(line, j) == 34 {
+                    closed = true
+                    break
+                }
+                b = b + substr(line, j, j + rune_len_at(line, j))
+                j = j + rune_len_at(line, j)
+            }
+            if !closed {
+                return nil, errors.new("unterminated quoted key")
+            }
+            key = b
+            rest := btrim(substr(line, j + 1, len(line)))
+            if !startswith(rest, ":") {
+                return nil, errors.new("expected colon after key")
+            }
+            value = btrim(substr(rest, 1, len(rest)))
+        } else {
+            p := find(line, ":")
+            if p < 0 {
+                return nil, errors.new("expected key: value")
+            }
+            key = btrim(substr(line, 0, p))
+            value = btrim(substr(line, p + 1, len(line)))
+        }
+        if enabled && startswith(key, "~") {
+            enabled = false
+            key = substr(key, 1, len(key))
+        }
+        if key == "" {
+            return nil, errors.new("empty key")
+        }
+        if startswith(value, "'''") {
+            value = substr(value, 3, len(value))
+            parts := push(mkslice(str, 0), value)
+            for !contains(parts[len(parts) - 1], "'''") {
+                i = i + 1
+                if i == len(lines) {
+                    return nil, errors.new("unterminated multiline value")
+                }
+                parts = push(parts, lines[i])
+            }
+            joined := str_join(parts, "\n")
+            end := find(joined, "'''")
+            tail := btrim(substr(joined, end + 3, len(joined)))
+            if tail != "" && !startswith(tail, "@contentType(") {
+                return nil, errors.new("unexpected multiline suffix")
+            }
+            before := substr(joined, 0, end)
+            segs := bsplit(before, "\n")
+            j2 := 0
+            for j2 < len(segs) {
+                segs[j2] = slice_utf16(segs[j2], 4)
+                j2 = j2 + 1
+            }
+            value = btrim(str_join(segs, "\n"))
+            if tail != "" {
+                value = value + " " + tail
+            }
+        } else if value == "[" {
+            i = i + 1
+            for i < len(lines) && btrim(lines[i]) != "]" {
+                i = i + 1
+            }
+            if i == len(lines) {
+                return nil, errors.new("unterminated list")
+            }
+            value = ""
+        }
+        if len(rows) >= 10000 {
+            return nil, errors.new("Bruno block exceeds 10000 rows")
+        }
+        rows = push(rows, model.KV{name: key, value: value, enabled: enabled})
+        i = i + 1
+    }
+    return rows, nil
+}
+
+// sliceUTF16 — Bruno's JS grammar applies line.slice(4) in UTF-16 units.
+fn slice_utf16(s: str, units: int) -> str {
+    i := 0
+    for i < len(s) {
+        if units == 0 {
+            return substr(s, i, len(s))
+        }
+        rl := rune_len_at(s, i)
+        c := byteat(s, i)
+        units = units - 1
+        if c >= 240 {
+            units = units - 1
+        }
+        if units < 0 {
+            return "\xef\xbf\xbd" + substr(s, i + rl, len(s))
+        }
+        i = i + rl
+    }
+    return ""
+}

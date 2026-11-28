@@ -1134,7 +1134,7 @@ fn s1(x: str) -> []str {
 fn pconvert(p: ref PParser, raw: ref json.Json, inherited: own json.Json, scp: []model.KV, where: str) -> [own collection.PRequest, err] {
     req := new(collection.PRequest)
     req.method = "GET"
-    req.kind = "http"
+    req.kind = ""
     node := json.jclone(raw)
     if node.kind == 3 {
         // URL-string shorthand → {url: raw}

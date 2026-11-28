@@ -1,0 +1,400 @@
+package importing
+
+// bruno_load.oxl — port of internal/importing/bruno/load.go
+// (posting @32c4566): Load of a .bru file or collection directory.
+// Deviations (ADR-0045): os.Root confinement → plain os.* with
+// check-then-read; symlink rejection approximated by os.exists/
+// isdir (no lstat); bruno.json parsed via json.Json DOM.
+import "std/encoding/json"
+import "std/errors"
+import "std/os"
+import "github.com/oxidean/oxttp/core/collection"
+import "github.com/oxidean/oxttp/core/model"
+
+let BMAX_COLL_FILES = 10000
+let BMAX_COLL_BYTES = 134217728 // 128 << 20
+let BMAX_COLL_ENTRIES = 20000
+let BMAX_COLL_DEPTH = 64
+let BMAX_MATERIAL = 134217728
+
+fn bjoin(dir: str, n: str) -> str {
+    if dir == "." {
+        return n
+    }
+    return dir + "/" + n
+}
+
+fn bbase(path: str) -> str {
+    // filepath.Base(filepath.Clean(path)) approximation
+    p := path
+    for len(p) > 1 && endswith(p, "/") {
+        p = substr(p, 0, len(p) - 1)
+    }
+    i := len(p) - 1
+    for i >= 0 {
+        if byteat(p, i) == 47 {
+            return substr(p, i + 1, len(p))
+        }
+        i = i - 1
+    }
+    return p
+}
+
+// bread — bounded read of one collection file (count/total budgets).
+struct BReadCtx { count: int, total: int, visited: int }
+
+fn bread(ctx: ref BReadCtx, path: str) -> [str, err] {
+    if !os.exists(path) || os.isdir(path) {
+        return "", errors.new(path + " is not a regular file")
+    }
+    ctx.count = ctx.count + 1
+    if ctx.count > BMAX_COLL_FILES {
+        return "", errors.new("Bruno collection exceeds 10000 files")
+    }
+    data := os.readfile_(path)
+    if len(data) > BMAX_FILE {
+        return "", errors.new(path + " exceeds 16 MiB")
+    }
+    ctx.total = ctx.total + len(data)
+    if ctx.total > BMAX_COLL_BYTES {
+        return "", errors.new("Bruno collection exceeds 128 MiB")
+    }
+    return data, nil
+}
+
+// breadir — sorted entry names with the visited budget.
+fn breadir(ctx: ref BReadCtx, dir: str) -> own []str {
+    names := os.ls(dir)
+    ctx.visited = ctx.visited + len(names)
+    return names
+}
+
+// requestFootprint — scoped values copied into each request need not
+// be bounded by source file bytes.
+fn breq_footprint(r: ref collection.PRequest, file: str) -> int {
+    size := 512 + len(r.name) + len(r.description) + len(r.url) + len(file)
+    if r.body != nil {
+        size = size + len(r.body.content) + len(r.body.content_type)
+        fi := 0
+        for fi < len(r.body.form_data) {
+            size = size + 64 + len(r.body.form_data[fi].name) + len(r.body.form_data[fi].value)
+            fi = fi + 1
+        }
+    }
+    if r.graphql != nil {
+        size = size + len(r.graphql.query)
+    }
+    if r.grpc != nil {
+        size = size + len(r.grpc.method) + len(r.grpc.message)
+    }
+    if r.auth != nil {
+        if r.auth.basic != nil {
+            size = size + len(r.auth.basic.username) + len(r.auth.basic.password)
+        }
+        if r.auth.digest != nil {
+            size = size + len(r.auth.digest.username) + len(r.auth.digest.password)
+        }
+        if r.auth.bearer_token != nil {
+            size = size + len(r.auth.bearer_token.token)
+        }
+    }
+    if r.variable_scope != nil {
+        vi := 0
+        for vi < len(r.variable_scope.variables) {
+            size = size + 64 + len(r.variable_scope.variables[vi].name) + len(r.variable_scope.variables[vi].value)
+            vi = vi + 1
+        }
+    }
+    ri := 0
+    for ri < len(r.headers) {
+        size = size + 64 + len(r.headers[ri].name) + len(r.headers[ri].value)
+        ri = ri + 1
+    }
+    qi := 0
+    for qi < len(r.params) {
+        size = size + 64 + len(r.params[qi].name) + len(r.params[qi].value)
+        qi = qi + 1
+    }
+    pi := 0
+    for pi < len(r.path_params) {
+        size = size + 64 + len(r.path_params[pi].name) + len(r.path_params[pi].value)
+        pi = pi + 1
+    }
+    return size
+}
+
+struct BWalk {
+    ctx: own BReadCtx,
+    res: own Result,
+    materialized: int,
+}
+
+fn bwalk(ctx: ref BWalk, dir: str, parent: ref BScope, depth: int) -> err {
+    if depth > BMAX_COLL_DEPTH {
+        return errors.new("Bruno collection exceeds 64 folder levels")
+    }
+    file_name := "folder.bru"
+    if dir == "." {
+        file_name = "collection.bru"
+    }
+    sname := bjoin(dir, file_name)
+    cur := new(BScope)
+    cur.deferred = parent.deferred
+    cur.headers = parent.headers
+    cur.query = parent.query
+    cur.vars = parent.vars
+    cur.collection = parent.collection
+    cur.auth_type = parent.auth_type
+    cur.auth_mode = parent.auth_mode
+    cur.auth_fields = parent.auth_fields
+    cur.proto_imports = parent.proto_imports
+    if os.exists(sname) && !os.isdir(sname) {
+        [data, rerr] = bread(ctx.ctx, sname)
+        if rerr != nil {
+            return rerr
+        }
+        [doc, derr] = parse_document(data)
+        if derr != nil {
+            return errors.new(sname + ": " + errors.msg(derr))
+        }
+        [ns, aerr] = apply_scope(doc, cur, ctx.res, dir == ".")
+        if aerr != nil {
+            return errors.new(sname + ": " + errors.msg(aerr))
+        }
+        cur = ns
+    }
+    if ctx.ctx.visited > BMAX_COLL_ENTRIES {
+        return errors.new("Bruno collection exceeds 20000 directory entries")
+    }
+    entries := breadir(ctx.ctx, dir)
+    ei := 0
+    for ei < len(entries) {
+        n := entries[ei]
+        ei = ei + 1
+        if n == "collection.bru" || n == "folder.bru" || startswith(n, ".") || n == "node_modules" {
+            continue
+        }
+        rel := bjoin(dir, n)
+        path := rel
+        if os.isdir(path) {
+            if dir == "." && n == "environments" {
+                eerr := ble_load_envs(ctx, n)
+                if eerr != nil {
+                    return eerr
+                }
+                continue
+            }
+            werr := bwalk(ctx, rel, cur, depth + 1)
+            if werr != nil {
+                return werr
+            }
+            continue
+        }
+        if !endswith(n, ".bru") {
+            continue
+        }
+        [data2, rerr2] = bread(ctx.ctx, path)
+        if rerr2 != nil {
+            return rerr2
+        }
+        [doc2, derr2] = parse_document(data2)
+        if derr2 != nil {
+            return errors.new(path + ": " + errors.msg(derr2))
+        }
+        start := len(ctx.res.warns)
+        [rq, cerr3] = convert(doc2, cur, ctx.res)
+        if cerr3 != nil {
+            return errors.new(path + ": " + errors.msg(cerr3))
+        }
+        wi := start
+        for wi < len(ctx.res.warns) {
+            ctx.res.warns[wi] = path + ": " + ctx.res.warns[wi]
+            wi = wi + 1
+        }
+        if rq != nil {
+            outname := trim_suffix2(rel, ".bru") + ".posting.yaml"
+            // materialized budget: re-convert with deferred vars
+            // materialized against collection constants.
+            msc := new(BScope)
+            msc.deferred = false
+            msc.vars = mkslice(model.KV, 0)
+            msc.collection = mkslice(model.KV, 0)
+            msc.auth_fields = mkslice(model.KV, 0)
+            msc.proto_imports = cur.proto_imports
+            msc.headers = cur.headers
+            msc.query = cur.query
+            msc.auth_type = cur.auth_type
+            msc.auth_mode = cur.auth_mode
+            vi := 0
+            for vi < len(cur.collection) {
+                msc.vars = kv_set(msc.vars, cur.collection[vi].name, cur.collection[vi].value)
+                vi = vi + 1
+            }
+            vi = 0
+            for vi < len(cur.vars) {
+                msc.vars = kv_set(msc.vars, cur.vars[vi].name, cur.vars[vi].value)
+                vi = vi + 1
+            }
+            [mat, merr4] = convert(doc2, msc, ctx.res)
+            if merr4 != nil {
+                return errors.new(path + ": " + errors.msg(merr4))
+            }
+            fp := breq_footprint(rq, outname)
+            if mat != nil {
+                fp2 := breq_footprint(mat, outname)
+                if fp2 > fp {
+                    fp = fp2
+                }
+            }
+            ctx.materialized = ctx.materialized + fp
+            if ctx.materialized > BMAX_MATERIAL {
+                return errors.new("materialized Bruno collection exceeds 128 MiB")
+            }
+            ctx.res.requests = push(ctx.res.requests, ImpRequest{file: outname, req: rq})
+        }
+    }
+    return nil
+}
+
+// ble_load_envs — environments/<name>.bru files at the collection root.
+fn ble_load_envs(ctx: ref BWalk, dir: str) -> err {
+    entries := breadir(ctx.ctx, dir)
+    ei := 0
+    for ei < len(entries) {
+        n := entries[ei]
+        ei = ei + 1
+        rel := bjoin(dir, n)
+        if startswith(n, ".") {
+            continue
+        }
+        if os.isdir(rel) || !endswith(n, ".bru") {
+            bwarn(ctx.res, "skipped " + rel + "; Bruno environments are .bru files")
+            continue
+        }
+        [data, rerr] = bread(ctx.ctx, rel)
+        if rerr != nil {
+            return rerr
+        }
+        [doc, derr] = parse_document(data)
+        if derr != nil {
+            return errors.new(rel + ": " + errors.msg(derr))
+        }
+        nm := trim_suffix2(n, ".bru")
+        [env, eerr] = environment(doc, nm, rel, ctx.res)
+        if eerr != nil {
+            return errors.new(rel + ": " + errors.msg(eerr))
+        }
+        ctx.res.envs = push(ctx.res.envs, env)
+    }
+    return nil
+}
+
+// bl_load — Load(path): a .bru file or a collection directory.
+fn bl_load(path: str) -> [own Result, err] {
+    if !os.exists(path) {
+        return nil, errors.new(path)
+    }
+    if os.isdir(path) {
+        // collection directory
+        res := new(Result)
+        res.name = bbase(path)
+        res.requests = mkslice(ImpRequest, 0)
+        res.variables = mkslice(model.KV, 0)
+        res.envs = mkslice(Env, 0)
+        res.deferred = true
+        ctx := new(BReadCtx)
+        // bruno.json
+        [cdata, cerr] = bread(ctx, "bruno.json")
+        if cerr != nil {
+            return nil, errors.new("read bruno.json: " + errors.msg(cerr))
+        }
+        cfg := json.jparse(cdata)
+        if cfg == nil {
+            return nil, errors.new("bruno.json: invalid JSON")
+        }
+        cname := jstrv(jgetk(cfg, "name"))
+        if len(cname) > 0 {
+            res.name = cname
+        }
+        ctype := jstrv(jgetk(cfg, "type"))
+        if ctype != "" && ctype != "collection" {
+            return nil, errors.new("bruno.json is not a collection")
+        }
+        ig := jgetk(cfg, "ignore")
+        if jpresent(ig) && ig.kind == 5 && ig.child != nil {
+            bwarn(res, "bruno.json ignore patterns are not interpreted; hidden directories and node_modules are excluded")
+        }
+        root := bempty_scope()
+        root.deferred = true
+        // protobuf.importPaths[].{path,enabled}
+        pb := jgetk(jgetk(cfg, "protobuf"), "importPaths")
+        if jpresent(pb) && pb.kind == 5 {
+            it := pb.child
+            for it != nil {
+                if jstrv(jgetk(it, "enabled")) == "true" {
+                    pp := jstrv(jgetk(it, "path"))
+                    if len(pp) > 0 {
+                        root.proto_imports = push(root.proto_imports, pp)
+                    }
+                }
+                it = it.next
+            }
+        }
+        wk := new(BWalk)
+        wk.ctx = ctx
+        wk.res = res
+        wk.materialized = 0
+        werr := bwalk(wk, ".", root, 0)
+        if werr != nil {
+            return nil, werr
+        }
+        if wk.ctx.visited > BMAX_COLL_ENTRIES {
+            return nil, errors.new("Bruno collection exceeds 20000 directory entries")
+        }
+        return wk.res, nil
+    }
+    // single .bru file
+    if !endswith(path, ".bru") {
+        // upstream accepts any regular file and parses it as bru
+    }
+    if len(path) > 0 && os.isdir(path) {
+        return nil, errors.new("Bruno input must be a regular file")
+    }
+    res := new(Result)
+    res.requests = mkslice(ImpRequest, 0)
+    res.variables = mkslice(model.KV, 0)
+    res.envs = mkslice(Env, 0)
+    scp := bempty_scope()
+    [data, rerr] = bread_single(path)
+    if rerr != nil {
+        return nil, rerr
+    }
+    [doc, derr] = parse_document(data)
+    if derr != nil {
+        return nil, derr
+    }
+    [rq, cerr2] = convert(doc, scp, res)
+    if cerr2 != nil {
+        return nil, cerr2
+    }
+    if rq != nil {
+        nm := bbase(path)
+        nm = trim_suffix2(nm, ".bru")
+        if !endswith(nm, ".posting.yaml") {
+            nm = nm + ".posting.yaml"
+        }
+        res.requests = push(res.requests, ImpRequest{file: nm, req: rq})
+    }
+    return res, nil
+}
+
+fn bread_single(path: str) -> [str, err] {
+    if !os.exists(path) {
+        return "", errors.new(path)
+    }
+    data := os.readfile_(path)
+    if len(data) > BMAX_FILE {
+        return "", errors.new("Bruno file exceeds 16 MiB")
+    }
+    return data, nil
+}
