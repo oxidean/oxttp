@@ -61,7 +61,39 @@ fn test_dotenv_refs_prior_layer() {
     testing.expect(e == nil, "parses")
     testing.expect_streq(p.vars[0].value, "9", "prior layer ref")
     testing.expect_streq(p.vars[1].value, "9x", "same-file chain")
-    testing.expect_streq(p.vars[2].value, "${NOPE}", "unresolved literal")
+    testing.expect_streq(p.vars[2].value, "", "unresolved expands empty")
+}
+
+fn test_dotenv_escaped_quotes_and_backslashes() {
+    q := chr(34)
+    sq := chr(39)
+    bs := chr(92)
+    src := "HOST=h\n" +
+        "URL=" + q + "${HOST}/a" + bs + q + "b" + q + "\n" +
+        "SQ=" + sq + "can" + bs + sq + "t" + sq + "\n" +
+        "BS=" + sq + "a" + bs + bs + "b" + sq + "\n"
+    prior := new(EnvSet)
+    [p, e] = parse_dotenv(src, prior)
+    testing.expect(e == nil, "parses escaped quotes")
+    testing.expect_eq(len(p.vars), 4, "four vars")
+    if len(p.vars) == 4 {
+        testing.expect_streq(p.vars[1].value, "h/a" + q + "b", "escaped double quote retained")
+        testing.expect_streq(p.vars[2].value, "can" + sq + "t", "escaped single quote retained")
+        testing.expect_streq(p.vars[3].value, "a" + bs + "b", "escaped backslash retained")
+    }
+}
+
+fn test_dotenv_template_literal_dollar_and_reference() {
+    sq := chr(39)
+    q := chr(34)
+    src := "LIT=" + sq + "${HOST}" + sq + "\nREF=" + q + "${HOST}/x" + q + "\n"
+    [p, e] = parse_dotenv_templates(src)
+    testing.expect(e == nil, "template parse")
+    testing.expect_eq(len(p.vars), 2, "two template vars")
+    if len(p.vars) == 2 {
+        testing.expect_streq(p.vars[0].value, "$${HOST}", "literal dollar escaped for templates")
+        testing.expect_streq(p.vars[1].value, "${HOST}/x", "reference retained")
+    }
 }
 
 fn test_dotenv_posting_warns() {
