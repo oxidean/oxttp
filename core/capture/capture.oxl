@@ -50,22 +50,6 @@ fn jpath_root(root: ref JVal) -> JPath {
     return JPath{steps: nil, node: ns}
 }
 
-fn jpath_eq(a: JPath, b: JPath) -> bool {
-    if len(a.steps) != len(b.steps) {
-        return false
-    }
-    i := 0
-    for i < len(a.steps) {
-        sa := a.steps[i]
-        sb := b.steps[i]
-        if sa.is_idx != sb.is_idx || sa.idx != sb.idx || sa.name != sb.name {
-            return false
-        }
-        i = i + 1
-    }
-    return true
-}
-
 // jwalk moves a borrowed cursor along p; returns the node kind or -1.
 fn jwalk(root: ref JVal, p: JPath) -> int {
     if len(p.node) > 0 {
@@ -740,6 +724,43 @@ fn pij_parse_and(p: mut PCur) -> [own FExpr, err] {
     return andnode, nil
 }
 
+// plit_num_in_range mirrors theory/jsonpath's literal conversion:
+// integer tokens use ParseInt(int64) and decimal tokens ParseFloat(float64).
+// Overflowing literals are parse errors; decimal underflow to zero is not.
+fn plit_num_in_range(tok: str) -> bool {
+    isfloat := false
+    i := 0
+    for i < len(tok) {
+        c := byteat(tok, i)
+        if c == 46 || c == 101 || c == 69 {
+            isfloat = true
+        }
+        i = i + 1
+    }
+    if isfloat {
+        [f, fe] = strconv.parsefloat(tok)
+        if fe != nil || f != f {
+            return false
+        }
+        [infv, _ife] = strconv.parsefloat("1e999")
+        return f < infv && f > -infv
+    }
+    digits := tok
+    neg := false
+    if len(digits) > 0 && byteat(digits, 0) == 45 {
+        neg = true
+        digits = substr(digits, 1, len(digits))
+    }
+    bound := "9223372036854775807"
+    if neg {
+        bound = "9223372036854775808"
+    }
+    if len(digits) > len(bound) || len(digits) == len(bound) && digits > bound {
+        return false
+    }
+    return true
+}
+
 // literal kinds for filter literals
 let FLIT_STR = 3
 let FLIT_NUM = 2
@@ -788,6 +809,10 @@ fn pij_parse_literal(p: mut PCur) -> [own FExpr, err] {
         tok := pij_scan_fltok(p)
         if p.err != 0 {
             return nil, errors.new("jsonpath: bad number literal")
+        }
+        if !plit_num_in_range(tok) {
+            pperr(p, "number literal out of range")
+            return nil, errors.new("jsonpath: number literal out of range")
         }
         lit.kind = FLIT_NUM
         lit.s = tok
@@ -2615,20 +2640,6 @@ fn capture_values(captures: []model.KV, body: []byte) -> [[]model.KV, err] {
         i = i + 1
     }
     return out, nil
-}
-
-fn jpath_obj_key(p: JPath) -> str {
-    return p.steps[len(p.steps) - 1].name
-}
-
-fn jpath_lt(a: JPath, b: JPath) -> bool {
-    return jpath_obj_key(a) < jpath_obj_key(b)
-}
-
-fn jsort_obj_paths(kids: []JPath) -> []JPath {
-    // encoding/json marshals Go map keys in byte-lexicographic order.
-    sort.sortfn(kids, jpath_lt)
-    return kids
 }
 
 // jemit_path — compact JSON emit of the node at path (jemit parity

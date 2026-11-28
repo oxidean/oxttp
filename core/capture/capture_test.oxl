@@ -434,8 +434,10 @@ fn test_capture_review_range_and_regex_edges() {
     // still compare equal through the raw-text fallback.
     expect_err("[{\"id\":1,\"n\":1e400}]", "$[?@.n > 5].id")
     expect_err("[{\"id\":1,\"n\":-1e400}]", "$[?@.n < 5].id")
-    expect_val("[{\"id\":1,\"n\":1e400}]", "$[?@.n == 1e400].id", "1")
+    expect_err("[{\"id\":1,\"n\":1e400}]", "$[?@.n == 1e400].id")
     expect_err("[{\"id\":1,\"n\":1e400}]", "$[?@.n == 1e999].id")
+    expect_err("[{\"id\":1,\"n\":5}]", "$[?@.n == 9223372036854775808].id")
+    expect_err("[{\"id\":1,\"n\":5}]", "$[?@.n == -9223372036854775809].id")
     expect_val("[{\"id\":1,\"n\":1e-999}]", "$[?@.n == 0].id", "1")
     testing.expect_streq(regex_dot_rewrite("\\Q.\\E"), "\\Q.\\E", "quoted literal dot preserved")
     expect_val("{\"items\":[{\"n\":\".\"},{\"n\":\"a\"}]}", "$.items[?(match(@.n, \"\\\\Q.\\\\E\"))].n", ".")
