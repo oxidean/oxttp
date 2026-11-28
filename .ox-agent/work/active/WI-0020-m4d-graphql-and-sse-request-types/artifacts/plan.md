@@ -1,6 +1,6 @@
 # WI-0020 plan — M4d GraphQL + SSE
 
-Direction: spec.md S1–S9 + ADR-0044/0045. TDD order — tests land
+Direction: spec.md S1–S9 + ADR-0054/0055. TDD order — tests land
 with or before each unit's code.
 
 ## Stage A — core/env + core/collection (leaf, no deps)
@@ -75,7 +75,7 @@ with or before each unit's code.
     warning class like error per upstream run.go (verify upstream
     during impl).
 15. `.ox-agent/context/specs/parity-matrix.md`: §7.2/§7.5 → done
-    + ADR-0044 footnote.
+    + ADR-0054 footnote.
 16. Full suite: `oxl test` per leaf dir + cli/tui golden.
 
 ## Gates

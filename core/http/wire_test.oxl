@@ -241,7 +241,7 @@ fn test_read_chunked() {
 }
 
 fn test_read_capped_sse() {
-    // WI-0020 ADR-0045: SSE body reads stop at the 64 MiB ceiling
+    // WI-0020 ADR-0055: SSE body reads stop at the 64 MiB ceiling
     // instead of draining an unbounded stream.
     r := sreader("0123456789")
     [cr, ce] = read_eof_capped(r, 4)

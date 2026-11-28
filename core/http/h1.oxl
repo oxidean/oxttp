@@ -65,7 +65,7 @@ struct H1 { }
 // TmoReader wraps a plain Conn with a whole-request deadline.
 struct TmoReader {
     c: net.Conn,
-    deadline: shared, // mkshared cell — SSE lifts it post-headers (ADR-0045)
+    deadline: shared, // mkshared cell — SSE lifts it post-headers (ADR-0055)
     tmo: int,
 }
 
@@ -584,7 +584,7 @@ fn finish_roundtrip(req: ref model.Req, br: own bufio.Reader, dlcell: shared, ca
         }
     }
     tr.recv_headers_ms = itof(now_ms() - c0)
-    // SSE (corpus §7.5, ADR-0045): text/event-stream on a body-capable
+    // SSE (corpus §7.5, ADR-0055): text/event-stream on a body-capable
     // method lifts the whole-request deadline now that headers arrived
     // — the stream may run until close or the 64 MiB cap.
     sse := sse_is_stream(h.headers, req.method)
@@ -971,7 +971,7 @@ fn h2_exchange(req: ref model.Req, rw: io.ReadWriter, fd: int, hdrs: []model.Hea
     tr.closed_ms = itof(now_ms() - c0)
     let bodyb: []byte = db
     // SSE over h2 parses events identically; the deadline is NOT
-    // lifted here (ADR-0045 D6 — h2 keeps the request budget).
+    // lifted here (ADR-0055 D6 — h2 keeps the request budget).
     serr := ""
     resp := model.Resp{status: status, reason: "", headers: rh, body: bodyb, elapsed_ms: itof(now_ms() - t0), remote: remote, version: "2.0", hops: nil, req_head: "", trace: tr, tls_ver: tls_ver, events: nil, stream_error: ""}
     if sse_is_stream(rh, req.method) {

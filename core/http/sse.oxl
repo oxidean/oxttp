@@ -1,6 +1,6 @@
 package http
 
-// SSE receive — buffered-at-EOF per ADR-0044 (corpus §7.5,
+// SSE receive — buffered-at-EOF per ADR-0054 (corpus §7.5,
 // upstream internal/client/sse.go). parse_sse is a pure port of
 // upstream parseSSE: event/data/id fields, comments and unknown
 // fields ignored, retry ignored (no auto-reconnect), id persists,

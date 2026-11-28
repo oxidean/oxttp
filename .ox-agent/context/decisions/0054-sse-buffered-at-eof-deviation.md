@@ -1,4 +1,4 @@
-# ADR-0044 — SSE events parsed at stream end (buffered), live-follow deferred
+# ADR-0054 — SSE events parsed at stream end (buffered), live-follow deferred
 
 - Status: accepted
 - Date: 2026-11-27

@@ -1,6 +1,6 @@
 # WI-0020 spec — M4d GraphQL and SSE request types
 
-Implements corpus-posting §7.2 (GraphQL) and §7.5 (SSE) per ADR-0044.
+Implements corpus-posting §7.2 (GraphQL) and §7.5 (SSE) per ADR-0054.
 Upstream references: `internal/model/graphql.go`, `internal/client/
 sse.go`, `internal/client/http.go`, `internal/model/response.go`,
 `internal/ui/response_messages.go`, `internal/collection/ckind.go`
@@ -99,7 +99,7 @@ sse-semantics.md`.
   Class 3 renders yellow (same attr as class 1) — render.oxl maps
   `resp_class==3 → tf=3` (extend the `>=2→1` chain: 3→yellow too).
 
-## S5 — core/http: SSE receive (buffered per ADR-0044)
+## S5 — core/http: SSE receive (buffered per ADR-0054)
 
 `core/http/h1.oxl` + `core/http/wire.oxl` + new `core/http/sse.oxl`:
 
@@ -187,7 +187,7 @@ sse-semantics.md`.
   "Variables" = JSON textarea; "Params" = URL query KV — the old
   "Query" KV slot is renamed "Params"). Wait — verify upstream order:
   `tabs = append(tabs, e.tabs()...)` then shared tabs — own first.
-  Jump letters stay positional (deviation, ADR-0044).
+  Jump letters stay positional (deviation, ADR-0054).
 - Tab content: `Query` → operation LineEdit row + gql_query TextView;
   `Variables` → gql_vars TextView; `Headers`/`Params`/`Path` → KV
   tables; Auth/Info/Options static. `req_pane_bindings`: treat
@@ -300,11 +300,11 @@ sse-semantics.md`.
 
 - `.ox-agent/context/specs/parity-matrix.md`: §7.2 GraphQL `post`→
   `done` (M4d), §7.5 SSE `post`→`done` — with deviation footnote
-  pointing at ADR-0044.
+  pointing at ADR-0054.
 - `docs/corpus/corpus-posting.md` stays untouched (corpus is the
   contract, not the status board).
 
-## Deviations (all recorded in ADR-0044/spec)
+## Deviations (all recorded in ADR-0054/spec)
 
 1. SSE events materialize at stream end/cap, not live (D1).
 2. Jump letters positional, not upstream fixed per-tab (D2).

@@ -461,7 +461,7 @@ fn read_eof(r: mut bufio.Reader) -> [[]byte, err] {
 }
 
 // read_eof_capped is read_eof with a hard byte ceiling — SSE bodies
-// (ADR-0045) stop at the cap instead of draining an unbounded stream.
+// (ADR-0055) stop at the cap instead of draining an unbounded stream.
 // hit reports the cap was reached before natural EOF.
 fn read_eof_capped(r: mut bufio.Reader, max: int) -> [CappedRead, err] {
     out := mkslice(byte, 0)
@@ -503,7 +503,7 @@ fn read_chunked(r: mut bufio.Reader) -> [ChunkedBody, err] {
 // read_chunked_cap is read_chunked with an optional decoded-byte
 // ceiling (max <= 0 = unbounded). Over-cap stops the decode early
 // and reports hit — the h1 transport closes the connection anyway,
-// so abandoning the stream mid-chunk is safe (ADR-0045 SSE cap).
+// so abandoning the stream mid-chunk is safe (ADR-0055 SSE cap).
 fn read_chunked_cap(r: mut bufio.Reader, max: int) -> [CappedChunked, err] {
     cb := ChunkedBody{data: mkslice(byte, 0), trailers: nil}
     done := CappedChunked{body: cb, hit: false}
