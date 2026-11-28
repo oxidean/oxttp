@@ -1,0 +1,15 @@
+schema_version: 1
+request_id: IN-0016
+work_item_id: WI-0018
+kind: approval
+question: 'Ship gate: PR #21 merged as c98555f; approve shipping WI-0018.'
+action:
+    type: transition
+    work_item_id: WI-0018
+    target: shipped
+status: approved
+answer: approved
+created_by: cli
+answered_by: cli-directive
+created_at: "2026-11-28T05:48:29Z"
+answered_at: "2026-11-28T05:48:46Z"
