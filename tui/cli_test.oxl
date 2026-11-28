@@ -5,6 +5,7 @@ package main
 
 import "std/testing"
 import "std/os"
+import "std/net/tls"
 import "github.com/oxidean/oxttp/core/model"
 
 fn test_cli_version() {
@@ -270,4 +271,64 @@ fn test_is_utf8_and_resp_json_binary() {
     testing.expect(find(j, "\"reason\":\"OK\"") >= 0, "reason")
     testing.expect(find(j, "\"proto\":\"HTTP/1.1\"") >= 0, "proto")
     testing.expect(find(j, "\"receivedAt\":1700000000000") >= 0, "receivedAt")
+}
+
+
+fn test_run_empty_client_cert_aborts() {
+    // WI-0017 review: a configured cert/key that exists but reads
+    // empty must fail before send — pairing empty PEM is a transport
+    // error, so the headless path rejects it like the TUI.
+    dir := "/tmp/oxttp-run-empty-cert"
+    os.remove_all(dir)
+    os.mkdir_all(dir)
+    cert := dir + "/cert.pem"
+    key := dir + "/key.pem"
+    os.writefile_(cert, "")
+    os.writefile_(key, "key")
+    cfg := dir + "/config.yaml"
+    os.writefile_(cfg, "ssl:\n  certificate_path: " + cert + "\n  key_file: " + key + "\n")
+    os.writefile_(dir + "/ok.posting.yaml", "name: ok\nmethod: GET\nurl: https://x.test/a\n")
+    o := new(RunOpts)
+    o.coll = dir
+    o.target = dir
+    o.cfg_file = cfg
+    fx := FakeSend{resp: fake_resp(200, "text/plain", "hi", nil), fail: ""}
+    rep := run_exec(o, fx)
+    testing.expect(rep.code == 1, "empty cert fails the run")
+    testing.expect(len(rep.err) > 0 || find(join(rep.lines), "unreadable or empty") >= 0, "failure names unreadable/empty")
+    os.writefile_(cert, "pem")
+    os.writefile_(key, "")
+    rep = run_exec(o, fx)
+    testing.expect(rep.code == 1, "empty key fails the run")
+    os.remove_all(dir)
+}
+
+fn test_run_ssl_password_and_tls12_warn() {
+    // WI-0017 (ADR-0045): ssl.password warns once on stderr; a client
+    // cert meeting TLS1.2 warns per request — both via the cfg_file
+    // seam (config.load's first arg).
+    dir := "/tmp/oxttp-run-ssl"
+    os.remove_all(dir)
+    os.mkdir_all(dir)
+    cert := dir + "/cert.pem"
+    os.writefile_(cert, "pem")
+    cfg := dir + "/config.yaml"
+    os.writefile_(cfg, "ssl:\n  certificate_path: " + cert + "\n  password: secret\n")
+    os.writefile_(dir + "/ok.posting.yaml", "name: ok\nmethod: GET\nurl: https://x.test/a\n")
+    o := new(RunOpts)
+    o.coll = dir
+    o.target = dir
+    o.cfg_file = cfg
+    r := fake_resp(200, "text/plain", "hi", nil)
+    r.tls_ver = tls.V12
+    fx := FakeSend{resp: r, fail: ""}
+    rep := run_exec(o, fx)
+    testing.expect(rep.code == 0, "run passes: " + rep.err)
+    testing.expect(find(rep.stderr, "encrypted private keys are unsupported") >= 0, "password warning on stderr")
+    testing.expect(find(rep.stderr, "empty certificate list") >= 0, "tls12 cert warning on stderr")
+    // password without a configured cert → no warning
+    os.writefile_(cfg, "ssl:\n  password: secret\n")
+    rep = run_exec(o, fx)
+    testing.expect(find(rep.stderr, "encrypted private keys") < 0, "no cert → no password warning")
+    os.remove_all(dir)
 }

@@ -1,0 +1,202 @@
+package collection
+
+// WI-0017: options.proxy_url + env proxy capture in plan_req —
+// corpus-posting §7.1 "proxy_url else env HTTP(S)_PROXY/NO_PROXY",
+// ADR-0044/0046/0047. Env semantics are Go httpproxy
+// (x/net/http/httpproxy): getEnvAny uppercase-first, no ALL_PROXY,
+// schemeless→http://, raw REQUEST_METHOD CGI flag, NO_PROXY text
+// passed through for the transport's Go matcher.
+import "std/testing"
+
+fn test_proxy_pick_explicit_url() {
+    pk := proxy_pick("http://p:8080", nil)
+    testing.expect_eq(len(pk.proxies), 1, "one proxy entry")
+    testing.expect_streq(pk.proxies[0], "all:http://p:8080", "all-wrapped")
+    testing.expect_eq(len(pk.env), 0, "env not consulted")
+    testing.expect_eq(len(pk.no_proxy), 0, "no_proxy empty")
+    testing.expect(pk.proxy_go, "go mode set")
+    // surrounding whitespace trims; interior is verbatim
+    pk2 := proxy_pick("  socks5://u:p@px:9  ", nil)
+    testing.expect_streq(pk2.proxies[0], "all:socks5://u:p@px:9", "trimmed wrap")
+    // explicit proxy_url wins over populated env pairs
+    let prs: []str = nil
+    prs = push(prs, "http_proxy=http://env:1")
+    prs = push(prs, "no_proxy=example.com")
+    pk3 := proxy_pick("http://px:1", prs)
+    testing.expect_eq(len(pk3.proxies), 1, "explicit still one")
+    testing.expect_eq(len(pk3.env), 0, "env skipped under explicit")
+    testing.expect_eq(len(pk3.no_proxy), 0, "no_proxy skipped under explicit")
+    // whitespace-only proxy_url falls through to the env path
+    pk4 := proxy_pick("   ", prs)
+    testing.expect_eq(len(pk4.proxies), 0, "ws-only -> env path")
+    testing.expect_eq(len(pk4.env), 1, "env captured")
+    testing.expect_streq(pk4.env[0], "http_proxy=http://env:1", "env entry")
+    testing.expect_streq(pk4.no_proxy, "example.com", "no_proxy")
+}
+
+fn test_proxy_pick_env_names() {
+    // Go getEnvAny: uppercase wins when both cases are non-empty;
+    // lowercase is the fallback only. Pairs may arrive in any order.
+    let prs: []str = nil
+    prs = push(prs, "HTTPS_PROXY=https://sec-upper:3128")
+    prs = push(prs, "https_proxy=https://sec-lc:3128")
+    prs = push(prs, "HTTP_PROXY=http://plain-upper:8080")
+    prs = push(prs, "http_proxy=http://plain-lc:8080")
+    prs = push(prs, "ALL_PROXY=all://any:1")
+    prs = push(prs, "all_proxy=all://any-lc:1")
+    prs = push(prs, "NO_PROXY=*.internal,10.0.0.0/8")
+    prs = push(prs, "no_proxy=lower.internal")
+    pk := proxy_pick("", prs)
+    testing.expect_eq(len(pk.proxies), 0, "no explicit")
+    testing.expect_eq(len(pk.env), 2, "one canonical pair per scheme")
+    testing.expect_streq(pk.env[0], "https_proxy=https://sec-upper:3128", "https uppercase wins")
+    testing.expect_streq(pk.env[1], "http_proxy=http://plain-upper:8080", "http uppercase wins")
+    testing.expect_streq(pk.no_proxy, "*.internal,10.0.0.0/8", "no_proxy uppercase wins")
+    // lowercase fallback when uppercase unset/empty
+    let prs2: []str = nil
+    prs2 = push(prs2, "HTTPS_PROXY=")
+    prs2 = push(prs2, "https_proxy=https://sec-lc:3128")
+    prs2 = push(prs2, "http_proxy=http://plain-lc:8080")
+    prs2 = push(prs2, "no_proxy=lower.internal")
+    pk2 := proxy_pick("", prs2)
+    testing.expect_eq(len(pk2.env), 2, "lowercase fallbacks captured")
+    testing.expect_streq(pk2.env[0], "https_proxy=https://sec-lc:3128", "https lowercase fallback")
+    testing.expect_streq(pk2.env[1], "http_proxy=http://plain-lc:8080", "http lowercase fallback")
+    testing.expect_streq(pk2.no_proxy, "lower.internal", "no_proxy fallback")
+    // ALL_PROXY is not a Go variable — never captured
+    let prs3: []str = nil
+    prs3 = push(prs3, "ALL_PROXY=all://any:1")
+    prs3 = push(prs3, "all_proxy=all://any-lc:1")
+    pk3 := proxy_pick("", prs3)
+    testing.expect_eq(len(pk3.env), 0, "ALL_PROXY ignored (Go has none)")
+}
+
+fn test_proxy_pick_env_normalization() {
+    // schemeless env values normalize to http:// (Go parseProxy
+    // host[:port] form); complete URLs pass through verbatim
+    let prs: []str = nil
+    prs = push(prs, "http_proxy=px.internal:3128")
+    prs = push(prs, "https_proxy=socks5://sec:1080")
+    pk := proxy_pick("", prs)
+    testing.expect_eq(len(pk.env), 2, "both schemes")
+    testing.expect_streq(pk.env[0], "https_proxy=socks5://sec:1080", "url verbatim")
+    testing.expect_streq(pk.env[1], "http_proxy=http://px.internal:3128", "schemeless normalized")
+    // whitespace-padded values trim before the scheme check
+    let prs2: []str = nil
+    prs2 = push(prs2, "http_proxy=  bare.host  ")
+    pk2 := proxy_pick("", prs2)
+    testing.expect_streq(pk2.env[0], "http_proxy=http://bare.host", "trim + normalize")
+}
+
+fn test_proxy_pick_env_empties_and_malformed() {
+    let prs: []str = nil
+    prs = push(prs, "HTTP_PROXY=")
+    prs = push(prs, "http_proxy=   ")
+    prs = push(prs, "HTTPS_PROXY=   ")
+    prs = push(prs, "NOEQUALS")
+    prs = push(prs, "=noname")
+    prs = push(prs, "")
+    prs = push(prs, "no_proxy=  ")
+    pk := proxy_pick("", prs)
+    testing.expect_eq(len(pk.env), 0, "empty values all unset")
+    testing.expect_eq(len(pk.no_proxy), 0, "whitespace no_proxy unset")
+    // no_proxy falls back to lowercase when uppercase empty
+    let prs2: []str = nil
+    prs2 = push(prs2, "NO_PROXY=")
+    prs2 = push(prs2, "no_proxy=lc.example")
+    pk2 := proxy_pick("", prs2)
+    testing.expect_streq(pk2.no_proxy, "lc.example", "lowercase fallback")
+}
+
+fn test_proxy_pick_cgi_guard() {
+    // Go: REQUEST_METHOD present with ANY non-empty raw value —
+    // whitespace included — sets CGI; http_proxy capture still
+    // happens and the transport errors at send on http:// hops.
+    let prs: []str = nil
+    prs = push(prs, "REQUEST_METHOD=GET")
+    prs = push(prs, "http_proxy=http://plain-lc:2")
+    prs = push(prs, "HTTP_PROXY=http://plain-upper:1")
+    prs = push(prs, "https_proxy=https://sec:3")
+    pk := proxy_pick("", prs)
+    testing.expect(pk.cgi, "cgi flag set")
+    testing.expect_eq(len(pk.env), 2, "both schemes still captured")
+    testing.expect_streq(pk.env[0], "https_proxy=https://sec:3", "https kept")
+    testing.expect_streq(pk.env[1], "http_proxy=http://plain-upper:1", "http kept for send-time error")
+    // whitespace-only REQUEST_METHOD still counts as CGI (raw check)
+    let prs2: []str = nil
+    prs2 = push(prs2, "REQUEST_METHOD=   ")
+    pk2 := proxy_pick("", prs2)
+    testing.expect(pk2.cgi, "whitespace REQUEST_METHOD is CGI")
+    // REQUEST_METHOD empty/unset → not CGI
+    let prs3: []str = nil
+    prs3 = push(prs3, "REQUEST_METHOD=")
+    prs3 = push(prs3, "http_proxy=http://plain:1")
+    pk3 := proxy_pick("", prs3)
+    testing.expect(!pk3.cgi, "empty REQUEST_METHOD no cgi")
+    testing.expect_eq(len(pk3.env), 1, "http proxy captured")
+}
+
+fn test_plan_req_proxy_wiring() {
+    es := plan_env()
+    [r, e] = decode_src("url: x.com\noptions:\n  proxy_url: http://px:3128\n")
+    testing.expect(e == nil, "decode")
+    sp := plan_req(r, es, nil, "d")
+    testing.expect(len(sp.err) == 0, "no err")
+    testing.expect_eq(len(sp.warns), 0, "no proxy warn anymore")
+    testing.expect_eq(len(sp.req.proxies), 1, "one proxies entry")
+    testing.expect_streq(sp.req.proxies[0], "all:http://px:3128", "all-wrapped")
+    testing.expect(sp.req.proxy_go, "go mode on plan")
+}
+
+fn test_plan_req_proxy_url_substitution() {
+    // corpus §6.2: proxy_url runs the same scoped-env substitution
+    // as URL/headers — $TOK resolves, $MISSING passes through
+    // literal (in_url=false), proxy still wires.
+    es := plan_env()
+    [r, e] = decode_src("url: x.com\noptions:\n  proxy_url: http://px-$TOK:3128\n")
+    testing.expect(e == nil, "decode")
+    sp := plan_req(r, es, nil, "d")
+    testing.expect(len(sp.err) == 0, "no err: " + sp.err)
+    testing.expect_eq(len(sp.req.proxies), 1, "one proxies entry")
+    testing.expect_streq(sp.req.proxies[0], "all:http://px-t1:3128", "substituted proxy_url")
+    // env path (no proxy_url) still sets proxy_go for the transport
+    [r2, e2] = decode_src("url: x.com\n")
+    testing.expect(e2 == nil, "decode2")
+    sp2 := plan_req(r2, es, nil, "d")
+    testing.expect(len(sp2.err) == 0, "no err2")
+    testing.expect(sp2.req.proxy_go, "env path go mode")
+    testing.expect_eq(len(sp2.req.proxies), 0, "no explicit proxies")
+}
+
+fn test_collect_proxy_env_names() {
+    // pin the exact name list — order is the getenv scan order and
+    // part of the contract (both cases captured for getEnvAny precedence).
+    want := mkslice(str, 0)
+    want = push(want, "REQUEST_METHOD")
+    want = push(want, "https_proxy")
+    want = push(want, "HTTPS_PROXY")
+    want = push(want, "http_proxy")
+    want = push(want, "HTTP_PROXY")
+    want = push(want, "no_proxy")
+    want = push(want, "NO_PROXY")
+    // collect_proxy_env emits only SET names, so assert membership
+    // shape instead: every emitted pair's name is in `want`.
+    prs := collect_proxy_env()
+    i := 0
+    for i < len(prs) {
+        eq := find(prs[i], "=")
+        testing.expect(eq > 0, "pair has =: " + prs[i])
+        nm := substr(prs[i], 0, eq)
+        hit := false
+        j := 0
+        for j < len(want) {
+            if want[j] == nm {
+                hit = true
+            }
+            j = j + 1
+        }
+        testing.expect(hit, "canonical name only: " + nm)
+        testing.expect(find(nm, "ALL_PROXY") < 0 && find(nm, "all_proxy") < 0, "no ALL_PROXY: " + nm)
+        i = i + 1
+    }
+}
