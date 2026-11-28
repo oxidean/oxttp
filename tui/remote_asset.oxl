@@ -1,0 +1,199 @@
+package main
+
+// Generated from posting @32c4566 cmd/posting/remote.go
+// (remoteUsage) and skills/using-posting/SKILL.md (WI-0019, ADR-0046).
+
+let REMOTE_USAGE = "Usage: posting remote COMMAND [REQUEST] [options]\n" +
+    "\n" +
+    "Drive the Posting running in another terminal. Requests open and send in its\n" +
+    "window, with its active environment, so whoever is watching sees each request\n" +
+    "and its response, and the response is printed here too. This is how coding\n" +
+    "agents can work through a Posting someone has open beside them.\n" +
+    "\n" +
+    "Commands:\n" +
+    "  list              List the running Postings\n" +
+    "  requests          List the requests saved in the collection\n" +
+    "  show              Print the request in the active tab, in Posting's YAML\n" +
+    "                    request format\n" +
+    "  open [REQUEST]    Open a request in a tab, without sending it\n" +
+    "  send [REQUEST]    Send a request, wait for the response, and print it\n" +
+    "  response          Print the active tab's latest response\n" +
+    "  env [NAME|FILE...]\n" +
+    "                    List the environments, marking the active one with *,\n" +
+    "                    after switching to the one named, or layering the files\n" +
+    "                    given. --none switches to no environment.\n" +
+    "  skill             Print a skill that teaches coding agents to use these\n" +
+    "                    commands, for Claude Code, Codex, Pi or Amp. It doesn't\n" +
+    "                    need a running Posting.\n" +
+    "  save [FILE]       Save the request in the active tab: as FILE, or where it\n" +
+    "                    was saved before, or else under its name. FILE is relative\n" +
+    "                    to the collection unless it starts with /, ./ or ../, and\n" +
+    "                    a request already saved there isn't replaced. --name NAME\n" +
+    "                    names the request.\n" +
+    "\n" +
+    "REQUEST is a request saved in the collection: its file (users/get.posting.yaml\n" +
+    "or users/get), a path to it, or its name. A request file outside the collection\n" +
+    "is opened unsaved. Without REQUEST, open and send use the active tab. Instead\n" +
+    "of REQUEST, give one of:\n" +
+    "  --curl COMMAND    a curl command\n" +
+    "  --yaml FILE       a request in Posting's YAML format; - reads standard input\n" +
+    "\n" +
+    "Requests that aren't saved open in a tab of their own, which is reused until\n" +
+    "someone edits or saves it. Responses print as status line, headers, a blank line and\n" +
+    "the body. Error statuses aren't failures: send exits 1 only when no response\n" +
+    "arrives.\n" +
+    "\n" +
+    "Options:\n" +
+    "  --json            Print the result as JSON\n" +
+    "  --instance PID    The Posting to drive, by process ID or socket path, when\n" +
+    "                    several are running, or when this command can't see the\n" +
+    "                    socket directory (as in some agent sandboxes). Defaults\n" +
+    "                    to $POSTING_INSTANCE, or else the only one running, the\n" +
+    "                    one started in this directory, or the one whose\n" +
+    "                    collection holds this directory.\n" +
+    "  -h, --help        Show this help\n" +
+    "\n" +
+    "Examples:\n" +
+    "  posting remote requests\n" +
+    "  posting remote send users/list\n" +
+    "  posting remote send --curl 'curl -X POST https://example.com/users -d \"{}\"'\n" +
+    "  posting remote show > draft.posting.yaml   # edit it, then\n" +
+    "  posting remote send --yaml draft.posting.yaml\n" +
+    "  posting remote send users/get --json | jq -r .response.body\n" +
+    "  posting remote env staging\n" +
+    "  posting remote open --curl 'curl https://example.com/health'\n" +
+    "  posting remote save health --name \"Health check\"\n" +
+    ""
+
+let REMOTE_SKILL_MD = "---\n" +
+    "name: using-posting\n" +
+    "description: Sends HTTP, GraphQL and gRPC requests through Posting with `posting remote`, or runs saved requests and collections without a running instance using `posting run`. Use when calling, testing or debugging an API with Posting, when the user mentions Posting, or when an agent needs to execute saved Posting requests headlessly.\n" +
+    "---\n" +
+    "\n" +
+    "# Using Posting\n" +
+    "\n" +
+    "The user may have Posting, a terminal API client, open beside you. Requests you send with\n" +
+    "`posting remote` open and send in their Posting window, using its active environment, so they see\n" +
+    "what you sent and what came back. The response is printed for you too.\n" +
+    "\n" +
+    "For explicitly headless work, use `posting run` on saved files instead; it doesn't need a running\n" +
+    "Posting or an instance-discovery step. See **Run without the UI** below.\n" +
+    "\n" +
+    "## Check whether Posting is open\n" +
+    "\n" +
+    "Unless the user asked for headless execution, check whether Posting is open before calling an API:\n" +
+    "\n" +
+    "```bash\n" +
+    "posting remote list\n" +
+    "```\n" +
+    "\n" +
+    "- A Posting is listed: send this project's API requests through it, as below.\n" +
+    "- \"No Posting is running\": use `posting run` for saved requests, or curl for ad hoc calls. Don't\n" +
+    "  start the full-screen UI yourself.\n" +
+    "- `posting` isn't installed: use curl as usual.\n" +
+    "- \"Postings are running; choose one\": pick the one whose collection or directory matches this\n" +
+    "  project, and pass `--instance PID` to every command.\n" +
+    "\n" +
+    "## Send requests\n" +
+    "\n" +
+    "Prefer the user's saved requests, which carry their headers, auth and variables:\n" +
+    "\n" +
+    "```bash\n" +
+    "posting remote requests                     # METHOD, FILE, NAME and URL of each saved request\n" +
+    "posting remote send users/get               # by file, without .posting.yaml\n" +
+    "posting remote send \"Get user\"              # or by name\n" +
+    "```\n" +
+    "\n" +
+    "For a request that isn't saved, give a curl command, or YAML on standard input. YAML avoids shell\n" +
+    "quoting problems with JSON bodies:\n" +
+    "\n" +
+    "```bash\n" +
+    "posting remote send --curl 'curl -X POST https://api.example.com/users -H \"Content-Type: application/json\" -d \"{}\"'\n" +
+    "\n" +
+    "posting remote send --yaml - <<'EOF'\n" +
+    "method: POST\n" +
+    "url: ${BASE_URL}/users\n" +
+    "headers:\n" +
+    "- name: Authorization\n" +
+    "  value: Bearer ${API_TOKEN}\n" +
+    "body:\n" +
+    "  content: '{\"name\": \"Ada\"}'\n" +
+    "  content_type: application/json\n" +
+    "EOF\n" +
+    "```\n" +
+    "\n" +
+    "`${NAME}` is filled in from the user's active environment. Use the variables they have rather than\n" +
+    "pasting values: `posting remote env` lists the environments and their variable names (never their\n" +
+    "values).\n" +
+    "\n" +
+    "Add `--json` to get structured output: `outcome`, `error`, and `response` with `status`, `headers`\n" +
+    "and `body`. For example, `posting remote send users/get --json | jq -r .response.body`.\n" +
+    "\n" +
+    "`send` exits 0 whenever a response arrives, including 4xx and 5xx; read the status. It exits 1 when\n" +
+    "no response arrives (connection refused, timeout, undefined variable), with the reason on stderr.\n" +
+    "\n" +
+    "## See what the user sees\n" +
+    "\n" +
+    "```bash\n" +
+    "posting remote show        # the request in the user's active tab, as YAML\n" +
+    "posting remote response    # the latest response in that tab\n" +
+    "```\n" +
+    "\n" +
+    "Use these when the user says \"this request\", \"the one I have open\" or \"look at the response\".\n" +
+    "\n" +
+    "## Run without the UI\n" +
+    "\n" +
+    "```bash\n" +
+    "posting run api/health.posting.yaml --json\n" +
+    "posting run api --env dev --json > results.json\n" +
+    "posting run -c api users/get.posting.yaml --env staging --json\n" +
+    "jq '.results[] | {file, outcome, error, status: .response.status}' results.json\n" +
+    "```\n" +
+    "\n" +
+    "Give a saved `.posting.yaml` file or a directory, not a request display name. Directories run\n" +
+    "recursively in lexical file-path order; numbered filenames order dependent requests. With `-c`,\n" +
+    "the path is relative to that collection root; omit it to run the whole collection. Without `-c`,\n" +
+    "the root is the directory given, or the file's parent directory. Upload and proto paths use this root.\n" +
+    "\n" +
+    "The default environment is `posting.env` + `posting.local.env` in the root, never the UI's last\n" +
+    "selection. `--env NAME` selects a named environment there; an explicit file path is relative to\n" +
+    "the working directory. Repeat `--env` to layer. Shell secrets can be referenced from these files.\n" +
+    "Cookies and successful response captures carry forward within one run, and nothing is written\n" +
+    "to UI history. `--fail-fast` stops after the first failure; otherwise later requests still run.\n" +
+    "\n" +
+    "Unlike `remote send`, `run` exits 1 for HTTP 4xx/5xx, GraphQL errors, non-OK gRPC statuses, transport\n" +
+    "errors, or failed captures. It exits 0 only when all requests pass, and 2 for invalid arguments.\n" +
+    "Empty collections, malformed files and legacy Python scripts are rejected. There are no custom\n" +
+    "response assertions: inspect JSON output to decide whether the response meets the task's expectations.\n" +
+    "An exit code of 1 can still include a useful response, such as an expected 404. Read the report\n" +
+    "even when the command exits nonzero; don't assume every failed result is a transport failure.\n" +
+    "\n" +
+    "`--json` includes response headers and bodies, which may contain secrets. Don't publish the report\n" +
+    "without checking its contents. Inspect the selected requests and environment before running a whole\n" +
+    "collection: it may contain destructive requests, and headless mode doesn't make those safe.\n" +
+    "\n" +
+    "## Rules\n" +
+    "\n" +
+    "- **Don't send the user's tab unasked.** `posting remote send` with no request sends whatever is in\n" +
+    "  their active tab. Only do that when they ask.\n" +
+    "- **Ask before risky requests.** Before a POST, PUT, PATCH or DELETE against anything other than a\n" +
+    "  local or test environment, use `posting remote open` instead of `send`, and ask the user to send\n" +
+    "  it themselves. For headless runs, get approval before sending risky requests to a shared environment.\n" +
+    "- **Say before switching environments.** `posting remote env NAME` changes the environment the user\n" +
+    "  is working in. Tell them, and switch back when you're done if they were using another.\n" +
+    "- **Keep bulk work out of Posting.** Loops, polling, load tests and large downloads would flood the\n" +
+    "  user's window. Use `posting run` for saved collections, or curl for other bulk work, and send one\n" +
+    "  representative request through the UI when useful.\n" +
+    "- **Save only when asked.** `posting remote save FILE --name NAME` saves the request in the active\n" +
+    "  tab into the collection. Open the request first, and never use it to overwrite the user's work.\n" +
+    "\n" +
+    "## Other commands\n" +
+    "\n" +
+    "| Command | Does |\n" +
+    "|---|---|\n" +
+    "| `posting remote open REQUEST` | Opens a request (same forms as `send`) without sending it |\n" +
+    "| `posting remote env NAME` | Switches environment; `--none` switches to none |\n" +
+    "| `posting remote save [FILE] --name NAME` | Saves the active tab's request |\n" +
+    "| `posting remote --help` | Full reference |\n" +
+    "| `posting run --help` | Headless runner reference |\n" +
+    ""

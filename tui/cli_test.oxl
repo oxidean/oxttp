@@ -37,11 +37,12 @@ fn test_cli_remote() {
     a = push(a, "list")
     r := cli_remote_args(a)
     testing.expect(r.code == 0, "list code")
-    testing.expect(find(r.stdout, "no running Posting") >= 0, "list text")
+    testing.expect(find(r.stderr, "No Posting is running.") >= 0, "list text on stderr")
     a[1] = "skill"
     r = cli_remote_args(a)
     testing.expect(r.code == 0, "skill code")
-    testing.expect(find(r.stdout, "posting-remote") >= 0, "skill emits md")
+    testing.expect(find(r.stdout, "using-posting") >= 0, "skill emits md")
+    testing.expect(find(r.stdout, "posting remote send") >= 0, "skill body")
     a[1] = "send"
     r = cli_remote_args(a)
     testing.expect(r.code == 1, "send degrade")
@@ -59,7 +60,7 @@ fn test_cli_remote_instance_and_json() {
     a = push(a, "list")
     r := cli_remote_args(a)
     testing.expect(r.code == 0, "--instance consumed, list runs")
-    testing.expect(find(r.stdout, "no running Posting") >= 0, "list text")
+    testing.expect(find(r.stderr, "No Posting is running.") >= 0, "list text")
     // = form
     a = nil
     a = push(a, "remote")
@@ -75,13 +76,43 @@ fn test_cli_remote_instance_and_json() {
     r = cli_remote_args(a)
     testing.expect(r.code == 0, "list --json code")
     testing.expect_streq(r.stdout, "[]\n", "list --json body")
-    // unknown command → usage → 2 (was 1)
+    // unknown command → posting remote: unknown command + usage hint → 2
     a = nil
     a = push(a, "remote")
     a = push(a, "bogus")
     r = cli_remote_args(a)
     testing.expect(r.code == 2, "unknown cmd usage")
-    testing.expect(find(r.stderr, "usage:") >= 0, "usage text")
+    testing.expect(find(r.stderr, "unknown command") >= 0, "err text")
+    testing.expect(find(r.stderr, "--help for usage") >= 0, "usage hint")
+    // removed commands new/focus are unknown too
+    a = nil
+    a = push(a, "remote")
+    a = push(a, "new")
+    r = cli_remote_args(a)
+    testing.expect(r.code == 2, "new removed")
+    // strict flag errors
+    a = nil
+    a = push(a, "remote")
+    a = push(a, "send")
+    a = push(a, "--bogus")
+    r = cli_remote_args(a)
+    testing.expect(r.code == 2, "unknown option")
+    testing.expect(find(r.stderr, "unknown option --bogus") >= 0, "option text")
+    // cross-flag: --curl on list
+    a = nil
+    a = push(a, "remote")
+    a = push(a, "list")
+    a = push(a, "--curl")
+    a = push(a, "x")
+    r = cli_remote_args(a)
+    testing.expect(r.code == 2, "curl on list")
+    testing.expect(find(r.stderr, "--curl and --yaml are for open and send") >= 0, "cross flag")
+    // no command at all
+    a = nil
+    a = push(a, "remote")
+    r = cli_remote_args(a)
+    testing.expect(r.code == 2, "no command")
+    testing.expect(find(r.stderr, "no command given") >= 0, "no command text")
 }
 
 fn test_cli_import() {
@@ -125,7 +156,7 @@ fn test_run_parse() {
     a = push(a, "--json")
     a = push(a, "requests/")
     rp := run_parse_args(a)
-    testing.expect(rp.code == 0, "code")
+    testing.expect(len(rp.err) == 0 && !rp.help, "parse ok")
     testing.expect_streq(rp.o.coll, "/coll", "coll")
     testing.expect(len(rp.o.envs) == 1, "envs")
     testing.expect_streq(rp.o.target, "requests/", "target")
@@ -138,25 +169,51 @@ fn test_run_parse() {
     a = push(a, "--collection=/c")
     a = push(a, "--env=prod")
     rp = run_parse_args(a)
-    testing.expect(rp.code == 0, "code2")
+    testing.expect(len(rp.err) == 0, "parse2 ok")
     testing.expect_streq(rp.o.coll, "/c", "coll2")
     testing.expect_streq(rp.o.envs[0], "prod", "env2")
-    // two positionals → usage
+    // two positionals → error
     a = push(a, "extra")
     rp = run_parse_args(a)
-    testing.expect(rp.code == 2, "two positional")
+    testing.expect_streq(rp.err, "expected one request file or directory", "two positional")
     // help
     a = nil
     a = push(a, "run")
     a = push(a, "-h")
     rp = run_parse_args(a)
-    testing.expect(rp.code == -1, "help sentinel")
+    testing.expect(rp.help, "help flag")
     // missing value
     a = nil
     a = push(a, "run")
     a = push(a, "-c")
     rp = run_parse_args(a)
-    testing.expect(rp.code == 2, "missing val")
+    testing.expect_streq(rp.err, "-c needs a value", "missing val")
+    // -c alone → target "."
+    a = nil
+    a = push(a, "run")
+    a = push(a, "-c")
+    a = push(a, "/coll")
+    rp = run_parse_args(a)
+    testing.expect(len(rp.err) == 0, "c alone ok")
+    testing.expect_streq(rp.o.target, ".", "c alone target")
+    // no target, no -c → error
+    a = nil
+    a = push(a, "run")
+    rp = run_parse_args(a)
+    testing.expect_streq(rp.err, "give a request file, directory, or --collection DIR", "no target")
+    // unknown option keeps original arg
+    a = nil
+    a = push(a, "run")
+    a = push(a, "--bogus")
+    rp = run_parse_args(a)
+    testing.expect_streq(rp.err, "unknown option --bogus", "unknown opt")
+    // --json=x rejected
+    a = nil
+    a = push(a, "run")
+    a = push(a, "t.posting.yaml")
+    a = push(a, "--json=yes")
+    rp = run_parse_args(a)
+    testing.expect_streq(rp.err, "--json takes no value", "json value")
 }
 
 fn test_run_env_file_layers() {
