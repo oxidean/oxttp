@@ -32,6 +32,26 @@ jobs:
           echo "/tmp/oxl-toolchain" >> "$GITHUB_PATH"
           /tmp/oxl-toolchain/oxl version
 
+      # The OAuth/HTTP closure pushes the app build over the hosted
+      # runner's memory ceiling (oxidean/oxl#232). Give the compiler the
+      # same transient swap headroom the test matrix uses.
+      - name: add swap for oxl build memory peak
+        run: |
+          cur_kb=$(awk '/^SwapTotal/ {print $2}' /proc/meminfo)
+          mem_kb=$(awk '/^MemTotal/ {print $2}' /proc/meminfo)
+          want_kb=$((40 * 1024 * 1024 - mem_kb - cur_kb))
+          avail_kb=$(df -k --output=avail / | tail -1)
+          disk_kb=$((avail_kb - 3 * 1024 * 1024))
+          [ "$want_kb" -gt "$disk_kb" ] && want_kb=$disk_kb
+          if [ "$want_kb" -gt 0 ]; then
+            want_mb=$((want_kb / 1024))
+            sudo fallocate -l "${want_mb}M" /oxttp-ci-swap || sudo dd if=/dev/zero of=/oxttp-ci-swap bs=1M count=$want_mb
+            sudo chmod 600 /oxttp-ci-swap
+            sudo mkswap /oxttp-ci-swap
+            sudo swapon /oxttp-ci-swap
+          fi
+          free -h
+
       # oxl build emits binaries only for `package main` dirs; building
       # the two apps transitively compiles shared/ and core/.
       - name: build apps
@@ -65,6 +85,7 @@ jobs:
           - core/http
           - core/item
           - core/model
+          - core/oauth
           - core/session
           - core/term
           - core/yaml
