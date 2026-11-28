@@ -2,9 +2,10 @@
   "schema_version": 1,
   "id": "WI-0022",
   "title": "M4f OAuth2 authorization flow",
-  "state": "verifying",
+  "state": "blocked",
   "profile": "normal",
-  "current_stage": "verification",
+  "current_stage": "shipping",
+  "blocked_from": "shipping",
   "created_at": "2026-11-27T20:42:24Z",
-  "updated_at": "2026-11-28T09:00:45Z"
+  "updated_at": "2026-11-28T09:43:42Z"
 }
