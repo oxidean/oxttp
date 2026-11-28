@@ -390,6 +390,37 @@ fn test_review_environment_data_roundtrips_apostrophe_backslash() {
     os.remove_all(dir)
 }
 
+fn test_review_environment_data_roundtrips_multiline_literal() {
+    want := "$${HOST}\nline2"
+    vars := mkslice(model.KV, 0)
+    vars = push(vars, model.KV{name: "VALUE", value: want, enabled: true})
+    [data, ee] = environment_data(vars)
+    testing.expect(ee == nil, "multiline environment data encodes")
+    testing.expect(find(data, "\\n") >= 0, "newline encoded inside one dotenv line: " + data)
+    dir := review_scratch("dotenv-multiline-roundtrip")
+    os.mkdir_all(dir)
+    os.writefile_(dir + "/posting.env", data)
+    bo := existing_base(dir)
+    testing.expect_eq(len(bo.vars), 1, "multiline roundtrip var count")
+    if len(bo.vars) == 1 {
+        testing.expect_streq(bo.vars[0].value, want, "multiline literal survives template reread")
+    }
+    os.remove_all(dir)
+}
+
+fn test_review_existing_base_unrepresentable_line_isolated() {
+    dir := review_scratch("base-partial")
+    os.mkdir_all(dir)
+    os.writefile_(dir + "/posting.env", "HOST=example.test\nFALLBACK=${MISSING:-x}\nAPI=\"https://${HOST}/v1\"\n")
+    bo := existing_base(dir)
+    testing.expect_eq(len(bo.vars), 2, "representable base vars retained")
+    if len(bo.vars) == 2 {
+        testing.expect_streq(bo.vars[0].name, "HOST", "first representable var")
+        testing.expect_streq(bo.vars[1].value, "https://${HOST}/v1", "template still retained")
+    }
+    os.remove_all(dir)
+}
+
 fn test_postman_apikey_folder_override_wins_before_defaults() {
     src := "{\"info\":{\"name\":\"Scoped\",\"schema\":\"https://schema.getpostman.com/json/collection/v2.1.0/collection.json\"}," +
         "\"variable\":[{\"key\":\"TARGET\",\"value\":\"header\"},{\"key\":\"PLACEMENT\",\"value\":\"{{TARGET}}\"}]," +

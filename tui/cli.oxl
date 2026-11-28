@@ -743,14 +743,14 @@ fn imp_envs_line(output: str, envs: []importing.WEnv) -> str {
     }
     files := ""
     selected := ""
-    base_file := ""
+    base_name := ""
     i := 0
     for i < len(envs) {
         f := imp_diag(envs[i].file)
         if envs[i].base {
             f = f + " (base)"
             if envs[i].file != "posting.env" {
-                base_file = envs[i].file
+                base_name = envs[i].name
             }
         } else if selected == "" {
             selected = envs[i].name
@@ -765,8 +765,8 @@ fn imp_envs_line(output: str, envs: []importing.WEnv) -> str {
         selected = envs[0].name
     }
     base_arg := ""
-    if len(base_file) > 0 {
-        base_arg = " --env " + imp_quote(base_file)
+    if len(base_name) > 0 {
+        base_arg = " --env " + imp_quote(base_name)
     }
     return "Environments: " + files + "\nOpen with: posting -c " + imp_quote(output) + base_arg + " --env " + imp_quote(selected) + "\n"
 }
@@ -1019,13 +1019,11 @@ fn join(lines: []str) -> str {
     return out
 }
 
-// run_env resolves -e names/files into an EnvSet over the env search
-// dirs (corpus §5.1: CWD → collection dir → config dir). Base files
-// (posting.env, posting.local.env) layer per dir in dir order; each
-// -e then composes IN CLI ORDER — a named env resolves first-dir-
-// wins via env_files_named, a file path parses verbatim. File-path
-// -e values therefore interleave with named ones exactly as passed
-// (upstream composes --env in arg order).
+// run_env is the test-seam form of run's environment resolver. File
+// specs probe the process CWD; named environments resolve in the
+// collection root. Any explicit -e suppresses the implicit root base;
+// multiple specs compose in CLI order (upstream composes --env in arg
+// order). See ADR-0067 for the production run_env_scoping contract.
 struct RunEnv { es: own env.EnvSet, err: str }
 
 fn run_env(dirs: []str, envs: []str) -> own RunEnv {

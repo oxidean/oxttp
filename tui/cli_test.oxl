@@ -270,7 +270,7 @@ fn test_cli_report_path_quote_and_missing_target_regressions() {
     envs = push(envs, importing.WEnv{name: "posting-2", file: "posting-2.env", base: true})
     envs = push(envs, importing.WEnv{name: "dev", file: "dev.env", base: false})
     line := imp_envs_line("out", envs)
-    testing.expect(find(line, " --env posting-2.env --env dev") >= 0, "renamed imported base precedes selected env: " + line)
+    testing.expect(find(line, " --env posting-2 --env dev") >= 0, "renamed imported base name precedes selected env: " + line)
     envs2 := mkslice(importing.WEnv, 0)
     envs2 = push(envs2, importing.WEnv{name: "posting", file: "posting.env", base: true})
     envs2 = push(envs2, importing.WEnv{name: "dev", file: "dev.env", base: false})

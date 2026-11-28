@@ -298,6 +298,17 @@ fn dotenv_value(template: str) -> str {
     if len(refs) == 0 {
         lit := replace_all(template, "$$", "$")
         lit = replace_all(lit, "\\", "\\\\")
+        if find(template, "\n") >= 0 || find(template, "\r") >= 0 {
+            // Single-quoted dotenv values cannot represent a literal LF/CR
+            // without splitting the line, so newline-bearing literals use
+            // double-quote escapes. `${` still needs template escaping to
+            // remain literal rather than becoming a reference on reload.
+            lit = replace_all(lit, "\"", "\\\"")
+            lit = replace_all(lit, "\n", "\\n")
+            lit = replace_all(lit, "\r", "\\r")
+            lit = replace_all(lit, "${", "${:-$}{")
+            return "\"" + lit + "\""
+        }
         lit = replace_all(lit, "'", "\\'")
         return "'" + lit + "'"
     }
@@ -357,6 +368,33 @@ fn existing_base(dir: str) -> own BaseOut {
     text := os.readfile_(path)
     [dp, perr] = env.parse_dotenv_templates(text)
     if perr != nil {
+        // Template parsing is strict because it is lossless. A single
+        // unsupported expression (notably ${NAME:-default}, which has no
+        // exact model-template form) must not discard unrelated variables
+        // that can round-trip; keep those lines and omit only the
+        // unrepresentable ones.
+        pos := 0
+        for pos <= len(text) {
+            eol := pos
+            for eol < len(text) && byteat(text, eol) != 10 {
+                eol = eol + 1
+            }
+            line := substr(text, pos, eol) + "\n"
+            pos = eol + 1
+            [lp, lerr] = env.parse_dotenv_templates(line)
+            if lerr == nil {
+                li := 0
+                for li < len(lp.vars) {
+                    bo.vars = push(bo.vars, lp.vars[li])
+                    li = li + 1
+                }
+                lw := 0
+                for lw < len(lp.warns) {
+                    bo.warns = push(bo.warns, lp.warns[lw])
+                    lw = lw + 1
+                }
+            }
+        }
         return bo
     }
     // Templates deliberately stay unexpanded here: repeated base vars in
