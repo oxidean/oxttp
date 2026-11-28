@@ -353,22 +353,6 @@ fn bexpand_mode(e: ref BExp, res: ref Result, s0: str, stack: []str, json_body: 
             i = i + 1
             continue
         }
-        // literal segment s[last:i] — update string state
-        seg := substr(s, last, i)
-        if json_body {
-            k := 0
-            for k < len(seg) {
-                c := byteat(seg, k)
-                if escaped {
-                    escaped = false
-                } else if c == 92 && in_string {
-                    escaped = true
-                } else if c == 34 {
-                    in_string = !in_string
-                }
-                k = k + 1
-            }
-        }
         name := btrim(name_raw)
         replacement := ""
         e.count = e.count + 1
@@ -1100,7 +1084,21 @@ fn convert(d: []BBlock, parent: ref BScope, res: ref Result) -> [own collection.
         pi3 = pi3 + 1
     }
     if req.body != nil && req.body.has_content {
-        req.body.content = bexpand(e, res, req.body.content, mkslice(str, 0), false)
+        // Bruno selects JSON string escaping from the effective
+        // Content-Type after header interpolation.
+        ctype := req.body.content_type
+        hi2 := 0
+        for hi2 < len(req.headers) {
+            h := req.headers[hi2]
+            hi2 = hi2 + 1
+            if h.enabled && case_eq_fold(h.name, "Content-Type") {
+                ctype = h.value
+            }
+        }
+        if contains(ctype, "${") || contains(ctype, "{{") {
+            bwarn(res, "unresolved Content-Type uses import-time body escaping; check body variables after setting the header")
+        }
+        req.body.content = bexpand(e, res, req.body.content, mkslice(str, 0), contains(ctype, "json"))
     }
     if req.body != nil && req.body.has_form_data {
         fi3 := 0

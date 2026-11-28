@@ -127,6 +127,17 @@ struct BWalk {
     ctx: own BReadCtx,
     res: own Result,
     materialized: int,
+    root: str,
+}
+
+fn bresolve(root: str, rel: str) -> str {
+    if rel == "." {
+        return root
+    }
+    if root == "" {
+        return rel
+    }
+    return root + "/" + rel
 }
 
 fn bwalk(ctx: ref BWalk, dir: str, parent: ref BScope, depth: int) -> err {
@@ -137,7 +148,7 @@ fn bwalk(ctx: ref BWalk, dir: str, parent: ref BScope, depth: int) -> err {
     if dir == "." {
         file_name = "collection.bru"
     }
-    sname := bjoin(dir, file_name)
+    sname := bresolve(ctx.root, bjoin(dir, file_name))
     cur := new(BScope)
     cur.deferred = parent.deferred
     cur.headers = parent.headers
@@ -166,7 +177,7 @@ fn bwalk(ctx: ref BWalk, dir: str, parent: ref BScope, depth: int) -> err {
     if ctx.ctx.visited > BMAX_COLL_ENTRIES {
         return errors.new("Bruno collection exceeds 20000 directory entries")
     }
-    entries := breadir(ctx.ctx, dir)
+    entries := breadir(ctx.ctx, bresolve(ctx.root, dir))
     ei := 0
     for ei < len(entries) {
         n := entries[ei]
@@ -175,7 +186,7 @@ fn bwalk(ctx: ref BWalk, dir: str, parent: ref BScope, depth: int) -> err {
             continue
         }
         rel := bjoin(dir, n)
-        path := rel
+        path := bresolve(ctx.root, rel)
         if os.isdir(path) {
             if dir == "." && n == "environments" {
                 eerr := ble_load_envs(ctx, n)
@@ -258,20 +269,21 @@ fn bwalk(ctx: ref BWalk, dir: str, parent: ref BScope, depth: int) -> err {
 
 // ble_load_envs — environments/<name>.bru files at the collection root.
 fn ble_load_envs(ctx: ref BWalk, dir: str) -> err {
-    entries := breadir(ctx.ctx, dir)
+    entries := breadir(ctx.ctx, bresolve(ctx.root, dir))
     ei := 0
     for ei < len(entries) {
         n := entries[ei]
         ei = ei + 1
         rel := bjoin(dir, n)
+        full := bresolve(ctx.root, rel)
         if startswith(n, ".") {
             continue
         }
-        if os.isdir(rel) || !endswith(n, ".bru") {
+        if os.isdir(full) || !endswith(n, ".bru") {
             bwarn(ctx.res, "skipped " + rel + "; Bruno environments are .bru files")
             continue
         }
-        [data, rerr] = bread(ctx.ctx, rel)
+        [data, rerr] = bread(ctx.ctx, full)
         if rerr != nil {
             return rerr
         }
@@ -304,7 +316,7 @@ fn bl_load(path: str) -> [own Result, err] {
         res.deferred = true
         ctx := new(BReadCtx)
         // bruno.json
-        [cdata, cerr] = bread(ctx, "bruno.json")
+        [cdata, cerr] = bread(ctx, bresolve(path, "bruno.json"))
         if cerr != nil {
             return nil, errors.new("read bruno.json: " + errors.msg(cerr))
         }
@@ -344,6 +356,7 @@ fn bl_load(path: str) -> [own Result, err] {
         wk.ctx = ctx
         wk.res = res
         wk.materialized = 0
+        wk.root = path
         werr := bwalk(wk, ".", root, 0)
         if werr != nil {
             return nil, werr

@@ -130,20 +130,6 @@ fn is_ident_pm(s: str) -> bool {
     return ok
 }
 
-fn upper_ascii2(s: str) -> str {
-    b := mkslice(byte, len(s))
-    i := 0
-    for i < len(s) {
-        c := byteat(s, i)
-        if c >= 97 && c <= 122 {
-            c = c - 32
-        }
-        b[i] = c
-        i = i + 1
-    }
-    return b as str
-}
-
 fn trim_space2(s: str) -> str {
     lo := 0
     for lo < len(s) && (byteat(s, lo) == 32 || byteat(s, lo) == 9 || byteat(s, lo) == 10 || byteat(s, lo) == 13) {

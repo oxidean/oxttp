@@ -1,0 +1,273 @@
+package importing
+
+// bruno_test.oxl — ports of upstream internal/importing/bruno tests
+// (posting @32c4566): parse/round-trip, bodies, warnings, expansion
+// bounds, GraphQL, collection inheritance. Filesystem cases use
+// os.temp_dir + writefile_ (ADR-0045 approximations).
+import "std/os"
+import "std/testing"
+import "github.com/oxidean/oxttp/core/collection"
+import "github.com/oxidean/oxttp/core/yaml"
+
+let BRUNO_SAMPLE = "meta {\n  name: Send event\n  type: http\n}\npost {\n  url: {{base}}/events/:id?repeat=1&repeat=2#top\n  body: json\n  auth: basic\n}\nheaders {\n  \"x:quoted\": yes\n  ~\"disabled:key\": retained\n  X-Token: {{token}}\n}\nparams:query {\n  ~off: disabled\n}\nparams:path {\n  id: {{id}}\n}\nauth:basic {\n  username: user\n  password: $literal\n}\nvars:pre-request {\n  base: https://example.test\n  id: 42\n}\nbody:json {\n  {\n    \"name\": \"{{name}}\",\n    \"value\": \"$literal\"\n  }\n}\ndocs {\n  Request documentation.\n}\n"
+
+fn roundtrip(r: ref collection.PRequest) -> [own collection.PRequest, err] {
+    data := collection.marshal(r)
+    [yn, ye] = yaml.parse(data)
+    if ye != nil {
+        return nil, ye
+    }
+    return collection.decode(yn)
+}
+
+fn test_parse_and_roundtrip() {
+    [res, err] = bparse(BRUNO_SAMPLE)
+    testing.expect(err == nil, "parse sample")
+    if err != nil {
+        return
+    }
+    testing.expect_eq(len(res.requests), 1, "one request")
+    testing.expect_streq(res.requests[0].req.url, "https://example.test/events/:id#top", "url")
+    testing.expect_streq(res.requests[0].req.method, "POST", "method")
+    testing.expect_eq(len(res.requests[0].req.params), 3, "query rows")
+    testing.expect_streq(res.requests[0].req.params[0].value, "1", "q0")
+    testing.expect_streq(res.requests[0].req.params[1].value, "2", "q1")
+    testing.expect(!res.requests[0].req.params[2].enabled, "q2 disabled")
+    testing.expect_eq(len(res.requests[0].req.headers), 3, "headers")
+    testing.expect_streq(res.requests[0].req.headers[0].name, "x:quoted", "h0 name")
+    testing.expect(!res.requests[0].req.headers[1].enabled, "h1 disabled")
+    testing.expect_streq(res.requests[0].req.headers[1].name, "disabled:key", "h1 name")
+    testing.expect_streq(res.requests[0].req.headers[2].value, "${token}", "h2 value")
+    testing.expect(res.requests[0].req.auth != nil && res.requests[0].req.auth.basic != nil, "basic auth")
+    if res.requests[0].req.auth != nil && res.requests[0].req.auth.basic != nil {
+        testing.expect_streq(res.requests[0].req.auth.basic.password, "$$literal", "auth password")
+    }
+    testing.expect_eq(len(res.requests[0].req.path_params), 1, "path params")
+    testing.expect_streq(res.requests[0].req.path_params[0].value, "42", "path value")
+    testing.expect(res.requests[0].req.body != nil && contains(res.requests[0].req.body.content, "\"name\": \"${name}\""), "json body escaped")
+    [back, derr] = roundtrip(res.requests[0].req)
+    testing.expect(derr == nil, "roundtrip decode")
+    if derr == nil {
+        testing.expect_streq(back.url, res.requests[0].req.url, "rt url")
+        testing.expect_eq(len(back.params), len(res.requests[0].req.params), "rt params")
+    }
+}
+
+fn test_raw_bodies_use_bru_indentation() {
+    input := "post {\n  url: https://example.test\n  body: text\n}\nbody:text {\n  }\n    deeper\n  trailing  \n\n}\n"
+    [res, err] = bparse(input)
+    testing.expect(err == nil, "parse")
+    if err != nil {
+        return
+    }
+    testing.expect_streq(res.requests[0].req.body.content, "}\n  deeper\ntrailing  \n", "raw body")
+    [back, derr] = roundtrip(res.requests[0].req)
+    testing.expect(derr == nil, "rt")
+    if derr == nil && back.body != nil {
+        testing.expect_streq(back.body.content, res.requests[0].req.body.content, "rt body")
+    }
+}
+
+fn test_form_multiline_and_quoted_keys() {
+    input := "post {\n  url: https://example.test\n  body: form-urlencoded\n}\nbody:form-urlencoded {\n  \"nested escaped \\\"quote\\\"\": allowed\n  ~off: no\n  value: '''\n    alpha\n    beta\n  '''\n}\n"
+    [res, err] = bparse(input)
+    testing.expect(err == nil, "parse")
+    if err != nil {
+        return
+    }
+    testing.expect(res.requests[0].req.body != nil && res.requests[0].req.body.has_form_data, "form body")
+    if res.requests[0].req.body != nil {
+        testing.expect_eq(len(res.requests[0].req.body.form_data), 3, "form rows")
+        testing.expect_streq(res.requests[0].req.body.form_data[0].name, "nested escaped \"quote\"", "quoted key")
+        testing.expect(!res.requests[0].req.body.form_data[1].enabled, "disabled row")
+        testing.expect_streq(res.requests[0].req.body.form_data[2].value, "alpha\nbeta", "multiline value")
+    }
+}
+
+fn test_unsupported_features_warn() {
+    input := "post {\n  url: https://example.test\n  body: multipart-form\n  auth: oauth2\n}\nbody:multipart-form {\n  upload: @file(/etc/passwd)\n}\nscript:pre-request {\n  throw new Error(\"never execute\");\n}\nassert {\n  res.status: 200\n}\n"
+    [res, err] = bparse(input)
+    testing.expect(err == nil, "parse")
+    if err != nil {
+        return
+    }
+    all := str_join(res.warns, " ")
+    testing.expect(contains(all, "multipart-form"), "multipart warn")
+    testing.expect(contains(all, "oauth2"), "oauth2 warn")
+    testing.expect(contains(all, "script:pre-request"), "script warn")
+    testing.expect(contains(all, "assert"), "assert warn")
+    testing.expect(res.requests[0].req.body == nil, "unsupported body omitted")
+}
+
+fn test_references_bounded_and_dollars() {
+    input := "get {\n  url: https://example.test/{{a}}/{{process.env.HOST}}/$literal\n}\nvars:pre-request {\n  a: {{b}}\n  b: {{a}}\n}\n"
+    [res, err] = bparse(input)
+    testing.expect(err == nil, "parse")
+    if err != nil {
+        return
+    }
+    testing.expect_streq(res.requests[0].req.url, "https://example.test/{{a}}/${HOST}/$$literal", "url")
+    testing.expect(len(res.warns) > 0, "warnings present")
+}
+
+fn test_invalid_inputs() {
+    inputs := mkslice(str, 0)
+    inputs = push(inputs, "")
+    inputs = push(inputs, "get {\n url: x")
+    inputs = push(inputs, "get { url: x }")
+    inputs = push(inputs, "get {\n url: x\n}\nget {\n url: y\n}")
+    inputs = push(inputs, "get {\n url: x\n}\nheaders {\n broken\n}")
+    inputs = push(inputs, "get {\n url: x\n}\nsettings {\n timeout: NaN\n}")
+    i := 0
+    for i < len(inputs) {
+        [res, err] = bparse(inputs[i])
+        testing.expect(err != nil, "rejects invalid input " + itoa(i))
+        i = i + 1
+    }
+}
+
+fn test_json_variable_escaping() {
+    input := "post {\n  url: https://example.test\n  body: json\n}\nvars:pre-request {\n  name: a\"b\n  count: 42\n}\nbody:json {\n  {\"name\":\"{{name}}\", \"count\":{{count}}}\n}\n"
+    [res, err] = bparse(input)
+    testing.expect(err == nil, "parse")
+    if err != nil {
+        return
+    }
+    if res.requests[0].req.body != nil {
+        testing.expect_streq(res.requests[0].req.body.content, "{\"name\":\"a\\\"b\", \"count\":42}", "json body")
+    } else {
+        testing.expect(false, "body present")
+    }
+}
+
+fn test_inline_dictionary_and_local_variable() {
+    [res, err] = bparse("get { url: https://example.test/{{local}}\n}\nvars:pre-request {\n  @local: function(value)\n}\n")
+    testing.expect(err == nil, "parse")
+    if err != nil {
+        return
+    }
+    testing.expect_streq(res.requests[0].req.url, "https://example.test/function(value)", "inline dict var")
+}
+
+fn test_expansion_bomb_rejected() {
+    s := "get {\n url: https://example.test/{{v0}}\n}\nvars:pre-request {\n"
+    i := 0
+    for i < 20 {
+        s = s + " v" + itoa(i) + ": {{v" + itoa(i + 1) + "}}{{v" + itoa(i + 1) + "}}\n"
+        i = i + 1
+    }
+    s = s + " v20: x\n}\n"
+    [res, err] = bparse(s)
+    testing.expect(err != nil, "expansion bomb rejected")
+}
+
+fn test_graphql_bodies_import_as_graphql() {
+    input := "meta {\n  name: Get user\n  type: graphql\n  seq: 1\n}\n\npost {\n  url: {{base}}/graphql\n  body: graphql\n  auth: bearer\n}\n\nauth:bearer {\n  token: {{token}}\n}\n\nbody:graphql {\n  query User($id: ID!) {\n    user(id: $id) { name }\n  }\n}\n\nbody:graphql:vars {\n  {\n    \"id\": \"{{userId}}\"\n  }\n}\n"
+    [res, err] = bparse(input)
+    testing.expect(err == nil, "parse")
+    if err != nil {
+        return
+    }
+    all := str_join(res.warns, "\n")
+    testing.expect(!contains(all, "skipped") && !contains(all, "unsupported"), "no graphql warnings")
+    testing.expect_streq(res.requests[0].req.kind, "graphql", "kind")
+    testing.expect(res.requests[0].req.graphql != nil, "graphql payload")
+    if res.requests[0].req.graphql != nil {
+        testing.expect(contains(res.requests[0].req.graphql.query, "query User"), "query text")
+        testing.expect(res.requests[0].req.graphql.variables != nil, "variables json")
+    }
+    testing.expect_streq(res.requests[0].req.url, "${base}/graphql", "url")
+    testing.expect(res.requests[0].req.auth != nil && res.requests[0].req.auth.type == "bearer_token", "bearer auth")
+    if res.requests[0].req.auth != nil && res.requests[0].req.auth.bearer_token != nil {
+        testing.expect_streq(res.requests[0].req.auth.bearer_token.token, "${token}", "token")
+    }
+    [back, derr] = roundtrip(res.requests[0].req)
+    testing.expect(derr == nil, "graphql roundtrip")
+}
+
+fn test_graphql_import_warnings() {
+    input1 := "meta {\n  type: graphql\n}\npost {\n  url: https://x/graphql\n  body: json\n}\nbody:json {\n  {}\n}\n"
+    [res1, e1] = bparse(input1)
+    testing.expect(e1 == nil, "parse1")
+    if e1 == nil {
+        testing.expect(contains(str_join(res1.warns, "\n"), "no GraphQL body"), "no body warn")
+    }
+    input2 := "get {\n  url: https://x/graphql\n  body: graphql\n}\nbody:graphql {\n  { a }\n}\n"
+    [res2, e2] = bparse(input2)
+    testing.expect(e2 == nil, "parse2")
+    if e2 == nil {
+        testing.expect(contains(str_join(res2.warns, "\n"), "uses GET"), "get warn")
+    }
+}
+
+fn bwrite(path: str, data: str) {
+    // mkdir -p the parent, then write
+    i := 0
+    for i < len(path) {
+        if byteat(path, i) == 47 && i > 0 {
+            d := substr(path, 0, i)
+            if len(d) > 0 {
+                os.mkdir_all(d)
+            }
+        }
+        i = i + 1
+    }
+    os.writefile_(path, data)
+}
+
+fn test_collection_inheritance() {
+    dir := os.temp_dir() + "/bcol_test"
+    os.mkdir_all(dir)
+    os.remove_all(dir + "/A")
+    os.remove_all(dir + "/B")
+    os.remove_all(dir + "/environments")
+    bwrite(dir + "/bruno.json", "{\"name\":\"Example\",\"type\":\"collection\"}")
+    bwrite(dir + "/collection.bru", "auth {\n  mode: basic\n}\nauth:basic {\n  username: {{who}}\n  password: root\n}\nheaders {\n  X-Test: root\n}\nvars:pre-request {\n  base: https://example.test\n  who: root\n}\n")
+    bwrite(dir + "/A/folder.bru", "auth {\n  mode: none\n}\nvars:pre-request {\n  who: A\n}\nheaders {\n  x-test: A\n}\n")
+    bwrite(dir + "/A/one.bru", "get {\n  url: {{base}}/{{who}}\n  auth: inherit\n}\n")
+    bwrite(dir + "/B/two.bru", "get {\n  url: {{base}}/{{who}}\n  auth: inherit\n}\nheaders {\n  ~X-Test: disabled\n}\n")
+    bwrite(dir + "/environments/Production.bru", "vars {\n  token: secret\n}\n")
+    [res, err] = bl_load(dir)
+    testing.expect(err == nil, "load collection")
+    if err != nil {
+        return
+    }
+    testing.expect_eq(len(res.requests), 2, "two requests")
+    testing.expect_eq(len(res.envs), 1, "one env")
+    if len(res.envs) == 1 {
+        testing.expect_streq(res.envs[0].name, "Production", "env name")
+    }
+    testing.expect(res.deferred, "deferred")
+    ai := -1
+    bi := -1
+    i := 0
+    for i < len(res.requests) {
+        if contains(res.requests[i].file, "one.posting.yaml") {
+            ai = i
+        }
+        if contains(res.requests[i].file, "two.posting.yaml") {
+            bi = i
+        }
+        i = i + 1
+    }
+    testing.expect(ai >= 0 && bi >= 0, "found requests")
+    if ai >= 0 {
+        // deferred: folder var who=A materializes in scope; base stays ${}
+        testing.expect_streq(res.requests[ai].req.url, "${base}/A", "a url")
+        testing.expect(res.requests[ai].req.auth == nil, "a auth none")
+        testing.expect_eq(len(res.requests[ai].req.headers), 1, "a headers")
+        if len(res.requests[ai].req.headers) == 1 {
+            testing.expect_streq(res.requests[ai].req.headers[0].value, "A", "a header")
+        }
+        testing.expect(res.requests[ai].req.variable_scope != nil, "a scope")
+    }
+    if bi >= 0 {
+        testing.expect_streq(res.requests[bi].req.url, "${base}/${who}", "b url")
+        testing.expect(res.requests[bi].req.auth != nil && res.requests[bi].req.auth.type == "basic", "b auth")
+        testing.expect_eq(len(res.requests[bi].req.headers), 2, "b headers")
+        if len(res.requests[bi].req.headers) == 2 {
+            testing.expect_streq(res.requests[bi].req.headers[0].value, "root", "b h0")
+            testing.expect(!res.requests[bi].req.headers[1].enabled, "b h1 disabled")
+        }
+    }
+}
