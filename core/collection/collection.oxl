@@ -1885,15 +1885,15 @@ fn px_pair_val(p: str) -> str {
     return px_trim(substr(p, eq + 1, len(p)))
 }
 
-// px_find_any is getEnvAny: lowercase name wins when both cases are
-// present and non-empty; uppercase only when lowercase is unset or
+// px_find_any is getEnvAny: uppercase name wins when both cases are
+// present and non-empty; lowercase only when uppercase is unset or
 // empty (Go httpproxy.FromEnvironment order).
 fn px_find_any(pairs: []str, lc: str, uc: str) -> str {
-    p := px_find(pairs, lc)
+    p := px_find(pairs, uc)
     if len(p) > 0 {
         return p
     }
-    return px_find(pairs, uc)
+    return px_find(pairs, lc)
 }
 
 // px_proxy_url normalizes an env proxy value for the Go path: Go's
@@ -1911,7 +1911,7 @@ fn px_proxy_url(v: str) -> str {
     return t
 }
 
-// px_val_any applies getEnvAny lowercase-first precedence.
+// px_val_any applies getEnvAny uppercase-first precedence.
 fn px_val_any(pairs: []str, lc: str, uc: str) -> str {
     p := px_find_any(pairs, lc, uc)
     if len(p) == 0 {
@@ -1926,13 +1926,13 @@ fn px_val_any(pairs: []str, lc: str, uc: str) -> str {
 // Req.proxies entry (the transport splits PROTO:URL on the first
 // colon — a bare URL would misparses) and the env set is not
 // consulted (corpus "else"). Otherwise env vars supply
-// proxy_env/no_proxy with getEnvAny lowercase-first precedence:
+// proxy_env/no_proxy with getEnvAny uppercase-first precedence:
 // https_proxy/HTTPS_PROXY and http_proxy/HTTP_PROXY only — Go has
 // NO ALL_PROXY. Values are normalized schemeless→http://. The CGI
 // flag records a raw non-empty REQUEST_METHOD; the transport turns
 // a usable http_proxy into a send-time error on http:// hops
 // (Go proxyForURL), NOT a silent skip. NO_PROXY/no_proxy is
-// lowercase-first, first non-empty.
+// uppercase-first, first non-empty.
 fn proxy_pick(proxy_url: str, pairs: []str) -> ProxyPick {
     pk := ProxyPick{proxies: nil, env: nil, no_proxy: "", proxy_go: true, cgi: false}
     u := px_trim(proxy_url)
@@ -1962,7 +1962,7 @@ fn proxy_pick(proxy_url: str, pairs: []str) -> ProxyPick {
 // collect_proxy_env reads the canonical proxy env names into
 // "NAME=value" pairs — the os.getenv seam (no environ iteration in
 // std/os; unset and empty are indistinguishable, empty omitted per
-// cli/main.oxl os_envpairs convention). Go reads lowercase-first
+// cli/main.oxl os_envpairs convention). Go reads uppercase-first
 // via getEnvAny — both cases are collected and proxy_pick applies
 // the precedence. No ALL_PROXY: Go has no such variable.
 fn collect_proxy_env() -> []str {

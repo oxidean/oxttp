@@ -1037,6 +1037,11 @@ fn begin_send_preq(a: mut App) -> int {
             return ENone
         }
         a.pending.cert_pem = os.readfile_(a.ssl_cert)
+        if len(a.pending.cert_pem) == 0 {
+            a.toast(2, "ssl.certificate_path: file unreadable or empty")
+            a.pending = nil
+            return ENone
+        }
         if len(a.ssl_key) > 0 {
             if !os.exists(a.ssl_key) {
                 a.toast(2, "ssl.key_file: file not found")
@@ -1044,6 +1049,11 @@ fn begin_send_preq(a: mut App) -> int {
                 return ENone
             }
             a.pending.key_pem = os.readfile_(a.ssl_key)
+            if len(a.pending.key_pem) == 0 {
+                a.toast(2, "ssl.key_file: file unreadable or empty")
+                a.pending = nil
+                return ENone
+            }
         }
         if len(a.ssl_pass) > 0 {
             // WI-0017 (ADR-0045): oxl 0.26.0 can't decrypt PKCS#8 /

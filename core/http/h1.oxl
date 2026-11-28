@@ -337,12 +337,19 @@ fn (t H1) roundtrip(req: ref model.Req, cap: mut model.Hop) -> [model.Resp, err]
         port = 443
     }
     ps := u.port()
+    canon_port := ps
     if len(ps) > 0 {
         [p, pe] = strconv.atoi(ps)
         if pe != nil || p <= 0 || p > 65535 {
             return bad, errors.new("http: bad port in " + req.url)
         }
         port = p
+    }
+    if len(canon_port) == 0 {
+        canon_port = "80"
+        if https {
+            canon_port = "443"
+        }
     }
     // userinfo becomes a Basic Authorization header unless the caller
     // already supplied one (reqwest's behavior).
@@ -366,7 +373,7 @@ fn (t H1) roundtrip(req: ref model.Req, cap: mut model.Hop) -> [model.Resp, err]
         // WI-0017 review fix: posting/TUI env proxies follow Go's
         // httpproxy (x/net/http/httpproxy) — scheme-only selection,
         // CGI error, Go NO_PROXY matchers, per-hop re-eval.
-        [gp, gpe] = pick_proxy_go(req, lwr(u.scheme), host, port)
+        [gp, gpe] = pick_proxy_go(req, lwr(u.scheme), host, canon_port)
         if gpe != nil {
             return bad, gpe
         }
@@ -1150,7 +1157,7 @@ fn no_proxy_match(list: str, host: str) -> bool {
         }
         cidr := go_cidr_parse(ent)
         if cidr.ok {
-            [ip, ie] = net.parse_ipv4(hl)
+            [ip, ie] = parse_ipv4_strict(hl)
             if ie == nil && go_cidr_has(cidr.base, cidr.bits, ip) {
                 return true
             }
@@ -1190,7 +1197,7 @@ fn no_proxy_match(list: str, host: str) -> bool {
 // posting/TUI env-proxy path; pick_proxy/no_proxy_match above stay
 // the reqwest/std port the xh CLI feeds. Env pairs arrive
 // pre-resolved to canonical lowercase names by collection.proxy_pick
-// (lowercase-first getEnvAny, no ALL_PROXY, schemeless→http://).
+// (uppercase-first getEnvAny, no ALL_PROXY, schemeless→http://).
 
 // go_parse_proxy mirrors httpproxy.parseProxy + config.init's
 // drop-on-error: a value that doesn't parse — even after the
@@ -1222,7 +1229,7 @@ fn go_parse_proxy(v: str) -> str {
 // (req.cgi, raw REQUEST_METHOD) is a send-time error, checked BEFORE
 // NO_PROXY like proxyForURL. NO_PROXY re-evaluates per hop against
 // host:port so redirect chains see fresh canonical addrs.
-fn pick_proxy_go(req: ref model.Req, scheme: str, host: str, port: int) -> [str, err] {
+fn pick_proxy_go(req: ref model.Req, scheme: str, host: str, port: str) -> [str, err] {
     i := len(req.proxies) - 1
     for i >= 0 {
         ent := req.proxies[i]
@@ -1250,7 +1257,7 @@ fn pick_proxy_go(req: ref model.Req, scheme: str, host: str, port: int) -> [str,
         nm := lwr(substr(req.proxy_env[i], 0, eq))
         val := trim_ows(substr(req.proxy_env[i], eq + 1, len(req.proxy_env[i])))
         // canonical lowercase names only (collection.proxy_pick
-        // already applied getEnvAny lowercase-first); an explicit
+        // already applied getEnvAny uppercase-first); an explicit
         // empty value is unset.
         if nm == scheme + "_proxy" && len(val) > 0 {
             want = val
@@ -1277,6 +1284,17 @@ fn pick_proxy_go(req: ref model.Req, scheme: str, host: str, port: int) -> [str,
     return purl, nil
 }
 
+// parse_ipv4_strict is the proxy-matching form of Go's modern IP
+// parsers: dotted quads with leading-zero octets are hostnames for
+// matching purposes, not IP literals. parse_ipv4 stays available for
+// dialing, where std intentionally accepts the legacy notation.
+fn parse_ipv4_strict(host: str) -> [int, err] {
+    if !net.isip4(host) {
+        return 0, errors.new("not a strict IPv4 literal: " + host)
+    }
+    return net.parse_ipv4(host)
+}
+
 // GoCidr is a parsed "a.b.c.d/bits" NO_PROXY entry (ok=false when
 // either half fails — caller falls through to the domain path, same
 // as Go treating the entry as a hostname that matches nothing).
@@ -1287,7 +1305,7 @@ fn go_cidr_parse(ent: str) -> GoCidr {
     if sl <= 0 {
         return GoCidr{base: 0, bits: 0, ok: false}
     }
-    [b, be] = net.parse_ipv4(substr(ent, 0, sl))
+    [b, be] = parse_ipv4_strict(substr(ent, 0, sl))
     if be != nil {
         return GoCidr{base: 0, bits: 0, ok: false}
     }
@@ -1351,24 +1369,25 @@ fn go_split_host_port(ent: str) -> GoHostPort {
 
 // no_proxy_match_go — Go httpproxy useProxy/init port. Matching is
 // against the canonical lowercased host plus the effective port
-// (80/443 defaults already resolved by the caller). localhost and
+// (the URL port text as written, or the 80/443 default when absent).
+// localhost and
 // loopback IPv4 always bypass regardless of the list. Entries:
 // "*" alone bypasses everything; CIDR → prefix match on the host IP;
 // IP[:port] → equality + optional port; domain[.com][:port] matches
 // the apex and all subdomains, ".y.com"/"*.y.com" subdomains only —
 // port-qualified entries match that port only. IDNA/punycode is NOT
 // implemented (ASCII hosts only — Go's idnaASCII approximation).
-fn no_proxy_match_go(list: str, host: str, port: int) -> bool {
+fn no_proxy_match_go(list: str, host: str, port: str) -> bool {
     h := lwr(host)
     if h == "localhost" {
         return true
     }
-    [ip, ie] = net.parse_ipv4(h)
+    [ip, ie] = parse_ipv4_strict(h)
     is_ip := ie == nil
     if is_ip && ip / 16777216 == 127 {
         return true // 127.0.0.0/8 loopback
     }
-    ps := itoa(port)
+    ps := port
     i := 0
     for i <= len(list) {
         j := find_from(list, ",", i)
@@ -1399,7 +1418,7 @@ fn no_proxy_match_go(list: str, host: str, port: int) -> bool {
             continue
         }
         // IP[:port] — IPv4 literal equality
-        [pip, pie] = net.parse_ipv4(phost)
+        [pip, pie] = parse_ipv4_strict(phost)
         if pie == nil {
             if is_ip && pip == ip && (len(pport) == 0 || pport == ps) {
                 return true

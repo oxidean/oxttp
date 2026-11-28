@@ -29,8 +29,8 @@ package — implementer's choice; keep `collection.oxl` cohesive).
    - else scan `pairs` for the canonical Go `httpproxy` names and
      build (ADR-0047 — posting is a Go application):
      - `HTTPS_PROXY`/`https_proxy` → one canonical lowercase
-       `https_proxy=<value>` entry; lowercase wins when both cases
-       are non-empty (`getEnvAny`), uppercase is fallback only.
+       `https_proxy=<value>` entry; uppercase wins when both cases
+       are non-empty (`getEnvAny`), lowercase is fallback only.
      - `HTTP_PROXY`/`http_proxy` → one canonical lowercase
        `http_proxy=<value>` entry with the same precedence. A raw
        non-empty `REQUEST_METHOD` sets the transport CGI flag instead
@@ -41,7 +41,7 @@ package — implementer's choice; keep `collection.oxl` cohesive).
      - Schemeless values normalize to `http://host[:port]`; complete
        URLs pass through.
      - `NO_PROXY`/`no_proxy` → `no_proxy` = first non-empty value
-       (lowercase preferred, uppercase fallback);
+       (uppercase preferred, lowercase fallback);
        empty/whitespace-only counts unset.
    - Only non-empty-after-trim values are pushed to `env` (Go treats
      set-but-empty as unset; pick_proxy also skips explicit-empty
@@ -108,10 +108,10 @@ New `*_test.oxl` coverage (existing suites must stay green):
     pairs contain proxy vars; whitespace-padded url trimmed;
     whitespace-only url → env path.
   - env path: scheme-specific canonical selection; lowercase names;
-    empty values skipped; lowercase-first `getEnvAny` precedence;
+    empty values skipped; uppercase-first `getEnvAny` precedence;
     `REQUEST_METHOD=GET` sets the CGI flag while HTTP_PROXY capture
     remains for the send-time error; ALL_PROXY is ignored;
-    NO_PROXY/no_proxy precedence (lowercase first, first non-empty);
+    NO_PROXY/no_proxy precedence (uppercase first, first non-empty);
     pairs without `=` ignored.
   - `plan_req` end-to-end: a `PRequest` with `options.proxy_url` set
     yields `req.proxies==["all:..."]`; with options absent yields env
@@ -123,6 +123,9 @@ New `*_test.oxl` coverage (existing suites must stay green):
 - `tui` (`coll_test.oxl`/`cfg_test.oxl`/`send_test.oxl` patterns):
   - `begin_send_preq` on a staged request with `proxy_url` →
     `a.pending.proxies` populated, no "proxy unsupported" toast.
+  - existing-but-empty `ssl.certificate_path`/`ssl.key_file` files
+    abort interactive send before staging (same fail-fast contract as
+    missing files).
   - ssl.password toast text updated (assert new substring).
   - TLS1.2-cert toast: drive `exec_send_t` with a fake Transport
     returning `Resp{tls_ver: tls.V12}` and a pending req with
@@ -130,10 +133,15 @@ New `*_test.oxl` coverage (existing suites must stay green):
     `tls_ver: tls.V13` → no toast; `cert_pem:""` → no toast.
 - `tui/cli_test.oxl`: headless run with ssl.password+cert configured
   emits the stderr warning once; TLS1.2 resp emits per-request
-  warning (fake transport seam if present, else factor the warning
-  into a testable helper).
-- Regression: existing `h1_test` proxy/CONNECT suite untouched and
-  green (transport unchanged).
+  warning; an existing-but-empty configured cert or key fails the
+  request before transport send.
+- `core/http` Go matcher corrections: strict dotted-quad parsing for
+  target/entry/CIDR matching (leading-zero octets are not IP literals),
+  automatic loopback bypass pinned, and port-qualified NO_PROXY
+  entries compare the canonical port text exactly (explicit `:080`
+  differs from `:80`).
+- Regression: existing `h1_test` proxy/CONNECT suite remains green;
+  the Go-mode corrections extend rather than weaken those pins.
 
 ## Acceptance criteria (verify-checkable)
 
@@ -179,6 +187,13 @@ New `*_test.oxl` coverage (existing suites must stay green):
   corpus "proxy_url else env" reads as full env replacement
   (preserved brainstorm disagreement; upstream posting source not
   re-read this pass — corpus is the contract).
+
+- **D7** Proxy URL schemes remain transport-limited: `http` proxies are
+  implemented; `https` and `socks5` proxy URLs error as unsupported in
+  this build (already documented for the xh protocol-flags surface).
+  Go supports those schemes upstream, so §7.1 proxy parity is otherwise
+  complete but scheme coverage is an explicit deviation, not silent.
+
 - **D6** No TLS-version config surface exists in posting (corpus
   §2.2/§5.2) — the CLI's `--ssl` pins have no TUI equivalent;
   transport `[V12,V13]` default applies. Documented absence.

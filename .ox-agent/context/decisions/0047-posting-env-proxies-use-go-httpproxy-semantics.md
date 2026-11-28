@@ -16,8 +16,8 @@ and `net/http`'s `ProxyFromEnvironment` shape:
 
 - only `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` exist — there is no
   `ALL_PROXY` in Go `httpproxy`;
-- `getEnvAny` prefers lowercase when both cases are present and
-  non-empty, with uppercase as fallback;
+- `getEnvAny` prefers uppercase when both cases are present and
+  non-empty, with lowercase as fallback;
 - schemeless proxy values are retried as `http://host[:port]`; unusable
   values are dropped rather than surfaced as parse errors;
 - any raw non-empty `REQUEST_METHOD` (including whitespace) marks CGI.
@@ -40,7 +40,7 @@ split.
    transport's Go `httpproxy` resolver; false keeps the reqwest-style
    resolver used by the xh CLI.
 2. `collection.proxy_pick` canonicalizes TUI/posting env capture to
-   lowercase `https_proxy=`/`http_proxy=` pairs using lowercase-first
+   lowercase `https_proxy=`/`http_proxy=` pairs using uppercase-first
    precedence, normalizes schemeless values to `http://`, ignores
    `ALL_PROXY`, passes `NO_PROXY` through, and sets `cgi` from the raw
    `REQUEST_METHOD` value. `plan_req` substitutes `options.proxy_url`

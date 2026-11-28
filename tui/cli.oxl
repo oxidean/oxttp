@@ -576,11 +576,17 @@ fn run_exec(o: ref RunOpts, t: http.Transport) -> own RunRep {
                 cert_err = "ssl.certificate_path: file not found"
             } else {
                 sp.req.cert_pem = os.readfile_(cr.s.ssl_certificate_path)
-                if len(cr.s.ssl_key_file) > 0 {
+                if len(sp.req.cert_pem) == 0 {
+                    cert_err = "ssl.certificate_path: file unreadable or empty"
+                }
+                if len(cert_err) == 0 && len(cr.s.ssl_key_file) > 0 {
                     if !os.exists(cr.s.ssl_key_file) {
                         cert_err = "ssl.key_file: file not found"
                     } else {
                         sp.req.key_pem = os.readfile_(cr.s.ssl_key_file)
+                        if len(sp.req.key_pem) == 0 {
+                            cert_err = "ssl.key_file: file unreadable or empty"
+                        }
                     }
                 }
             }

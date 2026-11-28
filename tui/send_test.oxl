@@ -365,6 +365,21 @@ fn test_begin_send_missing_client_cert() {
     testing.expect_eq(fx3, ESend, "valid identity still sends")
     testing.expect_streq(a2.pending.cert_pem, "pem", "cert pem loaded")
     testing.expect_streq(a2.pending.key_pem, "key", "key pem loaded")
+    // an existing-but-empty cert or key aborts too — pairing empty
+    // PEM text errors in the transport and the send must fail fast.
+    os.writefile_(cert, "")
+    a3 := new_app()
+    a3.url.text = "https://x"
+    a3.ssl_cert = cert
+    a3.ssl_key = key
+    fx4 := begin_send(a3)
+    testing.expect_eq(fx4, ENone, "empty cert aborts the send")
+    testing.expect(a3.pending == nil, "empty cert stages nothing")
+    os.writefile_(cert, "pem")
+    os.writefile_(key, "")
+    fx5 := begin_send(a3)
+    testing.expect_eq(fx5, ENone, "empty key aborts the send")
+    testing.expect(a3.pending == nil, "empty key stages nothing")
 }
 
 fn test_ssl_password_degrade_toast() {

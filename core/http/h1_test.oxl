@@ -856,30 +856,35 @@ fn test_no_proxy_match_cidr_units() {
 
 fn test_no_proxy_match_go_units() {
     // pure matcher pins — Go useProxy/init semantics
-    testing.expect(no_proxy_match_go("nx.invalid", "nx.invalid", 80), "exact domain")
-    testing.expect(no_proxy_match_go("example.com", "www.example.com", 443), "subdomain")
-    testing.expect(no_proxy_match_go("example.com", "example.com", 80), "apex")
-    testing.expect(!no_proxy_match_go("example.com", "notexample.com", 80), "no false suffix")
-    testing.expect(no_proxy_match_go(".y.com", "x.y.com", 80), "dot subdomain")
-    testing.expect(!no_proxy_match_go(".y.com", "y.com", 80), "dot skips apex")
-    testing.expect(no_proxy_match_go("*.y.com", "x.y.com", 80), "star subdomain")
-    testing.expect(!no_proxy_match_go("*.y.com", "y.com", 80), "star skips apex")
-    testing.expect(no_proxy_match_go("*", "anything.example", 80), "star all")
-    testing.expect(no_proxy_match_go("example.com:8080", "example.com", 8080), "port match")
-    testing.expect(!no_proxy_match_go("example.com:8080", "example.com", 80), "port mismatch")
-    testing.expect(no_proxy_match_go("example.com:8080", "deep.example.com", 8080), "port + subdomain")
-    testing.expect(no_proxy_match_go("1.2.3.4", "1.2.3.4", 80), "ip exact")
-    testing.expect(!no_proxy_match_go("1.2.3.4", "1.2.3.5", 80), "ip other")
-    testing.expect(no_proxy_match_go("1.2.3.4:99", "1.2.3.4", 99), "ip port")
-    testing.expect(no_proxy_match_go("10.0.0.0/8", "10.1.2.3", 80), "cidr /8")
-    testing.expect(!no_proxy_match_go("10.0.0.0/8", "11.0.0.1", 80), "cidr outside")
-    testing.expect(no_proxy_match_go("192.168.0.0/16", "192.168.9.9", 443), "cidr /16")
-    testing.expect(no_proxy_match_go("EXAMPLE.com, Other.ORG ", "other.org", 80), "case+space")
+    testing.expect(no_proxy_match_go("nx.invalid", "nx.invalid", "80"), "exact domain")
+    testing.expect(no_proxy_match_go("example.com", "www.example.com", "443"), "subdomain")
+    testing.expect(no_proxy_match_go("example.com", "example.com", "80"), "apex")
+    testing.expect(!no_proxy_match_go("example.com", "notexample.com", "80"), "no false suffix")
+    testing.expect(no_proxy_match_go(".y.com", "x.y.com", "80"), "dot subdomain")
+    testing.expect(!no_proxy_match_go(".y.com", "y.com", "80"), "dot skips apex")
+    testing.expect(no_proxy_match_go("*.y.com", "x.y.com", "80"), "star subdomain")
+    testing.expect(!no_proxy_match_go("*.y.com", "y.com", "80"), "star skips apex")
+    testing.expect(no_proxy_match_go("*", "anything.example", "80"), "star all")
+    testing.expect(no_proxy_match_go("example.com:8080", "example.com", "8080"), "port match")
+    testing.expect(!no_proxy_match_go("example.com:8080", "example.com", "80"), "port mismatch")
+    testing.expect(no_proxy_match_go("example.com:8080", "deep.example.com", "8080"), "port + subdomain")
+    testing.expect(no_proxy_match_go("1.2.3.4", "1.2.3.4", "80"), "ip exact")
+    testing.expect(!no_proxy_match_go("1.2.3.4", "1.2.3.5", "80"), "ip other")
+    testing.expect(no_proxy_match_go("1.2.3.4:99", "1.2.3.4", "99"), "ip port")
+    testing.expect(no_proxy_match_go("10.0.0.0/8", "10.1.2.3", "80"), "cidr /8")
+    testing.expect(!no_proxy_match_go("10.0.0.0/8", "11.0.0.1", "80"), "cidr outside")
+    testing.expect(no_proxy_match_go("192.168.0.0/16", "192.168.9.9", "443"), "cidr /16")
+    testing.expect(no_proxy_match_go("EXAMPLE.com, Other.ORG ", "other.org", "80"), "case+space")
     // localhost + loopback bypass regardless of the list (even empty)
-    testing.expect(no_proxy_match_go("", "localhost", 80), "localhost")
-    testing.expect(no_proxy_match_go("", "127.0.0.1", 80), "loopback")
-    testing.expect(no_proxy_match_go("nomatch", "127.9.9.9", 80), "loopback /8")
-    testing.expect(!no_proxy_match_go("", "example.com", 80), "empty list no match")
+    testing.expect(no_proxy_match_go("", "localhost", "80"), "localhost")
+    testing.expect(no_proxy_match_go("", "127.0.0.1", "80"), "loopback")
+    testing.expect(no_proxy_match_go("nomatch", "127.9.9.9", "80"), "loopback /8")
+    testing.expect(!no_proxy_match_go("", "example.com", "80"), "empty list no match")
+    testing.expect(!no_proxy_match_go("", "127.000.0.1", "80"), "leading-zero loopback is not an IP")
+    testing.expect(no_proxy_match_go("010.0.0.1", "010.0.0.1", "80"), "leading-zero entry falls through to exact domain match")
+    testing.expect(!no_proxy_match_go("010.0.0.0/8", "010.0.0.9", "80"), "leading-zero cidr is not an IP")
+    testing.expect(no_proxy_match_go("example.com:80", "example.com", "80"), "exact raw port")
+    testing.expect(!no_proxy_match_go("example.com:80", "example.com", "080"), "raw port text is significant")
 }
 
 fn test_pick_proxy_go_units() {
@@ -887,25 +892,25 @@ fn test_pick_proxy_go_units() {
     r := rq("GET", "http://example.org/")
     r.proxy_go = true
     r.proxy_env = one("http_proxy=http://plain:8080")
-    [p1, e1] = pick_proxy_go(r, "http", "example.org", 80)
+    [p1, e1] = pick_proxy_go(r, "http", "example.org", "80")
     testing.expect(e1 == nil, "http scheme resolves")
     testing.expect_streq(p1, "http://plain:8080", "http proxy url")
     r.proxy_env = push(r.proxy_env, "https_proxy=https://sec:3128")
-    [p2, e2] = pick_proxy_go(r, "https", "example.org", 443)
+    [p2, e2] = pick_proxy_go(r, "https", "example.org", "443")
     testing.expect(e2 == nil, "https scheme resolves")
     testing.expect_streq(p2, "https://sec:3128", "https proxy url")
     // schemeless env value normalizes http:// (parseProxy retry)
     r2 := rq("GET", "http://example.org/")
     r2.proxy_go = true
     r2.proxy_env = one("http_proxy=px.internal:3128")
-    [p3, e3] = pick_proxy_go(r2, "http", "example.org", 80)
+    [p3, e3] = pick_proxy_go(r2, "http", "example.org", "80")
     testing.expect(e3 == nil, "schemeless resolves")
     testing.expect_streq(p3, "http://px.internal:3128", "normalized")
     // unparseable env proxy is dropped like config.init — direct
     r3 := rq("GET", "http://example.org/")
     r3.proxy_go = true
     r3.proxy_env = one("http_proxy=ht tp://[")
-    [p4, e4] = pick_proxy_go(r3, "http", "example.org", 80)
+    [p4, e4] = pick_proxy_go(r3, "http", "example.org", "80")
     testing.expect(e4 == nil, "bad env proxy not an error")
     testing.expect_eq(len(p4), 0, "bad env proxy dropped")
     // CGI: usable http_proxy on an http hop errors BEFORE no_proxy
@@ -914,7 +919,7 @@ fn test_pick_proxy_go_units() {
     r4.cgi = true
     r4.proxy_env = one("http_proxy=http://plain:8080")
     r4.no_proxy = "example.org" // would bypass — CGI still errors first
-    [_p5, e5] = pick_proxy_go(r4, "http", "example.org", 80)
+    [_p5, e5] = pick_proxy_go(r4, "http", "example.org", "80")
     testing.expect(e5 != nil, "cgi errors")
     if e5 != nil {
         testing.expect(find(errors.msg(e5), "refusing to use HTTP_PROXY") >= 0, "cgi text: " + errors.msg(e5))
@@ -924,7 +929,7 @@ fn test_pick_proxy_go_units() {
     r5.proxy_go = true
     r5.cgi = true
     r5.proxy_env = one("https_proxy=https://sec:3128")
-    [p6, e6] = pick_proxy_go(r5, "https", "example.org", 443)
+    [p6, e6] = pick_proxy_go(r5, "https", "example.org", "443")
     testing.expect(e6 == nil, "https unaffected by cgi")
     testing.expect_streq(p6, "https://sec:3128", "https proxy under cgi")
     // explicit proxies entries behave like the reqwest path
@@ -932,7 +937,7 @@ fn test_pick_proxy_go_units() {
     r6.proxy_go = true
     r6.proxies = one("all:http://explicit:1")
     r6.proxy_env = one("http_proxy=http://env:2")
-    [p7, e7] = pick_proxy_go(r6, "http", "example.org", 80)
+    [p7, e7] = pick_proxy_go(r6, "http", "example.org", "80")
     testing.expect(e7 == nil, "explicit resolves")
     testing.expect_streq(p7, "http://explicit:1", "explicit wins over env")
 }
@@ -956,6 +961,7 @@ fn test_proxy_go_loopback_and_no_proxy() {
     // Go carve-out: loopback bypasses env proxies even with empty
     // NO_PROXY — opposite of the reqwest path pinned above.
     r := rq("GET", "http://127.0.0.1:1/")
+    r.timeout_ms = 200 // direct refusal path must stay bounded in local runs
     r.proxy_go = true
     r.proxy_env = one("http_proxy=" + f.url())
     [_r1, e1] = request(r)
@@ -963,6 +969,7 @@ fn test_proxy_go_loopback_and_no_proxy() {
     testing.expect_eq(sget(f.hits), 0, "proxy untouched for loopback")
     // localhost likewise
     r2 := rq("GET", "http://localhost:1/")
+    r2.timeout_ms = 200
     r2.proxy_go = true
     r2.proxy_env = one("http_proxy=" + f.url())
     [_r2, e2] = request(r2)
@@ -970,6 +977,7 @@ fn test_proxy_go_loopback_and_no_proxy() {
     testing.expect_eq(sget(f.hits), 0, "proxy untouched for localhost")
     // NO_PROXY domain match bypasses
     r3 := rq("GET", "http://nx.invalid/")
+    r3.timeout_ms = 200
     r3.proxy_go = true
     r3.proxy_env = one("http_proxy=" + f.url())
     r3.no_proxy = "nx.invalid"
