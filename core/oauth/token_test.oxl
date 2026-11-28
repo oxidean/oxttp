@@ -33,13 +33,13 @@ fn (f InspectTransport) send(req: ref model.Req) -> [model.Resp, err] {
         testing.expect_streq(hdr_value(req.headers, "authorization"), f.expect_basic, "basic authorization")
     }
     if len(f.fail) > 0 {
-        return model.Resp{status: 0, reason: "", headers: nil, body: nil, elapsed_ms: 0.0, remote: "", version: "", req_head: "", hops: nil, trace: nil, tls_ver: 0}, errors.new(f.fail)
+        return model.Resp{status: 0, reason: "", headers: nil, body: nil, elapsed_ms: 0.0, remote: "", version: "", req_head: "", hops: nil, trace: nil, tls_ver: 0, events: nil, stream_error: ""}, errors.new(f.fail)
     }
     let hs: []model.Header = nil
     if len(f.ctype) > 0 {
         hs = push(hs, model.Header{name: "Content-Type", value: f.ctype})
     }
-    return model.Resp{status: f.status, reason: "", headers: hs, body: f.body as []byte, elapsed_ms: 0.0, remote: "", version: "", req_head: "", hops: nil, trace: nil, tls_ver: 0}, nil
+    return model.Resp{status: f.status, reason: "", headers: hs, body: f.body as []byte, elapsed_ms: 0.0, remote: "", version: "", req_head: "", hops: nil, trace: nil, tls_ver: 0, events: nil, stream_error: ""}, nil
 }
 
 fn resource_req() -> own model.Req {

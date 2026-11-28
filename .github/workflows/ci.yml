@@ -32,9 +32,11 @@ jobs:
           echo "/tmp/oxl-toolchain" >> "$GITHUB_PATH"
           /tmp/oxl-toolchain/oxl version
 
-      # The OAuth/HTTP closure pushes the app build over the hosted
-      # runner's memory ceiling (oxidean/oxl#232). Give the compiler the
-      # same transient swap headroom the test matrix uses.
+
+      # The TUI compile peaks far above the hosted runner's memory
+      # ceiling (oxidean/oxl#232). Give the build leg the same transient
+      # swap headroom as the test matrix; keep the path distinct from the
+      # hosted image's active /swapfile.
       - name: add swap for oxl build memory peak
         run: |
           cur_kb=$(awk '/^SwapTotal/ {print $2}' /proc/meminfo)
@@ -59,7 +61,7 @@ jobs:
           oxl build ./cli -o /tmp/oxttp
           oxl build ./tui -o /tmp/oxttp-tui
           /tmp/oxttp --version
-          /tmp/oxttp-tui
+          timeout 10s /tmp/oxttp-tui </dev/null
 
   # `oxl test <pkg>` compiles every `_test.oxl` in the package's whole
   # dependency closure, not just the package's own tests. Running the
@@ -72,7 +74,9 @@ jobs:
     name: oxl-test-$suite
     if: github.event.action != 'edited'
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # The cli closure currently takes longest under oxidean/oxl#232;
+    # keep headroom while upstream compiler memory/time is unresolved.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -83,6 +87,7 @@ jobs:
           - core/config
           - core/env
           - core/http
+          - core/importing
           - core/item
           - core/model
           - core/oauth

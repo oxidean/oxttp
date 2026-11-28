@@ -47,6 +47,12 @@ struct Head { status: int, reason: str, headers: []model.Header, version: str }
 // the trailer fields that followed the 0-chunk.
 struct ChunkedBody { data: []byte, trailers: []model.Header }
 
+// CappedRead is a byte body plus whether a ceiling truncated it.
+struct CappedRead { data: []byte, hit: bool }
+
+// CappedChunked is a decoded chunked body plus the truncation flag.
+struct CappedChunked { body: ChunkedBody, hit: bool }
+
 // OutHead carries everything serialize_head needs for the request
 // head: resolved host line, caller headers, and body facts.
 struct OutHead {
@@ -435,6 +441,35 @@ fn read_exact(r: mut bufio.Reader, n: int) -> [[]byte, err] {
     return out, nil
 }
 
+// read_exact_partial is read_exact for SSE: bytes already received
+// survive an EOF/transport interruption so the stream log can keep
+// its complete-event prefix.
+fn read_exact_partial(r: mut bufio.Reader, n: int) -> [CappedRead, err] {
+    out := mkslice(byte, 0)
+    scratch := mkslice(byte, 8192)
+    for len(out) < n {
+        want := n - len(out)
+        if want > len(scratch) {
+            want = len(scratch)
+        }
+        [m, e] = r.read(scratch[0:want])
+        if m > 0 {
+            i := 0
+            for i < m {
+                out = push(out, scratch[i])
+                i = i + 1
+            }
+        }
+        if e == io.eof() {
+            return CappedRead{data: out, hit: false}, errors.new("http: response truncated: content-length " + itoa(n) + ", got " + itoa(len(out)))
+        }
+        if e != nil {
+            return CappedRead{data: out, hit: false}, e
+        }
+    }
+    return CappedRead{data: out, hit: false}, nil
+}
+
 // read_eof drains the reader until io.eof() — the HTTP/1.0 and
 // connection-close body framing.
 fn read_eof(r: mut bufio.Reader) -> [[]byte, err] {
@@ -475,20 +510,72 @@ fn read_eof_cap(r: mut bufio.Reader, limit: int) -> [[]byte, err] {
     return out, nil
 }
 
+// read_eof_capped is read_eof with a hard byte ceiling — SSE bodies
+// (ADR-0055) stop at the cap instead of draining an unbounded stream.
+// hit reports the cap was reached before natural EOF.
+fn read_eof_capped(r: mut bufio.Reader, max: int) -> [CappedRead, err] {
+    out := mkslice(byte, 0)
+    scratch := mkslice(byte, 8192)
+    for true {
+        if len(out) >= max {
+            // exact-fit is not truncation: probe for one more byte (or
+            // natural EOF) before setting hit — upstream reads cap+1
+            // through its LimitedReader for the same distinction.
+            probe := mkslice(byte, 1)
+            [pn, pe] = r.read(probe)
+            if pn > 0 {
+                return CappedRead{data: out, hit: true}, nil
+            }
+            if pe == io.eof() {
+                return CappedRead{data: out, hit: false}, nil
+            }
+            if pe != nil {
+                return CappedRead{data: out, hit: false}, pe
+            }
+            return CappedRead{data: out, hit: true}, nil
+        }
+        want := max - len(out)
+        if want > 8192 {
+            want = 8192
+        }
+        [n, e] = r.read(scratch[0:want])
+        if n > 0 {
+            i := 0
+            for i < n {
+                out = push(out, scratch[i])
+                i = i + 1
+            }
+        }
+        if e == io.eof() {
+            return CappedRead{data: out, hit: false}, nil
+        }
+        if e != nil {
+            return CappedRead{data: out, hit: false}, e
+        }
+    }
+    return CappedRead{data: out, hit: false}, nil
+}
+
 // read_chunked decodes a chunked body, returning data + trailer
 // fields in wire order. Chunk extensions are ignored; a missing
 // CRLF or truncated stream is a hard error.
 fn read_chunked(r: mut bufio.Reader) -> [ChunkedBody, err] {
-    return read_chunked_cap(r, 0)
+    [cc, ce] = read_chunked_cap(r, 0)
+    return cc.body, ce
 }
 
-// read_chunked_cap is read_chunked with an opt-in accumulated payload cap.
-fn read_chunked_cap(r: mut bufio.Reader, limit: int) -> [ChunkedBody, err] {
+// read_chunked_cap is read_chunked with an optional decoded-byte
+// ceiling (max <= 0 = unbounded). Over-cap stops the decode early
+// and reports hit — the h1 transport closes the connection anyway,
+// so abandoning the stream mid-chunk is safe (ADR-0055 SSE cap).
+fn read_chunked_cap(r: mut bufio.Reader, max: int) -> [CappedChunked, err] {
     cb := ChunkedBody{data: mkslice(byte, 0), trailers: nil}
+    done := CappedChunked{body: cb, hit: false}
     for true {
         [line, e] = r.readline()
         if e != nil {
-            return cb, errors.new("http: truncated chunk size")
+            done.body = cb
+            return done, errors.new("http: truncated chunk size")
         }
         szs := chomp(line)
         semi := find(szs, ";")
@@ -497,35 +584,58 @@ fn read_chunked_cap(r: mut bufio.Reader, limit: int) -> [ChunkedBody, err] {
         }
         szs = trim_ows(szs)
         if len(szs) == 0 || len(szs) > 16 {
-            return cb, errors.new("http: bad chunk size " + szs)
+            done.body = cb
+            return done, errors.new("http: bad chunk size " + szs)
         }
         [sz, se] = strconv.parseint(szs, 16)
         if se != nil || sz < 0 {
-            return cb, errors.new("http: bad chunk size " + szs)
+            done.body = cb
+            return done, errors.new("http: bad chunk size " + szs)
         }
         if sz == 0 {
             for true {
                 [tl, te] = r.readline()
                 if te != nil {
-                    return cb, errors.new("http: truncated trailer")
+                    done.body = cb
+                    return done, errors.new("http: truncated trailer")
                 }
                 t := chomp(tl)
                 if len(t) == 0 {
-                    return cb, nil
+                    done.body = cb
+                    return done, nil
                 }
                 c := find(t, ":")
                 if c <= 0 {
-                    return cb, errors.new("http: malformed trailer line")
+                    done.body = cb
+                    return done, errors.new("http: malformed trailer line")
                 }
                 cb.trailers = push(cb.trailers, model.Header{name: substr(t, 0, c), value: trim_ows(substr(t, c + 1, len(t)))})
             }
         }
-        if body_cap_hit(len(cb.data) + sz, limit) {
-            return cb, body_cap_error(limit)
+        if max > 0 && len(cb.data) + sz > max {
+            // over the ceiling: keep what fits, flag the truncation,
+            // and stop — remaining chunks are never read.
+            room := max - len(cb.data)
+            if room > 0 {
+                [d, de] = read_exact(r, room)
+                if de != nil {
+                    done.body = cb
+                    return done, errors.new("http: truncated chunk data")
+                }
+                i := 0
+                for i < len(d) {
+                    cb.data = push(cb.data, d[i])
+                    i = i + 1
+                }
+            }
+            done.body = cb
+            done.hit = true
+            return done, nil
         }
         [d, de] = read_exact(r, sz)
         if de != nil {
-            return cb, errors.new("http: truncated chunk data")
+            done.body = cb
+            return done, errors.new("http: truncated chunk data")
         }
         i := 0
         for i < len(d) {
@@ -534,10 +644,12 @@ fn read_chunked_cap(r: mut bufio.Reader, limit: int) -> [ChunkedBody, err] {
         }
         [nl, ne] = read_exact(r, 2)
         if ne != nil || byteat(nl as str, 0) != 13 || byteat(nl as str, 1) != 10 {
-            return cb, errors.new("http: missing CRLF after chunk")
+            done.body = cb
+            return done, errors.new("http: missing CRLF after chunk")
         }
     }
-    return cb, nil
+    done.body = cb
+    return done, nil
 }
 
 // byte_reader is the minimal io.Reader over immutable response bytes.
@@ -646,6 +758,146 @@ fn decode_body(raw: []byte, ce: str) -> [own []byte, err] {
         return flate.inflate(raw)
     }
     return nil, errors.new("http: unsupported content-encoding \"" + enc + "\"")
+}
+
+
+// DecodeCap is a decoded response body bounded at the uncompressed
+// byte ceiling. hit means more decoded bytes were available.
+struct DecodeCap { data: own []byte, hit: bool }
+
+// slice_reader adapts a byte slice to io.Reader for the streaming
+// decompressors (gzip/zlib/flate expose Reader, not just one-shot
+// decode).
+struct slice_reader { b: []byte, i: int }
+
+fn (s mut slice_reader) read(b: []byte) -> [int, err] {
+    if s.i >= len(s.b) {
+        return 0, io.eof()
+    }
+    n := len(s.b) - s.i
+    if n > len(b) {
+        n = len(b)
+    }
+    j := 0
+    for j < n {
+        b[j] = s.b[s.i + j]
+        j = j + 1
+    }
+    s.i = s.i + n
+    return n, nil
+}
+
+fn (s mut slice_reader) asreader() -> io.Reader {
+    return s
+}
+
+fn read_decode_capped(r: io.Reader, max: int) -> [DecodeCap, err] {
+    out := mkslice(byte, 0)
+    scratch := mkslice(byte, 32768)
+    dry := 0
+    for len(out) < max {
+        want := max - len(out)
+        if want > len(scratch) {
+            want = len(scratch)
+        }
+        [n, e] = r.read(scratch[0:want])
+        if n > 0 {
+            i := 0
+            for i < n {
+                out = push(out, scratch[i])
+                i = i + 1
+            }
+            dry = 0
+        }
+        if len(out) >= max {
+            if e == io.eof() {
+                return DecodeCap{data: new(out), hit: false}, nil
+            }
+            // Exact-fit is not truncation: probe for one more decoded
+            // byte (or clean EOF) before setting hit, matching the raw
+            // capped reader's cap+1 semantics.
+            probe := mkslice(byte, 1)
+            [pn, pe] = r.read(probe)
+            if pn > 0 {
+                return DecodeCap{data: new(out), hit: true}, nil
+            }
+            if pe == io.eof() {
+                return DecodeCap{data: new(out), hit: false}, nil
+            }
+            if pe != nil {
+                return DecodeCap{data: new(out), hit: false}, pe
+            }
+            return DecodeCap{data: new(out), hit: true}, nil
+        }
+        if e == io.eof() {
+            return DecodeCap{data: new(out), hit: false}, nil
+        }
+        if e != nil {
+            return DecodeCap{data: new(out), hit: false}, e
+        }
+        if n <= 0 {
+            dry = dry + 1
+            if dry >= 100 {
+                return DecodeCap{data: new(out), hit: false}, io.noprogress()
+            }
+        }
+    }
+    return DecodeCap{data: new(out), hit: len(out) >= max}, nil
+}
+
+fn zlib_header_ok(raw: []byte) -> bool {
+    if len(raw) < 2 {
+        return false
+    }
+    cmf := raw[0] as int
+    flg := raw[1] as int
+    return cmf % 16 == 8 && cmf / 16 <= 7 && (cmf * 256 + flg) % 31 == 0 && (flg & 32) == 0
+}
+
+// decode_body_capped is decode_body for untrusted stream bodies: the
+// ceiling applies to decoded bytes, and decompression is incremental
+// so a compressed representation larger than the ceiling can still
+// yield the first ceiling bytes instead of failing as a truncated
+// compressed stream.
+fn decode_body_capped(raw: []byte, ce: str, max: int) -> [DecodeCap, err] {
+    enc := lwr(trim_ows(ce))
+    if enc == "" || enc == "identity" {
+        lim := len(raw)
+        hit := false
+        if lim > max {
+            lim = max
+            hit = true
+        }
+        return DecodeCap{data: new(raw[0:lim]), hit: hit}, nil
+    }
+    sr := slice_reader{b: raw, i: 0}
+    if enc == "gzip" || enc == "x-gzip" {
+        [zr, ze] = gzip.newreader(sr.asreader())
+        if ze != nil {
+            return DecodeCap{data: new(mkslice(byte, 0)), hit: false}, ze
+        }
+        return read_decode_capped(zr.asreader(), max)
+    }
+    if enc == "deflate" || enc == "x-compress" {
+        if zlib_header_ok(raw) {
+            [zr, ze] = zlib.newreader(sr.asreader())
+            if ze == nil {
+                [zc, zde] = read_decode_capped(zr.asreader(), max)
+                if zde == nil {
+                    return zc, nil
+                }
+            }
+            // Match decode_body's zlib-then-raw-flate fallback: a raw
+            // deflate stream can coincidentally satisfy the two-byte
+            // zlib header check but must still decode as flate.
+            sr2 := slice_reader{b: raw, i: 0}
+            fr2 := flate.newreader(sr2.asreader())
+            return read_decode_capped(fr2.asreader(), max)
+        }
+        fr := flate.newreader(sr.asreader())
+        return read_decode_capped(fr.asreader(), max)
+    }
+    return DecodeCap{data: new(mkslice(byte, 0)), hit: false}, errors.new("http: unsupported content-encoding \"" + enc + "\"")
 }
 
 // is_redirect reports whether status is one of the five codes the

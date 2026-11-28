@@ -1,0 +1,1202 @@
+package importing
+
+// bruno.oxl — port of internal/importing/bruno/bruno.go
+// (posting @32c4566): scope layering, expansion, convert,
+// environments, diagnostics. Deviations (ADR-0065): vars/auth
+// fields are ordered KV lists standing in for Go maps (last wins);
+// graphql.variables is stored as raw JSON text (validated on import).
+import "std/encoding/json"
+import "std/errors"
+import "std/math"
+import "std/net/url"
+import "std/strconv"
+import "github.com/oxidean/oxttp/core/collection"
+import "github.com/oxidean/oxttp/core/model"
+
+// ---------- warnings ----------
+
+fn bwarn(res: ref Result, s: str) {
+    if len(res.warns) >= 500 {
+        if len(res.warns) == 500 {
+            res.warns = push(res.warns, "additional Bruno warnings omitted")
+        }
+        return
+    }
+    i := 0
+    for i < len(res.warns) {
+        if res.warns[i] == s {
+            return
+        }
+        i = i + 1
+    }
+    res.warns = push(res.warns, s)
+}
+
+// diagnostics — unsupported script/test/example blocks and annotation
+// metadata warnings, shared by requests, scopes and environments.
+fn bdiagnostics(d: []BBlock, res: ref Result) {
+    i := 0
+    for i < len(d) {
+        nm := d[i].name
+        if nm == "body:multipart-form" || nm == "body:file" {
+            bwarn(res, nm + " is not imported")
+        }
+        if startswith(nm, "script:") || nm == "tests" || nm == "assert" || nm == "vars:post-response" || nm == "example" || nm == "app" {
+            bwarn(res, nm + " is not imported or executed")
+        }
+        if !is_text_block(nm) && contains(d[i].text, "@") {
+            lines := bsplit(d[i].text, "\n")
+            j := 0
+            for j < len(lines) {
+                t := btrim(lines[j])
+                if startswith(t, "@") && find(t, ":") < 0 {
+                    bwarn(res, "Bruno variable type/description annotations are not preserved")
+                }
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+}
+
+// ---------- scope ----------
+
+struct BScope {
+    deferred: bool,
+    headers: []model.KV,
+    query: []model.KV,
+    // vars: folder variables and collection names Posting cannot
+    // reference (ordered KV, last wins per name).
+    vars: []model.KV,
+    // collection: the other collection variables, unexpanded.
+    collection: []model.KV,
+    auth_type: str,
+    auth_mode: str,
+    auth_fields: []model.KV,
+    proto_imports: []str,
+}
+
+fn bempty_scope() -> own BScope {
+    s := new(BScope)
+    s.vars = mkslice(model.KV, 0)
+    s.collection = mkslice(model.KV, 0)
+    s.auth_type = "none"
+    s.auth_fields = mkslice(model.KV, 0)
+    s.proto_imports = mkslice(str, 0)
+    return s
+}
+
+fn kv_copy(src: []model.KV) -> []model.KV {
+    out := mkslice(model.KV, 0)
+    i := 0
+    for i < len(src) {
+        out = push(out, src[i])
+        i = i + 1
+    }
+    return out
+}
+
+// kv_set — map assignment on an ordered KV list (last wins, keeps
+// enabled flag of the new row).
+fn kv_set(list: []model.KV, name: str, value: str) -> []model.KV {
+    i := len(list) - 1
+    for i >= 0 {
+        if list[i].name == name {
+            list[i].value = value
+            list[i].enabled = true
+            return list
+        }
+        i = i - 1
+    }
+    return push(list, model.KV{name: name, value: value, enabled: true})
+}
+
+// kv_present — name exists in the list (any enabled state).
+fn kv_present(list: []model.KV, name: str) -> bool {
+    i := 0
+    for i < len(list) {
+        if list[i].name == name {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// mergeRows — disabled child rows do not turn off enabled inherited
+// rows; enabled rows replace same-key (optionally case-folded) rows.
+fn merge_rows(parent: []model.KV, child: []model.KV, fold: bool) -> []model.KV {
+    out := mkslice(model.KV, 0)
+    positions := mkslice(str, 0)
+    posidx := mkslice(int, 0)
+    groups := push(mkslice([]model.KV, 0), parent)
+    groups = push(groups, child)
+    gi := 0
+    for gi < len(groups) {
+        rows := groups[gi]
+        ri := 0
+        for ri < len(rows) {
+            row := rows[ri]
+            ri = ri + 1
+            key := row.name
+            if fold {
+                key = lower_ascii3(key)
+            }
+            found := -1
+            pi := 0
+            for pi < len(positions) {
+                if positions[pi] == key {
+                    found = posidx[pi]
+                }
+                pi = pi + 1
+            }
+            if found >= 0 && row.enabled {
+                out[found] = row
+                continue
+            }
+            if row.enabled {
+                positions = push(positions, key)
+                posidx = push(posidx, len(out))
+            }
+            out = push(out, row)
+        }
+        gi = gi + 1
+    }
+    return out
+}
+
+// mergeQuery — child enabled names shadow parent rows of the same name.
+fn merge_query(parent: []model.KV, child: []model.KV) -> []model.KV {
+    names := mkslice(str, 0)
+    i := 0
+    for i < len(child) {
+        if child[i].enabled {
+            names = push(names, child[i].name)
+        }
+        i = i + 1
+    }
+    result := mkslice(model.KV, 0)
+    i = 0
+    for i < len(parent) {
+        shadowed := false
+        j := 0
+        for j < len(names) {
+            if names[j] == parent[i].name {
+                shadowed = true
+            }
+            j = j + 1
+        }
+        if !shadowed {
+            result = push(result, parent[i])
+        }
+        i = i + 1
+    }
+    return append_kv(result, child)
+}
+
+// applyScope — layers a collection.bru (collection=true) or folder.bru
+// over its parent scope.
+fn apply_scope(d: []BBlock, parent: ref BScope, res: ref Result, collection: bool) -> [own BScope, err] {
+    s := new(BScope)
+    s.deferred = parent.deferred
+    s.headers = parent.headers
+    s.query = parent.query
+    s.vars = kv_copy(parent.vars)
+    s.collection = kv_copy(parent.collection)
+    s.auth_type = parent.auth_type
+    s.auth_mode = parent.auth_mode
+    s.auth_fields = parent.auth_fields
+    s.proto_imports = parent.proto_imports
+    shared := mkslice(model.KV, 0)
+    scope_names := push(mkslice(str, 0), "headers")
+    scope_names = push(scope_names, "query")
+    scope_names = push(scope_names, "vars:pre-request")
+    ni := 0
+    for ni < len(scope_names) {
+        sname := scope_names[ni]
+        ni = ni + 1
+        [rows, perr] = dpairs(d, sname)
+        if perr != nil {
+            return nil, perr
+        }
+        if sname == "headers" {
+            s.headers = merge_rows(parent.headers, rows, true)
+        } else if sname == "query" {
+            s.query = merge_query(parent.query, rows)
+        } else {
+            ri := 0
+            for ri < len(rows) {
+                v := rows[ri]
+                ri = ri + 1
+                vname := trim_prefix(v.name, "@")
+                if !v.enabled {
+                    continue
+                }
+                if collection && is_ident_pm(vname) {
+                    shared = push(shared, model.KV{name: vname, value: v.value, enabled: true})
+                } else {
+                    s.vars = kv_set(s.vars, vname, v.value)
+                }
+            }
+        }
+    }
+    if collection {
+        s.collection = mkslice(model.KV, 0)
+        si := 0
+        for si < len(shared) {
+            s.collection = kv_set(s.collection, shared[si].name, shared[si].value)
+            si = si + 1
+        }
+        // Names Posting can't reference stay materialized, including
+        // inside the collection variables that use them.
+        e := new(BExp)
+        e.vars = s.vars
+        res.variables = posting_variables(shared, e, res)
+        if len(e.err) > 0 {
+            return nil, errors.new(e.err)
+        }
+    }
+    if dhas(d, "auth") {
+        [ap, aerr] = dpairs(d, "auth")
+        if aerr != nil {
+            return nil, aerr
+        }
+        mode := bvalue(ap, "mode")
+        if mode != "" && mode != "inherit" {
+            s.auth_mode = mode
+            [fp, ferr] = dpairs(d, "auth:" + mode)
+            if ferr != nil {
+                return nil, ferr
+            }
+            s.auth_fields = mkslice(model.KV, 0)
+            fi := 0
+            for fi < len(fp) {
+                if fp[fi].enabled {
+                    s.auth_fields = push(s.auth_fields, model.KV{name: fp[fi].name, value: fp[fi].value, enabled: true})
+                }
+                fi = fi + 1
+            }
+        }
+    }
+    bdiagnostics(d, res)
+    bi := 0
+    for bi < len(d) {
+        bn := d[bi].name
+        ok := bn == "meta" || bn == "headers" || bn == "query" || bn == "auth" || startswith(bn, "auth:") || bn == "vars:pre-request" || bn == "docs" || bn == "vars:post-response" || bn == "tests" || startswith(bn, "script:")
+        if !ok {
+            bwarn(res, "unsupported collection/folder block " + bn)
+        }
+        bi = bi + 1
+    }
+    return s, nil
+}
+
+// ---------- expander ----------
+
+struct BExp {
+    vars: []model.KV,
+    count: int,
+    bytes: int,
+    err: str,
+}
+
+// bexpand — {{name}} expansion; $ is doubled so native Posting ${}
+// references in literal Bruno input stay literal.
+fn bexpand(e: ref BExp, res: ref Result, s: str, stack: []str, json_body: bool) -> str {
+    return bexpand_mode(e, res, s, stack, json_body)
+}
+
+fn bexpand_mode(e: ref BExp, res: ref Result, s0: str, stack: []str, json_body: bool) -> str {
+    if len(e.err) > 0 {
+        return ""
+    }
+    s := replace_all(s0, "$", "$$")
+    out := ""
+    last := 0
+    in_string := false
+    escaped := false
+    i := 0
+    for i < len(s) {
+        // find next {{...}} reference (no braces inside)
+        if byteat(s, i) != 123 || i + 1 >= len(s) || byteat(s, i + 1) != 123 {
+            // track json string state over literal text
+            if json_body {
+                c := byteat(s, i)
+                if escaped {
+                    escaped = false
+                } else if c == 92 && in_string {
+                    escaped = true
+                } else if c == 34 {
+                    in_string = !in_string
+                }
+            }
+            i = i + 1
+            continue
+        }
+        // candidate "{{" at i: scan for "}}" without braces
+        j := i + 2
+        end := -1
+        name_raw := ""
+        for j + 1 < len(s) {
+            c := byteat(s, j)
+            if c == 123 || c == 125 {
+                if c == 125 && byteat(s, j + 1) == 125 {
+                    end = j
+                    name_raw = substr(s, i + 2, j)
+                }
+                break
+            }
+            j = j + 1
+        }
+        if end < 0 {
+            // lone "{{" — literal; still track string state for '{'
+            i = i + 1
+            continue
+        }
+        name := btrim(name_raw)
+        replacement := ""
+        e.count = e.count + 1
+        if len(stack) >= 32 || e.count > 10000 {
+            e.err = "Bruno variable expansion limit reached"
+            replacement = substr(s, i, end + 2)
+        } else {
+            cyclic := false
+            si := 0
+            for si < len(stack) {
+                if stack[si] == name {
+                    cyclic = true
+                }
+                si = si + 1
+            }
+            if cyclic {
+                if res != nil {
+                    bwarn(res, "cyclic variable reference " + name + " retained")
+                }
+                replacement = substr(s, i, end + 2)
+            } else {
+                val := ""
+                found := false
+                vi := len(e.vars) - 1
+                for vi >= 0 {
+                    if e.vars[vi].name == name && e.vars[vi].enabled {
+                        val = e.vars[vi].value
+                        found = true
+                    }
+                    vi = vi - 1
+                }
+                if found {
+                    nstack := append_slice(mkslice(str, 0), stack)
+                    nstack = push(nstack, name)
+                    replacement = bexpand(e, res, val, nstack, false)
+                } else {
+                    n2 := name
+                    if startswith(n2, "process.env.") {
+                        n2 = trim_prefix(n2, "process.env.")
+                    }
+                    if is_ident_pm(n2) {
+                        replacement = "${" + n2 + "}"
+                    } else {
+                        bwarn(res, "unsupported variable reference " + n2 + " retained")
+                        replacement = substr(s, i, end + 2)
+                    }
+                }
+            }
+        }
+        if json_body && in_string {
+            if contains(replacement, "${") || contains(replacement, "{{") {
+                if res != nil {
+                    bwarn(res, "unresolved JSON body variables require JSON-escaped values in Posting")
+                }
+            }
+            jq := json.jstr(replacement)
+            if jq != nil {
+                js := json.tojson(jq)
+                if len(js) >= 2 {
+                    replacement = substr(js, 1, len(js) - 1)
+                }
+            }
+        }
+        if len(out) + (i - last) + len(replacement) > BMAX_FILE {
+            e.err = "expanded Bruno value exceeds 16 MiB"
+            return ""
+        }
+        out = out + substr(s, last, i) + replacement
+        last = end + 2
+        i = end + 2
+    }
+    if len(out) + (len(s) - last) > BMAX_FILE {
+        e.err = "expanded Bruno value exceeds 16 MiB"
+        return ""
+    }
+    out = out + substr(s, last, len(s))
+    e.bytes = e.bytes + len(out)
+    if e.bytes > BMAX_FILE {
+        e.err = "Bruno aggregate variable expansion exceeds 16 MiB"
+        return ""
+    }
+    return out
+}
+
+// scopeConstants — vars that can be materialized with Bruno's JSON
+// escaping; values depending on env/host vars wait until send.
+struct BConstMemo { names: []str, states: []int, work: int }
+
+fn scope_constants(vars: []model.KV) -> []model.KV {
+    // state: 1 visiting, 2 constant, 3 not constant
+    memo := new(BConstMemo)
+    memo.names = mkslice(str, 0)
+    memo.states = mkslice(int, 0)
+    memo.work = 0
+    out := mkslice(model.KV, 0)
+    ci := 0
+    for ci < len(vars) {
+        if bconst(vars, vars[ci].name, 0, memo) == 2 {
+            out = push(out, vars[ci])
+        }
+        ci = ci + 1
+    }
+    return out
+}
+
+fn bconst_lookup(vars: []model.KV, name: str) -> str {
+    i := len(vars) - 1
+    for i >= 0 {
+        if vars[i].name == name && vars[i].enabled {
+            return vars[i].value
+        }
+        i = i - 1
+    }
+    return "\x00absent"
+}
+
+fn bconst(vars: []model.KV, name: str, depth: int, memo: ref BConstMemo) -> int {
+    memo.work = memo.work + 1
+    if memo.work > 100000 {
+        return 3
+    }
+    // memo tables are shared across every recursive call; completed
+    // states must not be recomputed by sibling references.
+    mi := 0
+    for mi < len(memo.names) {
+        if memo.names[mi] == name {
+            return memo.states[mi]
+        }
+        mi = mi + 1
+    }
+    val := bconst_lookup(vars, name)
+    if val == "\x00absent" || depth >= 32 {
+        memo.names = push(memo.names, name)
+        memo.states = push(memo.states, 3)
+        return 3
+    }
+    memo.names = push(memo.names, name)
+    memo.states = push(memo.states, 1)
+    // scan {{...}} refs inside value
+    refs := mkslice(str, 0)
+    i := 0
+    for i < len(val) {
+        if byteat(val, i) == 123 && i + 1 < len(val) && byteat(val, i + 1) == 123 {
+            j := i + 2
+            for j + 1 < len(val) {
+                if byteat(val, j) == 125 && byteat(val, j + 1) == 125 {
+                    refs = push(refs, btrim(substr(val, i + 2, j)))
+                    break
+                }
+                if byteat(val, j) == 123 || byteat(val, j) == 125 {
+                    break
+                }
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+    ok := true
+    ri := 0
+    for ri < len(refs) {
+        if bconst(vars, refs[ri], depth + 1, memo) != 2 {
+            ok = false
+        }
+        ri = ri + 1
+    }
+    // update memo entry (last pushed for this name is index len-1)
+    idx := len(memo.states) - 1
+    for idx >= 0 && memo.names[idx] != name {
+        idx = idx - 1
+    }
+    if idx >= 0 {
+        if ok {
+            memo.states[idx] = 2
+        } else {
+            memo.states[idx] = 3
+        }
+    }
+    if ok {
+        return 2
+    }
+    return 3
+}
+
+// postingVariables — enabled variables with identifier names; a
+// repeated name keeps its last value.
+fn posting_variables(rows: []model.KV, e: ref BExp, res: ref Result) -> []model.KV {
+    out := mkslice(model.KV, 0)
+    index := mkslice(str, 0)
+    iindices := mkslice(int, 0)
+    i := 0
+    for i < len(rows) {
+        row := rows[i]
+        i = i + 1
+        if !row.enabled {
+            continue
+        }
+        value := bexpand(e, res, row.value, mkslice(str, 0), false)
+        found := -1
+        pi := 0
+        for pi < len(index) {
+            if index[pi] == row.name {
+                found = iindices[pi]
+            }
+            pi = pi + 1
+        }
+        if found >= 0 {
+            out[found].value = value
+            continue
+        }
+        index = push(index, row.name)
+        iindices = push(iindices, len(out))
+        out = push(out, model.KV{name: row.name, value: value, enabled: true})
+    }
+    return out
+}
+
+// ---------- convert ----------
+
+fn bmethod_block(d: []BBlock) -> str {
+    method := ""
+    names := push(mkslice(str, 0), "get")
+    names = push(names, "post")
+    names = push(names, "put")
+    names = push(names, "delete")
+    names = push(names, "patch")
+    names = push(names, "head")
+    names = push(names, "options")
+    names = push(names, "connect")
+    names = push(names, "trace")
+    names = push(names, "http")
+    names = push(names, "grpc")
+    i := 0
+    for i < len(d) {
+        ni := 0
+        for ni < len(names) {
+            if d[i].name == names[ni] {
+                if len(method) > 0 {
+                    return "\x00multi"
+                }
+                method = d[i].name
+            }
+            ni = ni + 1
+        }
+        i = i + 1
+    }
+    return method
+}
+
+fn bvalid_method(m: str) -> bool {
+    return m == "GET" || m == "POST" || m == "PUT" || m == "PATCH" || m == "DELETE" || m == "HEAD" || m == "OPTIONS"
+}
+
+// grpcMessage — a request's body:grpc messages as one protojson value.
+fn grpc_message(d: []BBlock, method_type: str, res: ref Result) -> [str, err] {
+    contents := mkslice(str, 0)
+    i := 0
+    for i < len(d) {
+        if d[i].name != "body:grpc" {
+            i = i + 1
+            continue
+        }
+        [rows, perr] = parse_pairs(d[i].text)
+        if perr != nil {
+            return "", errors.new("body:grpc: " + errors.msg(perr))
+        }
+        contents = push(contents, bvalue(rows, "content"))
+        i = i + 1
+    }
+    if len(contents) == 0 {
+        return "", nil
+    }
+    multi := method_type == "client-streaming" || method_type == "bidi-streaming" || (method_type == "" && len(contents) > 1)
+    if multi {
+        out := "[\n"
+        ci := 0
+        for ci < len(contents) {
+            if ci > 0 {
+                out = out + ",\n"
+            }
+            out = out + "  " + replace_all(contents[ci], "\n", "\n  ")
+            ci = ci + 1
+        }
+        return out + "\n]", nil
+    }
+    if len(contents) > 1 {
+        bwarn(res, method_type + " method sends one message; imported only the first of " + itoa(len(contents)))
+    }
+    return contents[0], nil
+}
+
+// grpcProtos — schema protoPath names, or server reflection when blank.
+// Posting resolves file/import paths against the collection root.
+fn grpc_protos(proto_path: str, imports: []str, res: ref Result) -> own collection.PProto {
+    if proto_path == "" {
+        return nil
+    }
+    bwarn(res, "proto file " + proto_path + " is not copied; put it at that path relative to the imported collection")
+    p := new(collection.PProto)
+    p.files = push(mkslice(str, 0), proto_path)
+    p.import_paths = mkslice(str, 0)
+    search := imports
+    if len(search) == 0 {
+        search = push(mkslice(str, 0), ".")
+    }
+    si := 0
+    for si < len(search) {
+        p.import_paths = push(p.import_paths, search[si])
+        si = si + 1
+    }
+    // Posting compiles a .proto by its name under an import path;
+    // without model.ImportName, append the file's dir when the path
+    // is not plainly relative to an import root.
+    dir := bdir_of(proto_path)
+    if dir != "." && dir != "" && !kv_present_str(p.import_paths, dir) {
+        p.import_paths = push(p.import_paths, dir)
+    }
+    return p
+}
+
+fn kv_present_str(list: []str, name: str) -> bool {
+    i := 0
+    for i < len(list) {
+        if list[i] == name {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn bdir_of(path: str) -> str {
+    i := len(path) - 1
+    for i >= 0 {
+        if byteat(path, i) == 47 {
+            if i == 0 {
+                return "/"
+            }
+            return substr(path, 0, i)
+        }
+        i = i - 1
+    }
+    return "."
+}
+
+// convert — one .bru document + parent scope → PRequest (nil = skipped).
+fn convert(d: []BBlock, parent: ref BScope, res: ref Result) -> [own collection.PRequest, err] {
+    [meta, merr] = dpairs(d, "meta")
+    if merr != nil {
+        return nil, merr
+    }
+    mname := bvalue(meta, "name")
+    mtype := bvalue(meta, "type")
+    if mtype != "" && mtype != "http" && mtype != "graphql" && mtype != "grpc" {
+        bwarn(res, "skipped unsupported Bruno request type " + mtype)
+        return nil, nil
+    }
+    method := bmethod_block(d)
+    if method == "\x00multi" {
+        return nil, errors.new("multiple HTTP method blocks")
+    }
+    if method == "" {
+        return nil, errors.new("missing HTTP method block")
+    }
+    [hp, herr] = dpairs(d, method)
+    if herr != nil {
+        return nil, herr
+    }
+    actual := upper_ascii2(method)
+    if method == "http" {
+        actual = upper_ascii2(bvalue(hp, "method"))
+    }
+    if !bvalid_method(actual) && method != "grpc" {
+        bwarn(res, "skipped HTTP method " + actual + " unsupported by Posting request files")
+        return nil, nil
+    }
+    rawurl := bvalue(hp, "url")
+    if rawurl == "" {
+        return nil, errors.new("HTTP request URL is empty")
+    }
+    req := new(collection.PRequest)
+    req.name = mname
+    if req.name == "" {
+        req.name = "Imported request"
+    }
+    req.method = actual
+    if method == "grpc" {
+        // gRPC requests carry the RPC path in grpc.method, not method.
+        req.method = ""
+    }
+    req.url = rawurl
+    req.description = dtext(d, "docs")
+    // vars: parent scope + enabled vars:pre-request
+    vars := kv_copy(parent.vars)
+    [vp, verr] = dpairs(d, "vars:pre-request")
+    if verr != nil {
+        return nil, verr
+    }
+    vi := 0
+    for vi < len(vp) {
+        if vp[vi].enabled {
+            vars = kv_set(vars, trim_prefix(vp[vi].name, "@"), vp[vi].value)
+        }
+        vi = vi + 1
+    }
+    e := new(BExp)
+    e.vars = vars
+    if parent.deferred {
+        vs := new(collection.PVarScope)
+        vs.variables = mkslice(model.KV, 0)
+        unrep := mkslice(model.KV, 0)
+        ui := 0
+        for ui < len(vars) {
+            if !is_ident_pm(vars[ui].name) {
+                unrep = push(unrep, vars[ui])
+            }
+            ui = ui + 1
+        }
+        // expansion sees only unrepresentable names while building scope
+        e.vars = unrep
+        wi := 0
+        for wi < len(vars) {
+            if is_ident_pm(vars[wi].name) {
+                val := bexpand(e, res, vars[wi].value, mkslice(str, 0), false)
+                vs.variables = push(vs.variables, model.KV{name: vars[wi].name, value: val, enabled: true})
+            }
+            wi = wi + 1
+        }
+        if len(vs.variables) == 0 {
+            vs = nil
+        }
+        req.variable_scope = vs
+        // materialized expansion: constants + unrepresentable names
+        e.vars = scope_constants(vars)
+        uj := 0
+        for uj < len(unrep) {
+            e.vars = kv_set(e.vars, unrep[uj].name, unrep[uj].value)
+            uj = uj + 1
+        }
+    }
+    [hdrs, hdrr] = dpairs(d, "headers")
+    if hdrr != nil {
+        return nil, hdrr
+    }
+    [meta2, mdrr] = dpairs(d, "metadata")
+    if mdrr != nil {
+        return nil, mdrr
+    }
+    allh := append_kv(hdrs, meta2)
+    req.headers = merge_rows(parent.headers, allh, true)
+    [qp, qerr] = dpairs(d, "params:query")
+    if qerr != nil {
+        return nil, qerr
+    }
+    [lq, lqerr] = dpairs(d, "query")
+    if lqerr != nil {
+        return nil, lqerr
+    }
+    query := append_kv(lq, qp)
+    // URL ?query is a second serialized view of the same rows; only
+    // add URL keys absent from explicit rows.
+    rawurl = req.url
+    fragment := ""
+    fi := find(rawurl, "#")
+    if fi >= 0 {
+        fragment = substr(rawurl, fi, len(rawurl))
+        rawurl = substr(rawurl, 0, fi)
+    }
+    qi := find(rawurl, "?")
+    explicit := mkslice(str, 0)
+    ei := 0
+    for ei < len(query) {
+        explicit = push(explicit, query[ei].name)
+        ei = ei + 1
+    }
+    urlrows := mkslice(model.KV, 0)
+    if qi >= 0 {
+        qstr := substr(rawurl, qi + 1, len(rawurl))
+        parts := bsplit(qstr, "&")
+        pi := 0
+        for pi < len(parts) {
+            part := parts[pi]
+            pi = pi + 1
+            if part == "" {
+                continue
+            }
+            eq := find(part, "=")
+            pkey := part
+            pval := ""
+            if eq >= 0 {
+                pkey = substr(part, 0, eq)
+                pval = substr(part, eq + 1, len(part))
+            }
+            [key, kerr] = url.queryunescape(pkey)
+            if kerr != nil {
+                return nil, errors.new("invalid URL query: " + errors.msg(kerr))
+            }
+            if eq >= 0 {
+                [val, verr2] = url.queryunescape(pval)
+                if verr2 != nil {
+                    return nil, errors.new("invalid URL query: " + errors.msg(verr2))
+                }
+                pval = val
+            }
+            found := false
+            fk := 0
+            for fk < len(explicit) {
+                if explicit[fk] == key {
+                    found = true
+                }
+                fk = fk + 1
+            }
+            if !found {
+                urlrows = push(urlrows, model.KV{name: key, value: pval, enabled: true})
+            }
+        }
+        rawurl = substr(rawurl, 0, qi)
+    }
+    req.url = rawurl + fragment
+    req.params = merge_query(parent.query, append_kv(urlrows, query))
+    [pp, pperr] = dpairs(d, "params:path")
+    if pperr != nil {
+        return nil, pperr
+    }
+    req.path_params = mkslice(collection.PathParam, 0)
+    pi2 := 0
+    for pi2 < len(pp) {
+        req.path_params = push(req.path_params, collection.PathParam{name: pp[pi2].name, value: pp[pi2].value})
+        pi2 = pi2 + 1
+    }
+    // auth
+    auth_mode := bvalue(hp, "auth")
+    fields := mkslice(model.KV, 0)
+    if auth_mode == "inherit" {
+        auth_mode = parent.auth_mode
+        fields = parent.auth_fields
+        if auth_mode == "" {
+            bwarn(res, "auth: inherit has no available parent authentication")
+        }
+    } else {
+        [ap2, a2err] = dpairs(d, "auth:" + auth_mode)
+        if a2err != nil {
+            return nil, a2err
+        }
+        fi2 := 0
+        for fi2 < len(ap2) {
+            if ap2[fi2].enabled {
+                fields = push(fields, model.KV{name: ap2[fi2].name, value: ap2[fi2].value, enabled: true})
+            }
+            fi2 = fi2 + 1
+        }
+    }
+    if auth_mode == "basic" || auth_mode == "digest" {
+        a := new(collection.PAuth)
+        a.type = auth_mode
+        bb := new(collection.PBasic)
+        bb.username = bvalue(fields, "username")
+        bb.password = bvalue(fields, "password")
+        if auth_mode == "digest" {
+            a.digest = bb
+        } else {
+            a.basic = bb
+        }
+        req.auth = a
+    } else if auth_mode == "bearer" {
+        a2 := new(collection.PAuth)
+        a2.type = "bearer_token"
+        bt := new(collection.PBearer)
+        bt.token = bvalue(fields, "token")
+        a2.bearer_token = bt
+        req.auth = a2
+    } else if auth_mode == "apikey" {
+        kv := model.KV{name: bvalue(fields, "key"), value: bvalue(fields, "value"), enabled: true}
+        placement := bvalue(fields, "placement")
+        if placement == "header" {
+            req.headers = merge_rows(req.headers, push(mkslice(model.KV, 0), kv), true)
+        } else if placement == "queryparams" {
+            if method == "grpc" {
+                bwarn(res, "gRPC has no query parameters; API key was not imported")
+            } else {
+                req.params = merge_query(req.params, push(mkslice(model.KV, 0), kv))
+            }
+        } else {
+            bwarn(res, "unsupported API key placement " + placement)
+        }
+    } else if auth_mode != "" && auth_mode != "none" && auth_mode != "inherit" {
+        bwarn(res, "unsupported authentication " + auth_mode + "; credentials were not imported")
+    }
+    // body
+    body_mode := bvalue(hp, "body")
+    if method == "grpc" {
+        body_mode = "grpc"
+    }
+    is_graphql := false
+    if body_mode == "json" || body_mode == "text" || body_mode == "xml" || body_mode == "sparql" {
+        bname := "body:" + body_mode
+        if !dhas(d, bname) {
+            return nil, errors.new("missing " + bname + " block")
+        }
+        ctype := "text/plain"
+        if body_mode == "json" {
+            ctype = "application/json"
+        } else if body_mode == "xml" {
+            ctype = "application/xml"
+        } else if body_mode == "sparql" {
+            ctype = "application/sparql-query"
+        }
+        b := new(collection.PBody)
+        b.has_content = true
+        b.content = dtext(d, bname)
+        b.content_type = ctype
+        req.body = b
+    } else if body_mode == "form-urlencoded" {
+        [frows, ferr2] = dpairs(d, "body:form-urlencoded")
+        if ferr2 != nil {
+            return nil, ferr2
+        }
+        b2 := new(collection.PBody)
+        b2.has_form_data = true
+        b2.content_type = "application/x-www-form-urlencoded"
+        b2.form_data = frows
+        req.body = b2
+    } else if body_mode == "graphql" {
+        is_graphql = true
+        g := new(collection.PGraphQL)
+        g.query = dtext(d, "body:graphql")
+        gvars := dtext(d, "body:graphql:vars")
+        vt := bexpand(e, res, gvars, mkslice(str, 0), true)
+        if len(btrim(vt)) > 0 {
+            if json.jparse(vt) == nil {
+                bwarn(res, "GraphQL variables are not valid JSON after expansion; variables omitted")
+            } else {
+                g.variables = vt
+            }
+        }
+        req.graphql = g
+        req.kind = "graphql"
+    } else if body_mode == "grpc" {
+        [msg, gerr] = grpc_message(d, bvalue(hp, "methodType"), res)
+        if gerr != nil {
+            return nil, gerr
+        }
+        gr := new(collection.PGrpc)
+        gr.method = trim_prefix(bvalue(hp, "method"), "/")
+        gr.message = msg
+        gr.proto = grpc_protos(bvalue(hp, "protoPath"), parent.proto_imports, res)
+        req.grpc = gr
+        req.kind = "grpc"
+    } else if body_mode != "" && body_mode != "none" {
+        bwarn(res, "unsupported body mode " + body_mode + "; body was not imported")
+    }
+    if mtype == "graphql" && req.graphql == nil {
+        bwarn(res, "GraphQL request has no GraphQL body; imported as HTTP")
+    }
+    if is_graphql && actual != "POST" {
+        bwarn(res, "GraphQL request uses " + actual + "; Posting sends GraphQL requests as POST")
+    }
+    if dhas(d, "body") {
+        bwarn(res, "legacy body block is not imported")
+    }
+    // settings
+    [settings, serr] = dpairs(d, "settings")
+    if serr != nil {
+        return nil, serr
+    }
+    opt := new(collection.POptions)
+    opt.follow_redirects = true
+    opt.verify_ssl = true
+    opt.attach_cookies = true
+    opt.substitute_body_variables = true
+    opt.timeout = 5.0
+    si2 := 0
+    for si2 < len(settings) {
+        sv := settings[si2]
+        si2 = si2 + 1
+        if sv.name == "followRedirects" {
+            if sv.value != "true" && sv.value != "false" {
+                return nil, errors.new("invalid followRedirects")
+            }
+            opt.follow_redirects = sv.value == "true"
+            opt.set_mask = opt.set_mask | 1
+        } else if sv.name == "timeout" {
+            if sv.value == "inherit" {
+                bwarn(res, "inherited timeout uses Posting default")
+                continue
+            }
+            [n, perr2] = strconv.parsefloat(sv.value)
+            if perr2 != nil || math.isnan(n) || math.isinf(n) || n < 0.0 || n > 86400000.0 {
+                return nil, errors.new("invalid timeout")
+            }
+            opt.timeout = n / 1000.0
+            opt.set_mask = opt.set_mask | 32
+        } else {
+            bwarn(res, "unsupported request setting " + sv.name)
+        }
+    }
+    req.options = opt
+    bdiagnostics(d, res)
+    // unsupported-block sweep
+    bi := 0
+    for bi < len(d) {
+        bn := d[bi].name
+        ok := bn == "meta" || bn == method || bn == "headers" || bn == "metadata" || bn == "query" || bn == "params:query" || bn == "params:path" || bn == "vars:pre-request" || bn == "vars:post-response" || bn == "settings" || bn == "docs" || bn == "body" || bn == "tests" || bn == "assert" || bn == "example" || bn == "app" || startswith(bn, "body:") || startswith(bn, "auth:") || startswith(bn, "script:")
+        if !ok {
+            bwarn(res, "unsupported block " + bn)
+        }
+        bi = bi + 1
+    }
+    // final expansion pass over all fields
+    req.url = bexpand(e, res, req.url, mkslice(str, 0), false)
+    if req.auth != nil && req.auth.type == "basic" && req.auth.basic != nil {
+        req.auth.basic.username = bexpand(e, res, req.auth.basic.username, mkslice(str, 0), false)
+        req.auth.basic.password = bexpand(e, res, req.auth.basic.password, mkslice(str, 0), false)
+    }
+    if req.auth != nil && req.auth.type == "digest" && req.auth.digest != nil {
+        req.auth.digest.username = bexpand(e, res, req.auth.digest.username, mkslice(str, 0), false)
+        req.auth.digest.password = bexpand(e, res, req.auth.digest.password, mkslice(str, 0), false)
+    }
+    if req.auth != nil && req.auth.type == "bearer_token" && req.auth.bearer_token != nil {
+        req.auth.bearer_token.token = bexpand(e, res, req.auth.bearer_token.token, mkslice(str, 0), false)
+    }
+    hi := 0
+    for hi < len(req.headers) {
+        req.headers[hi].name = bexpand(e, res, req.headers[hi].name, mkslice(str, 0), false)
+        req.headers[hi].value = bexpand(e, res, req.headers[hi].value, mkslice(str, 0), false)
+        hi = hi + 1
+    }
+    qi2 := 0
+    for qi2 < len(req.params) {
+        req.params[qi2].name = bexpand(e, res, req.params[qi2].name, mkslice(str, 0), false)
+        req.params[qi2].value = bexpand(e, res, req.params[qi2].value, mkslice(str, 0), false)
+        qi2 = qi2 + 1
+    }
+    pi3 := 0
+    for pi3 < len(req.path_params) {
+        req.path_params[pi3].name = bexpand(e, res, req.path_params[pi3].name, mkslice(str, 0), false)
+        req.path_params[pi3].value = bexpand(e, res, req.path_params[pi3].value, mkslice(str, 0), false)
+        pi3 = pi3 + 1
+    }
+    if req.body != nil && req.body.has_content {
+        // Bruno selects JSON string escaping from the effective
+        // Content-Type after header interpolation.
+        ctype := req.body.content_type
+        hi2 := 0
+        for hi2 < len(req.headers) {
+            h := req.headers[hi2]
+            hi2 = hi2 + 1
+            if h.enabled && case_eq_fold(h.name, "Content-Type") {
+                ctype = h.value
+            }
+        }
+        if contains(ctype, "${") || contains(ctype, "{{") {
+            bwarn(res, "unresolved Content-Type uses import-time body escaping; check body variables after setting the header")
+        }
+        req.body.content = bexpand(e, res, req.body.content, mkslice(str, 0), contains(ctype, "json"))
+    }
+    if req.body != nil && req.body.has_form_data {
+        fi3 := 0
+        for fi3 < len(req.body.form_data) {
+            req.body.form_data[fi3].name = bexpand(e, res, req.body.form_data[fi3].name, mkslice(str, 0), false)
+            req.body.form_data[fi3].value = bexpand(e, res, req.body.form_data[fi3].value, mkslice(str, 0), false)
+            fi3 = fi3 + 1
+        }
+    }
+    if req.graphql != nil {
+        req.graphql.query = braced_only(bexpand(e, res, req.graphql.query, mkslice(str, 0), false))
+    }
+    if req.grpc != nil {
+        req.grpc.message = bexpand(e, res, req.grpc.message, mkslice(str, 0), true)
+        if req.auth != nil && req.auth.type == "digest" {
+            bwarn(res, "gRPC requests can't use digest authentication; credentials were not imported")
+        }
+    }
+    if len(e.err) > 0 {
+        return nil, errors.new(e.err)
+    }
+    return req, nil
+}
+
+// ---------- environment ----------
+
+// environment — environments/<name>.bru; secret values live only in
+// Bruno's app storage, so they are reported rather than imported.
+fn environment(d: []BBlock, name: str, where_: str, res: ref Result) -> [Env, err] {
+    [rows, perr] = dpairs(d, "vars")
+    if perr != nil {
+        return Env{name: "", variables: mkslice(model.KV, 0)}, perr
+    }
+    usable := mkslice(model.KV, 0)
+    ri := 0
+    for ri < len(rows) {
+        row := rows[ri]
+        ri = ri + 1
+        if !row.enabled {
+            continue
+        }
+        if !is_ident_pm(row.name) {
+            bwarn(res, where_ + ": variable " + row.name + " cannot be represented as a Posting variable and was not imported")
+            continue
+        }
+        usable = push(usable, row)
+    }
+    e := new(BExp)
+    e.vars = mkslice(model.KV, 0)
+    out := Env{name: name, variables: mkslice(model.KV, 0)}
+    out.variables = posting_variables(usable, e, res)
+    if len(e.err) > 0 {
+        return Env{name: "", variables: mkslice(model.KV, 0)}, errors.new(e.err)
+    }
+    secrets := dlist(d, "vars:secret")
+    if len(secrets) == 1 {
+        bwarn(res, where_ + ": secret variable " + secrets[0] + " has no value on disk; set it in " + name + ".local.env")
+    } else if len(secrets) > 1 {
+        bwarn(res, where_ + ": secret variables " + str_join(secrets, ", ") + " have no values on disk; set them in " + name + ".local.env")
+    }
+    bi := 0
+    for bi < len(d) {
+        if d[bi].name != "vars" && d[bi].name != "vars:secret" && d[bi].name != "color" {
+            bwarn(res, where_ + ": unsupported environment block " + d[bi].name)
+        }
+        bi = bi + 1
+    }
+    return out, nil
+}
+
+// ---------- entry points ----------
+
+// bparse — Parse(data): one standalone .bru request → Result.
+fn bparse(data: str) -> [own Result, err] {
+    [d, derr] = parse_document(data)
+    if derr != nil {
+        return nil, derr
+    }
+    res := new(Result)
+    res.requests = mkslice(ImpRequest, 0)
+    res.variables = mkslice(model.KV, 0)
+    res.envs = mkslice(Env, 0)
+    scp := bempty_scope()
+    [r, cerr2] = convert(d, scp, res)
+    if cerr2 != nil {
+        return nil, cerr2
+    }
+    if r != nil {
+        res.name = r.name
+        res.requests = push(res.requests, ImpRequest{file: r.name + ".posting.yaml", req: r})
+    }
+    return res, nil
+}

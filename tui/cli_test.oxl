@@ -5,7 +5,9 @@ package main
 
 import "std/testing"
 import "std/os"
+import "std/time"
 import "std/net/tls"
+import "github.com/oxidean/oxttp/core/importing"
 import "github.com/oxidean/oxttp/core/model"
 
 fn test_cli_version() {
@@ -38,11 +40,12 @@ fn test_cli_remote() {
     a = push(a, "list")
     r := cli_remote_args(a)
     testing.expect(r.code == 0, "list code")
-    testing.expect(find(r.stdout, "no running Posting") >= 0, "list text")
+    testing.expect(find(r.stderr, "No Posting is running.") >= 0, "list text on stderr")
     a[1] = "skill"
     r = cli_remote_args(a)
     testing.expect(r.code == 0, "skill code")
-    testing.expect(find(r.stdout, "posting-remote") >= 0, "skill emits md")
+    testing.expect(find(r.stdout, "using-posting") >= 0, "skill emits md")
+    testing.expect(find(r.stdout, "posting remote send") >= 0, "skill body")
     a[1] = "send"
     r = cli_remote_args(a)
     testing.expect(r.code == 1, "send degrade")
@@ -60,7 +63,7 @@ fn test_cli_remote_instance_and_json() {
     a = push(a, "list")
     r := cli_remote_args(a)
     testing.expect(r.code == 0, "--instance consumed, list runs")
-    testing.expect(find(r.stdout, "no running Posting") >= 0, "list text")
+    testing.expect(find(r.stderr, "No Posting is running.") >= 0, "list text")
     // = form
     a = nil
     a = push(a, "remote")
@@ -76,43 +79,210 @@ fn test_cli_remote_instance_and_json() {
     r = cli_remote_args(a)
     testing.expect(r.code == 0, "list --json code")
     testing.expect_streq(r.stdout, "[]\n", "list --json body")
-    // unknown command → usage → 2 (was 1)
+    // unknown command → posting remote: unknown command + usage hint → 2
     a = nil
     a = push(a, "remote")
     a = push(a, "bogus")
     r = cli_remote_args(a)
     testing.expect(r.code == 2, "unknown cmd usage")
-    testing.expect(find(r.stderr, "usage:") >= 0, "usage text")
+    testing.expect(find(r.stderr, "unknown command") >= 0, "err text")
+    testing.expect(find(r.stderr, "--help for usage") >= 0, "usage hint")
+    // removed commands new/focus are unknown too
+    a = nil
+    a = push(a, "remote")
+    a = push(a, "new")
+    r = cli_remote_args(a)
+    testing.expect(r.code == 2, "new removed")
+    // strict flag errors
+    a = nil
+    a = push(a, "remote")
+    a = push(a, "send")
+    a = push(a, "--bogus")
+    r = cli_remote_args(a)
+    testing.expect(r.code == 2, "unknown option")
+    testing.expect(find(r.stderr, "unknown option --bogus") >= 0, "option text")
+    // cross-flag: --curl on list
+    a = nil
+    a = push(a, "remote")
+    a = push(a, "list")
+    a = push(a, "--curl")
+    a = push(a, "x")
+    r = cli_remote_args(a)
+    testing.expect(r.code == 2, "curl on list")
+    testing.expect(find(r.stderr, "--curl and --yaml are for open and send") >= 0, "cross flag")
+    // no command at all
+    a = nil
+    a = push(a, "remote")
+    r = cli_remote_args(a)
+    testing.expect(r.code == 2, "no command")
+    testing.expect(find(r.stderr, "no command given") >= 0, "no command text")
 }
 
 fn test_cli_import() {
+    root := os.temp_dir() + "/oxttp-cli-import-" + itoa(time.unix_ms())
+    os.mkdir_all(root)
     let a: []str = nil
     a = push(a, "import")
     a = push(a, "-t")
     a = push(a, "postman")
-    a = push(a, "file.json")
+    a = push(a, root + "/missing-file.json")
     r := cli_import_args(a)
-    testing.expect(r.code == 1, "degrade code")
-    testing.expect(find(r.stderr, "postman import lands M4") >= 0, "text")
+    testing.expect(r.code == 1, "missing source errors")
+    testing.expect(find(r.stderr, "no such file") >= 0, "missing source text")
     a[2] = "bogus"
     r = cli_import_args(a)
     testing.expect(r.code == 2, "bad type")
-    // zero sources → usage 2, not the M4 degrade
+    testing.expect(find(r.stderr, "unknown import type \"bogus\" (choose openapi, postman, or bruno)") >= 0, "bad type text")
+    // non-regular sources are rejected before opening
+    a = nil
+    a = push(a, "import")
+    a = push(a, "/dev/null")
+    r = cli_import_args(a)
+    testing.expect(r.code == 1, "device source rejected")
+    testing.expect(find(r.stderr, "source must be a regular file or Bruno directory") >= 0, "regular file text")
+    // help is the upstream multi-line usage
+    a = nil
+    a = push(a, "import")
+    a = push(a, "--help")
+    r = cli_import_args(a)
+    testing.expect(r.code == 0, "help exits zero")
+    testing.expect(find(r.stdout, "Usage: posting import [options] SOURCE [ENVIRONMENT...]") == 0, "help usage")
+    testing.expect(find(r.stdout, "Existing files are never") >= 0, "help body")
+    // zero sources → usage 2
     a = nil
     a = push(a, "import")
     a = push(a, "-t")
     a = push(a, "postman")
     r = cli_import_args(a)
     testing.expect(r.code == 2, "no sources usage")
-    // --type=x / --output=x forms parse
+    testing.expect(find(r.stderr, "expected a source file or directory") >= 0, "no sources text")
+    // --type=x / --output=x forms parse and wire the real engine.
+    src := root + "/import.postman.json"
+    outdir := root + "/out"
+    os.writefile_(src, "{\"info\":{\"name\":\"CLI Import\",\"schema\":\"https://schema.getpostman.com/json/collection/v2.1.0/collection.json\"},\"item\":[{\"name\":\"Get\",\"request\":{\"method\":\"GET\",\"url\":\"https://example.test\"}}]}")
     a = nil
     a = push(a, "import")
     a = push(a, "--type=postman")
-    a = push(a, "--output=/tmp/out")
-    a = push(a, "coll.json")
+    a = push(a, "--output=" + outdir)
+    a = push(a, src)
     r = cli_import_args(a)
-    testing.expect(r.code == 1, "eq forms degrade")
-    testing.expect(find(r.stderr, "postman import lands M4") >= 0, "type applied")
+    testing.expect(r.code == 0, "import success")
+    testing.expect(find(r.stdout, "Imported 1 postman request(s)") >= 0, "success text")
+    testing.expect(find(r.stdout, outdir) >= 0, "output path text")
+    // No --type: detect the Postman envelope from info+item.
+    a = nil
+    a = push(a, "import")
+    a = push(a, "--output=" + outdir + "-detect")
+    a = push(a, src)
+    r = cli_import_args(a)
+    testing.expect(r.code == 0, "detect import success")
+    testing.expect(find(r.stdout, "Imported 1 postman request(s)") >= 0, "detect success text")
+    // Single-dash long forms parse, and type matching is case-insensitive.
+    a = nil
+    a = push(a, "import")
+    a = push(a, "-type=POSTMAN")
+    a = push(a, "-output=" + outdir + "-single")
+    a = push(a, src)
+    r = cli_import_args(a)
+    testing.expect(r.code == 0, "single-dash import success")
+    // Postman environment exports may accompany a collection, but an
+    // env-only import must name the output collection explicitly.
+    envsrc := root + "/import.postman_environment.json"
+    os.writefile_(envsrc, "{\"name\":\"dev\",\"values\":[{\"key\":\"TOKEN\",\"value\":\"abc\",\"enabled\":true}]}")
+    a = nil
+    a = push(a, "import")
+    a = push(a, envsrc)
+    r = cli_import_args(a)
+    testing.expect(r.code == 2, "env-only without output")
+    testing.expect(find(r.stderr, "importing only environments requires --output DIR") >= 0, "env-only error text")
+    a = nil
+    a = push(a, "import")
+    a = push(a, "--output=" + outdir + "-env")
+    a = push(a, envsrc)
+    r = cli_import_args(a)
+    testing.expect(r.code == 0, "env-only with output")
+    testing.expect(find(r.stdout, "Imported 1 environment(s)") >= 0, "env-only success text")
+    os.remove_all(root)
+}
+
+
+fn test_cli_import_env_before_collection_and_bruno_name() {
+    root := os.temp_dir() + "/oxttp-cli-review-" + itoa(time.unix_ms())
+    os.mkdir_all(root)
+    collsrc := root + "/collection.json"
+    envsrc := root + "/dev.postman_environment.json"
+    outdir := root + "/out"
+    os.writefile_(collsrc, "{\"info\":{\"name\":\"CLI Import\",\"schema\":\"https://schema.getpostman.com/json/collection/v2.1.0/collection.json\"},\"item\":[{\"name\":\"Get\",\"request\":{\"method\":\"GET\",\"url\":\"https://example.test\"}}]}")
+    os.writefile_(envsrc, "{\"name\":\"dev\",\"values\":[{\"key\":\"TOKEN\",\"value\":\"abc\",\"enabled\":true}]}")
+    let a: []str = nil
+    a = push(a, "import")
+    a = push(a, "--output=" + outdir)
+    a = push(a, envsrc)
+    a = push(a, collsrc)
+    r := cli_import_args(a)
+    testing.expect(r.code == 0, "env-before-collection import: " + r.stderr)
+    testing.expect(os.exists(outdir + "/dev.env"), "environment retained after collection")
+    // Standalone Bruno files use the source basename for the output file,
+    // while meta.name remains only the display name.
+    brusrc := root + "/status.bru"
+    brudir := root + "/bruno-out"
+    os.writefile_(brusrc, "meta {\n  name: Health check\n  type: http\n}\nget {\n  url: https://example.test\n}\n")
+    a = nil
+    a = push(a, "import")
+    a = push(a, "--output=" + brudir)
+    a = push(a, brusrc)
+    r = cli_import_args(a)
+    testing.expect(r.code == 0, "bruno import: " + r.stderr)
+    testing.expect(os.exists(brudir + "/status.posting.yaml"), "source basename output")
+    testing.expect(!os.exists(brudir + "/Health check.posting.yaml"), "display name not file name")
+    os.remove_all(root)
+}
+
+fn test_cli_import_output_comes_from_first_parse() {
+    // Output options before `--` are consumed as flags even when an
+    // option-looking source follows `--`; import_run must not rescan raw
+    // args and accidentally reinterpret that source as an output option.
+    root := os.temp_dir() + "/oxttp-cli-outparse-" + itoa(time.unix_ms())
+    os.mkdir_all(root)
+    collsrc := root + "/collection.json"
+    outdir := root + "/wanted"
+    os.writefile_(collsrc, "{\"info\":{\"name\":\"CLI Import\"},\"item\":[{\"name\":\"Get\",\"request\":{\"method\":\"GET\",\"url\":\"https://example.test\"}}]}")
+    let a: []str = nil
+    a = push(a, "import")
+    a = push(a, "-o")
+    a = push(a, outdir)
+    a = push(a, collsrc)
+    r := cli_import_args(a)
+    testing.expect(r.code == 0, "first-parse output used: " + r.stderr)
+    testing.expect(os.exists(outdir + "/Get.posting.yaml"), "request in wanted output")
+    os.remove_all(root)
+}
+
+fn test_cli_report_path_quote_and_missing_target_regressions() {
+    testing.expect_streq(rel_to_root("/tmp/api/.", "/tmp/api/get.posting.yaml"), "get.posting.yaml", "normalized report path")
+    testing.expect_streq(rel_to_root("/tmp/api", "/tmp/apisibling/get.posting.yaml"), "/tmp/apisibling/get.posting.yaml", "sibling not relative")
+    testing.expect_streq(rel_to_root("/", "/tmp/api/get.posting.yaml"), "tmp/api/get.posting.yaml", "filesystem root strips leading slash")
+    testing.expect_streq(rel_to_root("/", "/"), ".", "filesystem root itself relative")
+    testing.expect_streq(imp_quote("qa&dev"), "'qa&dev'", "shell metachar quoted")
+    testing.expect_streq(imp_quote(""), "''", "empty shell arg quoted")
+    testing.expect_streq(imp_quote("x';id;'y"), "'x'\\'';id;'\\''y'", "apostrophe shell encoding keeps backslash")
+    envs := mkslice(importing.WEnv, 0)
+    envs = push(envs, importing.WEnv{name: "posting-2", file: "posting-2.env", base: true})
+    envs = push(envs, importing.WEnv{name: "dev", file: "dev.env", base: false})
+    line := imp_envs_line("out", envs)
+    testing.expect(find(line, " --env posting-2 --env dev") >= 0, "renamed imported base name precedes selected env: " + line)
+    envs2 := mkslice(importing.WEnv, 0)
+    envs2 = push(envs2, importing.WEnv{name: "posting", file: "posting.env", base: true})
+    envs2 = push(envs2, importing.WEnv{name: "dev", file: "dev.env", base: false})
+    line2 := imp_envs_line("out", envs2)
+    testing.expect(find(line2, " --env dev") >= 0 && find(line2, "posting.env --env") < 0, "ordinary base not duplicated: " + line2)
+    o := new(RunOpts)
+    o.coll = "/tmp/definitely-missing-oxttp-coll"
+    o.target = "missing.posting.yaml"
+    fx := FakeSend{resp: fake_resp(200, "text/plain", "hi", nil), fail: "", expect_path: ""}
+    rep := run_exec(o, fx)
+    testing.expect(rep.code == 1, "missing target fails")
+    testing.expect(find(rep.err, "missing.posting.yaml") >= 0, "missing path retained: " + rep.err)
 }
 
 fn test_run_parse() {
@@ -126,7 +296,7 @@ fn test_run_parse() {
     a = push(a, "--json")
     a = push(a, "requests/")
     rp := run_parse_args(a)
-    testing.expect(rp.code == 0, "code")
+    testing.expect(len(rp.err) == 0 && !rp.help, "parse ok")
     testing.expect_streq(rp.o.coll, "/coll", "coll")
     testing.expect(len(rp.o.envs) == 1, "envs")
     testing.expect_streq(rp.o.target, "requests/", "target")
@@ -139,25 +309,51 @@ fn test_run_parse() {
     a = push(a, "--collection=/c")
     a = push(a, "--env=prod")
     rp = run_parse_args(a)
-    testing.expect(rp.code == 0, "code2")
+    testing.expect(len(rp.err) == 0, "parse2 ok")
     testing.expect_streq(rp.o.coll, "/c", "coll2")
     testing.expect_streq(rp.o.envs[0], "prod", "env2")
-    // two positionals → usage
+    // two positionals → error
     a = push(a, "extra")
     rp = run_parse_args(a)
-    testing.expect(rp.code == 2, "two positional")
+    testing.expect_streq(rp.err, "expected one request file or directory", "two positional")
     // help
     a = nil
     a = push(a, "run")
     a = push(a, "-h")
     rp = run_parse_args(a)
-    testing.expect(rp.code == -1, "help sentinel")
+    testing.expect(rp.help, "help flag")
     // missing value
     a = nil
     a = push(a, "run")
     a = push(a, "-c")
     rp = run_parse_args(a)
-    testing.expect(rp.code == 2, "missing val")
+    testing.expect_streq(rp.err, "-c needs a value", "missing val")
+    // -c alone → target "."
+    a = nil
+    a = push(a, "run")
+    a = push(a, "-c")
+    a = push(a, "/coll")
+    rp = run_parse_args(a)
+    testing.expect(len(rp.err) == 0, "c alone ok")
+    testing.expect_streq(rp.o.target, ".", "c alone target")
+    // no target, no -c → error
+    a = nil
+    a = push(a, "run")
+    rp = run_parse_args(a)
+    testing.expect_streq(rp.err, "give a request file, directory, or --collection DIR", "no target")
+    // unknown option keeps original arg
+    a = nil
+    a = push(a, "run")
+    a = push(a, "--bogus")
+    rp = run_parse_args(a)
+    testing.expect_streq(rp.err, "unknown option --bogus", "unknown opt")
+    // --json=x rejected
+    a = nil
+    a = push(a, "run")
+    a = push(a, "t.posting.yaml")
+    a = push(a, "--json=yes")
+    rp = run_parse_args(a)
+    testing.expect_streq(rp.err, "--json takes no value", "json value")
 }
 
 fn test_run_env_file_layers() {
@@ -247,6 +443,32 @@ fn test_run_exec_orders_by_rel() {
     testing.expect(len(rep.lines) == 3, "2 req + summary")
     testing.expect(find(rep.lines[0], "PASSED a.posting.yaml") == 0, "a first")
     testing.expect(find(rep.lines[1], "PASSED z/b.posting.yaml") == 0, "z/b second")
+    os.remove_all(dir)
+}
+
+fn test_run_exec_fail_fast_shape() {
+    dir := "/tmp/oxttp-run-ff"
+    os.remove_all(dir)
+    os.mkdir_all(dir)
+    os.writefile_(dir + "/01.bad.posting.yaml", "name: bad\nmethod: GET\nurl: http://x.test/a\ncaptures:\n  NOPE: $.missing\n")
+    os.writefile_(dir + "/02.good.posting.yaml", "name: good\nmethod: GET\nurl: http://x.test/b\n")
+    o := new(RunOpts)
+    o.target = dir
+    o.fail_fast = true
+    fx := FakeSend{resp: fake_resp(200, "application/json", "{}", nil), fail: "", expect_path: ""}
+    rep := run_exec(o, fx)
+    testing.expect(rep.code == 1, "failed run")
+    testing.expect_eq(len(rep.lines), 2, "failure plus summary only")
+    testing.expect(find(rep.lines[0], "FAILED 01.bad.posting.yaml") == 0, "failure line")
+    testing.expect(find(rep.lines[1], "0 passed, 1 failed, 1 skipped") >= 0, "numeric skipped summary")
+    joined := str_join(rep.lines, "")
+    testing.expect(find(joined, "SKIPPED") < 0, "no per-request skipped lines")
+    o.json = true
+    rep = run_exec(o, fx)
+    testing.expect_eq(len(rep.lines), 1, "json report line")
+    testing.expect(find(rep.lines[0], "\"outcome\":\"failed\"") >= 0, "failed result present")
+    testing.expect(find(rep.lines[0], "\"outcome\":\"skipped\"") < 0, "no skipped result object")
+    testing.expect(find(rep.lines[0], "\"skipped\":1") >= 0, "json skipped count")
     os.remove_all(dir)
 }
 
@@ -385,7 +607,7 @@ fn run_oauth_resp(body: str) -> model.Resp {
     hs = push(hs, model.Header{name: "Content-Type", value: "application/json"})
     return model.Resp{status: 200, reason: "OK", headers: hs,
         body: body as []byte, elapsed_ms: 1.0, remote: "", version: "1.1",
-        req_head: "", hops: nil, trace: nil, tls_ver: 0}
+        req_head: "", hops: nil, trace: nil, tls_ver: 0, events: nil, stream_error: ""}
 }
 
 fn (f RunOAuthTransport) send(req: ref model.Req) -> [model.Resp, err] {
@@ -450,5 +672,43 @@ fn test_run_oauth_client_credentials_reuse_and_code_refusal() {
     testing.expect(find(repj.lines[0], "send the request to authorize OAuth in your browser first") >= 0, "json exact safe refusal")
     testing.expect(find(repj.lines[0], "run-oauth-token") < 0, "runtime token never enters json stdout")
     testing.expect(find(repj.lines[0], "OAuth token is kept") < 0, "warning never enters json stdout")
+    os.remove_all(dir)
+}
+
+
+fn test_resp_json_stream_error_and_events() {
+    r := fake_resp(200, "text/event-stream", "data: x\n\n", nil)
+    r.stream_error = "SSE response exceeded 64.00 MB"
+    evs := mkslice(model.StreamEvent, 0)
+    evs = push(evs, model.StreamEvent{at_ms: 1234, kind: 1, title: "", body: "hi" as []byte, content_type: "text/plain", event: "tick", id: "7"})
+    evs = push(evs, model.StreamEvent{at_ms: 1235, kind: 1, title: "", body: mkslice(byte, 0), content_type: "text/plain", event: "empty", id: ""})
+    r.events = new(evs)
+    rq := new(model.Req)
+    rq.method = "GET"
+    rq.url = "http://x.test/sse"
+    j := resp_json(rq, r, 1700000000000)
+    testing.expect(find(j, "\"streamError\":\"SSE response exceeded 64.00 MB\"") >= 0, "streamError emitted")
+    testing.expect(find(j, "\"events\":[") >= 0, "events emitted")
+    testing.expect(find(j, "\"at\":1234") >= 0, "event at")
+    testing.expect(find(j, "\"body\":\"aGk=\"") >= 0, "event body base64")
+    testing.expect(find(j, "\"body\":\"\"") >= 0, "empty event body still emitted")
+    testing.expect(find(j, "\"event\":\"tick\"") >= 0, "event name")
+    testing.expect(find(j, "\"id\":\"7\"") >= 0, "event id")
+}
+
+fn test_run_graphql_payload_errors_pass() {
+    // corpus §1.4: GraphQL payload-level errors are data, not transport
+    // failure. Headless runs pass unless a declared capture fails.
+    dir := "/tmp/oxttp-run-gqlwarn"
+    os.remove_all(dir)
+    os.mkdir_all(dir)
+    os.writefile_(dir + "/q.posting.yaml", "name: q\nkind: graphql\nurl: http://x.test/graphql\ngraphql:\n  query: '{ q }'\n")
+    o := new(RunOpts)
+    o.target = dir
+    fx := FakeSend{resp: fake_resp(200, "application/json", "{\"errors\":[{\"message\":\"bad\"}]}", nil), fail: "", expect_path: ""}
+    rep := run_exec(o, fx)
+    testing.expect(len(rep.err) == 0, "err: " + rep.err)
+    testing.expect(rep.code == 0, "graphql payload errors pass run")
+    testing.expect(find(rep.lines[0], "PASSED q.posting.yaml") == 0, "passed line")
     os.remove_all(dir)
 }

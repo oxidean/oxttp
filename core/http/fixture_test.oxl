@@ -78,6 +78,23 @@ fn fx_conn(c: net.Conn, resp: str, hits: shared) {
     if resp == "<ECHO>" {
         resp = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: " + itoa(len(req)) + "\r\nConnection: close\r\n\r\n" + req
     }
+    if len(resp) >= 7 && substr(resp, 0, 7) == "<QUIET:" {
+        // "<QUIET:n>head|body" writes head immediately, then parks n ms
+        // before body — SSE post-header deadline-lift coverage.
+        end := find(resp, ">")
+        [qms, _qe] = strconv.atoi(substr(resp, 7, end))
+        resp = substr(resp, end + 1, len(resp))
+        cut := find(resp, "|")
+        if cut < 0 {
+            cut = len(resp)
+        }
+        fx_write_all(c, substr(resp, 0, cut) as []byte)
+        msleep(qms)
+        if cut < len(resp) {
+            fx_write_all(c, substr(resp, cut + 1, len(resp)) as []byte)
+        }
+        return
+    }
     if delay > 0 {
         msleep(delay)
     }

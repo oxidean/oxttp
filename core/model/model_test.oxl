@@ -27,7 +27,7 @@ fn test_req_resp_surface() {
     b := r.body as Body.Raw
     testing.expect_streq(b.ctype, "application/json", "raw ctype")
 
-    rp := Resp{status: 200, reason: "OK", headers: h, body: nil, elapsed_ms: 1.5, remote: "127.0.0.1:8080", version: "", hops: nil, req_head: "", trace: nil, tls_ver: 0}
+    rp := Resp{status: 200, reason: "OK", headers: h, body: nil, elapsed_ms: 1.5, remote: "127.0.0.1:8080", version: "", hops: nil, req_head: "", trace: nil, tls_ver: 0, events: nil, stream_error: ""}
     testing.expect_eq(rp.status, 200, "resp status")
     testing.expect(rp.trace == nil, "trace optional")
 

@@ -46,10 +46,10 @@ Updated: 2026-11-26 · pin oxl 0.26.0
 | §6 Environments / captures | `done`/`partial` | S10: env files+layers+switching+substitution; environments.json S11; captures M4 |
 | §7.1 HTTP(+TLS) send | `done` | S10 TUI send via existing H1+TLS path (HTTPS included); WI-0017: `options.proxy_url`→`all:`-scoped proxies + env HTTP(S)_PROXY/NO_PROXY capture under Go httpproxy semantics (CGI guard) in plan_req, both interactive and `run`; DevD — only `http` proxy URLs transport-implemented, `https`/`socks5` proxy schemes error unsupported |
 | §7.1 client certs | `done` | WI-0017: `ssl.certificate_path`/`key_file`/`ca_bundle` fold at send time (interactive + run); DevDs — `ssl.password` undecryptable in oxl 0.26.0 (explicit warning), client certs TLS1.3-only (TLS1.2 negotiation warns, empty cert list) |
-| §7.2 GraphQL | `post` | M4 |
+| §7.2 GraphQL | `done` | M4d: kind lowering + TUI editors; ADR-0054/0055 |
 | §7.3 gRPC | `post` | oxl 0.26.0 `net/grpc` shipped → M4 |
 | §7.4 WebSocket | `post` | oxl 0.26.0 `net/websocket` shipped → M4 |
-| §7.5 SSE | `post` | M4 |
+| §7.5 SSE | `done` | M4d: buffered receive + Messages tab; ADR-0054/0055 |
 | §7.6 OAuth2 | `post` | M4 |
 | §8 Themes / import / remote / tools | `post` | M4 |
 | S8 terminal driver | `done` | ADR-0027 AnsiScreen Session |

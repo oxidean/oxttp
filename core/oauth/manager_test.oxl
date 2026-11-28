@@ -23,7 +23,7 @@ fn seq_resp(status: int, ctype: str, body: str) -> model.Resp {
     if len(ctype) > 0 {
         hs = push(hs, model.Header{name: "Content-Type", value: ctype})
     }
-    return model.Resp{status: status, reason: "", headers: hs, body: body as []byte, elapsed_ms: 0.0, remote: "", version: "", req_head: "", hops: nil, trace: nil, tls_ver: 0}
+    return model.Resp{status: status, reason: "", headers: hs, body: body as []byte, elapsed_ms: 0.0, remote: "", version: "", req_head: "", hops: nil, trace: nil, tls_ver: 0, events: nil, stream_error: ""}
 }
 
 fn (f SeqTransport) send(req: ref model.Req) -> [model.Resp, err] {

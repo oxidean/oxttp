@@ -79,7 +79,7 @@ struct FlowTokenTransport {
 fn flow_resp(body: str) -> model.Resp {
     let hs: []model.Header = nil
     hs = push(hs, model.Header{name: "Content-Type", value: "application/json"})
-    return model.Resp{status: 200, reason: "OK", headers: hs, body: body as []byte, elapsed_ms: 0.0, remote: "", version: "", req_head: "", hops: nil, trace: nil, tls_ver: 0}
+    return model.Resp{status: 200, reason: "OK", headers: hs, body: body as []byte, elapsed_ms: 0.0, remote: "", version: "", req_head: "", hops: nil, trace: nil, tls_ver: 0, events: nil, stream_error: ""}
 }
 
 fn (f FlowTokenTransport) send(req: ref model.Req) -> [model.Resp, err] {

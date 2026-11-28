@@ -269,6 +269,18 @@ fn env_file_list(dirs: []str, specs: []str) -> own EnvFiles {
 // file sharing the name must not shadow the env stack (corpus §6.1
 // resolves --env file-or-name; the switcher is name-typed).
 fn env_file_list_mode(dirs: []str, specs: []str, files_ok: bool) -> own EnvFiles {
+    probe := ""
+    if files_ok && len(dirs) > 0 {
+        probe = dirs[0]
+    }
+    return env_file_list_probe(probe, dirs, specs, files_ok)
+}
+
+// env_file_list_probe — env_file_list_mode with the file-spec probe
+// dir decoupled from the named-env search dirs: `posting run` probes
+// file specs against the CWD but resolves names in the collection
+// root only (upstream environmentFiles(specs, []string{root})).
+fn env_file_list_probe(probe: str, dirs: []str, specs: []str, files_ok: bool) -> own EnvFiles {
     r := new(EnvFiles)
     r.files = mkslice(str, 0)
     if len(specs) == 0 {
@@ -284,12 +296,12 @@ fn env_file_list_mode(dirs: []str, specs: []str, files_ok: bool) -> own EnvFiles
         if len(e) == 0 {
             continue
         }
-        // file specs resolve against dirs[0] (the app cwd) so the
-        // probe is honest off-process-cwd too — absolute paths pass
-        // through untouched.
+        // file specs resolve against the probe dir (app cwd / run
+        // cwd) so the probe is honest off-process-cwd too — absolute
+        // paths pass through untouched.
         fp := e
-        if files_ok && len(dirs) > 0 && find(e, "/") != 0 {
-            fp = dirs[0] + "/" + e
+        if files_ok && len(probe) > 0 && find(e, "/") != 0 {
+            fp = probe + "/" + e
         }
         if files_ok && os.exists(fp) && !os.isdir(fp) {
             r.files = push(r.files, os.fullpath(fp))
@@ -1130,7 +1142,15 @@ fn ext_apply_edit(a: mut App, f: str, tab: int) {
     }
     text := os.readfile_(f)
     cur := ""
-    if tab == a.cur_tab {
+    gql_target := 0
+    if tab == a.cur_tab && a.kind == KGraphql {
+        gql_target = gql_text_view(a)
+    }
+    if gql_target == 1 {
+        cur = join_lines(a.gql_query.lines)
+    } else if gql_target == 2 {
+        cur = join_lines(a.gql_vars.lines)
+    } else if tab == a.cur_tab {
         cur = join_lines(a.body.lines)
     } else {
         cur = join_lines(a.tabs[tab].draft.body.lines)
@@ -1138,7 +1158,11 @@ fn ext_apply_edit(a: mut App, f: str, tab: int) {
     if text == cur {
         return
     }
-    if tab == a.cur_tab {
+    if gql_target == 1 {
+        a.gql_query = new_text_view(text)
+    } else if gql_target == 2 {
+        a.gql_vars = new_text_view(text)
+    } else if tab == a.cur_tab {
         a.body = new_text_view(text)
     } else {
         a.tabs[tab].draft.body = new_text_view(text)
@@ -1903,6 +1927,15 @@ fn mline_action(a: mut App, m: int, act: str) {
 fn body_text_for(a: ref App) -> str {
     if a.focus == FRespPane {
         return join_lines(a.resp_view.lines)
+    }
+    if a.focus == FReqPane && a.kind == KGraphql {
+        which := gql_text_view(a)
+        if which == 1 {
+            return join_lines(a.gql_query.lines)
+        }
+        if which == 2 {
+            return join_lines(a.gql_vars.lines)
+        }
     }
     return join_lines(a.body.lines)
 }

@@ -61,7 +61,39 @@ fn test_dotenv_refs_prior_layer() {
     testing.expect(e == nil, "parses")
     testing.expect_streq(p.vars[0].value, "9", "prior layer ref")
     testing.expect_streq(p.vars[1].value, "9x", "same-file chain")
-    testing.expect_streq(p.vars[2].value, "${NOPE}", "unresolved literal")
+    testing.expect_streq(p.vars[2].value, "", "unresolved expands empty")
+}
+
+fn test_dotenv_escaped_quotes_and_backslashes() {
+    q := chr(34)
+    sq := chr(39)
+    bs := chr(92)
+    src := "HOST=h\n" +
+        "URL=" + q + "${HOST}/a" + bs + q + "b" + q + "\n" +
+        "SQ=" + sq + "can" + bs + sq + "t" + sq + "\n" +
+        "BS=" + sq + "a" + bs + bs + "b" + sq + "\n"
+    prior := new(EnvSet)
+    [p, e] = parse_dotenv(src, prior)
+    testing.expect(e == nil, "parses escaped quotes")
+    testing.expect_eq(len(p.vars), 4, "four vars")
+    if len(p.vars) == 4 {
+        testing.expect_streq(p.vars[1].value, "h/a" + q + "b", "escaped double quote retained")
+        testing.expect_streq(p.vars[2].value, "can" + sq + "t", "escaped single quote retained")
+        testing.expect_streq(p.vars[3].value, "a" + bs + "b", "escaped backslash retained")
+    }
+}
+
+fn test_dotenv_template_literal_dollar_and_reference() {
+    sq := chr(39)
+    q := chr(34)
+    src := "LIT=" + sq + "${HOST}" + sq + "\nREF=" + q + "${HOST}/x" + q + "\n"
+    [p, e] = parse_dotenv_templates(src)
+    testing.expect(e == nil, "template parse")
+    testing.expect_eq(len(p.vars), 2, "two template vars")
+    if len(p.vars) == 2 {
+        testing.expect_streq(p.vars[0].value, "$${HOST}", "literal dollar escaped for templates")
+        testing.expect_streq(p.vars[1].value, "${HOST}/x", "reference retained")
+    }
 }
 
 fn test_dotenv_posting_warns() {
@@ -212,4 +244,29 @@ fn test_dotenv_expansion_limits() {
     }
     [_p, e] = parse_dotenv(text, new(EnvSet))
     testing.expect(e != nil, "expansion bomb rejected")
+}
+
+fn test_substitute_braced() {
+    // WI-0020 §7.2: GraphQL query documents substitute ${NAME} only —
+    // $name is a GraphQL variable, $$ still collapses, ${$gen} works,
+    // unresolved refs pass through literally (upstream SubstituteBraced).
+    s := set_with(strs2("USER_ID", "TOK"), strs2("42", "sekret"))
+    [r, e] = substitute_braced("query($id: ID!) { user(id: $id) { name } }", s)
+    testing.expect(e == nil, "braced ok")
+    testing.expect_streq(r, "query($id: ID!) { user(id: $id) { name } }", "$name untouched")
+    [r2, e2] = substitute_braced("{ u(id: ${USER_ID}) }", s)
+    testing.expect(e2 == nil, "braced expand")
+    testing.expect_streq(r2, "{ u(id: 42) }", "${NAME} expanded")
+    [r3, e3] = substitute_braced("a $$ b ${MISSING} c", s)
+    testing.expect(e3 == nil, "braced passthrough")
+    testing.expect_streq(r3, "a $ b ${MISSING} c", "$$ collapses, missing literal")
+    [r4, e4] = substitute_braced("${$uuid}", s)
+    testing.expect(e4 == nil, "braced gen")
+    testing.expect(len(r4) > 4, "uuid emitted")
+    // the real distinction: $NAME expands under full substitute,
+    // stays literal under braced (GraphQL $vars are not Posting vars)
+    [r5, _e5] = substitute_braced("$USER_ID", s)
+    testing.expect_streq(r5, "$USER_ID", "braced leaves $NAME literal")
+    [r6, _e6] = substitute("$USER_ID", s, false)
+    testing.expect_streq(r6, "42", "full expands $NAME")
 }

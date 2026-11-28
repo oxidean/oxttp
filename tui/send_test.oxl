@@ -49,7 +49,8 @@ fn fake_resp(status: int, ct: str, body: str, hops: own []model.Hop) -> model.Re
     tr.closed_ms = 0.1
     return model.Resp{status: status, reason: "OK", headers: hs,
         body: body as []byte, elapsed_ms: 14.0, remote: "127.0.0.1:9",
-        version: "1.1", req_head: "", hops: hops, trace: tr, tls_ver: 0}
+        version: "1.1", req_head: "", hops: hops, trace: tr, tls_ver: 0,
+        events: nil, stream_error: ""}
 }
 
 // stage_send arms a.pending/a.pending_preq the way begin_send leaves
@@ -71,13 +72,36 @@ fn test_begin_send_plan_err() {
     testing.expect_eq(len(a.toasts), 1, "error toast")
     testing.expect_eq(a.toasts[0].level, 2, "send errors are error toasts")
     testing.expect(a.pending == nil, "no pending req")
-    // kind degrades through plan_req (graphql/grpc/ws sends are M4)
+    // graphql is a sendable HTTP-carried kind (WI-0020): the editor
+    // fields lower to the upstream JSON document POST.
     a2 := new_app()
     a2.kind = KGraphql
-    a2.url.text = "http://x"
+    a2.url.text = "http://x/graphql"
+    a2.gql_query = new_text_view("query Q($id: ID!) { u(id: $id) }")
+    a2.gql_vars = new_text_view("{\"id\": \"1\"}")
+    a2.gql_op = new_line_edit("Q")
     fx2 := begin_send(a2)
-    testing.expect_eq(fx2, ENone, "kind send degrades")
-    testing.expect(str_contains(a2.toasts[0].msg, "M4"), "kind toast names M4")
+    testing.expect_eq(fx2, ESend, "graphql send plans")
+    testing.expect_streq(a2.pending.method, "POST", "graphql method POST")
+    grb := a2.pending.body as model.Body.Raw
+    testing.expect_streq(grb.ctype, "application/json", "graphql ctype")
+    testing.expect_streq(grb.text, "{\"query\":\"query Q($id: ID!) { u(id: $id) }\",\"variables\":{\"id\":\"1\"},\"operationName\":\"Q\"}", "graphql document exact")
+    gacc := ""
+    gi := 0
+    for gi < len(a2.pending.headers) {
+        if lower_ascii(a2.pending.headers[gi].name) == "accept" {
+            gacc = a2.pending.headers[gi].value
+        }
+        gi = gi + 1
+    }
+    testing.expect_streq(gacc, "application/graphql-response+json, application/json", "graphql accept")
+    // grpc/websocket still degrade through plan_req.
+    a3 := new_app()
+    a3.kind = KGrpc
+    a3.url.text = "http://x"
+    fx3 := begin_send(a3)
+    testing.expect_eq(fx3, ENone, "grpc send degrades")
+    testing.expect(str_contains(a3.toasts[0].msg, "M4"), "kind toast names M4")
 }
 
 fn test_begin_send_ok() {
@@ -263,6 +287,106 @@ fn test_history_open_and_delete() {
     hist_delete(a)
     testing.expect_eq(len(a.history), 1, "entry removed")
     testing.expect_streq(a.history[0].url, "http://x/one", "oldest survives")
+}
+
+fn test_graphql_draft_load_and_snapshot() {
+    // draft_from_request fills the GraphQL widgets; draft capture/restore
+    // keeps them independent across tab switches.
+    r := new(collection.PRequest)
+    r.url = "http://x/graphql"
+    r.method = "" // missing methods normalize to POST for graphql
+    r.kind = "graphql"
+    g := new(collection.PGraphQL)
+    g.query = "query Q { viewer { id } }"
+    g.variables = "{\"id\": \"7\"}"
+    g.operation_name = "Q"
+    r.graphql = g
+    d := draft_from_request(r, "")
+    a := new_app()
+    draft_restore(a, d)
+    testing.expect_eq(a.kind, KGraphql, "kind restored")
+    testing.expect_streq(a.method, "POST", "graphql method normalized")
+    testing.expect_streq(join_lines(a.gql_query.lines), "query Q { viewer { id } }", "query widget filled")
+    testing.expect_streq(join_lines(a.gql_vars.lines), "{\"id\": \"7\"}", "variables widget filled")
+    testing.expect_streq(a.gql_op.text, "Q", "operation widget filled")
+    snap := draft_capture(a)
+    a.gql_query = new_text_view("mutation M { x }")
+    a.gql_vars = new_text_view("{}")
+    a.gql_op = new_line_edit("M")
+    draft_restore(a, snap)
+    testing.expect_streq(join_lines(a.gql_query.lines), "query Q { viewer { id } }", "snapshot restores query")
+    testing.expect_streq(join_lines(a.gql_vars.lines), "{\"id\": \"7\"}", "snapshot restores variables")
+    testing.expect_streq(a.gql_op.text, "Q", "snapshot restores operation")
+    out := draft_to_request(a)
+    testing.expect_streq(out.method, "", "draft_to_request omits the kindless method field")
+    testing.expect(out.graphql != nil, "graphql payload rebuilt")
+    testing.expect_streq(out.graphql.query, "query Q { viewer { id } }", "draft_to_request query")
+    testing.expect(out.body == nil || !out.body.has_content, "graphql does not write an http body")
+}
+
+fn test_install_resp_graphql_warning_and_events() {
+    a := new_app()
+    a.kind = KGraphql
+    stage_send(a, "http://x/graphql")
+    evs := mkslice(model.StreamEvent, 0)
+    evs = push(evs, model.StreamEvent{at_ms: 1700000000123, kind: 2, title: "Stream connected", body: nil, content_type: "", event: "", id: ""})
+    evs = push(evs, model.StreamEvent{at_ms: 1700000001123, kind: 1, title: "", body: "line one" as []byte, content_type: "text/plain", event: "tick", id: "7"})
+    r := fake_resp(200, "text/event-stream", "{\"errors\":[{\"message\":\"bad\"}]}", nil)
+    r.events = new(evs)
+    install_resp(a, r, "http://x/graphql")
+    testing.expect_eq(a.resp_class, 3, "graphql errors are warning class")
+    testing.expect(find(a.resp_title, "1 error") >= 0, "warning count in title")
+    testing.expect_eq(len(a.msg_rows), 2, "message rows installed")
+    testing.expect_streq(resp_tab_label(a, 0), "Events", "SSE tab label")
+    testing.expect_eq(a.resp_rows.sel, 1, "follows latest row")
+    testing.expect(a.msg_following, "install follows latest")
+    testing.expect(str_contains(a.msg_rows[1], "tick · line one"), "row preview")
+    // moving the cursor unfollows; f re-pins to latest.
+    a.focus = FRespPane
+    a.resp_tab = 0
+    dispatch(a, knamed(term.KeyUp))
+    testing.expect(!a.msg_following, "cursor move unfollows")
+    dispatch(a, kev("f", false, false, false))
+    testing.expect(a.msg_following, "f follows latest")
+    testing.expect_eq(a.resp_rows.sel, 1, "f reselects latest")
+    // enter inspects the selected event; escape restores the raw body view.
+    dispatch(a, knamed(term.KeyEnter))
+    testing.expect_eq(a.msg_detail, 1, "enter opens detail")
+    detail := join_lines(a.resp_view.lines)
+    testing.expect(str_contains(detail, "↓ Received · #2"), "detail kind/index header")
+    testing.expect(str_contains(detail, "tick · ID: 7"), "detail metadata")
+    testing.expect(str_contains(detail, "line one"), "detail body")
+    dispatch(a, knamed(term.KeyEscape))
+    testing.expect_eq(a.msg_detail, -1, "escape returns to log")
+    testing.expect(str_contains(join_lines(a.resp_view.lines), "errors"), "body restored")
+    // events on a non-event-stream response use the upstream Messages label.
+    evs2 := mkslice(model.StreamEvent, 0)
+    evs2 = push(evs2, model.StreamEvent{at_ms: 1, kind: 2, title: "note", body: nil, content_type: "", event: "", id: ""})
+    r2 := fake_resp(200, "text/plain", "ok", nil)
+    r2.events = new(evs2)
+    install_resp(a, r2, "http://x/graphql")
+    testing.expect_streq(resp_tab_label(a, 0), "Messages", "non-SSE tab label")
+    // upstream StatusOf: stream errors warn even when the HTTP status is 2xx.
+    r3 := fake_resp(200, "text/event-stream", "data: x\n\n", nil)
+    r3.stream_error = "SSE response exceeded 64.00 MB"
+    install_resp(a, r3, "http://x/graphql")
+    testing.expect_eq(a.resp_class, 3, "stream interruption is warning class")
+    testing.expect(find(a.resp_title, "Stream interrupted") >= 0, "stream interruption in title")
+}
+
+fn test_msg_time_and_rows_format() {
+    // WI-0020 deviation: std/time has no local-time conversion, so the
+    // row clock is UTC (documented in ADR-0054/spec).
+    testing.expect_streq(msg_time(1700000000123), "22:13:20.123", "HH:MM:SS.mmm")
+    ev := model.StreamEvent{at_ms: 1700000000123, kind: 1, title: "", body: "hello   \n world" as []byte, content_type: "text/plain", event: "tick", id: ""}
+    rows := build_msg_rows(new(mkslice(model.StreamEvent, 0)))
+    testing.expect_eq(len(rows), 0, "nil-ish rows empty")
+    evs := mkslice(model.StreamEvent, 0)
+    evs = push(evs, ev)
+    rows = build_msg_rows(new(evs))
+    testing.expect_eq(len(rows), 1, "one row")
+    testing.expect(str_contains(rows[0], "↓ tick · hello world"), "collapsed preview")
+    testing.expect(str_contains(rows[0], "22:13:20.123"), "timestamp")
 }
 
 fn test_send_failed_via_dispatch() {
@@ -584,7 +708,7 @@ fn oauth_fake_resp(body: str) -> model.Resp {
     hs = push(hs, model.Header{name: "Content-Type", value: "application/json"})
     return model.Resp{status: 200, reason: "OK", headers: hs,
         body: body as []byte, elapsed_ms: 1.0, remote: "127.0.0.1:9",
-        version: "1.1", req_head: "", hops: nil, trace: nil, tls_ver: 0}
+        version: "1.1", req_head: "", hops: nil, trace: nil, tls_ver: 0, events: nil, stream_error: ""}
 }
 
 fn (f FakeOAuthTransport) send(req: ref model.Req) -> [model.Resp, err] {
