@@ -2365,17 +2365,21 @@ fn fcmp_eval(op: int, l: PVal, r: PVal, root: ref JVal) -> bool {
     if op == OP_NE {
         return !pv_eq(l, r, root)
     }
+    // RFC 9535 ordering: a > b is b < a; equality implies the
+    // inclusive forms (including two missing operands). pv_less only
+    // orders numbers/strings, so containers and booleans never gain
+    // a strict ordering by accident.
     if op == OP_LT {
-        return pv_same_type(l, r, root) && pv_less(l, r, root)
+        return pv_less(l, r, root)
     }
     if op == OP_LE {
-        return pv_same_type(l, r, root) && (pv_less(l, r, root) || pv_eq(l, r, root))
+        return pv_less(l, r, root) || pv_eq(l, r, root)
     }
     if op == OP_GT {
-        return pv_same_type(l, r, root) && !pv_less(l, r, root) && !pv_eq(l, r, root)
+        return pv_less(r, l, root)
     }
     if op == OP_GE {
-        return pv_same_type(l, r, root) && !pv_less(l, r, root)
+        return pv_less(r, l, root) || pv_eq(l, r, root)
     }
     return false
 }
@@ -2520,50 +2524,127 @@ fn jemit_path(root: ref JVal, p: JPath) -> str {
     return b as str
 }
 
-fn jemit_path_into(root: ref JVal, p: JPath, b: []byte) -> []byte {
-    kind := jwalk(root, p)
-    if kind < 0 || kind == 0 {
+struct JObjEnt { key: str, text: str }
+
+fn jobjent_lt(a: JObjEnt, b: JObjEnt) -> bool {
+    return a.key < b.key
+}
+
+// jemit_node serializes the already-resolved node directly. Object
+// emission keeps Go's byte-lexicographic key order and duplicate-key
+// last-wins semantics without resolving every child back from the
+// document root (linear child enumeration, not quadratic path scans).
+fn jemit_node(cur: ref JVal, b: []byte) -> []byte {
+    if cur.kind == 0 {
         return bpush(b, "null")
     }
-    if kind == 1 {
-        if jbool_at(root, p) == 1 {
+    if cur.kind == 1 {
+        if cur.b {
             return bpush(b, "true")
         }
         return bpush(b, "false")
     }
-    if kind == 2 {
-        return bpush(b, jnum_at(root, p))
+    if cur.kind == 2 {
+        return bpush(b, cur.s)
     }
-    if kind == 3 {
+    if cur.kind == 3 {
         b = push(b, 34)
-        b = jesc_into(b, jstr_at(root, p))
+        b = jesc_into(b, cur.s)
         return push(b, 34)
     }
-    kids := jchild_paths(root, p)
-    if kind == 4 {
-        kids = jsort_obj_paths(kids)
-        b = push(b, 123)
-    } else {
+    if cur.kind == 5 {
         b = push(b, 91)
+        first := true
+        m := cur.child
+        for m != nil {
+            if !first {
+                b = push(b, 44)
+            }
+            first = false
+            b = jemit_node(m, b)
+            m = m.next
+        }
+        return push(b, 93)
     }
+    // object: record each key's final document position, then serialize
+    // only surviving members in that same single pass. Sort the finished
+    // entries by key for Go encoding/json output order.
+    seen := collections.map_new()
+    pos := 0
+    m := cur.child
+    for m != nil {
+        collections.map_set(seen, m.key, pos)
+        pos = pos + 1
+        m = m.next
+    }
+    entries := mkslice(JObjEnt, 0)
+    pos = 0
+    m = cur.child
+    for m != nil {
+        [last, le] = collections.map_get(seen, m.key)
+        if le == nil && last == pos {
+            eb := mkslice(byte, 0)
+            eb = jemit_node(m, eb)
+            entries = push(entries, JObjEnt{key: m.key, text: eb as str})
+        }
+        pos = pos + 1
+        m = m.next
+    }
+    sort.sortfn(entries, jobjent_lt)
+    b = push(b, 123)
     i := 0
-    for i < len(kids) {
+    for i < len(entries) {
         if i > 0 {
             b = push(b, 44)
         }
-        if kind == 4 {
-            // member key = last step name
-            st := kids[i].steps[len(kids[i].steps) - 1]
-            b = push(b, 34)
-            b = jesc_into(b, st.name)
-            b = push(b, 34)
-            b = push(b, 58)
-        }
-        b = jemit_path_into(root, kids[i], b)
+        b = push(b, 34)
+        b = jesc_into(b, entries[i].key)
+        b = push(b, 34)
+        b = push(b, 58)
+        b = bpush(b, entries[i].text)
         i = i + 1
     }
-    if kind == 4 {
-        return push(b, 125)
+    return push(b, 125)
+}
+
+// jemit_path_rec resolves p once while descending, then emits the node
+// directly. Missing trailing/intermediate nodes emit null, preserving
+// jemit_path's existing capture contract.
+fn jemit_path_rec(cur: ref JVal, p: JPath, off: int, b: []byte) -> []byte {
+    if off >= len(p.steps) {
+        return jemit_node(cur, b)
     }
-    return push(b, 93)
+    st := p.steps[off]
+    nxt := new(JVal)
+    found := false
+    if st.is_idx {
+        n := 0
+        m := cur.child
+        for m != nil {
+            if n == st.idx {
+                nxt = m
+                found = true
+                break
+            }
+            n = n + 1
+            m = m.next
+        }
+    } else {
+        m := cur.child
+        for m != nil {
+            if m.key == st.name {
+                nxt = m
+                found = true
+            }
+            m = m.next
+        }
+    }
+    if !found {
+        return bpush(b, "null")
+    }
+    return jemit_path_rec(nxt, p, off + 1, b)
+}
+
+fn jemit_path_into(root: ref JVal, p: JPath, b: []byte) -> []byte {
+    return jemit_path_rec(root, p, 0, b)
 }

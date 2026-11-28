@@ -251,6 +251,14 @@ fn test_capture_quoted_empty_key_and_mixed_union() {
 fn test_capture_missing_value_comparison() {
     body := "{\"items\":[{\"id\":1},{\"id\":2,\"x\":1}]}"
     expect_val(body, "$.items[?(@.x != 1)].id", "1")
+    // RFC 9535: equality implies <= and >=, even when both operands
+    // are missing; strict ordering never appears for non-orderable types.
+    expect_val("[{\"id\":1}]", "$[?(@.missing <= @.also_missing)].id", "1")
+    expect_val("[{\"id\":1}]", "$[?(@.missing >= @.also_missing)].id", "1")
+    expect_val("[{\"id\":1,\"a\":[1],\"b\":[1]}]", "$[?(@.a <= @.b)].id", "1")
+    expect_val("[{\"id\":1,\"a\":2,\"b\":1}]", "$[?(@.a > @.b)].id", "1")
+    expect_err("[{\"id\":1,\"a\":true,\"b\":false}]", "$[?@.a > @.b].id")
+    expect_err("[{\"id\":1,\"a\":[1],\"b\":[1]}]", "$[?@.a > @.b].id")
 }
 
 fn test_capture_object_emit_sorts_keys() {
@@ -286,6 +294,22 @@ fn test_wide_object_capture_completes() {
     [out, e] = capture_values(caps, bs)
     testing.expect(e == nil, "wide object captures")
     testing.expect_eq(len(out), 1, "wide object count")
+    // root array emission likewise resolves once and streams children
+    // in order — regression coverage for the quadratic child-path scans.
+    ab := mkslice(byte, 0)
+    ab = push(ab, 91)
+    i = 0
+    for i < 3000 {
+        if i > 0 {
+            ab = push(ab, 44)
+        }
+        ab = bpush(ab, itoa(i))
+        i = i + 1
+    }
+    ab = push(ab, 93)
+    [out2, e2] = capture_values(caps, ab)
+    testing.expect(e2 == nil, "wide array captures")
+    testing.expect_eq(len(out2), 1, "wide array count")
 }
 
 
