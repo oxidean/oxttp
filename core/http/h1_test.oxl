@@ -14,7 +14,7 @@ import "std/encoding/base64"
 import "github.com/oxidean/oxttp/core/model"
 
 fn rq(method: str, u: str) -> own model.Req {
-    return new(model.Req{method: method, url: u, headers: nil, body: model.Body.Empty, timeout_ms: 0, follow: false, max_redirects: 10, httpver: "", synth: nil, verify: "", jar_off: false, h2: "", ssl_min: 0, ssl_max: 0, cert_pem: "", key_pem: "", proxies: nil, proxy_env: nil, no_proxy: "", proxy_go: false, cgi: false})
+    return new(model.Req{method: method, url: u, headers: nil, body: model.Body.Empty, timeout_ms: 0, follow: false, max_redirects: 10, httpver: "", synth: nil, verify: "", jar_off: false, h2: "", ssl_min: 0, ssl_max: 0, cert_pem: "", key_pem: "", proxies: nil, proxy_env: nil, no_proxy: "", proxy_go: false, cgi: false, max_body_bytes: 0})
 }
 
 fn hs1(n: str, v: str) -> []model.Header {
@@ -305,7 +305,7 @@ fn test_redirect_strips_headers() {
     r := rq("GET", f.url() + "/a")
     r.follow = true
     let hs: []model.Header = nil
-    hs = push(hs, model.Header{name: "Authorization", value: "Basic x"})
+    hs = push(hs, model.Header{name: "Authorization", value: "Bearer oauth-test-token"})
     hs = push(hs, model.Header{name: "Signature", value: "sig"})
     hs = push(hs, model.Header{name: "X-Keep", value: "k"})
     r.headers = hs
@@ -316,7 +316,7 @@ fn test_redirect_strips_headers() {
     }
     b := resp.body as str
     testing.expect(find(b, "Signature:") < 0, "signature always stripped")
-    testing.expect(find(b, "Authorization:") >= 0, "auth kept same-origin")
+    testing.expect(find(b, "Authorization:") >= 0, "bearer kept same-origin")
     testing.expect(find(b, "X-Keep:") >= 0, "custom kept")
 }
 
@@ -332,7 +332,7 @@ fn test_redirect_cross_origin() {
     r := rq("GET", f1.url() + "/a")
     r.follow = true
     let hs: []model.Header = nil
-    hs = push(hs, model.Header{name: "Authorization", value: "Basic x"})
+    hs = push(hs, model.Header{name: "Authorization", value: "Bearer oauth-test-token"})
     hs = push(hs, model.Header{name: "Cookie", value: "c=1"})
     r.headers = hs
     [resp, e] = request(r)
@@ -341,7 +341,7 @@ fn test_redirect_cross_origin() {
         return
     }
     b := resp.body as str
-    testing.expect(find(b, "Authorization:") < 0, "auth stripped cross-origin")
+    testing.expect(find(b, "Authorization:") < 0, "bearer stripped cross-origin")
     testing.expect(find(b, "Cookie:") < 0, "cookie stripped cross-origin")
     testing.expect_eq(sget(f2.hits), 1, "landed on f2")
 }
@@ -1021,4 +1021,40 @@ fn test_proxy_go_cgi_send_error() {
         testing.expect(find(errors.msg(e), "refusing to use HTTP_PROXY") >= 0, "cgi error text: " + errors.msg(e))
     }
     testing.expect_eq(sget(f.hits), 0, "proxy never dialed under cgi")
+}
+
+fn test_max_body_bytes_content_length_cap() {
+    body := "01234567890"
+    s := "HTTP/1.1 200 OK\r\nContent-Length: " + itoa(len(body)) + "\r\n\r\n" + body
+    f := fx_start(one(s))
+    defer f.stop()
+    r := rq("GET", f.url() + "/")
+    r.max_body_bytes = 4
+    [_resp, e] = request(r)
+    testing.expect(e != nil, "declared oversized body fails")
+    if e != nil {
+        testing.expect(find(errors.msg(e), "response body exceeds 4 byte limit") >= 0, "cap error text: " + errors.msg(e))
+    }
+}
+
+fn test_max_body_bytes_chunked_cap_and_uncapped_legacy() {
+    s := "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n3\r\ndef\r\n0\r\n\r\n"
+    sc := mkslice(str, 2)
+    sc[0] = s
+    sc[1] = s
+    f := fx_start(sc)
+    defer f.stop()
+    r := rq("GET", f.url() + "/")
+    r.max_body_bytes = 5
+    [_resp, e] = request(r)
+    testing.expect(e != nil, "streamed oversized body fails")
+    if e != nil {
+        testing.expect(find(errors.msg(e), "response body exceeds 5 byte limit") >= 0, "stream cap text: " + errors.msg(e))
+    }
+    r2 := rq("GET", f.url() + "/")
+    [resp2, e2] = request(r2)
+    testing.expect(e2 == nil, "zero cap preserves uncapped behavior")
+    if e2 == nil {
+        testing.expect_streq(resp2.body as str, "abcdef", "uncapped body unchanged")
+    }
 }

@@ -14,6 +14,7 @@ import "github.com/oxidean/oxttp/core/collection"
 import "github.com/oxidean/oxttp/core/env"
 import "github.com/oxidean/oxttp/core/http"
 import "github.com/oxidean/oxttp/core/model"
+import "github.com/oxidean/oxttp/core/oauth"
 import "github.com/oxidean/oxttp/core/term"
 import "github.com/oxidean/oxttp/core/yaml"
 import "github.com/oxidean/oxttp/shared/version"
@@ -431,6 +432,222 @@ fn kv_from(rows: []model.KV) -> KVTable {
     return t
 }
 
+// ---------- OAuth auth editor ----------
+
+fn oauth_grant_label(v: str) -> str {
+    if v == "client_credentials" {
+        return "Client credentials"
+    }
+    if v == "authorization_code" {
+        return "Code + PKCE"
+    }
+    // Unknown file values stay visible verbatim so validation can reject
+    // them; they must not be silently rewritten into a valid default.
+    return v
+}
+
+fn oauth_grant_yaml(v: str) -> str {
+    if v == "Client credentials" {
+        return "client_credentials"
+    }
+    if v == "Code + PKCE" {
+        return "authorization_code"
+    }
+    // Raw enum values round-trip exactly, including invalid ones. Validation
+    // owns rejection; the editor must not materialize a default over them.
+    return v
+}
+
+fn oauth_clientauth_label(v: str) -> str {
+    if v == "client_secret_basic" {
+        return "Basic header"
+    }
+    if v == "client_secret_post" {
+        return "Body"
+    }
+    return v
+}
+
+fn oauth_clientauth_yaml(v: str) -> str {
+    if v == "Basic header" {
+        return "client_secret_basic"
+    }
+    if v == "Body" {
+        return "client_secret_post"
+    }
+    return v
+}
+
+fn oauth_row(rows: []KVRow, name: str, value: str) -> KVRow {
+    return KVRow{name: name, value: value, enabled: true}
+}
+
+fn oauth_table_value(rows: []KVRow, name: str) -> str {
+    i := 0
+    for i < len(rows) {
+        if rows[i].name == name {
+            return rows[i].value
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn oauth_row_present(rows: []KVRow, name: str) -> bool {
+    i := 0
+    for i < len(rows) {
+        if rows[i].name == name {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// oauth_hidden_value reads the backing copy used when a conditional row is
+// not visible. Visible rows still win at save/send time because they are the
+// user's newest edit.
+fn oauth_hidden_value(a: ref App, name: str) -> str {
+    if name == "type" { return a.oauth_h_type }
+    if name == "grant_type" { return a.oauth_h_grant }
+    if name == "authorization_url" { return a.oauth_h_auth_url }
+    if name == "token_url" { return a.oauth_h_token_url }
+    if name == "client_id" { return a.oauth_h_client_id }
+    if name == "client_secret" { return a.oauth_h_client_secret }
+    if name == "scope" { return a.oauth_h_scope }
+    if name == "redirect_uri" { return a.oauth_h_redirect }
+    if name == "client_auth" { return a.oauth_h_client_auth }
+    return ""
+}
+
+fn oauth_value(a: ref App, name: str) -> str {
+    if oauth_row_present(a.oauth_kv.rows, name) {
+        return oauth_table_value(a.oauth_kv.rows, name)
+    }
+    return oauth_hidden_value(a, name)
+}
+
+fn oauth_sync_hidden(a: mut App) {
+    names := mkslice(str, 0)
+    names = push(names, "type")
+    names = push(names, "grant_type")
+    names = push(names, "authorization_url")
+    names = push(names, "token_url")
+    names = push(names, "client_id")
+    names = push(names, "client_secret")
+    names = push(names, "scope")
+    names = push(names, "redirect_uri")
+    names = push(names, "client_auth")
+    i := 0
+    for i < len(names) {
+        n := names[i]
+        if !oauth_row_present(a.oauth_kv.rows, n) {
+            i = i + 1
+            continue
+        }
+        v := oauth_table_value(a.oauth_kv.rows, n)
+        if n == "type" { a.oauth_h_type = v }
+        if n == "grant_type" { a.oauth_h_grant = v }
+        if n == "authorization_url" { a.oauth_h_auth_url = v }
+        if n == "token_url" { a.oauth_h_token_url = v }
+        if n == "client_id" { a.oauth_h_client_id = v }
+        if n == "client_secret" { a.oauth_h_client_secret = v }
+        if n == "scope" { a.oauth_h_scope = v }
+        if n == "redirect_uri" { a.oauth_h_redirect = v }
+        if n == "client_auth" { a.oauth_h_client_auth = v }
+        i = i + 1
+    }
+}
+
+// oauth_rebuild projects the fixed backing values into the conditional form:
+// only the type selector for non-OAuth drafts; code-only URL rows disappear
+// for client credentials. Values are never discarded when hidden.
+fn oauth_rebuild(a: mut App) {
+    oauth_sync_hidden(a)
+    typ := a.oauth_h_type
+    if len(typ) == 0 {
+        typ = "none"
+    }
+    rows := mkslice(KVRow, 0)
+    rows = push(rows, oauth_row(rows, "type", typ))
+    if lower_ascii(typ) == "oauth2" || lower_ascii(typ) == "oauth 2.0" {
+        grant := a.oauth_h_grant
+        if len(grant) == 0 {
+            grant = "Code + PKCE"
+        }
+        rows = push(rows, KVRow{name: "grant_type", value: grant, enabled: true})
+        if oauth_grant_yaml(grant) == "authorization_code" {
+            rows = push(rows, KVRow{name: "authorization_url", value: a.oauth_h_auth_url, enabled: true})
+        }
+        rows = push(rows, KVRow{name: "token_url", value: a.oauth_h_token_url, enabled: true})
+        rows = push(rows, KVRow{name: "client_id", value: a.oauth_h_client_id, enabled: true})
+        rows = push(rows, KVRow{name: "client_secret", value: a.oauth_h_client_secret, enabled: true})
+        rows = push(rows, KVRow{name: "scope", value: a.oauth_h_scope, enabled: true})
+        if oauth_grant_yaml(grant) == "authorization_code" {
+            rows = push(rows, KVRow{name: "redirect_uri", value: a.oauth_h_redirect, enabled: true})
+        }
+        ca := a.oauth_h_client_auth
+        if len(ca) == 0 {
+            ca = "Body"
+        }
+        rows = push(rows, KVRow{name: "client_auth", value: ca, enabled: true})
+    }
+    cur := a.oauth_kv.cur
+    editing := a.oauth_kv.editing
+    edit := a.oauth_kv.edit
+    a.oauth_kv.rows = rows
+    a.oauth_kv.cur = cur
+    if a.oauth_kv.cur >= len(rows) {
+        a.oauth_kv.cur = len(rows) - 1
+    }
+    if a.oauth_kv.cur < 0 {
+        a.oauth_kv.cur = 0
+    }
+    a.oauth_kv.col = 1
+    a.oauth_kv.editing = editing
+    a.oauth_kv.edit = edit
+}
+
+fn new_oauth_kv() -> KVTable {
+    t := new_kv()
+    t.rows = mkslice(KVRow, 0)
+    t.rows = push(t.rows, KVRow{name: "type", value: "none", enabled: true})
+    t.col = 1
+    return t
+}
+
+// oauth_seed loads a decoded auth block into the backing values and visible
+// conditional table. Non-OAuth blocks keep their existing read-only behavior;
+// only selecting oauth2 in the type row creates OAuth YAML.
+fn oauth_seed(a: mut App, r: ref collection.PRequest) {
+    a.oauth_h_type = "none"
+    a.oauth_h_grant = "Code + PKCE"
+    a.oauth_h_auth_url = ""
+    a.oauth_h_token_url = ""
+    a.oauth_h_client_id = ""
+    a.oauth_h_client_secret = ""
+    a.oauth_h_scope = ""
+    a.oauth_h_redirect = "http://127.0.0.1:8765/oauth/callback"
+    a.oauth_h_client_auth = "Body"
+    if r.auth != nil {
+        a.oauth_h_type = r.auth.type
+        if r.auth.type == "oauth2" && r.auth.oauth2 != nil {
+            o := r.auth.oauth2
+            a.oauth_h_grant = oauth_grant_label(o.grant_type)
+            a.oauth_h_auth_url = o.authorization_url
+            a.oauth_h_token_url = o.token_url
+            a.oauth_h_client_id = o.client_id
+            a.oauth_h_client_secret = o.client_secret
+            a.oauth_h_scope = o.scope
+            a.oauth_h_redirect = o.redirect_uri
+            a.oauth_h_client_auth = oauth_clientauth_label(o.client_auth)
+        }
+    }
+    a.oauth_kv = new_oauth_kv()
+    a.oauth_kv.rows[0].value = a.oauth_h_type
+    oauth_rebuild(a)
+}
+
 // draft_from_request builds the editor draft for a decoded request —
 // editable fields fill the widgets; auth/options/info render into the
 // read-only panes; the decoded request itself stays on the draft so
@@ -479,6 +696,21 @@ fn draft_from_request(r: own collection.PRequest, path: str) -> RDraft {
         d.gql_vars = new_text_view(r.graphql.variables)
         d.gql_op = new_line_edit(r.graphql.operation_name)
     }
+    // Seed through a temporary app-shaped table projection; the draft then
+    // receives a deep copy so tabs never alias editor rows.
+    tmp := new_app()
+    tmp.oauth_kv = d.oauth_kv
+    oauth_seed(tmp, r)
+    d.oauth_kv = copy_kv(tmp.oauth_kv)
+    d.oauth_h_type = tmp.oauth_h_type
+    d.oauth_h_grant = tmp.oauth_h_grant
+    d.oauth_h_auth_url = tmp.oauth_h_auth_url
+    d.oauth_h_token_url = tmp.oauth_h_token_url
+    d.oauth_h_client_id = tmp.oauth_h_client_id
+    d.oauth_h_client_secret = tmp.oauth_h_client_secret
+    d.oauth_h_scope = tmp.oauth_h_scope
+    d.oauth_h_redirect = tmp.oauth_h_redirect
+    d.oauth_h_client_auth = tmp.oauth_h_client_auth
     d.preq = r
     return d
 }
@@ -612,10 +844,42 @@ fn draft_to_request(a: ref App) -> own collection.PRequest {
         g.operation_name = a.gql_op.text
         r.graphql = g
     }
+    atype := lower_ascii(oauth_value(a, "type"))
+    if atype == "oauth2" || atype == "oauth 2.0" {
+        r.auth = new(collection.PAuth)
+        r.auth.type = "oauth2"
+        r.auth.oauth2 = new(collection.POAuth2)
+        r.auth.oauth2.grant_type = oauth_grant_yaml(oauth_value(a, "grant_type"))
+        r.auth.oauth2.authorization_url = oauth_value(a, "authorization_url")
+        r.auth.oauth2.token_url = oauth_value(a, "token_url")
+        r.auth.oauth2.client_id = oauth_value(a, "client_id")
+        r.auth.oauth2.client_secret = oauth_value(a, "client_secret")
+        r.auth.oauth2.scope = oauth_value(a, "scope")
+        r.auth.oauth2.redirect_uri = oauth_value(a, "redirect_uri")
+        r.auth.oauth2.client_auth = oauth_clientauth_yaml(oauth_value(a, "client_auth"))
+    } else if len(atype) > 0 && atype != "none" {
+        if a.preq != nil && a.preq.auth != nil && a.preq.auth.type == atype {
+            // Unchanged non-OAuth auth keeps its existing fields verbatim.
+            r.auth = a.preq.auth
+        } else if atype == "basic" || atype == "digest" || atype == "bearer_token" {
+            // The shared type control is authoritative: switching away from
+            // a prior auth block must not keep that hidden block alive. These
+            // non-OAuth kinds retain the pre-existing empty-field editing
+            // scope, but the YAML type itself is honest.
+            r.auth = new(collection.PAuth)
+            r.auth.type = atype
+            if atype == "basic" {
+                r.auth.basic = new(collection.PBasic)
+            } else if atype == "digest" {
+                r.auth.digest = new(collection.PBasic)
+            } else {
+                r.auth.bearer_token = new(collection.PBearer)
+            }
+        }
+    }
     if a.preq != nil {
         r.name = a.preq.name
         r.description = a.preq.description
-        r.auth = a.preq.auth
         r.options = a.preq.options
         r.scripts = a.preq.scripts
         r.captures = a.preq.captures
@@ -1049,6 +1313,14 @@ fn begin_send_preq(a: mut App) -> int {
         return ENone
     }
     a.pending = sp.req
+    a.pending_oauth = sp.oauth
+    if sp.oauth != nil {
+        // main.oxl paints one Sending frame before exec_send blocks. Seed the
+        // Auth status here so a browser-required wait is visible in that frame;
+        // the text is honest about the three-minute budget and does not claim
+        // Escape cancellation is available in the synchronous send loop.
+        a.oauth_status = "authorizing OAuth… browser authorization may wait up to three minutes"
+    }
     // ssl.* app settings fold into the plan (corpus §2.2): ca_bundle
     // becomes the verify path when the request verifies; cert/key PEM
     // text reads eagerly here (send-time files); ssl.password is the
@@ -1110,6 +1382,42 @@ fn exec_send_t(a: mut App, t: http.Transport) {
     }
     send_url := a.pending.url
     had_cert := len(a.pending.cert_pem) > 0
+    if a.pending_oauth != nil {
+        // OAuth authorization is synchronous and precedes the resource send;
+        // its token endpoint traffic uses the same injected transport seam but
+        // never becomes response/history data. The resource timeout starts only
+        // after this returns because H1 has not yet been invoked for it.
+        a.oauth_status = "authorizing OAuth…"
+        flow := oauth.production_browser_flow()
+        ar := oauth.authorize(a.oauth_mgr, a.pending_oauth.cfg, a.pending_oauth.identity, a.pending, true, flow, t)
+        if len(ar.err) > 0 {
+            a.oauth_status = ar.err
+            a.pending = nil
+            a.pending_oauth = nil
+            send_failed(a, ar.err)
+            return
+        }
+        ni := 0
+        for ni < len(ar.notes) {
+            a.oauth_status = ar.notes[ni]
+            a.toast(0, ar.notes[ni])
+            ni = ni + 1
+        }
+        // OAuth owns the wire Authorization header for this send. Enabled
+        // explicit rows were already materialized by planning; replace them
+        // without touching the saved request or disabled rows.
+        let ohs: []model.Header = nil
+        hi := 0
+        for hi < len(a.pending.headers) {
+            if !ascii_eq(a.pending.headers[hi].name, "Authorization") {
+                ohs = push(ohs, a.pending.headers[hi])
+            }
+            hi = hi + 1
+        }
+        ohs = push(ohs, model.Header{name: "Authorization", value: "Bearer " + ar.bearer})
+        a.pending.headers = ohs
+        a.pending_oauth = nil
+    }
     [resp, e] = t.send(a.pending)
     a.pending = nil
     if e != nil {
@@ -1122,6 +1430,38 @@ fn exec_send_t(a: mut App, t: http.Transport) {
     if had_cert && resp.tls_ver == tls.V12 {
         a.toast(1, "client certificate was not presented: TLS 1.2 sends an empty certificate list in this build")
     }
+}
+
+// forget_oauth resolves the current draft exactly like a send plan, then
+// removes only that configuration's session token. It never contacts the
+// provider and never claims consent revocation.
+fn forget_oauth(a: mut App) -> int {
+    pr := draft_to_request(a)
+    if pr.auth == nil || pr.auth.type != "oauth2" || pr.auth.oauth2 == nil {
+        a.toast(0, "Forget OAuth token: request does not use OAuth 2.0")
+        return ENone
+    }
+    es := a.env
+    if es == nil {
+        es = new(env.EnvSet)
+    }
+    sp := collection.plan_req_for_forget(pr, es, nil, a.coll_dir)
+    if len(sp.err) > 0 {
+        a.toast(2, "forget OAuth token: " + sp.err)
+        return ENone
+    }
+    if sp.oauth == nil {
+        a.toast(0, "Forget OAuth token: request does not use OAuth 2.0")
+        return ENone
+    }
+    fe := oauth.forget(a.oauth_mgr, sp.oauth.cfg, sp.oauth.identity)
+    if fe != nil {
+        a.toast(2, "forget OAuth token: " + errors.msg(fe))
+        return ENone
+    }
+    a.oauth_status = "OAuth session token forgotten for this request configuration; the next send authorizes again"
+    a.toast(1, a.oauth_status)
+    return ENone
 }
 
 // send_failed installs the transport error as the response view —

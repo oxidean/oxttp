@@ -32,6 +32,7 @@ jobs:
           echo "/tmp/oxl-toolchain" >> "$GITHUB_PATH"
           /tmp/oxl-toolchain/oxl version
 
+
       # The TUI compile peaks far above the hosted runner's memory
       # ceiling (oxidean/oxl#232). Give the build leg the same transient
       # swap headroom as the test matrix; keep the path distinct from the
@@ -89,6 +90,7 @@ jobs:
           - core/importing
           - core/item
           - core/model
+          - core/oauth
           - core/session
           - core/term
           - core/yaml

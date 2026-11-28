@@ -6,9 +6,9 @@ package http
 // readers come in as mut bufio.Reader so tests run on bytes.Buffer.
 import "std/bufio"
 
-import "std/errors"
-
 import "std/io"
+
+import "std/errors"
 
 import "std/os"
 
@@ -412,6 +412,16 @@ fn content_length(hs: []model.Header) -> [int, err] {
     return v, nil
 }
 
+// body_cap_error is deliberately non-secret and byte-exact for callers
+// (notably OAuth) that need a safe transport failure category.
+fn body_cap_error(limit: int) -> err {
+    return errors.new("http: response body exceeds " + itoa(limit) + " byte limit")
+}
+
+fn body_cap_hit(got: int, limit: int) -> bool {
+    return limit > 0 && got > limit
+}
+
 // read_exact reads exactly n bytes or fails (short read = truncation).
 fn read_exact(r: mut bufio.Reader, n: int) -> [[]byte, err] {
     out := mkslice(byte, n)
@@ -463,12 +473,21 @@ fn read_exact_partial(r: mut bufio.Reader, n: int) -> [CappedRead, err] {
 // read_eof drains the reader until io.eof() — the HTTP/1.0 and
 // connection-close body framing.
 fn read_eof(r: mut bufio.Reader) -> [[]byte, err] {
+    return read_eof_cap(r, 0)
+}
+
+// read_eof_cap is read_eof with an opt-in accumulated-byte cap. The cap is
+// enforced while streaming, before the peer can grow memory without bound.
+fn read_eof_cap(r: mut bufio.Reader, limit: int) -> [[]byte, err] {
     out := mkslice(byte, 0)
     scratch := mkslice(byte, 8192)
     dry := 0
     for true {
         [n, e] = r.read(scratch)
         if n > 0 {
+            if body_cap_hit(len(out) + n, limit) {
+                return nil, body_cap_error(limit)
+            }
             i := 0
             for i < n {
                 out = push(out, scratch[i])
@@ -631,6 +650,89 @@ fn read_chunked_cap(r: mut bufio.Reader, max: int) -> [CappedChunked, err] {
     }
     done.body = cb
     return done, nil
+}
+
+// byte_reader is the minimal io.Reader over immutable response bytes.
+struct byte_reader { b: []byte, i: int }
+
+fn (r mut byte_reader) read(out: []byte) -> [int, err] {
+    if r.i >= len(r.b) {
+        return 0, io.eof()
+    }
+    n := len(r.b) - r.i
+    if n > len(out) {
+        n = len(out)
+    }
+    j := 0
+    for j < n {
+        out[j] = r.b[r.i + j]
+        j = j + 1
+    }
+    r.i = r.i + n
+    return n, nil
+}
+
+fn (r mut byte_reader) asreader() -> io.Reader {
+    return r
+}
+
+fn read_decode_cap(r: io.Reader, limit: int) -> [own []byte, err] {
+    out := mkslice(byte, 0)
+    buf := mkslice(byte, 8192)
+    for true {
+        [n, e] = r.read(buf)
+        if n > 0 {
+            if limit > 0 && len(out) + n > limit {
+                return nil, body_cap_error(limit)
+            }
+            i := 0
+            for i < n {
+                out = push(out, buf[i])
+                i = i + 1
+            }
+        }
+        if e != nil {
+            if e == io.eof() {
+                return new(out), nil
+            }
+            return nil, e
+        }
+    }
+    return nil, errors.new("http: decoder stalled")
+}
+
+// decode_body_cap is decode_body with the limit enforced while the
+// decoder emits bytes, not after the plaintext has already materialized.
+fn decode_body_cap(raw: []byte, ce: str, limit: int) -> [own []byte, err] {
+    if len(raw) == 0 {
+        return new(mkslice(byte, 0)), nil
+    }
+    enc := lwr(trim_ows(ce))
+    if enc == "" || enc == "identity" {
+        if limit > 0 && len(raw) > limit {
+            return nil, body_cap_error(limit)
+        }
+        return new(raw), nil
+    }
+    if enc == "gzip" || enc == "x-gzip" {
+        sr := byte_reader{b: raw, i: 0}
+        [g, ge] = gzip.newreader(sr.asreader())
+        if ge != nil {
+            return nil, ge
+        }
+        return read_decode_cap(g.asreader(), limit)
+    }
+    if enc == "deflate" || enc == "x-compress" {
+        zs := byte_reader{b: raw, i: 0}
+        [z, ze] = zlib.newreader(zs.asreader())
+        if ze == nil {
+            return read_decode_cap(z.asreader(), limit)
+        }
+        fs := byte_reader{b: raw, i: 0}
+        f := flate.newreader(fs.asreader())
+        return read_decode_cap(f.asreader(), limit)
+    }
+    return nil, errors.new("http: unsupported content-encoding \"" + enc + "\"")
 }
 
 // decode_body applies content-encoding: identity/""/gzip/x-gzip/

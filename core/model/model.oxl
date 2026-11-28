@@ -74,6 +74,10 @@ struct Req {
     // HTTP_PROXY env value errors at send time (Go CGI guard).
     proxy_go: bool,
     cgi: bool,
+    // opt-in response-body byte cap, enforced while wire bytes accumulate
+    // and again after content decoding; zero preserves legacy uncapped
+    // behavior. OAuth token endpoints use 1 MiB.
+    max_body_bytes: int,
 }
 
 // ReqHead is what the wire emitted for one request — kept verbatim

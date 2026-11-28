@@ -21,7 +21,7 @@ fn test_req_resp_surface() {
     h := mkslice(Header, 1)
     h[0].name = "accept"
     h[0].value = "application/json"
-    r := Req{method: "POST", url: "http://localhost:8080/x", headers: h, body: Body.Raw{ctype: "application/json", text: "{}"}, timeout_ms: 0, follow: false, max_redirects: 10, httpver: "", synth: nil, verify: "", jar_off: false, h2: "", ssl_min: 0, ssl_max: 0, cert_pem: "", key_pem: "", proxies: nil, proxy_env: nil, no_proxy: "", proxy_go: false, cgi: false}
+    r := Req{method: "POST", url: "http://localhost:8080/x", headers: h, body: Body.Raw{ctype: "application/json", text: "{}"}, timeout_ms: 0, follow: false, max_redirects: 10, httpver: "", synth: nil, verify: "", jar_off: false, h2: "", ssl_min: 0, ssl_max: 0, cert_pem: "", key_pem: "", proxies: nil, proxy_env: nil, no_proxy: "", proxy_go: false, cgi: false, max_body_bytes: 0}
     testing.expect_streq(r.method, "POST", "req method")
     testing.expect_streq(r.headers[0].name, "accept", "hdr order")
     b := r.body as Body.Raw
@@ -31,7 +31,7 @@ fn test_req_resp_surface() {
     testing.expect_eq(rp.status, 200, "resp status")
     testing.expect(rp.trace == nil, "trace optional")
 
-    jr := Req{method: "POST", url: "u", headers: nil, body: Body.Json{j: json.jparse("{\"a\":1}")}, timeout_ms: 0, follow: false, max_redirects: 0, httpver: "", synth: nil, verify: "", jar_off: false, h2: "", ssl_min: 0, ssl_max: 0, cert_pem: "", key_pem: "", proxies: nil, proxy_env: nil, no_proxy: "", proxy_go: false, cgi: false}
+    jr := Req{method: "POST", url: "u", headers: nil, body: Body.Json{j: json.jparse("{\"a\":1}")}, timeout_ms: 0, follow: false, max_redirects: 0, httpver: "", synth: nil, verify: "", jar_off: false, h2: "", ssl_min: 0, ssl_max: 0, cert_pem: "", key_pem: "", proxies: nil, proxy_env: nil, no_proxy: "", proxy_go: false, cgi: false, max_body_bytes: 0}
     jb := jr.body as Body.Json
     testing.expect(jb.j.kind == 4, "json body kind")
 }

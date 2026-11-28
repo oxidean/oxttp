@@ -404,11 +404,20 @@ fn render_req_pane(a: mut App, scr: mut term.AnsiScreen, x: int, y: int, w: int,
         render_kv(scr, a.path_kv, x, cy, w, ch, a.focus == FReqPane)
     } else if cur == "Body" {
         render_body(a, scr, x, cy, w, ch)
+    } else if cur == "Auth" {
+        render_kv(scr, a.oauth_kv, x, cy, w, ch - 3, a.focus == FReqPane)
+        atype := lower_ascii(oauth_table_value(a.oauth_kv.rows, "type"))
+        if atype != "oauth2" && atype != "oauth 2.0" && len(a.auth_text) > 0 {
+            put_text_lines(scr, a.auth_text, x, cy + 2, w, ch - 5)
+        }
+        put_str_max(scr, x + 1, y + h - 3, "send fetches/refreshes a token; code grants open the browser", w - 2, 7, term.AttrDim)
+        put_str_max(scr, x + 1, y + h - 2, "use variables for secrets; literal credentials are saved in request YAML", w - 2, 7, term.AttrDim)
+        if len(a.oauth_status) > 0 {
+            put_str_max(scr, x + 1, y + h - 1, "status: " + a.oauth_status, w - 2, 7, 0)
+        }
     } else {
         txt := ""
-        if cur == "Auth" {
-            txt = a.auth_text
-        } else if cur == "Info" {
+        if cur == "Info" {
             txt = a.info_text
         } else if cur == "Options" {
             txt = a.opts_text

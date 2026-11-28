@@ -17,6 +17,18 @@ cited corpora under `docs/corpus/` and the feature work is driven through
 ox-agent work items. HTTP/1.1 only for now — HTTPS lands when oxl std
 gains TLS support.
 
+## Posting OAuth2 notes
+
+`oxttp-tui` supports OAuth2 client-credentials and authorization-code+PKCE
+requests from Posting YAML. Runtime tokens are memory-only for the current
+TUI or `posting run` process; they are never written into request YAML,
+history, or exports. Code-grant browser waits are synchronous (Escape does
+not cancel an in-flight wait in this build). The loopback listener is IPv4
+in this build; IPv6 loopback redirect URIs fail explicitly. `posting run`
+is non-interactive: client-credentials can acquire tokens, while an
+authorization-code request that requires browser consent fails in a fresh run
+process; memory-only storage means no TUI token persists into that process.
+
 ## Layout
 
 ```

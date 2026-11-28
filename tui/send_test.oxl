@@ -692,3 +692,150 @@ fn test_exec_send_captures_transport_failure() {
     exec_send_t(a, f)
     testing.expect_eq(len(a.session_vars), 0, "transport failure publishes nothing")
 }
+
+// WI-0022 S8 — OAuth execution is staged after planning and before the
+// resource transport send. One fake transport serves both endpoints so the
+// test proves ordering, exact bearer injection, failure suppression, Forget,
+// and secret sanitization without sockets.
+struct FakeOAuthTransport {
+    token_hits: shared,
+    resource_hits: shared,
+    fail_token: bool,
+}
+
+fn oauth_fake_resp(body: str) -> model.Resp {
+    hs := mkslice(model.Header, 0)
+    hs = push(hs, model.Header{name: "Content-Type", value: "application/json"})
+    return model.Resp{status: 200, reason: "OK", headers: hs,
+        body: body as []byte, elapsed_ms: 1.0, remote: "127.0.0.1:9",
+        version: "1.1", req_head: "", hops: nil, trace: nil, tls_ver: 0, events: nil, stream_error: ""}
+}
+
+fn (f FakeOAuthTransport) send(req: ref model.Req) -> [model.Resp, err] {
+    if find(req.url, "/token") >= 0 {
+        sadd(f.token_hits, 1)
+        if f.fail_token {
+            return oauth_fake_resp(""), errors.new("dial secret-token-material")
+        }
+        return oauth_fake_resp("{\"access_token\":\"oauth-access\",\"token_type\":\"Bearer\",\"expires_in\":3600}"), nil
+    }
+    sadd(f.resource_hits, 1)
+    auths := 0
+    i := 0
+    for i < len(req.headers) {
+        if ascii_eq(req.headers[i].name, "Authorization") {
+            auths = auths + 1
+            testing.expect_streq(req.headers[i].value, "Bearer oauth-access", "exact bearer wire header")
+        }
+        i = i + 1
+    }
+    testing.expect_eq(auths, 1, "exactly one authorization header")
+    return fake_resp(200, "text/plain", "ok", nil), nil
+}
+
+fn oauth_preq() -> own collection.PRequest {
+    pr := new(collection.PRequest)
+    pr.method = "GET"
+    pr.url = "https://api.example.test/data"
+    pr.headers = push(pr.headers, model.KV{name: "Authorization", value: "Bearer stale", enabled: true})
+    pr.headers = push(pr.headers, model.KV{name: "Authorization", value: "Bearer disabled", enabled: false})
+    pr.auth = new(collection.PAuth)
+    pr.auth.type = "oauth2"
+    pr.auth.oauth2 = new(collection.POAuth2)
+    pr.auth.oauth2.grant_type = "client_credentials"
+    pr.auth.oauth2.token_url = "https://issuer.example.test/token"
+    pr.auth.oauth2.client_id = "cid"
+    pr.auth.oauth2.client_secret = "sec"
+    pr.auth.oauth2.scope = "read"
+    return pr
+}
+
+fn test_oauth_send_success_injects_one_bearer() {
+    a := new_app()
+    a.pending_preq = oauth_preq()
+    fx := begin_send_preq(a)
+    testing.expect_eq(fx, ESend, "oauth request plans")
+    testing.expect(a.pending_oauth != nil, "oauth plan staged")
+    tr := FakeOAuthTransport{token_hits: mkshared(0), resource_hits: mkshared(0), fail_token: false}
+    exec_send_t(a, tr)
+    testing.expect_eq(sget(tr.token_hits), 1, "token endpoint hit once")
+    testing.expect_eq(sget(tr.resource_hits), 1, "resource sent once")
+    testing.expect_streq(a.resp_body, "ok", "resource response installed")
+    testing.expect(len(a.oauth_status) > 0, "safe oauth status visible")
+    saw_mem := false
+    i := 0
+    for i < len(a.toasts) {
+        if str_contains(a.toasts[i].msg, "session only") {
+            saw_mem = true
+        }
+        i = i + 1
+    }
+    testing.expect(saw_mem, "memory-only warning toasted")
+    // saved/draft YAML carries no runtime token
+    testing.expect(!str_contains(a.history[0].req_yaml, "oauth-access"), "history yaml has no token")
+
+    a.pending_preq = oauth_preq()
+    fx_reuse := begin_send_preq(a)
+    testing.expect_eq(fx_reuse, ESend, "second oauth request plans")
+    exec_send_t(a, tr)
+    testing.expect_eq(sget(tr.token_hits), 1, "second send reuses session token")
+    testing.expect_eq(sget(tr.resource_hits), 2, "second resource send occurs")
+}
+
+fn test_oauth_failure_prevents_resource_and_sanitizes() {
+    a := new_app()
+    a.pending_preq = oauth_preq()
+    fx := begin_send_preq(a)
+    testing.expect_eq(fx, ESend, "oauth request plans")
+    tr := FakeOAuthTransport{token_hits: mkshared(0), resource_hits: mkshared(0), fail_token: true}
+    exec_send_t(a, tr)
+    testing.expect_eq(sget(tr.token_hits), 1, "token endpoint attempted")
+    testing.expect_eq(sget(tr.resource_hits), 0, "resource not sent after oauth failure")
+    testing.expect(!str_contains(a.resp_view.lines[0], "secret-token-material"), "raw transport detail suppressed")
+    testing.expect_eq(len(a.history), 0, "oauth failure is not history")
+}
+
+fn test_forget_oauth_token_palette_behavior() {
+    a := new_app()
+    a.pending_preq = oauth_preq()
+    fx := begin_send_preq(a)
+    testing.expect_eq(fx, ESend, "oauth request plans")
+    tr := FakeOAuthTransport{token_hits: mkshared(0), resource_hits: mkshared(0), fail_token: false}
+    exec_send_t(a, tr)
+    testing.expect_eq(len(a.oauth_mgr.entries), 1, "session token cached")
+    // forget plans from the live draft; stage the same draft fields used by
+    // oauth_preq for this focused fixture.
+    a.url.text = "https://api.example.test/data"
+    a.preq = oauth_preq()
+    oauth_seed(a, a.preq)
+    fx2 := forget_oauth(a)
+    testing.expect_eq(fx2, ENone, "forget consumes no effect")
+    testing.expect_eq(len(a.oauth_mgr.entries), 0, "exact session token forgotten")
+    items := palette_filtered(a)
+    saw_forget := false
+    saw_fake_signin := false
+    i := 0
+    for i < len(items) {
+        if items[i].name == "Forget OAuth token" {
+            saw_forget = true
+        }
+        if items[i].name == "OAuth sign-in" {
+            saw_fake_signin = true
+        }
+        i = i + 1
+    }
+    testing.expect(saw_forget, "oauth palette has real forget row")
+    testing.expect(!saw_fake_signin, "fake OAuth sign-in row removed")
+
+    plain := new_app()
+    plain_items := palette_filtered(plain)
+    saw_plain_forget := false
+    pi := 0
+    for pi < len(plain_items) {
+        if plain_items[pi].action == "forget-oauth" {
+            saw_plain_forget = true
+        }
+        pi = pi + 1
+    }
+    testing.expect(!saw_plain_forget, "forget row hidden for non-oauth drafts")
+}

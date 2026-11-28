@@ -1,0 +1,122 @@
+package oauth
+
+// WI-0022 S6 — authorization-code+PKCE browser orchestration. Listener
+// creation precedes browser launch, port 0 expands into every protocol use,
+// the wait is capped at 180s, and the listener closes on every outcome.
+import "std/net"
+import "std/net/url"
+import "github.com/oxidean/oxttp/core/http"
+import "github.com/oxidean/oxttp/core/model"
+
+let BrowserOpenError = "could not open the browser for OAuth; check your system browser configuration"
+let BrowserCancelError = "OAuth authorization cancelled or timed out; send again to retry"
+let BrowserDenialError = "OAuth authorization was denied; send again to retry"
+
+// OAuthBrowserFlow is the production BrowserFlow implementation with an
+// injectable opener seam. Tests substitute opener; no test needs a real
+// browser.
+struct OAuthBrowserFlow {
+    opener: BrowserOpener,
+}
+
+fn browser_fail(msg: str, class: str) -> TokenResult {
+    return token_error_result(msg, class, 0, "")
+}
+
+fn append_auth_param(q: str, name: str, value: str) -> str {
+    if len(q) > 0 {
+        q = q + "&"
+    }
+    return q + url.queryescape(name) + "=" + url.queryescape(value)
+}
+
+// authorization_url builds the exact upstream query while preserving any
+// existing authorization-endpoint query ahead of the appended parameters.
+fn authorization_url(cfg: Config, actual_redirect_uri: str, state: str, verifier: str) -> str {
+    c := with_defaults(cfg)
+    q := "response_type=code"
+    q = append_auth_param(q, "client_id", c.client_id)
+    q = append_auth_param(q, "redirect_uri", actual_redirect_uri)
+    if len(c.scope) > 0 {
+        q = append_auth_param(q, "scope", c.scope)
+    }
+    q = append_auth_param(q, "state", state)
+    q = append_auth_param(q, "code_challenge", pkce_challenge(verifier))
+    q = append_auth_param(q, "code_challenge_method", "S256")
+    q = append_auth_param(q, "access_type", "offline")
+    sep := "?"
+    if find(c.authorization_url, "?") >= 0 {
+        sep = "&"
+    }
+    if len(c.authorization_url) > 0 {
+        last := byteat(c.authorization_url, len(c.authorization_url) - 1)
+        if last == 63 || last == 38 { // already ends in ? or &
+            sep = ""
+        }
+    }
+    return c.authorization_url + sep + q
+}
+
+fn redirect_with_port(raw: str, port: int) -> str {
+    [u, e] = url.parse(raw)
+    if e != nil {
+        return raw
+    }
+    host := u.hostname()
+    if ipv6_loopback(host) {
+        host = "[" + host + "]"
+    }
+    return "http://" + host + ":" + itoa(port) + u.escapedpath()
+}
+
+// run executes one synchronous browser authorization. It never falls back
+// to weak randomness and never leaks callback/error detail into user text.
+fn (f OAuthBrowserFlow) run(cfg: Config, resource: ref model.Req, tr: http.Transport) -> TokenResult {
+    c := with_defaults(cfg)
+    if redirect_is_ipv6_loopback(c.redirect_uri) {
+        return browser_fail(IPv6RedirectUnsupported, "unsupported_platform")
+    }
+    [state, se] = new_state()
+    if se != nil {
+        return browser_fail(BrowserCancelError, "random")
+    }
+    [verifier, ve] = new_pkce_verifier()
+    if ve != nil {
+        return browser_fail(BrowserCancelError, "random")
+    }
+    [ru, ue] = url.parse(c.redirect_uri)
+    if ue != nil {
+        return browser_fail(BrowserCancelError, "validation")
+    }
+    port := atoi(ru.port())
+    [listener, le] = net.listen(port)
+    if le != nil {
+        return browser_fail(BrowserCancelError, "listen")
+    }
+    l := listener
+    defer l.close()
+    actual := redirect_with_port(c.redirect_uri, l.port())
+    start := now_ms()
+    deadline := start + CallbackWaitMs
+    if f.opener == nil {
+        return browser_fail(BrowserOpenError, "browser_open")
+    }
+    oe := f.opener.open(authorization_url(c, actual, state, verifier))
+    if oe != nil {
+        return browser_fail(BrowserOpenError, "browser_open")
+    }
+    oc := wait_callback(l, actual, state, deadline)
+    if oc.kind != "success" {
+        if oc.kind == "denial" {
+            return browser_fail(BrowserDenialError, "browser_denial")
+        }
+        return browser_fail(BrowserCancelError, "browser_" + oc.kind)
+    }
+    xreq := code_exchange_request(c, resource, oc.code, actual, verifier)
+    return send_token_at(tr, xreq, 0)
+}
+
+// production_browser_flow constructs the default argv opener flow.
+fn production_browser_flow() -> OAuthBrowserFlow {
+    return OAuthBrowserFlow{opener: ArgvBrowserOpener{}}
+}

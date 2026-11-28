@@ -1,0 +1,591 @@
+package oauth
+
+// core/oauth — reusable OAuth2 engine foundations for WI-0022.
+// This file deliberately has no socket, browser, collection-YAML, or UI
+// dependency: validation, canonical cache keys, encoding, fixed-loop state
+// comparison, and CSPRNG/PKCE helpers stay pure and reusable by later
+// HTTP/TUI/run callers.
+import "std/crypto/rand"
+import "std/crypto/sha256"
+import "std/encoding/base64"
+import "std/errors"
+import "std/net"
+import "std/net/url"
+import "std/strconv"
+
+// Config is the fully transport-independent OAuth configuration surface.
+// Empty grant_type/client_auth/redirect_uri receive upstream defaults in
+// with_defaults; client_secret remains optional for authorization-code but
+// is required for client-credentials.
+struct Config {
+    grant_type: str,
+    authorization_url: str,
+    token_url: str,
+    client_id: str,
+    client_secret: str,
+    scope: str,
+    redirect_uri: str,
+    client_auth: str,
+}
+
+// Token is one memory-only OAuth token set. expiry_unix is seconds; when
+// has_expiry is false the token does not expire.
+struct Token {
+    access_token: str,
+    token_type: str,
+    refresh_token: str,
+    expiry_unix: int,
+    has_expiry: bool,
+}
+
+// TokenEntry is one cache row. Key is the SHA-256 hex digest produced by
+// cache_key — plaintext collection/proxy/secret material is never stored
+// as the key.
+struct TokenEntry {
+    key: str,
+    token: Token,
+}
+
+// Manager is a session-local memory token store. now_unix is a narrow test
+// clock seam: zero means the wall clock. Manager values must not be global;
+// each TUI app/run process owns its own instance.
+struct Manager {
+    entries: []TokenEntry,
+    now_unix: int,
+}
+
+// AuthResult is the sanitized public result shape used by later execution
+// stages. err/classification never carry raw endpoint bodies or secrets.
+struct AuthResult {
+    bearer: str,
+    notes: []str,
+    err: str,
+    classification: str,
+    status: int,
+    endpoint_code: str,
+}
+
+// TokenResult is the sanitized result of one token endpoint exchange.
+struct TokenResult {
+    token: Token,
+    err: str,
+    classification: str,
+    status: int,
+    endpoint_code: str,
+}
+
+// CacheIdentity carries the non-secret cache-key inputs collection planning
+// resolves before transport. proxy_url is the substituted configured proxy
+// value; verify_ssl is the request option.
+struct CacheIdentity {
+    collection_root: str,
+    resource_url: str,
+    verify_ssl: bool,
+    proxy_url: str,
+}
+
+// Plan is the pure collection-planning output: fully substituted/defaulted
+// config plus the cache identity inputs needed at execution. It has no
+// socket/browser side effect.
+struct Plan {
+    cfg: Config,
+    identity: CacheIdentity,
+}
+
+// FormField is one application/x-www-form-urlencoded pair.
+struct FormField { name: str, value: str }
+
+// ListenerCapability records what the current oxl runtime can execute.
+// oxl 0.26.0 exposes only IPv4 INADDR_ANY listeners, so IPv6 loopback is a
+// semantically valid redirect form but an explicit unsupported execution
+// result (ADR-0063).
+struct ListenerCapability {
+    ipv6_loopback: bool,
+    note: str,
+}
+
+let MemoryOnlyWarning = "OAuth token is kept for this session only (OS credential store unsupported in this build)."
+let NonInteractiveRefusal = "send the request to authorize OAuth in your browser first"
+let IPv6RedirectUnsupported = "OAuth IPv6 loopback redirect URIs are unsupported in this build"
+
+fn oauth_err(msg: str) -> err {
+    return errors.new(msg)
+}
+
+fn lwr(s: str) -> str {
+    b := s as []byte
+    out := mkslice(byte, len(s))
+    i := 0
+    for i < len(s) {
+        c := b[i]
+        if c >= 65 && c <= 90 {
+            c = c + 32
+        }
+        out[i] = c
+        i = i + 1
+    }
+    return out as str
+}
+
+fn trim_ws(s: str) -> str {
+    a := 0
+    b := len(s)
+    for a < b {
+        c := byteat(s, a)
+        if c != 32 && c != 9 && c != 10 && c != 13 {
+            break
+        }
+        a = a + 1
+    }
+    for b > a {
+        c := byteat(s, b - 1)
+        if c != 32 && c != 9 && c != 10 && c != 13 {
+            break
+        }
+        b = b - 1
+    }
+    return substr(s, a, b)
+}
+
+fn is_ws(c: int) -> bool {
+    return c == 32 || c == 9 || c == 10 || c == 13
+}
+
+fn scope_has(parts: []str, p: str) -> bool {
+    i := 0
+    for i < len(parts) {
+        if parts[i] == p {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// normalize_scope splits on ASCII whitespace, removes empty and duplicate
+// fields, and rejoins with single spaces for authorization/token parameters.
+fn normalize_scope(scope: str) -> str {
+    let parts: []str = nil
+    i := 0
+    for i < len(scope) {
+        for i < len(scope) && is_ws(byteat(scope, i)) {
+            i = i + 1
+        }
+        if i >= len(scope) {
+            break
+        }
+        st := i
+        for i < len(scope) && !is_ws(byteat(scope, i)) {
+            i = i + 1
+        }
+        p := substr(scope, st, i)
+        if len(p) > 0 && !scope_has(parts, p) {
+            parts = push(parts, p)
+        }
+    }
+    out := ""
+    i = 0
+    for i < len(parts) {
+        if i > 0 {
+            out = out + " "
+        }
+        out = out + parts[i]
+        i = i + 1
+    }
+    return out
+}
+
+// with_defaults applies upstream model.OAuth2.WithDefaults after variable
+// substitution. The input is copied; saved YAML is never mutated here.
+fn with_defaults(cfg: Config) -> Config {
+    out := cfg
+    if len(out.grant_type) == 0 {
+        out.grant_type = "authorization_code"
+    }
+    if len(out.client_auth) == 0 {
+        out.client_auth = "client_secret_post"
+    }
+    if len(out.redirect_uri) == 0 {
+        out.redirect_uri = "http://127.0.0.1:8765/oauth/callback"
+    }
+    out.scope = normalize_scope(out.scope)
+    return out
+}
+
+fn ipv4_loopback(host: str) -> bool {
+    if !net.isip4(host) {
+        return false
+    }
+    [ip, e] = net.parse_ipv4(host)
+    if e != nil {
+        return false
+    }
+    return ip / 16777216 == 127
+}
+
+fn ipv6_side_parts(s: str) -> []str {
+    let out: []str = nil
+    if len(s) == 0 {
+        return out
+    }
+    st := 0
+    i := 0
+    for i <= len(s) {
+        if i == len(s) || byteat(s, i) == 58 {
+            out = push(out, substr(s, st, i))
+            st = i + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn ipv6_hextet(s: str) -> int {
+    [v, e] = strconv.parseint(s, 16)
+    if e != nil || v < 0 || v > 65535 {
+        return -1
+    }
+    return v
+}
+
+fn ipv6_loopback(host: str) -> bool {
+    // std validates IPv6 syntax but exposes no canonical representation.
+    // Expand compression and leading zeros here so every spelling of the
+    // loopback address is treated identically.
+    h := lwr(host)
+    zi := find(h, "%")
+    if zi >= 0 {
+        h = substr(h, 0, zi)
+    }
+    if find(h, ".") >= 0 || !net.isip6(h) {
+        return false
+    }
+    vals := mkslice(int, 0)
+    zi2 := 0
+    for zi2 < 8 {
+        vals = push(vals, 0)
+        zi2 = zi2 + 1
+    }
+    di := find(h, "::")
+    if di >= 0 {
+        lp := ipv6_side_parts(substr(h, 0, di))
+        rp := ipv6_side_parts(substr(h, di + 2, len(h)))
+        zeros := 8 - len(lp) - len(rp)
+        if zeros <= 0 {
+            return false
+        }
+        i := 0
+        for i < len(lp) {
+            v := ipv6_hextet(lp[i])
+            if v < 0 {
+                return false
+            }
+            vals[i] = v
+            i = i + 1
+        }
+        i = 0
+        for i < len(rp) {
+            v := ipv6_hextet(rp[i])
+            if v < 0 {
+                return false
+            }
+            vals[len(lp) + zeros + i] = v
+            i = i + 1
+        }
+    } else {
+        parts := ipv6_side_parts(h)
+        if len(parts) != 8 {
+            return false
+        }
+        i := 0
+        for i < 8 {
+            v := ipv6_hextet(parts[i])
+            if v < 0 {
+                return false
+            }
+            vals[i] = v
+            i = i + 1
+        }
+    }
+    i := 0
+    for i < 7 {
+        if vals[i] != 0 {
+            return false
+        }
+        i = i + 1
+    }
+    return vals[7] == 1
+}
+
+fn loopback_host(host: str, localhost_ok: bool) -> bool {
+    if localhost_ok && lwr(host) == "localhost" {
+        return true
+    }
+    return ipv4_loopback(host) || ipv6_loopback(host)
+}
+
+fn endpoint_valid(raw: str, localhost_ok: bool) -> bool {
+    if len(raw) == 0 || find(raw, "#") >= 0 {
+        return false
+    }
+    [u, e] = url.parse(raw)
+    if e != nil {
+        return false
+    }
+    if len(u.host) == 0 || u.hasuser || len(u.fragment) > 0 {
+        return false
+    }
+    sch := lwr(u.scheme)
+    if sch == "https" {
+        return true
+    }
+    if sch != "http" {
+        return false
+    }
+    return loopback_host(u.hostname(), localhost_ok)
+}
+
+fn validate_token_endpoint(raw: str) -> err {
+    if !endpoint_valid(raw, true) {
+        return oauth_err("OAuth token URL must use HTTPS (HTTP is allowed only on loopback)")
+    }
+    return nil
+}
+
+fn validate_auth_endpoint(raw: str) -> err {
+    if !endpoint_valid(raw, true) {
+        return oauth_err("OAuth authorization URL must use HTTPS (HTTP is allowed only on loopback)")
+    }
+    return nil
+}
+
+fn validate_resource_url(raw: str) -> err {
+    msg := "OAuth requests require HTTPS (HTTP is allowed only on loopback)"
+    if len(raw) == 0 {
+        return oauth_err(msg)
+    }
+    [u, e] = url.parse(raw)
+    if e != nil || len(u.host) == 0 {
+        return oauth_err(msg)
+    }
+    sch := lwr(u.scheme)
+    if sch == "https" {
+        return nil
+    }
+    if sch == "http" && loopback_host(u.hostname(), true) {
+        return nil
+    }
+    return oauth_err(msg)
+}
+
+// validate_redirect enforces the strict callback URI shape. Port 0 is
+// valid and later expands to the listener's actual ephemeral port.
+fn validate_redirect(raw: str) -> err {
+    msg := "OAuth redirect URI must be an HTTP loopback IP with a port and path, e.g. http://127.0.0.1:8765/oauth/callback"
+    if len(raw) == 0 || find(raw, "#") >= 0 {
+        return oauth_err(msg)
+    }
+    [u, e] = url.parse(raw)
+    if e != nil {
+        return oauth_err(msg)
+    }
+    if lwr(u.scheme) != "http" || len(u.host) == 0 || u.hasuser || len(u.fragment) > 0 || len(u.rawquery) > 0 || u.forcequery {
+        return oauth_err(msg)
+    }
+    host := u.hostname()
+    if !ipv4_loopback(host) && !ipv6_loopback(host) {
+        return oauth_err(msg)
+    }
+    ps := u.port()
+    if len(ps) == 0 {
+        return oauth_err(msg)
+    }
+    p := atoi(ps)
+    if p < 0 || p > 65535 {
+        return oauth_err(msg)
+    }
+    if len(u.path) == 0 {
+        return oauth_err(msg)
+    }
+    return nil
+}
+
+// validate_config implements the send-time validation contract. cfg should
+// already have variables substituted; defaults are applied internally so a
+// caller may pass the raw decoded shape.
+fn validate_config(cfg: Config, resource_url: str) -> err {
+    c := with_defaults(cfg)
+    if c.grant_type != "authorization_code" && c.grant_type != "client_credentials" {
+        return oauth_err("OAuth grant must be authorization_code or client_credentials")
+    }
+    if len(trim_ws(c.client_id)) == 0 {
+        return oauth_err("OAuth client ID is required")
+    }
+    te := validate_token_endpoint(c.token_url)
+    if te != nil {
+        return te
+    }
+    if c.client_auth != "client_secret_basic" && c.client_auth != "client_secret_post" {
+        return oauth_err("OAuth client authentication must be client_secret_basic or client_secret_post")
+    }
+    if c.grant_type == "client_credentials" && len(c.client_secret) == 0 {
+        return oauth_err("OAuth client secret is required for client credentials")
+    }
+    if c.grant_type == "authorization_code" {
+        ae := validate_auth_endpoint(c.authorization_url)
+        if ae != nil {
+            return ae
+        }
+        re := validate_redirect(c.redirect_uri)
+        if re != nil {
+            return re
+        }
+    }
+    return validate_resource_url(resource_url)
+}
+
+fn append_lenpref(out: str, label: str, value: str) -> str {
+    return out + label + "=" + itoa(len(value)) + ":" + value + ";"
+}
+
+// resource_origin is <scheme>://<host>. URL parsing lowercases the
+// scheme; host text remains exactly as parsed, matching upstream cache keys.
+// Explicit default ports remain part of host, matching the spec partition.
+fn resource_origin(raw: str) -> [str, err] {
+    [u, e] = url.parse(raw)
+    if e != nil || len(u.host) == 0 {
+        return "", oauth_err("invalid resource URL for OAuth cache key")
+    }
+    return lwr(u.scheme) + "://" + u.host, nil
+}
+
+// cache_key produces the SHA-256 hex digest of an unambiguous length-prefixed
+// canonical encoding. Values are fully resolved and defaulted. No secret is
+// recoverable from the digest; changing any field partitions token reuse.
+fn cache_key(collection_root: str, resource_url: str, cfg: Config, verify_ssl: bool, proxy_url: str) -> [str, err] {
+    c := with_defaults(cfg)
+    [origin, oe] = resource_origin(resource_url)
+    if oe != nil {
+        return "", oe
+    }
+    verify := "false"
+    if verify_ssl {
+        verify = "true"
+    }
+    enc := "oxttp-oauth-cache-v1;"
+    enc = append_lenpref(enc, "collection", collection_root)
+    enc = append_lenpref(enc, "origin", origin)
+    enc = append_lenpref(enc, "grant_type", c.grant_type)
+    enc = append_lenpref(enc, "authorization_url", c.authorization_url)
+    enc = append_lenpref(enc, "token_url", c.token_url)
+    enc = append_lenpref(enc, "client_id", c.client_id)
+    enc = append_lenpref(enc, "client_secret", c.client_secret)
+    enc = append_lenpref(enc, "scope", c.scope)
+    enc = append_lenpref(enc, "redirect_uri", c.redirect_uri)
+    enc = append_lenpref(enc, "client_auth", c.client_auth)
+    enc = append_lenpref(enc, "verify_ssl", verify)
+    enc = append_lenpref(enc, "proxy_url", proxy_url)
+    return sha256.hexdigest(enc as []byte), nil
+}
+
+// query_escape is the token/authorization endpoint escaping primitive.
+fn query_escape(s: str) -> str {
+    return url.queryescape(s)
+}
+
+// form_encode emits deterministic sorted application/x-www-form-urlencoded
+// data. Repeated keys retain input order within the key group.
+fn form_encode(fields: []FormField) -> str {
+    let idx: []int = nil
+    i := 0
+    for i < len(fields) {
+        idx = push(idx, i)
+        i = i + 1
+    }
+    i = 1
+    for i < len(idx) {
+        x := idx[i]
+        j := i - 1
+        for j >= 0 && fields[idx[j]].name > fields[x].name {
+            idx[j + 1] = idx[j]
+            j = j - 1
+        }
+        idx[j + 1] = x
+        i = i + 1
+    }
+    out := ""
+    i = 0
+    for i < len(idx) {
+        if i > 0 {
+            out = out + "&"
+        }
+        f := fields[idx[i]]
+        out = out + url.queryescape(f.name) + "=" + url.queryescape(f.value)
+        i = i + 1
+    }
+    return out
+}
+
+// raw_url_base64 is unpadded URL-safe base64 (RFC 4648 §5).
+fn raw_url_base64(b: []byte) -> str {
+    return base64.url_encode_raw(b)
+}
+
+// state_equal compares equal-length strings byte-by-byte without an early
+// exit; different lengths reject before comparison.
+fn state_equal(a: str, b: str) -> bool {
+    if len(a) != len(b) {
+        return false
+    }
+    diff := 0
+    i := 0
+    for i < len(a) {
+        diff = diff | (byteat(a, i) ^ byteat(b, i))
+        i = i + 1
+    }
+    return diff == 0
+}
+
+// new_state returns 32 CSPRNG bytes encoded as 43 raw-url-base64 chars.
+// Failure is propagated; there is deliberately no weak-random fallback.
+fn new_state() -> [str, err] {
+    [b, e] = rand.bytes(32)
+    if e != nil {
+        return "", e
+    }
+    return raw_url_base64(b), nil
+}
+
+// new_pkce_verifier independently draws 32 CSPRNG bytes for PKCE.
+fn new_pkce_verifier() -> [str, err] {
+    [b, e] = rand.bytes(32)
+    if e != nil {
+        return "", e
+    }
+    return raw_url_base64(b), nil
+}
+
+// pkce_challenge is BASE64URL-NOPAD(SHA256(verifier)).
+fn pkce_challenge(verifier: str) -> str {
+    return raw_url_base64(sha256.sum256(verifier as []byte))
+}
+
+// listener_capability exposes the ADR-0063 execution capability without
+// attempting a socket bind in the pure foundation package.
+fn listener_capability() -> ListenerCapability {
+    return ListenerCapability{ipv6_loopback: false, note: "std/net.listen binds IPv4 INADDR_ANY in oxl 0.26.0"}
+}
+
+fn redirect_is_ipv6_loopback(raw: str) -> bool {
+    [u, e] = url.parse(raw)
+    if e != nil {
+        return false
+    }
+    return ipv6_loopback(u.hostname())
+}
+
+// ipv6_redirect_execution_error is the explicit degradation used when an
+// authorization-code flow is otherwise valid but cannot bind IPv6 loopback.
+fn ipv6_redirect_execution_error() -> err {
+    return oauth_err(IPv6RedirectUnsupported)
+}

@@ -1,0 +1,151 @@
+package oauth
+
+// WI-0022 S5 loopback listener tests. Clients are spawned because the
+// listener API is synchronous; each client writes a complete callback then
+// closes, so no test depends on a real browser or external network.
+import "std/net"
+import "std/testing"
+
+fn cb_write_close(c: net.Conn, text: str) {
+    b := text as []byte
+    off := 0
+    for off < len(b) {
+        [n, e] = c.write(b[off:])
+        if e != nil || n <= 0 {
+            break
+        }
+        off = off + n
+    }
+    c.close()
+}
+
+fn cb_send(port: int, target: str, host: str) {
+    [c, e] = net.dial("127.0.0.1", port)
+    if e != nil {
+        return
+    }
+    cb_write_close(c, "GET " + target + " HTTP/1.1\r\nHost: " + host + "\r\nUser-Agent: fixture\r\n\r\n")
+}
+
+fn cb_send_raw(port: int, text: str) {
+    [c, e] = net.dial("127.0.0.1", port)
+    if e != nil {
+        return
+    }
+    cb_write_close(c, text)
+}
+
+fn cb_one_shot_client(port: int, target: str, host: str) {
+    msleep(20)
+    cb_send(port, target, host)
+}
+
+fn run_cb_case(target: str, state: str) -> CallbackOutcome {
+    [l, e] = net.listen(0)
+    testing.expect(e == nil, "callback fixture listen")
+    if e != nil {
+        return CallbackOutcome{kind: "listen_error", code: "", error_code: "", detail: ""}
+    }
+    actual := "http://127.0.0.1:" + itoa(l.port()) + "/cb"
+    spawnBlocking cb_one_shot_client(l.port(), target, "127.0.0.1:" + itoa(l.port()))
+    out := wait_callback(l, actual, state, now_ms() + 2000)
+    l.close()
+    return out
+}
+
+fn test_callback_success_denial_and_state() {
+    good := run_cb_case("/cb?code=abc&state=state-1", "state-1")
+    testing.expect_streq(good.kind, "success", "strict correct Host succeeds")
+    testing.expect_streq(good.code, "abc", "strict Host code")
+
+    [l, e] = net.listen(0)
+    testing.expect(e == nil, "listen exact host")
+    actual := "http://127.0.0.1:" + itoa(l.port()) + "/cb"
+    spawnBlocking cb_one_shot_client(l.port(), "/cb?code=abc&state=state-1", "127.0.0.1:" + itoa(l.port()))
+    oc := wait_callback(l, actual, "state-1", now_ms() + 2000)
+    l.close()
+    testing.expect_streq(oc.kind, "success", "valid callback succeeds")
+    testing.expect_streq(oc.code, "abc", "code captured")
+
+    [l2, e2] = net.listen(0)
+    testing.expect(e2 == nil, "listen denial")
+    actual2 := "http://127.0.0.1:" + itoa(l2.port()) + "/cb"
+    spawnBlocking cb_one_shot_client(l2.port(), "/cb?error=access_denied&state=state-1", "127.0.0.1:" + itoa(l2.port()))
+    od := wait_callback(l2, actual2, "state-1", now_ms() + 2000)
+    l2.close()
+    testing.expect_streq(od.kind, "denial", "provider denial outcome")
+    testing.expect_streq(od.error_code, "access_denied", "denial metadata")
+}
+
+fn cb_bad_then_good_client(port: int, actual_host: str) {
+    msleep(20)
+    cb_send(port, "/wrong?code=no&state=state-1", actual_host)
+    cb_send(port, "/cb?state=state-1", actual_host)
+    cb_send(port, "/cb?code=good&state=state-1", actual_host)
+}
+
+fn test_callback_extraneous_then_success_and_malformed() {
+    [l, e] = net.listen(0)
+    testing.expect(e == nil, "listen extraneous")
+    actual := "http://127.0.0.1:" + itoa(l.port()) + "/cb"
+    spawnBlocking cb_bad_then_good_client(l.port(), "127.0.0.1:" + itoa(l.port()))
+    oc := wait_callback(l, actual, "state-1", now_ms() + 2000)
+    l.close()
+    testing.expect_streq(oc.kind, "success", "extraneous wrong path does not end wait")
+    testing.expect_streq(oc.code, "good", "missing code does not consume first valid outcome")
+
+    badstate := run_cb_case("/cb?code=x&state=wrong", "state-1")
+    testing.expect_streq(badstate.kind, "timeout", "bad state remains extraneous")
+}
+
+fn cb_header_cap_client(port: int) {
+    msleep(20)
+    huge := "GET /cb HTTP/1.1\r\nHost: x\r\nX-Pad: "
+    for len(huge) < CallbackHeadCap + 128 {
+        huge = huge + "a"
+    }
+    huge = huge + "\r\n\r\n"
+    cb_send_raw(port, huge)
+}
+
+fn test_callback_head_cap_is_bounded() {
+    [l, e] = net.listen(0)
+    testing.expect(e == nil, "listen cap")
+    actual := "http://127.0.0.1:" + itoa(l.port()) + "/cb"
+    spawnBlocking cb_header_cap_client(l.port())
+    oc := wait_callback(l, actual, "state-1", now_ms() + 250)
+    l.close()
+    testing.expect(oc.kind == "timeout" || oc.kind == "extraneous", "oversized head never becomes success")
+    testing.expect_streq(oc.code, "", "no code retained")
+}
+
+
+fn test_callback_response_security_shape() {
+    ok := callback_response(200, "OK", "Authorization response received. Return to Posting.", true)
+    testing.expect(find(ok, "Cache-Control: no-store") >= 0, "eligible response no-store")
+    testing.expect(find(ok, "Referrer-Policy: no-referrer") >= 0, "eligible response no-referrer")
+    testing.expect(find(ok, "Authorization response received. Return to Posting.") >= 0, "upstream success body")
+    nf := callback_response(404, "Not Found", "Not found", false)
+    testing.expect(find(nf, "Cache-Control: no-store") >= 0, "nonmatching response also no-store upstream")
+    testing.expect(find(nf, "Referrer-Policy: no-referrer") >= 0, "nonmatching response also no-referrer upstream")
+}
+
+fn test_authorization_url_and_ipv6_degrade() {
+    c := with_defaults(Config{grant_type: "authorization_code", authorization_url: "https://issuer.test/auth?prompt=consent", token_url: "https://issuer.test/token", client_id: "cid", client_secret: "", scope: "read write", redirect_uri: "http://127.0.0.1:0/cb", client_auth: ""})
+    u := authorization_url(c, "http://127.0.0.1:991/cb", "state x", "verifier")
+    testing.expect(find(u, "prompt=consent") >= 0, "existing endpoint query preserved")
+    testing.expect(find(u, "response_type=code") >= 0, "response type")
+    testing.expect(find(u, "redirect_uri=http") >= 0, "redirect parameter present")
+    testing.expect(find(u, "code_challenge_method=S256") >= 0, "PKCE method")
+    testing.expect(find(u, "state=state+x") >= 0 || find(u, "state=state%20x") >= 0, "state query escaped")
+    testing.expect(redirect_is_ipv6_loopback("http://[::1]:8765/cb"), "IPv6 loopback detected")
+    c2 := c
+    c2.authorization_url = "https://issuer.test/auth?"
+    u2 := authorization_url(c2, "http://127.0.0.1:991/cb", "state", "verifier")
+    testing.expect(find(u2, "?response_type=code") >= 0, "trailing question mark not doubled")
+    c3 := c
+    c3.authorization_url = "https://issuer.test/auth?prompt=consent&"
+    u3 := authorization_url(c3, "http://127.0.0.1:991/cb", "state", "verifier")
+    testing.expect(find(u3, "&response_type=code") >= 0, "trailing ampersand reused")
+    testing.expect(find(u3, "&&") < 0, "separator not doubled")
+}

@@ -5,6 +5,7 @@ import "std/errors"
 import "std/testing"
 import "github.com/oxidean/oxttp/core/model"
 import "github.com/oxidean/oxttp/core/env"
+import "github.com/oxidean/oxttp/core/oauth"
 import "github.com/oxidean/oxttp/core/yaml"
 
 fn ymap_idx(n: ref yaml.YNode, key: str) -> int {
@@ -202,8 +203,34 @@ fn plan_env() -> own env.EnvSet {
     l := env.EnvLayer{name: "s", source: "session", vars: nil}
     l.vars = push(l.vars, model.KV{name: "BASE", value: "http://b.test", enabled: true})
     l.vars = push(l.vars, model.KV{name: "TOK", value: "t1", enabled: true})
+    l.vars = push(l.vars, model.KV{name: "OAUTH_ID", value: "cid", enabled: true})
+    l.vars = push(l.vars, model.KV{name: "OAUTH_SECRET", value: "sec", enabled: true})
     s.layers = push(s.layers, l)
     return s
+}
+
+
+fn test_plan_req_for_forget_skips_oauth_validation() {
+    src := "method: get\nurl: https://api.example.test/x\nauth:\n  type: oauth2\n  oauth2:\n    grant_type: bogus\n    token_url: https://issuer.example.test/token\n    client_id: cid\n"
+    [r, e] = decode_src(src)
+    testing.expect(e == nil, "decode invalid-grant oauth request")
+    es := plan_env()
+    sp := plan_req(r, es, nil, "d")
+    testing.expect(len(sp.err) > 0, "send planning still validates grant")
+    fp := plan_req_for_forget(r, es, nil, "d")
+    testing.expect(len(fp.err) == 0, "forget planning ignores oauth validation")
+    testing.expect(fp.oauth != nil, "forget plan carries cache identity")
+    if fp.oauth != nil {
+        m := new(oauth.Manager)
+        [key, ke] = oauth.manager_key(fp.oauth.cfg, fp.oauth.identity)
+        testing.expect(ke == nil, "invalid config still has stable cache key")
+        if ke == nil {
+            m.entries = push(m.entries, oauth.TokenEntry{key: key, token: oauth.Token{access_token: "old", token_type: "Bearer", refresh_token: "", expiry_unix: 0, has_expiry: false}})
+            fe := oauth.forget(m, fp.oauth.cfg, fp.oauth.identity)
+            testing.expect(fe == nil, "forget succeeds despite invalid oauth config")
+            testing.expect_eq(len(m.entries), 0, "invalid config token removed")
+        }
+    }
 }
 
 fn test_plan_req_basic() {
@@ -470,6 +497,8 @@ fn test_plan_req_substituted_header_guards() {
     l := env.EnvLayer{name: "s", source: "session", vars: nil}
     l.vars = push(l.vars, model.KV{name: "HN", value: "Authorization", enabled: true})
     l.vars = push(l.vars, model.KV{name: "TOK", value: "t1", enabled: true})
+    l.vars = push(l.vars, model.KV{name: "OAUTH_ID", value: "cid", enabled: true})
+    l.vars = push(l.vars, model.KV{name: "OAUTH_SECRET", value: "sec", enabled: true})
     es.layers = push(es.layers, l)
     [r, e] = decode_src("url: x.com\nheaders:\n  - name: $HN\n    value: Custom z\nauth:\n  type: bearer_token\n  bearer_token:\n    token: $TOK\n")
     testing.expect(e == nil, "decode")
@@ -531,4 +560,61 @@ fn test_encode_validate_captures() {
     testing.expect(ee != nil, "encode rejects invalid capture")
     [_, me] = marshal(r)
     testing.expect(me != nil, "marshal rejects invalid capture")
+}
+
+fn test_plan_req_oauth_client_credentials_plan() {
+    src := "url: https://api.example.test/x\nauth:\n  type: oauth2\n  oauth2:\n    grant_type: client_credentials\n    token_url: https://issuer.example.test/token\n    client_id: $OAUTH_ID\n    client_secret: $OAUTH_SECRET\n    scope: ' read   write  read '\n    authorization_url: $INACTIVE_UNDEFINED\n    redirect_uri: $ALSO_INACTIVE\n"
+    [r, e] = decode_src(src)
+    testing.expect(e == nil, "oauth yaml decodes")
+    es := plan_env()
+    sp := plan_req(r, es, nil, "/tmp/wi22-coll")
+    testing.expect_streq(sp.err, "", "inactive code-only undefined fields do not block client credentials")
+    testing.expect(sp.oauth != nil, "oauth plan attached")
+    if sp.oauth != nil {
+        testing.expect_streq(sp.oauth.cfg.client_id, "cid", "client id substituted")
+        testing.expect_streq(sp.oauth.cfg.client_secret, "sec", "secret substituted")
+        testing.expect_streq(sp.oauth.cfg.scope, "read write", "scope normalized")
+        testing.expect_streq(sp.oauth.cfg.client_auth, "client_secret_post", "client auth default")
+        testing.expect_streq(sp.oauth.identity.resource_url, "https://api.example.test/x", "resource identity")
+        testing.expect_streq(sp.oauth.identity.collection_root, "/tmp/wi22-coll", "collection root preserved")
+    }
+    testing.expect(sp.req != nil, "request still planned")
+    testing.expect_eq(len(sp.req.headers), 0, "planner does not inject runtime bearer")
+}
+
+fn test_plan_req_oauth_code_substitution_and_validation() {
+    src := "url: https://api.example.test/x\nauth:\n  type: oauth2\n  oauth2:\n    grant_type: authorization_code\n    authorization_url: https://issuer.example.test/auth?prompt=consent\n    token_url: https://issuer.example.test/token\n    client_id: $OAUTH_ID\n    redirect_uri: http://127.0.0.1:0/cb\n"
+    [r, e] = decode_src(src)
+    testing.expect(e == nil, "code yaml decodes")
+    es := plan_env()
+    sp := plan_req(r, es, nil, "d")
+    testing.expect_streq(sp.err, "", "valid code config plans")
+    testing.expect(sp.oauth != nil, "code plan attached")
+    if sp.oauth != nil {
+        testing.expect_streq(sp.oauth.cfg.authorization_url, "https://issuer.example.test/auth?prompt=consent", "authorization url preserved")
+        testing.expect_streq(sp.oauth.cfg.redirect_uri, "http://127.0.0.1:0/cb", "redirect uri substituted")
+    }
+
+    [r2, e2] = decode_src("url: https://api.example.test/x\nauth:\n  type: oauth2\n  oauth2:\n    grant_type: client_credentials\n    token_url: https://issuer.example.test/token\n    client_id: $MISSING_OAUTH_ID\n    client_secret: x\n")
+    testing.expect(e2 == nil, "bad var yaml decodes")
+    sp2 := plan_req(r2, es, nil, "d")
+    testing.expect(find(sp2.err, "unresolved variable") >= 0, "active undefined variable is send error: " + sp2.err)
+
+    [r3, e3] = decode_src("url: https://api.example.test/x\nauth:\n  type: oauth2\n  oauth2:\n    grant_type: client_credentials\n    token_url: http://issuer.example.test/token\n    client_id: x\n    client_secret: x\n")
+    testing.expect(e3 == nil, "bad endpoint yaml decodes")
+    sp3 := plan_req(r3, es, nil, "d")
+    testing.expect_streq(sp3.err, "OAuth token URL must use HTTPS (HTTP is allowed only on loopback)", "validation surfaces in planner")
+    testing.expect(sp3.req == nil, "invalid oauth stops before transport request completion")
+}
+
+fn test_plan_req_oauth_explicit_authorization_still_plans() {
+    src := "url: https://api.example.test/x\nheaders:\n  - name: Authorization\n    value: Custom abc\nauth:\n  type: oauth2\n  oauth2:\n    grant_type: client_credentials\n    token_url: https://issuer.example.test/token\n    client_id: x\n    client_secret: x\n"
+    [r, e] = decode_src(src)
+    testing.expect(e == nil, "yaml decodes")
+    es := plan_env()
+    sp := plan_req(r, es, nil, "d")
+    testing.expect_streq(sp.err, "", "oauth plans despite explicit authorization")
+    testing.expect(sp.oauth != nil, "oauth plan attached with explicit header")
+    testing.expect_eq(len(sp.req.headers), 1, "saved explicit row remains in planned request pre-authorization")
+    testing.expect_streq(sp.req.headers[0].value, "Custom abc", "explicit row unchanged until execution")
 }

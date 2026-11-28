@@ -130,7 +130,7 @@ fn (t mut TmoTlsReader) asreader() -> io.Reader {
 // req.follow) through roundtrip; the final Resp is returned.
 fn (t H1) send(req: ref model.Req) -> [model.Resp, err] {
     rt_sigpipe_ignore()
-    cur := new(model.Req{method: req.method, url: req.url, headers: req.headers, body: req.body, timeout_ms: req.timeout_ms, follow: req.follow, max_redirects: req.max_redirects, httpver: req.httpver, synth: req.synth, verify: req.verify, jar_off: req.jar_off, h2: req.h2, ssl_min: req.ssl_min, ssl_max: req.ssl_max, cert_pem: req.cert_pem, key_pem: req.key_pem, proxies: req.proxies, proxy_env: req.proxy_env, no_proxy: req.no_proxy, proxy_go: req.proxy_go, cgi: req.cgi})
+    cur := new(model.Req{method: req.method, url: req.url, headers: req.headers, body: req.body, timeout_ms: req.timeout_ms, follow: req.follow, max_redirects: req.max_redirects, httpver: req.httpver, synth: req.synth, verify: req.verify, jar_off: req.jar_off, h2: req.h2, ssl_min: req.ssl_min, ssl_max: req.ssl_max, cert_pem: req.cert_pem, key_pem: req.key_pem, proxies: req.proxies, proxy_env: req.proxy_env, no_proxy: req.no_proxy, proxy_go: req.proxy_go, cgi: req.cgi, max_body_bytes: req.max_body_bytes})
     hops := 0
     let jar: []model.Header = nil // jar-lite: set-cookie pairs across hops (ADR 0023)
     let hs: []model.Hop = nil
@@ -648,14 +648,17 @@ fn finish_roundtrip(req: ref model.Req, br: own bufio.Reader, dlcell: shared, ca
                     i = i + 1
                 }
             } else {
-                [cb, ce] = read_chunked(br)
+                [ccb2, ce] = read_chunked_cap(br, req.max_body_bytes)
                 if ce != nil {
                     return bad, ce
                 }
-                body = cb.data
+                if ccb2.hit {
+                    return bad, body_cap_error(req.max_body_bytes)
+                }
+                body = ccb2.body.data
                 i := 0
-                for i < len(cb.trailers) {
-                    h.headers = push(h.headers, cb.trailers[i])
+                for i < len(ccb2.body.trailers) {
+                    h.headers = push(h.headers, ccb2.body.trailers[i])
                     i = i + 1
                 }
             }
@@ -670,7 +673,7 @@ fn finish_roundtrip(req: ref model.Req, br: own bufio.Reader, dlcell: shared, ca
                 }
                 body = cr.data
             } else {
-                [b2, e2] = read_eof(br)
+                [b2, e2] = read_eof_cap(br, req.max_body_bytes)
                 if e2 != nil {
                     return bad, e2
                 }
@@ -689,6 +692,9 @@ fn finish_roundtrip(req: ref model.Req, br: own bufio.Reader, dlcell: shared, ca
                     body_err = errors.msg(e3)
                 }
             } else {
+                if req.max_body_bytes > 0 && cl > req.max_body_bytes {
+                    return bad, body_cap_error(req.max_body_bytes)
+                }
                 [b3, e3] = read_exact(br, rd)
                 if e3 != nil {
                     return bad, e3
@@ -706,7 +712,7 @@ fn finish_roundtrip(req: ref model.Req, br: own bufio.Reader, dlcell: shared, ca
                 }
                 body = cr2.data
             } else {
-                [b4, e4] = read_eof(br)
+                [b4, e4] = read_eof_cap(br, req.max_body_bytes)
                 if e4 != nil {
                     return bad, e4
                 }
@@ -739,11 +745,14 @@ fn finish_roundtrip(req: ref model.Req, br: own bufio.Reader, dlcell: shared, ca
             }
         }
     } else {
-        [db, dbe] = decode_body(body, hdr_get(h.headers, "content-encoding"))
+        [db, dbe] = decode_body_cap(body, hdr_get(h.headers, "content-encoding"), req.max_body_bytes)
         if dbe != nil {
             return bad, dbe
         }
         bodyb = db
+    }
+    if !sse && req.max_body_bytes > 0 && len(bodyb) > req.max_body_bytes {
+        return bad, body_cap_error(req.max_body_bytes)
     }
     tr.closed_ms = itof(now_ms() - c0)
     serr := ""
@@ -1011,6 +1020,9 @@ fn h2_exchange(req: ref model.Req, rw: io.ReadWriter, fd: int, hdrs: []model.Hea
                     sse_raw_over = true
                 }
             }
+            if !sse_is_stream(rh, req.method) && req.max_body_bytes > 0 && len(body) + len(ev.payload) > req.max_body_bytes {
+                return bad, body_cap_error(req.max_body_bytes)
+            }
             i := 0
             for i < keep {
                 body = push(body, ev.payload[i])
@@ -1069,11 +1081,14 @@ fn h2_exchange(req: ref model.Req, rw: io.ReadWriter, fd: int, hdrs: []model.Hea
         }
         decoded_over = dc.hit
     } else {
-        [db, dbe] = decode_body(body, hdr_get(rh, "content-encoding"))
+        [db, dbe] = decode_body_cap(body, hdr_get(rh, "content-encoding"), req.max_body_bytes)
         if dbe != nil {
             return bad, dbe
         }
         bodyb = db
+    }
+    if !is_sse && req.max_body_bytes > 0 && len(bodyb) > req.max_body_bytes {
+        return bad, body_cap_error(req.max_body_bytes)
     }
     tr.closed_ms = itof(now_ms() - c0)
     // SSE over h2 parses events identically; the deadline is NOT
