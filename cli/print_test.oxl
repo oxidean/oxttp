@@ -185,7 +185,7 @@ fn test_meta_and_human_bytes() {
     testing.expect_streq(human_bytes(2048), "2.00 KiB", "2KiB")
     testing.expect_streq(human_bytes(5242880), "5.00 MiB", "5MiB")
     testing.expect_streq(human_bytes(3221225472), "3.00 GiB", "3GiB")
-    resp := model.Resp{status: 200, reason: "OK", headers: nil, body: nil, elapsed_ms: 12.3, remote: "127.0.0.1:80", version: "1.1", req_head: "", hops: nil, trace: nil, tls_ver: 0}
+    resp := model.Resp{status: 200, reason: "OK", headers: nil, body: nil, elapsed_ms: 12.3, remote: "127.0.0.1:80", version: "1.1", req_head: "", hops: nil, trace: nil, tls_ver: 0, events: nil, stream_error: ""}
     m := meta_render(resp)
     testing.expect(find(m, "Elapsed time: 0.01230s") >= 0, "meta elapsed: " + m)
     testing.expect(find(m, "Remote address: 127.0.0.1:80") >= 0, "meta remote")

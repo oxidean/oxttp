@@ -55,10 +55,14 @@ fn test_decode_strict_and_kind() {
     testing.expect(e2 != nil, "bad method err")
     [_r3, e3] = decode_src("kind: socks\n")
     testing.expect(e3 != nil, "bad kind err")
-    [r4, e4] = decode_src("kind: graphql\ngraphql:\n  query: '{ q }'\n  variables:\n    a: 1\n")
+    [r4, e4] = decode_src("kind: graphql\ngraphql:\n  query: '{ q }'\n  variables: '{\"a\": 1}'\n")
     testing.expect(e4 == nil, "graphql ok")
     testing.expect_streq(r4.kind, "graphql", "kind kept")
-    testing.expect(r4.graphql != nil && r4.graphql.variables != nil, "vars json")
+    testing.expect(r4.graphql != nil, "graphql block")
+    testing.expect_streq(r4.graphql.variables, "{\"a\": 1}", "vars raw text")
+    // upstream yamlString: variables is scalar-only — a map is an error
+    [_r4b, e4b] = decode_src("kind: graphql\ngraphql:\n  variables:\n    a: 1\n")
+    testing.expect(e4b != nil, "variables map rejected")
     [_r5, e5] = decode_src("graphql:\n  query: q\n  bogus: 1\n")
     testing.expect(e5 != nil, "graphql strict")
     [_r6, e6] = decode_src("websocket:\n  message: hi\n  bogus: 1\n")
@@ -265,9 +269,14 @@ fn test_plan_req_bodies() {
     sp3 := plan_req(r3, es, nil, "d")
     fb := sp3.req.body as model.Body.Form
     testing.expect_streq(fb.fields[0].value, "t1", "form sub")
-    [r4, e4] = decode_src("kind: graphql\nurl: x.com\n")
+    // graphql plans (WI-0020); grpc/ws still degrade
+    [r4, e4] = decode_src("kind: graphql\nurl: x.com\ngraphql:\n  query: '{ q }'\n")
     sp4 := plan_req(r4, es, nil, "d")
-    testing.expect(len(sp4.err) > 0, "kind degrades")
+    testing.expect(len(sp4.err) == 0, "graphql plans")
+    testing.expect_streq(sp4.req.method, "POST", "graphql forced POST")
+    [r5, e5] = decode_src("kind: grpc\nurl: x.com\ngrpc:\n  method: m\n")
+    sp5 := plan_req(r5, es, nil, "d")
+    testing.expect(len(sp5.err) > 0, "grpc still degrades")
 }
 
 fn test_plan_req_options() {
@@ -332,43 +341,76 @@ fn test_plan_req_cookies_and_unresolved() {
     testing.expect(len(sp3.err) > 0, "unresolved url err")
 }
 
-fn test_yjson_quoted_provenance() {
-    // quoted scalars keep string type in graphql.variables — only
-    // plain scalars coerce. `code: "001"` must not become int 1.
-    [r, e] = decode_src("kind: graphql\ngraphql:\n  query: '{ q }'\n  variables:\n    code: \"001\"\n    num: 7\n")
+fn test_graphql_variables_scalar() {
+    // WI-0020: variables is raw text upstream (yamlString) — quoted
+    // scalars, JSON-looking text and invalid JSON all round-trip
+    // verbatim; only the scalar node type is enforced.
+    [r, e] = decode_src("kind: graphql\ngraphql:\n  query: '{ q }'\n  variables: '{\"code\": \"001\", \"num\": 7}'\n  operation_name: Op\n")
     testing.expect(e == nil, "decode")
-    vs := r.graphql.variables
-    testing.expect(vs != nil, "vars json")
-    csaw := false
-    nsaw := false
-    c := vs.child
-    for c != nil {
-        if c.key == "code" {
-            csaw = true
-            testing.expect_eq(c.kind, 3, "quoted stays string")
-            testing.expect_streq(c.s, "001", "leading zeros kept")
-        }
-        if c.key == "num" {
-            nsaw = true
-            testing.expect_eq(c.kind, 2, "plain coerces int")
-        }
-        c = c.next
-    }
-    testing.expect(csaw && nsaw, "both keys seen")
-    // save → reload keeps the string form
+    testing.expect_streq(r.graphql.variables, "{\"code\": \"001\", \"num\": 7}", "vars verbatim")
+    testing.expect_streq(r.graphql.operation_name, "Op", "op name")
     out := marshal(r)
-    testing.expect(find(out, "\"001\"") >= 0, "string emits quoted")
+    testing.expect(find(out, "variables:") >= 0, "vars emitted")
     [r2, e2] = decode_src(out)
     testing.expect(e2 == nil, "re-decode")
-    c2 := r2.graphql.variables.child
-    ok := false
-    for c2 != nil {
-        if c2.key == "code" {
-            ok = c2.kind == 3 && c2.s == "001"
+    testing.expect_streq(r2.graphql.variables, "{\"code\": \"001\", \"num\": 7}", "round-trip verbatim")
+    // invalid-JSON text is legal — the document builder splices it raw
+    [r3, e3] = decode_src("kind: graphql\ngraphql:\n  variables: 'not json {{'\n")
+    testing.expect(e3 == nil, "invalid json vars decode")
+    testing.expect_streq(r3.graphql.variables, "not json {{", "raw kept")
+}
+
+fn test_plan_req_graphql_document() {
+    // WI-0020 §7.2: POST {"query","variables","operationName"} JSON;
+    // braced-only sub on query, full sub on variables, none on op.
+    es := plan_env()
+    [r, e] = decode_src("kind: graphql\nurl: $BASE/gql\ngraphql:\n  query: 'query Q($id: ID!) { u(id: $id, t: ${TOK}) }'\n  variables: '{\"id\": \"${TOK}\"}'\n  operation_name: Q\nparams:\n  - name: a\n    value: '1'\n")
+    testing.expect(e == nil, "decode")
+    sp := plan_req(r, es, nil, "d")
+    testing.expect(len(sp.err) == 0, "plan ok")
+    testing.expect_streq(sp.req.method, "POST", "POST")
+    testing.expect_streq(sp.req.url, "http://b.test/gql?a=1", "params kept")
+    br := sp.req.body as model.Body.Raw
+    testing.expect_streq(br.ctype, "application/json", "json ctype")
+    // $id survives (braced-only); ${TOK} -> t1 in query; variables
+    // compacted with ${TOK} -> t1; operationName present.
+    want := "{\"query\":\"query Q($id: ID!) { u(id: $id, t: t1) }\",\"variables\":{\"id\":\"t1\"},\"operationName\":\"Q\"}"
+    testing.expect_streq(br.text, want, "document exact")
+    // Accept synthesized when absent
+    acc := ""
+    i := 0
+    for i < len(sp.req.headers) {
+        if ascii_lower(sp.req.headers[i].name) == "accept" {
+            acc = sp.req.headers[i].value
         }
-        c2 = c2.next
+        i = i + 1
     }
-    testing.expect(ok, "round-trip keeps string")
+    testing.expect_streq(acc, "application/graphql-response+json, application/json", "accept synth")
+    // explicit Accept wins — no second Accept row
+    [r2, e2] = decode_src("kind: graphql\nurl: x.com\nheaders:\n  - name: Accept\n    value: application/json\ngraphql:\n  query: q\n")
+    sp2 := plan_req(r2, es, nil, "d")
+    n := 0
+    j := 0
+    for j < len(sp2.req.headers) {
+        if ascii_lower(sp2.req.headers[j].name) == "accept" {
+            n = n + 1
+        }
+        j = j + 1
+    }
+    testing.expect_eq(n, 1, "one accept")
+    testing.expect_streq(sp2.req.headers[0].value, "application/json", "explicit accept")
+    // substitute_body_variables=false leaves query+vars literal
+    [r3, e3] = decode_src("kind: graphql\nurl: x.com\ngraphql:\n  query: 'q ${TOK}'\n  variables: '{\"a\": \"${TOK}\"}'\noptions:\n  substitute_body_variables: false\n")
+    sp3 := plan_req(r3, es, nil, "d")
+    br3 := sp3.req.body as model.Body.Raw
+    testing.expect(find(br3.text, "q ${TOK}") >= 0, "query literal")
+    testing.expect(find(br3.text, "\"${TOK}\"") >= 0, "vars literal")
+    // variables omitted when blank; invalid JSON spliced verbatim
+    [r4, e4] = decode_src("kind: graphql\nurl: x.com\ngraphql:\n  query: q\n  variables: 'oops {{'\n")
+    sp4 := plan_req(r4, es, nil, "d")
+    br4 := sp4.req.body as model.Body.Raw
+    testing.expect(find(br4.text, "\"variables\":oops {{") >= 0, "verbatim splice")
+    testing.expect(find(br4.text, "operationName") < 0, "op omitted")
 }
 
 fn test_plan_req_path_param_with_query_and_frag() {

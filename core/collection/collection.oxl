@@ -26,7 +26,7 @@ struct PBody {
 
 struct PGraphQL {
     query: str,
-    variables: own json.Json,
+    variables: str, // raw text — upstream yamlString; document() compacts at send
     operation_name: str,
 }
 
@@ -569,7 +569,13 @@ fn gql_dec(v: ref yaml.YNode) -> [own PGraphQL, err] {
             }
             g.query = s
         } else if k == "variables" {
-            g.variables = yjson(pv)
+            // upstream yamlString — scalar text only; the JSON
+            // compaction/splice happens at document build, not decode
+            [sv, sve] = scal(pv, "graphql.variables")
+            if sve != nil {
+                return nil, sve
+            }
+            g.variables = sv
         } else if k == "operation_name" {
             [s2, se2] = scal(pv, "graphql.operation_name")
             if se2 != nil {
@@ -1179,57 +1185,6 @@ fn ystr_list(xs: []str) -> own yaml.YNode {
     return n
 }
 
-// jnode converts a json tree back into YNode scalars/containers for
-// graphql.variables round-trips.
-fn jnode(j: ref json.Json) -> own yaml.YNode {
-    n := new(yaml.YNode)
-    if j == nil {
-        n.kind = 0
-        n.s = "null"
-        n.plain = true
-        return n
-    }
-    if j.kind == 4 {
-        n.kind = 1
-        c := j.child
-        for c != nil {
-            yput(n, c.key, jnode(c))
-            c = c.next
-        }
-        return n
-    }
-    if j.kind == 5 {
-        n.kind = 2
-        c := j.child
-        for c != nil {
-            n.items = push(n.items, jnode(c))
-            c = c.next
-        }
-        return n
-    }
-    n.kind = 0
-    if j.kind == 0 {
-        n.s = "null"
-        n.plain = true
-    } else if j.kind == 1 {
-        n.plain = true
-        if j.b {
-            n.s = "true"
-        } else {
-            n.s = "false"
-        }
-    } else if j.kind == 2 {
-        n.s = itoa(j.i)
-        n.plain = true
-    } else if j.kind == 6 {
-        n.s = ftoa(j.f)
-        n.plain = true
-    } else {
-        n.s = j.s
-    }
-    return n
-}
-
 // encode renders a PRequest into a YNode DOM — corpus key order,
 // omitempty throughout (only non-defaults written).
 fn encode(r: ref PRequest) -> own yaml.YNode {
@@ -1300,8 +1255,8 @@ fn encode(r: ref PRequest) -> own yaml.YNode {
         if len(r.graphql.query) > 0 {
             yput_str(gm, "query", r.graphql.query)
         }
-        if r.graphql.variables != nil {
-            yput(gm, "variables", jnode(r.graphql.variables))
+        if len(r.graphql.variables) > 0 {
+            yput_str(gm, "variables", r.graphql.variables)
         }
         if len(r.graphql.operation_name) > 0 {
             yput_str(gm, "operation_name", r.graphql.operation_name)
@@ -1806,12 +1761,63 @@ fn bad_wire(s: str) -> bool {
     return find(s, "\r") >= 0 || find(s, "\n") >= 0
 }
 
+
+// gql_trim strips ASCII whitespace — upstream strings.TrimSpace on
+// the variables text before the empty check.
+fn gql_trim(s: str) -> str {
+    lo := 0
+    for lo < len(s) && (byteat(s, lo) == 32 || byteat(s, lo) == 9 || byteat(s, lo) == 10 || byteat(s, lo) == 13) {
+        lo = lo + 1
+    }
+    hi := len(s)
+    for hi > lo && (byteat(s, hi - 1) == 32 || byteat(s, hi - 1) == 9 || byteat(s, hi - 1) == 10 || byteat(s, hi - 1) == 13) {
+        hi = hi - 1
+    }
+    return substr(s, lo, hi)
+}
+
+// gql_json_ok reports whether s parses as a complete JSON document.
+// jparse collapses every failure to jnull, so validity is "non-null
+// tree, or the literal null".
+fn gql_json_ok(s: str) -> bool {
+    j := json.jparse(s)
+    if j == nil {
+        return false
+    }
+    if j.kind == 0 {
+        return gql_trim(s) == "null"
+    }
+    return true
+}
+
+// gql_document builds the GraphQL POST body — upstream
+// model.GraphQL.document(): {"query","variables","operationName"}
+// with blank fields omitted; variables compacted when valid JSON,
+// spliced verbatim otherwise.
+fn gql_document(query: str, variables: str, operation_name: str) -> str {
+    out := "{\"query\":" + json.tojson(json.jstr(query))
+    v := gql_trim(variables)
+    if len(v) > 0 {
+        out = out + ",\"variables\":"
+        if gql_json_ok(v) {
+            out = out + json.tojson(json.jparse(v))
+        } else {
+            out = out + v
+        }
+    }
+    if len(operation_name) > 0 {
+        out = out + ",\"operationName\":" + json.tojson(json.jstr(operation_name))
+    }
+    return out + "}"
+}
+
 // plan_req maps a decoded request + environment + cookie jar into a
 // wire model.Req — corpus §7.1. err set → caller toasts; warns → info
 // toasts (proxy etc.).
 fn plan_req(r: ref PRequest, envset: ref env.EnvSet, jar: []str, coll_dir: str) -> SendPlan {
     sp := SendPlan{req: nil, warns: nil, err: ""}
-    if len(r.kind) > 0 {
+    if len(r.kind) > 0 && r.kind != "graphql" {
+        // grpc/websocket sends land M4e; graphql lowers to HTTP here
         sp.err = "kind " + r.kind + " sends land M4 — unsupported in this build"
         return sp
     }
@@ -1910,9 +1916,38 @@ fn plan_req(r: ref PRequest, envset: ref env.EnvSet, jar: []str, coll_dir: str) 
         timeout = o.timeout
         proxy = o.proxy_url
     }
-    // body
+    // body — graphql lowers its payload to a JSON document POST
+    // (corpus §7.2); r.method/r.body are ignored for the kind
+    // (upstream Normalize resets Method/Body).
     b := model.Body.Empty
-    if r.body != nil {
+    if r.kind == "graphql" {
+        gq := ""
+        gv := ""
+        gn := ""
+        if r.graphql != nil {
+            gq = r.graphql.query
+            gv = r.graphql.variables
+            gn = r.graphql.operation_name
+        }
+        if subbody {
+            // upstream resolve(): query → SubstituteBraced (${NAME}
+            // only — $name GraphQL vars survive); variables → full
+            // Substitute; operationName → none.
+            [gq2, ge2] = env.substitute_braced(gq, es)
+            if ge2 != nil {
+                sp.err = errors.msg(ge2)
+                return sp
+            }
+            gq = gq2
+            [gv2, ge3] = env.substitute(gv, es, false)
+            if ge3 != nil {
+                sp.err = errors.msg(ge3)
+                return sp
+            }
+            gv = gv2
+        }
+        b = model.Body.Raw{ctype: "application/json", text: gql_document(gq, gv, gn)}
+    } else if r.body != nil {
         if r.body.has_content {
             text := r.body.content
             if subbody {
@@ -2046,6 +2081,11 @@ fn plan_req(r: ref PRequest, envset: ref env.EnvSet, jar: []str, coll_dir: str) 
         }
         hdrs = push(hdrs, model.Header{name: "Cookie", value: cv})
     }
+    // graphql Accept — upstream Lower appends it when the request
+    // has no enabled Accept of its own (appended last among headers)
+    if r.kind == "graphql" && !hdr_named(hdrs, "Accept") {
+        hdrs = push(hdrs, model.Header{name: "Accept", value: "application/graphql-response+json, application/json"})
+    }
     // wire hygiene: CR/LF inside a header or the request-target
     // splices into the head — refuse before it reaches a socket.
     if bad_wire(u) {
@@ -2066,6 +2106,9 @@ fn plan_req(r: ref PRequest, envset: ref env.EnvSet, jar: []str, coll_dir: str) 
         m = "GET"
     }
     rq.method = m
+    if r.kind == "graphql" {
+        rq.method = "POST"
+    }
     rq.url = u
     rq.headers = hdrs
     rq.body = b

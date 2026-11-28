@@ -599,7 +599,7 @@ fn run_exec(o: ref RunOpts, t: http.Transport) -> own RunRep {
         }
         // carry cookies for this run only (upstream run.go).
         jar = jar_collect(jar, url_origin(sp.req.url), resp)
-        if model.status_class(resp.status) == 2 {
+        if run_resp_failed(n.req.kind, resp) {
             rep.lines = push(rep.lines, "FAILED " + n.rel + ": " + itoa(resp.status) + " " + resp.reason + "\n")
             failed = failed + 1
             if o.fail_fast { stop = true }
@@ -685,13 +685,67 @@ fn resp_json(req: ref model.Req, resp: model.Resp, rts: int) -> str {
     if len(ct) > 0 {
         extra = extra + ",\"contentType\":" + jesc(ct)
     }
+    if len(resp.stream_error) > 0 {
+        extra = extra + ",\"streamError\":" + jesc(resp.stream_error)
+    }
     extra = extra + ",\"receivedAt\":" + itoa(rts)
     head := "{\"method\":" + jesc(req.method) + ",\"url\":" + jesc(req.url) + ",\"status\":" + jesc(itoa(resp.status) + " " + resp.reason) + ",\"statusCode\":" + itoa(resp.status) + extra + ",\"headers\":[" + h + "],"
-    tail := "\"size\":" + itoa(len(resp.body)) + ",\"elapsedMs\":" + ftoa(resp.elapsed_ms) + "}"
+    evs := ""
+    if resp.events != nil {
+        evs = events_json(resp.events)
+    }
+    tail := "\"size\":" + itoa(len(resp.body)) + ",\"elapsedMs\":" + ftoa(resp.elapsed_ms)
+    if len(evs) > 0 {
+        tail = tail + ",\"events\":" + evs
+    }
+    tail = tail + "}"
     if !is_utf8(resp.body) {
         return head + "\"bodyBase64\":" + jesc(base64.encode(resp.body)) + "," + tail
     }
     return head + "\"body\":" + jesc(resp.body as str) + "," + tail
+}
+
+fn run_resp_failed(kind: str, resp: model.Resp) -> bool {
+    cls := model.status_class(resp.status)
+    if cls == 2 {
+        return true
+    }
+    // GraphQL warning: 2xx with a top-level errors array fails the run
+    // like upstream's warning status class.
+    return kind == "graphql" && cls == 0 && graphql_error_count(resp.body) > 0
+}
+
+fn events_json(evs: own []model.StreamEvent) -> str {
+    out := "["
+    i := 0
+    first := true
+    for i < len(evs) {
+        ev := evs[i]
+        if !first {
+            out = out + ","
+        }
+        first = false
+        out = out + "{\"at\":" + itoa(ev.at_ms) + ",\"kind\":" + itoa(ev.kind)
+        if len(ev.title) > 0 {
+            out = out + ",\"title\":" + jesc(ev.title)
+        }
+        if len(ev.body) > 0 {
+            // upstream []byte marshals base64 — keep that wire shape.
+            out = out + ",\"body\":" + jesc(base64.encode(ev.body))
+        }
+        if len(ev.content_type) > 0 {
+            out = out + ",\"contentType\":" + jesc(ev.content_type)
+        }
+        if len(ev.event) > 0 {
+            out = out + ",\"event\":" + jesc(ev.event)
+        }
+        if len(ev.id) > 0 {
+            out = out + ",\"id\":" + jesc(ev.id)
+        }
+        out = out + "}"
+        i = i + 1
+    }
+    return out + "]"
 }
 
 fn is_utf8(b: []byte) -> bool {

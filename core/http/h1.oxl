@@ -65,20 +65,21 @@ struct H1 { }
 // TmoReader wraps a plain Conn with a whole-request deadline.
 struct TmoReader {
     c: net.Conn,
-    deadline: int,
+    deadline: shared, // mkshared cell — SSE lifts it post-headers (ADR-0045)
     tmo: int,
 }
 
 fn (t mut TmoReader) read(b: []byte) -> [int, err] {
-    if t.deadline > 0 {
-        rem := t.deadline - now_ms()
+    dl := sget(t.deadline)
+    if dl > 0 {
+        rem := dl - now_ms()
         if rem <= 0 {
             return 0, errors.new("http: request timed out after " + itoa(t.tmo) + "ms")
         }
         set_rcvtimo_ms(t.c.rawfd(), rem)
     }
     [n, e] = t.c.read(b)
-    if e != nil && e != io.eof() && t.deadline > 0 && now_ms() >= t.deadline {
+    if e != nil && e != io.eof() && dl > 0 && now_ms() >= dl {
         return 0, errors.new("http: request timed out after " + itoa(t.tmo) + "ms")
     }
     return n, e
@@ -91,20 +92,21 @@ fn (t mut TmoReader) asreader() -> io.Reader {
 // TmoTlsReader is TmoReader for a TLS conn (rawfd still works).
 struct TmoTlsReader {
     c: tls.Conn,
-    deadline: int,
+    deadline: shared,
     tmo: int,
 }
 
 fn (t mut TmoTlsReader) read(b: []byte) -> [int, err] {
-    if t.deadline > 0 {
-        rem := t.deadline - now_ms()
+    dl := sget(t.deadline)
+    if dl > 0 {
+        rem := dl - now_ms()
         if rem <= 0 {
             return 0, errors.new("http: request timed out after " + itoa(t.tmo) + "ms")
         }
         set_rcvtimo_ms(t.c.rawfd(), rem)
     }
     [n, e] = t.c.read(b)
-    if e != nil && e != io.eof() && t.deadline > 0 && now_ms() >= t.deadline {
+    if e != nil && e != io.eof() && dl > 0 && now_ms() >= dl {
         return 0, errors.new("http: request timed out after " + itoa(t.tmo) + "ms")
     }
     return n, e
@@ -128,7 +130,7 @@ fn (t H1) send(req: ref model.Req) -> [model.Resp, err] {
     if req.timeout_ms > 0 {
         deadline = now_ms() + req.timeout_ms
     }
-    bad := model.Resp{status: 0, reason: "", headers: nil, body: nil, elapsed_ms: 0.0, remote: "", version: "", hops: nil, req_head: "", trace: nil, tls_ver: 0}
+    bad := model.Resp{status: 0, reason: "", headers: nil, body: nil, elapsed_ms: 0.0, remote: "", version: "", hops: nil, req_head: "", trace: nil, tls_ver: 0, events: nil, stream_error: ""}
     last := bad
     for true {
         if deadline > 0 {
@@ -317,7 +319,7 @@ fn dial_h1(host: str, port: int, tmo_ms: int) -> [net.Conn, err] {
 // roundtrip performs one request/response exchange on a fresh
 // connection and fills the stage timings on the way out.
 fn (t H1) roundtrip(req: ref model.Req, cap: mut model.Hop) -> [model.Resp, err] {
-    bad := model.Resp{status: 0, reason: "", headers: nil, body: nil, elapsed_ms: 0.0, remote: "", version: "", hops: nil, req_head: "", trace: nil, tls_ver: 0}
+    bad := model.Resp{status: 0, reason: "", headers: nil, body: nil, elapsed_ms: 0.0, remote: "", version: "", hops: nil, req_head: "", trace: nil, tls_ver: 0, events: nil, stream_error: ""}
     t0 := now_ms()
     tr := new(model.Trace)
     [u, ue] = check_url(req.url)
@@ -520,9 +522,10 @@ fn (t H1) roundtrip(req: ref model.Req, cap: mut model.Hop) -> [model.Resp, err]
             }
         }
         tr.send_body_ms = itof(now_ms() - c0)
-        trr := TmoTlsReader{c: tc, deadline: deadline, tmo: req.timeout_ms}
+        dlc := mkshared(deadline)
+        trr := TmoTlsReader{c: tc, deadline: dlc, tmo: req.timeout_ms}
         br := new(bufio.newreadersize(trr.asreader(), 16384))
-        [resp, re] = finish_roundtrip(req, br, cap, remote, t0, c0, tr, bad, tc.s.ver)
+        [resp, re] = finish_roundtrip(req, br, dlc, cap, remote, t0, c0, tr, bad, tc.s.ver)
         tc.close()
         return resp, re
     }
@@ -551,16 +554,17 @@ fn (t H1) roundtrip(req: ref model.Req, cap: mut model.Hop) -> [model.Resp, err]
         }
     }
     tr.send_body_ms = itof(now_ms() - c0)
-    trr := TmoReader{c: raw, deadline: deadline, tmo: req.timeout_ms}
+    dlc := mkshared(deadline)
+    trr := TmoReader{c: raw, deadline: dlc, tmo: req.timeout_ms}
     br := new(bufio.newreadersize(trr.asreader(), 16384))
-    [resp, re] = finish_roundtrip(req, br, cap, remote, t0, c0, tr, bad, 0)
+    [resp, re] = finish_roundtrip(req, br, dlc, cap, remote, t0, c0, tr, bad, 0)
     raw.close()
     return resp, re
 }
 
 // finish_roundtrip reads the HTTP response from br, fills hop cap, and
 // builds Resp (shared by cleartext and TLS paths).
-fn finish_roundtrip(req: ref model.Req, br: own bufio.Reader, cap: mut model.Hop, remote: str, t0: int, c0: int, tr: own model.Trace, bad: model.Resp, tls_ver: int) -> [model.Resp, err] {
+fn finish_roundtrip(req: ref model.Req, br: own bufio.Reader, dlcell: shared, cap: mut model.Hop, remote: str, t0: int, c0: int, tr: own model.Trace, bad: model.Resp, tls_ver: int) -> [model.Resp, err] {
     h := Head{status: 0, reason: "", headers: nil, version: ""}
     for true {
         [raw, rhe] = read_head(br)
@@ -580,6 +584,13 @@ fn finish_roundtrip(req: ref model.Req, br: own bufio.Reader, cap: mut model.Hop
         }
     }
     tr.recv_headers_ms = itof(now_ms() - c0)
+    // SSE (corpus §7.5, ADR-0045): text/event-stream on a body-capable
+    // method lifts the whole-request deadline now that headers arrived
+    // — the stream may run until close or the 64 MiB cap.
+    sse := sse_is_stream(h.headers, req.method)
+    if sse {
+        sset(dlcell, 0)
+    }
     cap.status = h.status
     cap.reason = h.reason
     cap.version = h.version
@@ -587,6 +598,7 @@ fn finish_roundtrip(req: ref model.Req, br: own bufio.Reader, cap: mut model.Hop
     // body framing: HEAD/1xx/204/304 have none by definition; chunked
     // wins over Content-Length; no framing at all reads to EOF.
     body := mkslice(byte, 0)
+    raw_trunc := false
     if !bodyless(req.method, h.status) {
         te := lwr(hdr_get(h.headers, "transfer-encoding"))
         [cl, cle] = content_length(h.headers)
@@ -594,35 +606,82 @@ fn finish_roundtrip(req: ref model.Req, br: own bufio.Reader, cap: mut model.Hop
             return bad, cle
         }
         if find(te, "chunked") >= 0 {
-            [cb, ce] = read_chunked(br)
-            if ce != nil {
-                return bad, ce
-            }
-            body = cb.data
-            i := 0
-            for i < len(cb.trailers) {
-                h.headers = push(h.headers, cb.trailers[i])
-                i = i + 1
+            if sse {
+                [ccb, ce2] = read_chunked_cap(br, sse_max_body)
+                if ce2 != nil {
+                    return bad, ce2
+                }
+                if ccb.hit {
+                    raw_trunc = true
+                }
+                body = ccb.body.data
+                i := 0
+                for i < len(ccb.body.trailers) {
+                    h.headers = push(h.headers, ccb.body.trailers[i])
+                    i = i + 1
+                }
+            } else {
+                [cb, ce] = read_chunked(br)
+                if ce != nil {
+                    return bad, ce
+                }
+                body = cb.data
+                i := 0
+                for i < len(cb.trailers) {
+                    h.headers = push(h.headers, cb.trailers[i])
+                    i = i + 1
+                }
             }
         } else if len(te) > 0 {
-            [b2, e2] = read_eof(br)
-            if e2 != nil {
-                return bad, e2
+            if sse {
+                [cr, ce3] = read_eof_capped(br, sse_max_body)
+                if ce3 != nil {
+                    return bad, ce3
+                }
+                if cr.hit {
+                    raw_trunc = true
+                }
+                body = cr.data
+            } else {
+                [b2, e2] = read_eof(br)
+                if e2 != nil {
+                    return bad, e2
+                }
+                body = b2
             }
-            body = b2
         } else if cl >= 0 {
-            [b3, e3] = read_exact(br, cl)
+            rd := cl
+            if sse && cl > sse_max_body {
+                rd = sse_max_body
+                raw_trunc = true
+            }
+            [b3, e3] = read_exact(br, rd)
             if e3 != nil {
                 return bad, e3
             }
             body = b3
         } else {
-            [b4, e4] = read_eof(br)
-            if e4 != nil {
-                return bad, e4
+            if sse {
+                [cr2, ce4] = read_eof_capped(br, sse_max_body)
+                if ce4 != nil {
+                    return bad, ce4
+                }
+                if cr2.hit {
+                    raw_trunc = true
+                }
+                body = cr2.data
+            } else {
+                [b4, e4] = read_eof(br)
+                if e4 != nil {
+                    return bad, e4
+                }
+                body = b4
             }
-            body = b4
         }
+    }
+    if sse && len(body) > sse_max_body {
+        body = body[0:sse_max_body]
+        raw_trunc = true
     }
     cap.body = body
     cap.elapsed_ms = itof(now_ms() - t0)
@@ -633,7 +692,23 @@ fn finish_roundtrip(req: ref model.Req, br: own bufio.Reader, cap: mut model.Hop
     }
     tr.closed_ms = itof(now_ms() - c0)
     let bodyb: []byte = db
-    return model.Resp{status: h.status, reason: h.reason, headers: h.headers, body: bodyb, elapsed_ms: itof(now_ms() - t0), remote: remote, version: h.version, hops: nil, req_head: "", trace: tr, tls_ver: tls_ver}, nil
+    serr := ""
+    resp := model.Resp{status: h.status, reason: h.reason, headers: h.headers, body: bodyb, elapsed_ms: itof(now_ms() - t0), remote: remote, version: h.version, hops: nil, req_head: "", trace: tr, tls_ver: tls_ver, events: nil, stream_error: ""}
+    if sse {
+        dec_trunc := raw_trunc
+        if len(bodyb) > sse_max_body {
+            bodyb = bodyb[0:sse_max_body]
+            dec_trunc = true
+        }
+        resp.body = bodyb
+        [evs, serr_e] = sse_finish(bodyb, dec_trunc)
+        if serr_e != nil {
+            serr = errors.msg(serr_e)
+        }
+        resp.events = evs
+        resp.stream_error = serr
+    }
+    return resp, nil
 }
 
 // --- h2 exchange (WI-0013 P3, ADR-0030) ----------------------------
@@ -895,7 +970,28 @@ fn h2_exchange(req: ref model.Req, rw: io.ReadWriter, fd: int, hdrs: []model.Hea
     }
     tr.closed_ms = itof(now_ms() - c0)
     let bodyb: []byte = db
-    return model.Resp{status: status, reason: "", headers: rh, body: bodyb, elapsed_ms: itof(now_ms() - t0), remote: remote, version: "2.0", hops: nil, req_head: "", trace: tr, tls_ver: tls_ver}, nil
+    // SSE over h2 parses events identically; the deadline is NOT
+    // lifted here (ADR-0045 D6 — h2 keeps the request budget).
+    serr := ""
+    resp := model.Resp{status: status, reason: "", headers: rh, body: bodyb, elapsed_ms: itof(now_ms() - t0), remote: remote, version: "2.0", hops: nil, req_head: "", trace: tr, tls_ver: tls_ver, events: nil, stream_error: ""}
+    if sse_is_stream(rh, req.method) {
+        over := false
+        if len(bodyb) > sse_max_body {
+            bodyb = bodyb[0:sse_max_body]
+            over = true
+        }
+        if len(body) > sse_max_body {
+            over = true
+        }
+        resp.body = bodyb
+        [evs, serr_e] = sse_finish(bodyb, over)
+        if serr_e != nil {
+            serr = errors.msg(serr_e)
+        }
+        resp.events = evs
+        resp.stream_error = serr
+    }
+    return resp, nil
 }
 
 // h2_check_length enforces RFC 9113 §8.1.1: received DATA content

@@ -12,6 +12,7 @@ import "github.com/oxidean/oxttp/core/collection"
 import "github.com/oxidean/oxttp/core/env"
 import "github.com/oxidean/oxttp/core/http"
 import "github.com/oxidean/oxttp/core/model"
+import "github.com/oxidean/oxttp/core/term"
 import "github.com/oxidean/oxttp/core/yaml"
 import "github.com/oxidean/oxttp/shared/version"
 
@@ -465,6 +466,11 @@ fn draft_from_request(r: own collection.PRequest, path: str) -> RDraft {
     } else if r.body != nil && r.body.has_file {
         d.body = new_text_view("(file body: " + r.body.file + ")")
     }
+    if d.kind == KGraphql && r.graphql != nil {
+        d.gql_query = new_text_view(r.graphql.query)
+        d.gql_vars = new_text_view(r.graphql.variables)
+        d.gql_op = new_line_edit(r.graphql.operation_name)
+    }
     d.preq = r
     return d
 }
@@ -585,6 +591,13 @@ fn draft_to_request(a: ref App) -> own collection.PRequest {
             r.body = b
         }
     }
+    if a.kind == KGraphql {
+        g := new(collection.PGraphQL)
+        g.query = join_lines(a.gql_query.lines)
+        g.variables = join_lines(a.gql_vars.lines)
+        g.operation_name = a.gql_op.text
+        r.graphql = g
+    }
     if a.preq != nil {
         r.name = a.preq.name
         r.description = a.preq.description
@@ -593,7 +606,9 @@ fn draft_to_request(a: ref App) -> own collection.PRequest {
         r.scripts = a.preq.scripts
         r.captures = a.preq.captures
         r.variable_scope = a.preq.variable_scope
-        r.graphql = a.preq.graphql
+        if a.kind != KGraphql {
+            r.graphql = a.preq.graphql
+        }
         r.grpc = a.preq.grpc
         r.websocket = a.preq.websocket
         if r.body == nil && locked {
@@ -1085,6 +1100,11 @@ fn send_failed(a: mut App, msg: str) {
     a.resp_hdr_rows = nil
     a.resp_ck_rows = nil
     a.resp_tr_rows = nil
+    a.resp_events = nil
+    a.resp_is_sse = false
+    a.msg_rows = nil
+    a.msg_detail = -1
+    a.msg_following = true
     a.resp_title = "response · error"
     a.resp_class = 2
     a.resp_rows = new_list(resp_row_count(a))
@@ -1097,6 +1117,10 @@ fn send_failed(a: mut App, msg: str) {
 // history entry (cap 100, drop-oldest). req_url is the wire URL the
 // response answered — jar entries scope to its origin.
 fn install_resp(a: mut App, resp: model.Resp, req_url: str) {
+    kind := ""
+    if a.pending_preq != nil {
+        kind = a.pending_preq.kind
+    }
     text := resp.body as str
     a.resp_body = text
     ct := ""
@@ -1176,14 +1200,51 @@ fn install_resp(a: mut App, resp: model.Resp, req_url: str) {
         trs = push(trs, "hops: " + itoa(len(resp.hops)))
     }
     a.resp_tr_rows = trs
+    // SSE/stream responses carry a message log (corpus §4.15); the
+    // first response tab relabels Events/Messages and renders rows.
+    a.resp_events = resp.events
+    a.resp_is_sse = false
+    if resp.events != nil {
+        i := 0
+        for i < len(resp.headers) {
+            if ascii_eq(resp.headers[i].name, "content-type") && media_type_is(resp.headers[i].value, "text/event-stream") {
+                a.resp_is_sse = true
+            }
+            i = i + 1
+        }
+        a.msg_rows = build_msg_rows(resp.events)
+        a.msg_detail = -1
+        a.msg_following = true
+    } else {
+        a.msg_rows = nil
+        a.msg_detail = -1
+        a.msg_following = true
+    }
     a.resp_size = len(resp.body)
     a.elapsed_ms = resp.elapsed_ms
     a.resp_class = model.status_class(resp.status)
+    warn := 0
+    if kind == "graphql" && a.resp_class == 0 {
+        warn = graphql_error_count(resp.body)
+        if warn > 0 {
+            a.resp_class = 3
+        }
+    }
     a.resp_title = "response · " + itoa(resp.status) + " " + resp.reason
+    if warn > 0 {
+        a.resp_title = a.resp_title + " · " + itoa(warn) + " error"
+        if warn != 1 {
+            a.resp_title = a.resp_title + "s"
+        }
+    }
     if a.resp_size_time {
         a.resp_title = a.resp_title + " · " + size_str(a.resp_size) + " · " + ms_str(resp.elapsed_ms)
     }
     a.resp_rows = new_list(resp_row_count(a))
+    if a.msg_following && len(a.msg_rows) > 0 {
+        a.resp_rows.sel = len(a.msg_rows) - 1
+        a.resp_rows.top = a.resp_rows.sel
+    }
     if a.pending_preq != nil {
         m := a.method
         u := a.url.text
@@ -1221,6 +1282,182 @@ fn install_resp(a: mut App, resp: model.Resp, req_url: str) {
     }
 }
 
+// ---------- response stream log (SSE Messages/Events tab) ----------
+
+fn media_type_is(ct: str, want: str) -> bool {
+    l := lower_ascii(ct)
+    i := 0
+    for i < len(l) && byteat(l, i) != 59 && byteat(l, i) != 32 && byteat(l, i) != 9 {
+        i = i + 1
+    }
+    mt := l
+    if i < len(l) {
+        mt = substr(l, 0, i)
+    }
+    return mt == want
+}
+
+fn graphql_error_count(body: []byte) -> int {
+    if len(body) == 0 {
+        return 0
+    }
+    j := json.jparse(body as str)
+    if j == nil || j.kind != 4 {
+        return 0
+    }
+    v := json.jget(j, "errors")
+    if v == nil || v.kind != 5 {
+        return 0
+    }
+    n := 0
+    m := v.child
+    for m != nil {
+        n = n + 1
+        m = m.next
+    }
+    return n
+}
+
+fn resp_tab_label(a: ref App, i: int) -> str {
+    ts := resp_tabs()
+    if i == 0 && len(a.msg_rows) > 0 {
+        if a.resp_is_sse {
+            return "Events"
+        }
+        return "Messages"
+    }
+    if i >= 0 && i < len(ts) {
+        return ts[i]
+    }
+    return ""
+}
+
+fn resp_tab_names(a: ref App) -> []str {
+    out := mkslice(str, 0)
+    ts := resp_tabs()
+    i := 0
+    for i < len(ts) {
+        out = push(out, resp_tab_label(a, i))
+        i = i + 1
+    }
+    return out
+}
+
+fn msg_glyph(kind: int) -> str {
+    if kind == 1 {
+        return "↓"
+    }
+    if kind == 0 {
+        return "↑"
+    }
+    if kind == 3 {
+        return "!"
+    }
+    return "·"
+}
+
+fn msg_time(ms: int) -> str {
+    if ms < 0 {
+        ms = 0
+    }
+    sec := ms / 1000
+    msec := ms - sec * 1000
+    sod := sec % 86400
+    hh := sod / 3600
+    mm := (sod - hh * 3600) / 60
+    ss := sod - hh * 3600 - mm * 60
+    return pad2(hh) + ":" + pad2(mm) + ":" + pad2(ss) + "." + pad3(msec)
+}
+
+fn pad2(n: int) -> str {
+    if n < 10 {
+        return "0" + itoa(n)
+    }
+    return itoa(n)
+}
+
+fn pad3(n: int) -> str {
+    if n < 10 {
+        return "00" + itoa(n)
+    }
+    if n < 100 {
+        return "0" + itoa(n)
+    }
+    return itoa(n)
+}
+
+fn ws_collapse(s: str) -> str {
+    out := ""
+    pending := false
+    i := 0
+    for i < len(s) {
+        c := byteat(s, i)
+        if c == 32 || c == 9 || c == 10 || c == 13 {
+            pending = true
+        } else {
+            if pending && len(out) > 0 {
+                out = out + " "
+            }
+            pending = false
+            // copy the whole glyph, not one byte
+            gl := term.glyph_len(s, i)
+            out = out + substr(s, i, i + gl)
+            i = i + gl
+            continue
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn trunc_cols(s: str, max: int) -> str {
+    if str_cols(s) <= max {
+        return s
+    }
+    n := 0
+    i := 0
+    for i < len(s) {
+        gl := term.glyph_len(s, i)
+        w := glyph_cols(s, i, gl)
+        if n + w > max {
+            break
+        }
+        n = n + w
+        i = i + gl
+    }
+    return substr(s, 0, i) + "…"
+}
+
+fn msg_preview(ev: model.StreamEvent) -> str {
+    body := ws_collapse(ev.body as str)
+    pick := ev.title
+    if len(pick) == 0 {
+        pick = body
+    }
+    if len(ev.event) > 0 {
+        return ev.event + " · " + pick
+    }
+    return pick
+}
+
+fn build_msg_rows(evs: own []model.StreamEvent) -> []str {
+    out := mkslice(str, 0)
+    if evs == nil {
+        return out
+    }
+    i := 0
+    for i < len(evs) {
+        ev := evs[i]
+        row := msg_glyph(ev.kind) + " " + trunc_cols(msg_preview(ev), 256)
+        // right-align-ish timestamp: pad to a stable column when the
+        // pane is wide enough; render clips anyway.
+        row = row + "    " + msg_time(ev.at_ms)
+        out = push(out, row)
+        i = i + 1
+    }
+    return out
+}
+
 // resp_row_count — the active resp tab's row count for its ListCur.
 fn resp_row_count(a: ref App) -> int {
     ts := resp_tabs()
@@ -1228,6 +1465,9 @@ fn resp_row_count(a: ref App) -> int {
         return 0
     }
     n := ts[a.resp_tab]
+    if a.resp_tab == 0 && len(a.msg_rows) > 0 && a.msg_detail < 0 {
+        return len(a.msg_rows)
+    }
     if n == "Headers" {
         return len(a.resp_hdr_rows)
     }
@@ -1246,6 +1486,9 @@ fn resp_rows_active(a: ref App) -> []str {
         return nil
     }
     n := ts[a.resp_tab]
+    if a.resp_tab == 0 && len(a.msg_rows) > 0 && a.msg_detail < 0 {
+        return a.msg_rows
+    }
     if n == "Headers" {
         return a.resp_hdr_rows
     }

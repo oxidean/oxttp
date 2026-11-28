@@ -213,3 +213,28 @@ fn test_dotenv_expansion_limits() {
     [_p, e] = parse_dotenv(text, new(EnvSet))
     testing.expect(e != nil, "expansion bomb rejected")
 }
+
+fn test_substitute_braced() {
+    // WI-0020 §7.2: GraphQL query documents substitute ${NAME} only —
+    // $name is a GraphQL variable, $$ still collapses, ${$gen} works,
+    // unresolved refs pass through literally (upstream SubstituteBraced).
+    s := set_with(strs2("USER_ID", "TOK"), strs2("42", "sekret"))
+    [r, e] = substitute_braced("query($id: ID!) { user(id: $id) { name } }", s)
+    testing.expect(e == nil, "braced ok")
+    testing.expect_streq(r, "query($id: ID!) { user(id: $id) { name } }", "$name untouched")
+    [r2, e2] = substitute_braced("{ u(id: ${USER_ID}) }", s)
+    testing.expect(e2 == nil, "braced expand")
+    testing.expect_streq(r2, "{ u(id: 42) }", "${NAME} expanded")
+    [r3, e3] = substitute_braced("a $$ b ${MISSING} c", s)
+    testing.expect(e3 == nil, "braced passthrough")
+    testing.expect_streq(r3, "a $ b ${MISSING} c", "$$ collapses, missing literal")
+    [r4, e4] = substitute_braced("${$uuid}", s)
+    testing.expect(e4 == nil, "braced gen")
+    testing.expect(len(r4) > 4, "uuid emitted")
+    // the real distinction: $NAME expands under full substitute,
+    // stays literal under braced (GraphQL $vars are not Posting vars)
+    [r5, _e5] = substitute_braced("$USER_ID", s)
+    testing.expect_streq(r5, "$USER_ID", "braced leaves $NAME literal")
+    [r6, _e6] = substitute("$USER_ID", s, false)
+    testing.expect_streq(r6, "42", "full expands $NAME")
+}

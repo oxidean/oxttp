@@ -41,9 +41,18 @@ fn new_app() -> own App {
     a.path_kv = new_kv()
     a.body = new_text_view("")
     a.body_edit = false
+    a.gql_query = new_text_view("")
+    a.gql_vars = new_text_view("")
+    a.gql_op = new_line_edit("")
+    a.gql_op_on = false
     a.body_ct = 0
     a.resp_view = new_text_view("(no response yet — ctrl+j sends)")
     a.resp_rows = new_list(0)
+    a.resp_events = nil
+    a.resp_is_sse = false
+    a.msg_detail = -1
+    a.msg_following = true
+    a.msg_rows = nil
     a.resp_title = "response"
     a.resp_class = -1
     a.env = nil
@@ -112,8 +121,11 @@ fn new_draft() -> RDraft {
         req_tab: 0, resp_tab: 0, body_ct: 0,
         headers: new_kv(), query_kv: new_kv(), path_kv: new_kv(),
         body: new_text_view(""),
+        gql_query: new_text_view(""), gql_vars: new_text_view(""),
+        gql_op: new_line_edit(""), gql_op_on: false,
         resp_view: new_text_view("(no response yet — ctrl+j sends)"),
         resp_rows: new_list(0),
+        resp_events: nil, resp_is_sse: false, msg_detail: -1, msg_following: true, msg_rows: nil,
         resp_body: "",
         resp_hdr_rows: nil, resp_ck_rows: nil, resp_tr_rows: nil,
         resp_title: "response", resp_class: -1,
@@ -172,7 +184,11 @@ fn draft_capture(a: ref App) -> RDraft {
         req_tab: a.req_tab, resp_tab: a.resp_tab, body_ct: a.body_ct,
         headers: copy_kv(a.headers), query_kv: copy_kv(a.query_kv),
         path_kv: copy_kv(a.path_kv), body: copy_tv(a.body),
+        gql_query: copy_tv(a.gql_query), gql_vars: copy_tv(a.gql_vars),
+        gql_op: a.gql_op, gql_op_on: a.gql_op_on,
         resp_view: copy_tv(a.resp_view), resp_rows: a.resp_rows,
+        resp_events: a.resp_events, resp_is_sse: a.resp_is_sse,
+        msg_detail: a.msg_detail, msg_following: a.msg_following, msg_rows: a.msg_rows,
         resp_body: a.resp_body,
         resp_hdr_rows: copy_strs(a.resp_hdr_rows),
         resp_ck_rows: copy_strs(a.resp_ck_rows),
@@ -196,8 +212,17 @@ fn draft_restore(a: mut App, d: RDraft) {
     a.query_kv = copy_kv(d.query_kv)
     a.path_kv = copy_kv(d.path_kv)
     a.body = copy_tv(d.body)
+    a.gql_query = copy_tv(d.gql_query)
+    a.gql_vars = copy_tv(d.gql_vars)
+    a.gql_op = d.gql_op
+    a.gql_op_on = d.gql_op_on
     a.resp_view = copy_tv(d.resp_view)
     a.resp_rows = d.resp_rows
+    a.resp_events = d.resp_events
+    a.resp_is_sse = d.resp_is_sse
+    a.msg_detail = d.msg_detail
+    a.msg_following = d.msg_following
+    a.msg_rows = d.msg_rows
     a.resp_body = d.resp_body
     a.resp_hdr_rows = copy_strs(d.resp_hdr_rows)
     a.resp_ck_rows = copy_strs(d.resp_ck_rows)
@@ -347,10 +372,13 @@ fn req_tabs(kind: int) -> []str {
         return t
     }
     if kind == KGraphql {
-        t = push(t, "Headers")
-        t = push(t, "Params")
-        t = push(t, "Path")
+        // upstream requestTabList: kind's own tabs first (Query doc,
+        // Variables JSON), then shared (Params = URL query KV).
         t = push(t, "Query")
+        t = push(t, "Variables")
+        t = push(t, "Headers")
+        t = push(t, "Path")
+        t = push(t, "Params")
         t = push(t, "Auth")
         t = push(t, "Info")
         t = push(t, "Options")
@@ -474,7 +502,12 @@ fn req_pane_bindings(a: ref App) -> []Binding {
     ts := req_tabs(a.kind)
     name := ts[a.req_tab]
     if a.kind == KHttp || a.kind == KGraphql {
-        if name == "Headers" || name == "Query" || name == "Params" {
+        // KV tabs per kind: http Query=URL params; graphql Params=
+        // URL params while Query/Variables are the document editors.
+        kv_tab := name == "Headers" || name == "Path" ||
+            (name == "Query" && a.kind == KHttp) ||
+            (name == "Params" && a.kind == KGraphql)
+        if kv_tab {
             // KV table bindings (§4.6). While a cell edit is live the
             // letters are TEXT — hjkl must type into the cell, not
             // navigate the table (they re-bind once it commits).
@@ -510,15 +543,30 @@ fn req_pane_bindings(a: ref App) -> []Binding {
                 bs = push(bs, bind("ctrl+z", "edit-undo"))
                 bs = push(bs, bind("ctrl+shift+z", "edit-redo"))
             }
-        } else if name == "Body" {
+        } else if name == "Body" || (a.kind == KGraphql && (name == "Query" || name == "Variables")) {
             bs = push(bs, bind("f3", "body-pager"))
             bs = push(bs, bind("f4", "body-editor"))
-            bs = push(bs, bind("up", "tv-up"))
-            bs = push(bs, bind("down", "tv-down"))
-            bs = push(bs, bind("left", "tv-left"))
-            bs = push(bs, bind("right", "tv-right"))
-            bs = push(bs, bind("enter", "body-newline"))
-            bs = push(bs, bind("backspace", "body-backspace"))
+            if a.kind == KGraphql && name == "Query" {
+                bs = push(bs, bind("ctrl+e", "gql-op-focus"))
+            }
+            if a.kind == KGraphql && name == "Query" && a.gql_op_on {
+                bs = push(bs, bind("left", "gql-op-left"))
+                bs = push(bs, bind("right", "gql-op-right"))
+                bs = push(bs, bind("home", "gql-op-home"))
+                bs = push(bs, bind("end", "gql-op-end"))
+                bs = push(bs, bind("ctrl+a", "gql-op-home"))
+                bs = push(bs, bind("backspace", "gql-op-backspace"))
+                bs = push(bs, bind("delete", "gql-op-del"))
+                bs = push(bs, bind("enter", "gql-op-enter"))
+                bs = push(bs, bind("escape", "gql-op-exit"))
+            } else {
+                bs = push(bs, bind("up", "tv-up"))
+                bs = push(bs, bind("down", "tv-down"))
+                bs = push(bs, bind("left", "tv-left"))
+                bs = push(bs, bind("right", "tv-right"))
+                bs = push(bs, bind("enter", "body-newline"))
+                bs = push(bs, bind("backspace", "body-backspace"))
+            }
         }
         // Auth/Info/Options: static panes — up/down scrolls
         if name == "Auth" || name == "Info" || name == "Options" {
@@ -540,6 +588,20 @@ fn resp_pane_bindings(a: ref App) -> []Binding {
     bs = push(bs, bind("alt+z", "expand-section"))
     ts := resp_tabs()
     name := ts[a.resp_tab]
+    if name == "Body" && len(a.resp_events) > 0 && a.msg_detail < 0 {
+        // Messages/Events log (corpus §4.15): cursor rows + follow +
+        // inspect; f re-pins to latest, enter opens the event body.
+        bs = push(bs, bind("up", "rows-up"))
+        bs = push(bs, bind("down", "rows-down"))
+        bs = push(bs, bind("k", "rows-up"))
+        bs = push(bs, bind("j", "rows-down"))
+        bs = push(bs, bind("enter", "msg-inspect"))
+        bs = push(bs, bind("f", "msg-follow"))
+        bs = push(bs, bind("escape", "msg-back"))
+        bs = push(bs, bind("g", "rows-home"))
+        bs = push(bs, bind("G", "rows-end"))
+        return bs
+    }
     if name == "Body" {
         // §4.14 text view keys
         bs = push(bs, bind("k", "tv-up"))
@@ -1212,31 +1274,85 @@ fn widget_action(a: mut App, act: str, ev: term.KeyEvent) -> int {
         // pane and placeholder bodies stay read-only (upstream).
         return ext_stage(a, a.editor, body_text_for(a), ext,
             a.focus == FReqPane && !body_locked(a))
+    } else if act == "msg-follow" {
+        // f: re-pin the log to the latest event (corpus §4.15)
+        a.msg_following = true
+        a.resp_rows.sel = len(a.resp_events) - 1
+        if a.resp_rows.sel < 0 {
+            a.resp_rows.sel = 0
+        }
+        a.resp_rows.top = a.resp_rows.sel
+        return ENone
+    } else if act == "msg-inspect" {
+        // enter: inspect the selected event's body in place
+        i := a.resp_rows.sel
+        if i >= 0 && i < len(a.resp_events) {
+            ev := a.resp_events[i]
+            txt := ""
+            if len(ev.event) > 0 {
+                txt = ev.event
+                if len(ev.id) > 0 {
+                    txt = txt + " · ID: " + ev.id
+                }
+                txt = txt + "\n"
+            }
+            txt = txt + ev.body as str
+            if len(txt) == 0 {
+                txt = ev.title
+            }
+            a.resp_view = new_text_view(txt)
+            a.msg_detail = i
+            a.msg_following = false
+        }
+        return ENone
+    } else if act == "msg-back" {
+        a.msg_detail = -1
+        // restore the response body view — event-stream bodies are
+        // never JSON-prettified, so resp_body is what install showed.
+        a.resp_view = new_text_view(a.resp_body)
+        return ENone
+    } else if act == "gql-op-focus" {
+        a.gql_op_on = !a.gql_op_on
+        return ENone
+    } else if act == "gql-op-left" {
+        a.gql_op.move(a.gql_op.cur - 1, false)
+    } else if act == "gql-op-right" {
+        a.gql_op.move(a.gql_op.cur + 1, false)
+    } else if act == "gql-op-home" {
+        a.gql_op.move(0, false)
+    } else if act == "gql-op-end" {
+        a.gql_op.move(len(a.gql_op.text), false)
+    } else if act == "gql-op-backspace" {
+        a.gql_op.backspace()
+    } else if act == "gql-op-del" {
+        a.gql_op.del_right()
+    } else if act == "gql-op-enter" || act == "gql-op-exit" {
+        a.gql_op_on = false
     } else if act == "body-newline" {
-        body_insert(a, "\n")
+        req_text_insert(a, "\n")
     } else if act == "body-backspace" {
-        body_backspace(a)
+        req_text_backspace(a)
     } else if act == "tv-up" {
         if wants_body(a) {
-            a.body.move(0, -1, false)
+            req_text_move(a, 0, -1)
         } else {
             a.resp_view.move(0, -1, false)
         }
     } else if act == "tv-down" {
         if wants_body(a) {
-            a.body.move(0, 1, false)
+            req_text_move(a, 0, 1)
         } else {
             a.resp_view.move(0, 1, false)
         }
     } else if act == "tv-left" {
         if wants_body(a) {
-            a.body.move(-1, 0, false)
+            req_text_move(a, -1, 0)
         } else {
             a.resp_view.move(-1, 0, false)
         }
     } else if act == "tv-right" {
         if wants_body(a) {
-            a.body.move(1, 0, false)
+            req_text_move(a, 1, 0)
         } else {
             a.resp_view.move(1, 0, false)
         }
@@ -1378,7 +1494,10 @@ fn active_kv(a: ref App) -> int {
     if n == "Headers" || n == "Metadata" {
         return 0
     }
-    if n == "Query" || n == "Params" {
+    if n == "Params" {
+        return 1
+    }
+    if n == "Query" && a.kind != KGraphql {
         return 1
     }
     if n == "Path" {
@@ -1628,7 +1747,11 @@ fn wants_body(a: ref App) -> bool {
         return false
     }
     n := active_kv_name(a)
-    return n == "Body" || n == "Message"
+    if n == "Body" || n == "Message" {
+        return true
+    }
+    // graphql Query/Variables are text panes over gql_query/gql_vars.
+    return a.kind == KGraphql && (n == "Query" || n == "Variables")
 }
 
 // widget_wants_text — does the focused widget eat plain runes?
@@ -1643,6 +1766,9 @@ fn widget_wants_text(a: ref App) -> bool {
         }
         n := active_kv_name(a)
         if n == "Body" || n == "Message" {
+            return true
+        }
+        if a.kind == KGraphql && (n == "Query" || n == "Variables") {
             return true
         }
     }
@@ -1670,6 +1796,16 @@ fn widget_text_char(a: mut App, ch: str) -> int {
         n := active_kv_name(a)
         if n == "Body" || n == "Message" {
             body_insert(a, ch)
+            return ENone
+        }
+        if a.kind == KGraphql && (n == "Query" || n == "Variables") {
+            if n == "Query" && a.gql_op_on {
+                pin_tab(a)
+                a.gql_op.insert(ch)
+            } else {
+                pin_tab(a)
+                gql_text_insert(a, ch)
+            }
             return ENone
         }
     }
@@ -1757,41 +1893,46 @@ fn body_locked(a: ref App) -> bool {
 
 // body editor: the S9 body area is a TextView buffer the focused
 // pane appends into (full smart-edit is S10); insert + backspace +
-// pairing handled at line level.
+// pairing handled at line level. GraphQL Query/Variables reuse the
+// same line-level editor against their own TextViews.
 fn body_insert(a: mut App, ch: str) {
     if body_locked(a) {
         return
     }
     pin_tab(a)
+    a.body.insert_line(ch)
+}
+
+fn (v mut TextView) insert_line(ch: str) {
     // rebuild lines: insert at (cy, cx)
-    if len(a.body.lines) == 0 {
-        a.body.lines = push(a.body.lines, "")
+    if len(v.lines) == 0 {
+        v.lines = push(v.lines, "")
     }
-    ln := a.body.lines[a.body.cy]
+    ln := v.lines[v.cy]
     if ch == "\n" {
-        before := substr(ln, 0, a.body.cx)
-        after := substr(ln, a.body.cx, len(ln))
-        a.body.lines[a.body.cy] = before
+        before := substr(ln, 0, v.cx)
+        after := substr(ln, v.cx, len(ln))
+        v.lines[v.cy] = before
         // insert new line after cy
         out := mkslice(str, 0)
         i := 0
-        for i < len(a.body.lines) {
-            out = push(out, a.body.lines[i])
-            if i == a.body.cy {
+        for i < len(v.lines) {
+            out = push(out, v.lines[i])
+            if i == v.cy {
                 out = push(out, auto_indent(after, ln))
             }
             i = i + 1
         }
-        a.body.lines = out
-        a.body.cy = a.body.cy + 1
-        a.body.cx = len(a.body.lines[a.body.cy]) - len(after)
-        a.body.clamp()
+        v.lines = out
+        v.cy = v.cy + 1
+        v.cx = len(v.lines[v.cy]) - len(after)
+        v.clamp()
         return
     }
-    ins := pair_char(ch, ln, a.body.cx)
-    a.body.lines[a.body.cy] = substr(ln, 0, a.body.cx) + ins + substr(ln, a.body.cx, len(ln))
-    a.body.cx = a.body.cx + len(ch)
-    a.body.clamp()
+    ins := pair_char(ch, ln, v.cx)
+    v.lines[v.cy] = substr(ln, 0, v.cx) + ins + substr(ln, v.cx, len(ln))
+    v.cx = v.cx + len(ch)
+    v.clamp()
 }
 
 // pair_char: corpus §4.7 smart bracket/quote pairing.
@@ -1849,32 +1990,104 @@ fn body_backspace(a: mut App) {
         return
     }
     pin_tab(a)
-    if len(a.body.lines) == 0 {
+    a.body.backspace_line()
+}
+
+fn (v mut TextView) backspace_line() {
+    if len(v.lines) == 0 {
         return
     }
-    ln := a.body.lines[a.body.cy]
-    if a.body.cx > 0 {
+    ln := v.lines[v.cy]
+    if v.cx > 0 {
         // drop the whole code point left of the cursor — deleting one
         // byte of a multibyte glyph leaves invalid UTF-8.
-        lo := glyph_start(ln, a.body.cx - 1)
-        a.body.lines[a.body.cy] = substr(ln, 0, lo) + substr(ln, a.body.cx, len(ln))
-        a.body.cx = lo
-    } else if a.body.cy > 0 {
-        prev := a.body.lines[a.body.cy - 1]
-        a.body.lines[a.body.cy - 1] = prev + ln
+        lo := glyph_start(ln, v.cx - 1)
+        v.lines[v.cy] = substr(ln, 0, lo) + substr(ln, v.cx, len(ln))
+        v.cx = lo
+    } else if v.cy > 0 {
+        prev := v.lines[v.cy - 1]
+        v.lines[v.cy - 1] = prev + ln
         out := mkslice(str, 0)
         i := 0
-        for i < len(a.body.lines) {
-            if i != a.body.cy {
-                out = push(out, a.body.lines[i])
+        for i < len(v.lines) {
+            if i != v.cy {
+                out = push(out, v.lines[i])
             }
             i = i + 1
         }
-        a.body.lines = out
-        a.body.cy = a.body.cy - 1
-        a.body.cx = len(prev)
+        v.lines = out
+        v.cy = v.cy - 1
+        v.cx = len(prev)
     }
-    a.body.clamp()
+    v.clamp()
+}
+
+// req_text_* route the request pane's text editing to the active
+// buffer: HTTP body, or the graphql document/variables store.
+fn req_text_insert(a: mut App, ch: str) {
+    if a.kind == KGraphql {
+        gql_text_insert(a, ch)
+        return
+    }
+    body_insert(a, ch)
+}
+
+fn req_text_backspace(a: mut App) {
+    if a.kind == KGraphql {
+        gql_text_backspace(a)
+        return
+    }
+    body_backspace(a)
+}
+
+fn req_text_move(a: mut App, dx: int, dy: int) {
+    if a.kind == KGraphql {
+        gql_text_move(a, dx, dy)
+        return
+    }
+    a.body.move(dx, dy, false)
+}
+
+fn gql_text_view(a: ref App) -> int {
+    // 1 = query document, 2 = variables JSON; 0 = not a graphql text tab
+    if a.kind != KGraphql {
+        return 0
+    }
+    n := active_kv_name(a)
+    if n == "Query" {
+        return 1
+    }
+    if n == "Variables" {
+        return 2
+    }
+    return 0
+}
+
+fn gql_text_insert(a: mut App, ch: str) {
+    which := gql_text_view(a)
+    if which == 1 {
+        a.gql_query.insert_line(ch)
+    } else if which == 2 {
+        a.gql_vars.insert_line(ch)
+    }
+}
+
+fn gql_text_backspace(a: mut App) {
+    which := gql_text_view(a)
+    if which == 1 {
+        a.gql_query.backspace_line()
+    } else if which == 2 {
+        a.gql_vars.backspace_line()
+    }
+}
+
+fn gql_text_move(a: mut App, dx: int, dy: int) {
+    which := gql_text_view(a)
+    if which == 1 {
+        a.gql_query.move(dx, dy, false)
+    } else if which == 2 {
+        a.gql_vars.move(dx, dy, false)
+    }
 }
 
 // --- modal actions ---

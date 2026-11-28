@@ -392,7 +392,13 @@ fn render_req_pane(a: mut App, scr: mut term.AnsiScreen, x: int, y: int, w: int,
     ch := h - 3
     if cur == "Headers" {
         render_kv(scr, a.headers, x, cy, w, ch, a.focus == FReqPane)
+    } else if cur == "Query" && a.kind == KGraphql {
+        render_gql_query(a, scr, x, cy, w, ch)
+    } else if cur == "Variables" && a.kind == KGraphql {
+        render_numbered_tv(a.gql_vars, scr, x, cy, w, ch, a.focus == FReqPane)
     } else if cur == "Query" {
+        render_kv(scr, a.query_kv, x, cy, w, ch, a.focus == FReqPane)
+    } else if cur == "Params" && a.kind == KGraphql {
         render_kv(scr, a.query_kv, x, cy, w, ch, a.focus == FReqPane)
     } else if cur == "Path" {
         render_kv(scr, a.path_kv, x, cy, w, ch, a.focus == FReqPane)
@@ -430,6 +436,44 @@ fn put_text_lines(scr: mut term.AnsiScreen, txt: str, x: int, y: int, w: int, h:
     }
 }
 
+fn render_numbered_tv(v: TextView, scr: mut term.AnsiScreen, x: int, y: int, w: int, h: int, focused: bool) {
+    i := 0
+    for i < h && v.top + i < len(v.lines) {
+        ln := v.lines[v.top + i]
+        a2 := 0
+        if focused && v.top + i == v.cy {
+            a2 = term.AttrReverse
+        }
+        put_str_max(scr, x + 1, y + i, itoa(v.top + i + 1) + " " + ln, w - 2, 7, a2)
+        i = i + 1
+    }
+    if focused && len(v.lines) > 0 && v.cy < len(v.lines) {
+        ln := v.lines[v.cy]
+        c0 := v.cx
+        if c0 > len(ln) {
+            c0 = len(ln)
+        }
+        pre := itoa(v.cy + 1) + " "
+        scr.cursor(x + 1 + len(pre) + str_cols(substr(ln, 0, c0)), y + v.cy - v.top, true)
+    }
+}
+
+fn render_gql_query(a: mut App, scr: mut term.AnsiScreen, x: int, y: int, w: int, h: int) {
+    // operationName is a single-line field above the document editor.
+    op := "operationName: " + a.gql_op.text
+    a2 := 0
+    if a.focus == FReqPane && a.gql_op_on {
+        a2 = term.AttrReverse
+    }
+    put_str_max(scr, x + 1, y, op, w - 2, 7, a2)
+    if a.focus == FReqPane && a.gql_op_on {
+        scr.cursor(x + 1 + len("operationName: ") + a.gql_op.cur, y, true)
+    }
+    if h > 1 {
+        render_numbered_tv(a.gql_query, scr, x, y + 1, w, h - 1, a.focus == FReqPane && !a.gql_op_on)
+    }
+}
+
 fn render_body(a: mut App, scr: mut term.AnsiScreen, x: int, y: int, w: int, h: int) {
     i := 0
     for i < h && a.body.top + i < len(a.body.lines) {
@@ -464,18 +508,28 @@ fn render_resp_pane(a: mut App, scr: mut term.AnsiScreen, x: int, y: int, w: int
     // status class tints the title: green 2xx, yellow 3xx, red else
     if !a.sending && a.resp_class >= 0 {
         tf := 2
-        if a.resp_class == 1 {
+        if a.resp_class == 1 || a.resp_class == 3 {
             tf = 3
         } else if a.resp_class == 2 {
             tf = 1
         }
         put_str_max(scr, x + 2, y, " " + title + " ", w - 4, tf, term.AttrBold)
     }
-    render_tabstrip(scr, x, y + 1, w, resp_tabs(), a.resp_tab, a.focus == FRespTabs)
-    rts := resp_tabs()
-    cur := "Body"
-    if a.resp_tab < len(rts) {
-        cur = rts[a.resp_tab]
+    render_tabstrip(scr, x, y + 1, w, resp_tab_names(a), a.resp_tab, a.focus == FRespTabs)
+    cur := resp_tab_label(a, a.resp_tab)
+    if a.resp_tab == 0 && len(a.msg_rows) > 0 && a.msg_detail >= 0 {
+        // event detail: the selected event's body occupies the pane
+        i := 0
+        for i < h - 3 && a.resp_view.top + i < len(a.resp_view.lines) {
+            ln := a.resp_view.lines[a.resp_view.top + i]
+            a3 := 0
+            if focused && a.resp_view.top + i == a.resp_view.cy {
+                a3 = term.AttrReverse
+            }
+            put_str_max(scr, x + 1, y + 2 + i, ln, w - 2, 7, a3)
+            i = i + 1
+        }
+        return
     }
     if cur != "Body" {
         // Headers/Cookies/Trace: selection rows

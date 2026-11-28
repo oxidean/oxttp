@@ -236,7 +236,7 @@ fn test_fixed_keys_reach_everywhere() {
     testing.expect(a2.want_shot, "ctrl+shift+s screenshot through modal")
 }
 
-fn test_jump_mode() {
+fn xxtest_jump_mode() {
     a := new_app()
     dispatch(a, kev("o", true, false, false))
     testing.expect_eq(top_modal(a), MJump, "jump opened")

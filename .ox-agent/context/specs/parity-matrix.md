@@ -46,10 +46,10 @@ Updated: 2026-11-26 · pin oxl 0.26.0
 | §6 Environments / captures | `done`/`partial` | S10: env files+layers+switching+substitution; environments.json S11; captures M4 |
 | §7.1 HTTP(+TLS) send | `done` | S10 TUI send via existing H1+TLS path (HTTPS included); proxy warns |
 | §7.1 client certs | `next` | oxl 0.26.0 `client_cert` → WI-0013 cli + M4 tui; TLS 1.3-only — negotiated 1.2 sends empty cert list |
-| §7.2 GraphQL | `post` | M4 |
+| §7.2 GraphQL | `done` | M4d: kind lowering + TUI editors; ADR-0044/0045 |
 | §7.3 gRPC | `post` | oxl 0.26.0 `net/grpc` shipped → M4 |
 | §7.4 WebSocket | `post` | oxl 0.26.0 `net/websocket` shipped → M4 |
-| §7.5 SSE | `post` | M4 |
+| §7.5 SSE | `done` | M4d: buffered receive + Messages tab; ADR-0044/0045 |
 | §7.6 OAuth2 | `post` | M4 |
 | §8 Themes / import / remote / tools | `post` | M4 |
 | S8 terminal driver | `done` | ADR-0027 AnsiScreen Session |

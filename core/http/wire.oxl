@@ -45,6 +45,12 @@ struct Head { status: int, reason: str, headers: []model.Header, version: str }
 // the trailer fields that followed the 0-chunk.
 struct ChunkedBody { data: []byte, trailers: []model.Header }
 
+// CappedRead is a byte body plus whether a ceiling truncated it.
+struct CappedRead { data: []byte, hit: bool }
+
+// CappedChunked is a decoded chunked body plus the truncation flag.
+struct CappedChunked { body: ChunkedBody, hit: bool }
+
 // OutHead carries everything serialize_head needs for the request
 // head: resolved host line, caller headers, and body facts.
 struct OutHead {
@@ -454,15 +460,57 @@ fn read_eof(r: mut bufio.Reader) -> [[]byte, err] {
     return out, nil
 }
 
+// read_eof_capped is read_eof with a hard byte ceiling — SSE bodies
+// (ADR-0045) stop at the cap instead of draining an unbounded stream.
+// hit reports the cap was reached before natural EOF.
+fn read_eof_capped(r: mut bufio.Reader, max: int) -> [CappedRead, err] {
+    out := mkslice(byte, 0)
+    scratch := mkslice(byte, 8192)
+    for true {
+        if len(out) >= max {
+            return CappedRead{data: out, hit: true}, nil
+        }
+        want := max - len(out)
+        if want > 8192 {
+            want = 8192
+        }
+        [n, e] = r.read(scratch[0:want])
+        if n > 0 {
+            i := 0
+            for i < n {
+                out = push(out, scratch[i])
+                i = i + 1
+            }
+        }
+        if e == io.eof() {
+            return CappedRead{data: out, hit: false}, nil
+        }
+        if e != nil {
+            return CappedRead{data: nil, hit: false}, e
+        }
+    }
+    return CappedRead{data: out, hit: false}, nil
+}
+
 // read_chunked decodes a chunked body, returning data + trailer
 // fields in wire order. Chunk extensions are ignored; a missing
 // CRLF or truncated stream is a hard error.
 fn read_chunked(r: mut bufio.Reader) -> [ChunkedBody, err] {
+    [cc, ce] = read_chunked_cap(r, 0)
+    return cc.body, ce
+}
+
+// read_chunked_cap is read_chunked with an optional decoded-byte
+// ceiling (max <= 0 = unbounded). Over-cap stops the decode early
+// and reports hit — the h1 transport closes the connection anyway,
+// so abandoning the stream mid-chunk is safe (ADR-0045 SSE cap).
+fn read_chunked_cap(r: mut bufio.Reader, max: int) -> [CappedChunked, err] {
     cb := ChunkedBody{data: mkslice(byte, 0), trailers: nil}
+    done := CappedChunked{body: cb, hit: false}
     for true {
         [line, e] = r.readline()
         if e != nil {
-            return cb, errors.new("http: truncated chunk size")
+            return done, errors.new("http: truncated chunk size")
         }
         szs := chomp(line)
         semi := find(szs, ";")
@@ -471,32 +519,52 @@ fn read_chunked(r: mut bufio.Reader) -> [ChunkedBody, err] {
         }
         szs = trim_ows(szs)
         if len(szs) == 0 || len(szs) > 16 {
-            return cb, errors.new("http: bad chunk size " + szs)
+            return done, errors.new("http: bad chunk size " + szs)
         }
         [sz, se] = strconv.parseint(szs, 16)
         if se != nil || sz < 0 {
-            return cb, errors.new("http: bad chunk size " + szs)
+            return done, errors.new("http: bad chunk size " + szs)
         }
         if sz == 0 {
             for true {
                 [tl, te] = r.readline()
                 if te != nil {
-                    return cb, errors.new("http: truncated trailer")
+                    return done, errors.new("http: truncated trailer")
                 }
                 t := chomp(tl)
                 if len(t) == 0 {
-                    return cb, nil
+                    done.body = cb
+                    return done, nil
                 }
                 c := find(t, ":")
                 if c <= 0 {
-                    return cb, errors.new("http: malformed trailer line")
+                    return done, errors.new("http: malformed trailer line")
                 }
                 cb.trailers = push(cb.trailers, model.Header{name: substr(t, 0, c), value: trim_ows(substr(t, c + 1, len(t)))})
             }
         }
+        if max > 0 && len(cb.data) + sz > max {
+            // over the ceiling: keep what fits, flag the truncation,
+            // and stop — remaining chunks are never read.
+            room := max - len(cb.data)
+            if room > 0 {
+                [d, de] = read_exact(r, room)
+                if de != nil {
+                    return done, errors.new("http: truncated chunk data")
+                }
+                i := 0
+                for i < len(d) {
+                    cb.data = push(cb.data, d[i])
+                    i = i + 1
+                }
+            }
+            done.body = cb
+            done.hit = true
+            return done, nil
+        }
         [d, de] = read_exact(r, sz)
         if de != nil {
-            return cb, errors.new("http: truncated chunk data")
+            return done, errors.new("http: truncated chunk data")
         }
         i := 0
         for i < len(d) {
@@ -505,10 +573,11 @@ fn read_chunked(r: mut bufio.Reader) -> [ChunkedBody, err] {
         }
         [nl, ne] = read_exact(r, 2)
         if ne != nil || byteat(nl as str, 0) != 13 || byteat(nl as str, 1) != 10 {
-            return cb, errors.new("http: missing CRLF after chunk")
+            return done, errors.new("http: missing CRLF after chunk")
         }
     }
-    return cb, nil
+    done.body = cb
+    return done, nil
 }
 
 // decode_body applies content-encoding: identity/""/gzip/x-gzip/
