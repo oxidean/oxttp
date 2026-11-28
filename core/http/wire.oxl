@@ -468,6 +468,20 @@ fn read_eof_capped(r: mut bufio.Reader, max: int) -> [CappedRead, err] {
     scratch := mkslice(byte, 8192)
     for true {
         if len(out) >= max {
+            // exact-fit is not truncation: probe for one more byte (or
+            // natural EOF) before setting hit — upstream reads cap+1
+            // through its LimitedReader for the same distinction.
+            probe := mkslice(byte, 1)
+            [pn, pe] = r.read(probe)
+            if pn > 0 {
+                return CappedRead{data: out, hit: true}, nil
+            }
+            if pe == io.eof() {
+                return CappedRead{data: out, hit: false}, nil
+            }
+            if pe != nil {
+                return CappedRead{data: nil, hit: false}, pe
+            }
             return CappedRead{data: out, hit: true}, nil
         }
         want := max - len(out)

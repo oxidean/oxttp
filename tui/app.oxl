@@ -588,19 +588,24 @@ fn resp_pane_bindings(a: ref App) -> []Binding {
     bs = push(bs, bind("alt+z", "expand-section"))
     ts := resp_tabs()
     name := ts[a.resp_tab]
-    if name == "Body" && len(a.resp_events) > 0 && a.msg_detail < 0 {
-        // Messages/Events log (corpus §4.15): cursor rows + follow +
-        // inspect; f re-pins to latest, enter opens the event body.
-        bs = push(bs, bind("up", "rows-up"))
-        bs = push(bs, bind("down", "rows-down"))
-        bs = push(bs, bind("k", "rows-up"))
-        bs = push(bs, bind("j", "rows-down"))
-        bs = push(bs, bind("enter", "msg-inspect"))
-        bs = push(bs, bind("f", "msg-follow"))
+    if name == "Body" && len(a.resp_events) > 0 {
+        if a.msg_detail < 0 {
+            // Messages/Events log (corpus §4.15): cursor rows + follow +
+            // inspect; f re-pins to latest, enter opens the event body.
+            bs = push(bs, bind("up", "rows-up"))
+            bs = push(bs, bind("down", "rows-down"))
+            bs = push(bs, bind("k", "rows-up"))
+            bs = push(bs, bind("j", "rows-down"))
+            bs = push(bs, bind("enter", "msg-inspect"))
+            bs = push(bs, bind("f", "msg-follow"))
+            bs = push(bs, bind("escape", "msg-back"))
+            bs = push(bs, bind("g", "rows-home"))
+            bs = push(bs, bind("G", "rows-end"))
+            return bs
+        }
+        // detail view keeps normal text navigation but escape must return
+        // to the log (the plain Body table has no escape row).
         bs = push(bs, bind("escape", "msg-back"))
-        bs = push(bs, bind("g", "rows-home"))
-        bs = push(bs, bind("G", "rows-end"))
-        return bs
     }
     if name == "Body" {
         // §4.14 text view keys
@@ -1288,19 +1293,7 @@ fn widget_action(a: mut App, act: str, ev: term.KeyEvent) -> int {
         i := a.resp_rows.sel
         if i >= 0 && i < len(a.resp_events) {
             ev := a.resp_events[i]
-            txt := ""
-            if len(ev.event) > 0 {
-                txt = ev.event
-                if len(ev.id) > 0 {
-                    txt = txt + " · ID: " + ev.id
-                }
-                txt = txt + "\n"
-            }
-            txt = txt + ev.body as str
-            if len(txt) == 0 {
-                txt = ev.title
-            }
-            a.resp_view = new_text_view(txt)
+            a.resp_view = new_text_view(msg_detail_text(ev, i))
             a.msg_detail = i
             a.msg_following = false
         }
@@ -1707,6 +1700,10 @@ fn rows_cur(a: mut App) -> int {
     return 0
 }
 
+fn msg_log_active(a: ref App) -> bool {
+    return a.focus == FRespPane && a.resp_tab == 0 && len(a.resp_events) > 0 && a.msg_detail < 0
+}
+
 fn rows_move(a: mut App, d: int, shift: bool) {
     if top_modal(a) == MHistory {
         a.hist.move(d, shift)
@@ -1720,6 +1717,9 @@ fn rows_move(a: mut App, d: int, shift: bool) {
         a.vars.move(d, shift)
         return
     }
+    if msg_log_active(a) {
+        a.msg_following = false
+    }
     a.resp_rows.move(d, shift)
 }
 
@@ -1728,6 +1728,9 @@ fn rows_home(a: mut App, shift: bool) {
         a.hist.home(shift)
         return
     }
+    if msg_log_active(a) {
+        a.msg_following = false
+    }
     a.resp_rows.home(shift)
 }
 
@@ -1735,6 +1738,9 @@ fn rows_end(a: mut App, shift: bool) {
     if top_modal(a) == MHistory {
         a.hist.end(shift)
         return
+    }
+    if msg_log_active(a) {
+        a.msg_following = false
     }
     a.resp_rows.end(shift)
 }

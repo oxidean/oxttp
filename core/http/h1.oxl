@@ -77,6 +77,11 @@ fn (t mut TmoReader) read(b: []byte) -> [int, err] {
             return 0, errors.new("http: request timed out after " + itoa(t.tmo) + "ms")
         }
         set_rcvtimo_ms(t.c.rawfd(), rem)
+    } else {
+        // A zero deadline means either no timeout or an SSE post-header
+        // lift. The previous read may already have installed a finite
+        // socket timeout; clear it or a quiet stream still dies.
+        set_rcvtimo_ms(t.c.rawfd(), 0)
     }
     [n, e] = t.c.read(b)
     if e != nil && e != io.eof() && dl > 0 && now_ms() >= dl {
@@ -104,6 +109,11 @@ fn (t mut TmoTlsReader) read(b: []byte) -> [int, err] {
             return 0, errors.new("http: request timed out after " + itoa(t.tmo) + "ms")
         }
         set_rcvtimo_ms(t.c.rawfd(), rem)
+    } else {
+        // A zero deadline means either no timeout or an SSE post-header
+        // lift. The previous read may already have installed a finite
+        // socket timeout; clear it or a quiet stream still dies.
+        set_rcvtimo_ms(t.c.rawfd(), 0)
     }
     [n, e] = t.c.read(b)
     if e != nil && e != io.eof() && dl > 0 && now_ms() >= dl {
@@ -893,6 +903,8 @@ fn h2_exchange(req: ref model.Req, rw: io.ReadWriter, fd: int, hdrs: []model.Hea
     let rh: []model.Header = nil
     n_rh_head := -1
     body := mkslice(byte, 0)
+    wire_bytes := 0
+    sse_raw_over := false
     got_final := false
     done := false
     for !done {
@@ -945,8 +957,24 @@ fn h2_exchange(req: ref model.Req, rw: io.ReadWriter, fd: int, hdrs: []model.Hea
             continue
         }
         if ev.kind == 0 { // DATA
+            wire_bytes = wire_bytes + len(ev.payload)
+            keep := len(ev.payload)
+            if got_final && sse_is_stream(rh, req.method) {
+                // h1's SSE raw-body ceiling applies here too: keep at
+                // most 64 MiB but continue reading/acking until END_STREAM
+                // so flow control and content-length validation still see
+                // the real wire stream.
+                room := sse_max_body - len(body)
+                if room < 0 {
+                    room = 0
+                }
+                if keep > room {
+                    keep = room
+                    sse_raw_over = true
+                }
+            }
             i := 0
-            for i < len(ev.payload) {
+            for i < keep {
                 body = push(body, ev.payload[i])
                 i = i + 1
             }
@@ -976,7 +1004,7 @@ fn h2_exchange(req: ref model.Req, rw: io.ReadWriter, fd: int, hdrs: []model.Hea
     if n_rh_head >= 0 {
         hdr_scope = rh[:n_rh_head]
     }
-    le := h2_check_length(req.method, status, hdr_scope, len(body))
+    le := h2_check_length(req.method, status, hdr_scope, wire_bytes)
     if le != nil {
         return bad, le
     }
@@ -991,7 +1019,7 @@ fn h2_exchange(req: ref model.Req, rw: io.ReadWriter, fd: int, hdrs: []model.Hea
     serr := ""
     resp := model.Resp{status: status, reason: "", headers: rh, body: bodyb, elapsed_ms: itof(now_ms() - t0), remote: remote, version: "2.0", hops: nil, req_head: "", trace: tr, tls_ver: tls_ver, events: nil, stream_error: ""}
     if sse_is_stream(rh, req.method) {
-        over := false
+        over := sse_raw_over
         if len(bodyb) > sse_max_body {
             bodyb = bodyb[0:sse_max_body]
             over = true

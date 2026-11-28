@@ -443,6 +443,12 @@ fn draft_from_request(r: own collection.PRequest, path: str) -> RDraft {
         d.method = "GET"
     }
     d.kind = kind_idx(r.kind)
+    if d.kind == KGraphql {
+        // upstream Normalize forces the HTTP-carried kind to POST —
+        // even when an old/hand-written file omitted method or kept a
+        // stale one.
+        d.method = "POST"
+    }
     d.path = path
     d.info_text = info_render(r)
     d.auth_text = auth_render(r)
@@ -545,6 +551,12 @@ fn opts_render(r: ref collection.PRequest) -> str {
 fn draft_to_request(a: ref App) -> own collection.PRequest {
     r := new(collection.PRequest)
     r.method = a.method
+    if a.kind == KGraphql {
+        // method is not a GraphQL file field (upstream Kind.Fields);
+        // keep it empty so marshal omits it. plan_req still lowers the
+        // wire send to POST.
+        r.method = ""
+    }
     r.url = a.url.text
     r.kind = kind_str(a.kind)
     i := 0
@@ -1257,6 +1269,14 @@ fn install_resp(a: mut App, resp: model.Resp, req_url: str) {
             a.resp_title = a.resp_title + "s"
         }
     }
+    // upstream StatusOf: any interrupted stream is a warning unless the
+    // transport status was already an error.
+    if len(resp.stream_error) > 0 {
+        if a.resp_class != 2 {
+            a.resp_class = 3
+        }
+        a.resp_title = a.resp_title + " · Stream interrupted"
+    }
     if a.resp_size_time {
         a.resp_title = a.resp_title + " · " + size_str(a.resp_size) + " · " + ms_str(resp.elapsed_ms)
     }
@@ -1398,6 +1418,38 @@ fn resp_tab_names(a: ref App) -> []str {
         i = i + 1
     }
     return out
+}
+
+fn msg_kind_label(kind: int) -> str {
+    if kind == 0 {
+        return "↑ Sent"
+    }
+    if kind == 1 {
+        return "↓ Received"
+    }
+    if kind == 3 {
+        return "! Error"
+    }
+    return "· Event"
+}
+
+// msg_detail_text is the inspector payload pinned by the spec: kind /
+// index / timestamp header, optional SSE event metadata, then the
+// message body (or the informational title when there is no body).
+fn msg_detail_text(ev: model.StreamEvent, idx: int) -> str {
+    txt := msg_kind_label(ev.kind) + " · #" + itoa(idx + 1) + "    " + msg_time(ev.at_ms) + "\n"
+    if len(ev.event) > 0 {
+        txt = txt + ev.event
+        if len(ev.id) > 0 {
+            txt = txt + " · ID: " + ev.id
+        }
+        txt = txt + "\n"
+    }
+    body := ev.body as str
+    if len(body) == 0 && len(ev.event) == 0 {
+        body = ev.title
+    }
+    return txt + body
 }
 
 fn msg_glyph(kind: int) -> str {

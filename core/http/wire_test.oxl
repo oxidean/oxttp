@@ -252,6 +252,10 @@ fn test_read_capped_sse() {
     [cr2, ce2] = read_eof_capped(r2, 100)
     testing.expect(ce2 == nil && !cr2.hit, "under cap no hit")
     testing.expect_streq(cr2.data as str, "short", "under cap bytes")
+    r2e := sreader("abcd")
+    [cr2e, ce2e] = read_eof_capped(r2e, 4)
+    testing.expect(ce2e == nil && !cr2e.hit, "exact cap is not truncation")
+    testing.expect_streq(cr2e.data as str, "abcd", "exact cap bytes")
 
     wire := "8\r\nabcdefgh\r\n8\r\nijklmnop\r\n0\r\n\r\n"
     [cc, cce] = read_chunked_cap(sreader(wire), 10)

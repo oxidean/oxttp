@@ -10,6 +10,7 @@ package http
 import "std/encoding/json"
 import "std/errors"
 import "std/time"
+import "std/unicode/utf8"
 
 import "github.com/oxidean/oxttp/core/model"
 
@@ -62,6 +63,25 @@ fn sse_is_stream(headers: []model.Header, method: str) -> bool {
 
 // parse_sse decodes event-stream framing into received MessageEvents.
 // Returns the event list (own) and an error string ("" clean).
+// utf8_line matches upstream strings.ToValidUTF8: malformed input
+// bytes become U+FFFD; valid input is returned byte-for-byte.
+fn utf8_line(s: str) -> str {
+    if utf8.valid(s) {
+        return s
+    }
+    out := ""
+    i := 0
+    for i < len(s) {
+        d := utf8.decode(s, i)
+        if d.n == 0 {
+            break
+        }
+        out = out + utf8.encode(d.r)
+        i = i + d.n
+    }
+    return out
+}
+
 fn parse_sse(body: []byte) -> [own []model.StreamEvent, err] {
     s := body as str
     evs := mkslice(model.StreamEvent, 0)
@@ -96,10 +116,13 @@ fn parse_sse(body: []byte) -> [own []model.StreamEvent, err] {
             }
         }
         i = ni
+        line = utf8_line(line)
         if len(line) == 0 {
             if len(data) > 0 {
                 if count == sse_max_events {
-                    return nil, errors.new("SSE log reached 10000 events")
+                    // upstream retains the events already logged and
+                    // marks the stream interrupted at the cap.
+                    return new(evs), errors.new("SSE log reached 10000 events")
                 }
                 // accumulated data always ends with \n — drop it
                 db := substr(data, 0, len(data) - 1)
@@ -124,7 +147,9 @@ fn parse_sse(body: []byte) -> [own []model.StreamEvent, err] {
         }
         size = size + len(line)
         if size > sse_max_event {
-            return nil, errors.new("SSE event exceeded 1.00 MB")
+            // partial log survives; the truncated/incomplete event is
+            // not dispatched (upstream stream-interrupted semantics).
+            return new(evs), errors.new("SSE event exceeded 1.00 MB")
         }
         // field[: value] — cut at first colon, strip one leading space
         field := line

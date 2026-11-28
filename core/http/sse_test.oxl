@@ -63,6 +63,13 @@ fn test_parse_sse_edge_cases() {
     nid = push_str(nid, "b\ndata: x\n\n")
     [evs2, _e3] = parse_sse(nid)
     testing.expect_streq(evs2[0].id, "", "nul id dropped")
+    // malformed UTF-8 is replaced per upstream strings.ToValidUTF8.
+    bad := mkslice(byte, 0)
+    bad = push_str(bad, "data: a")
+    bad = push(bad, 255)
+    bad = push_str(bad, "b\n\n")
+    [evs3, _e4] = parse_sse(bad)
+    testing.expect_streq(evs3[0].body as str, "a�b", "malformed byte replaced")
 }
 
 fn test_sse_stream_gate() {
@@ -104,8 +111,12 @@ fn test_parse_sse_caps() {
         many = push_str(many, "data: x\n\n")
         j = j + 1
     }
-    [_evs2, err2] = parse_sse(many)
+    [evs2, err2] = parse_sse(many)
     testing.expect(err2 != nil, "event cap errors")
+    testing.expect(evs2 != nil, "cap retains completed events")
+    if evs2 != nil {
+        testing.expect_eq(len(evs2), 10000, "partial log retained")
+    }
 }
 
 fn sse_resp(body: str) -> str {
@@ -180,6 +191,47 @@ fn test_sse_non_head_only_and_ct() {
     testing.expect(e2 == nil, "echo send")
     if e2 == nil {
         testing.expect(resp2.events == nil, "non-sse: no events")
+    }
+}
+
+
+
+fn test_sse_gzip_encoded() {
+    // gzip.compress(b"data: gz\n\n", mtime=0)
+    gz := hx_b("1f8b08000000000002ff4b492c49b45248afe2e20200c7a9c8f40a000000")
+    resp := "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Encoding: gzip\r\nContent-Length: " + itoa(len(gz)) + "\r\nConnection: close\r\n\r\n" + gz
+    f := fx_start(one(resp))
+    defer f.stop()
+    let tr: Transport = H1{}
+    [r, e] = tr.send(sse_rq("GET", f.url() + "/sse"))
+    testing.expect(e == nil, "gzip sse send")
+    if e == nil {
+        testing.expect(r.events != nil, "gzip events")
+        if r.events != nil {
+            testing.expect_eq(len(r.events), 3, "decoded event parsed")
+            testing.expect_streq(r.events[1].body as str, "gz", "gzip event body")
+        }
+    }
+}
+
+fn test_sse_deadline_lift_clears_socket_timeout() {
+    // Headers arrive inside the 100ms request budget, then the stream
+    // is quiet for 250ms. Lifting the shared deadline must also clear
+    // the socket receive timeout installed by the header reads.
+    head := "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n"
+    f := fx_start(one("<QUIET:250>" + head + "|data: slow\n\n"))
+    defer f.stop()
+    q := sse_rq("GET", f.url() + "/sse")
+    q.timeout_ms = 100
+    let tr: Transport = H1{}
+    [resp, e] = tr.send(q)
+    testing.expect(e == nil, "quiet stream survives past header deadline")
+    if e == nil {
+        testing.expect(resp.events != nil, "events installed")
+        if resp.events != nil {
+            testing.expect_eq(len(resp.events), 3, "seed+event+end")
+            testing.expect_streq(resp.events[1].body as str, "slow", "slow body parsed")
+        }
     }
 }
 

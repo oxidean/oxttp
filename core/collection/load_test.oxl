@@ -419,6 +419,12 @@ fn test_plan_req_graphql_document() {
     br4 := sp4.req.body as model.Body.Raw
     testing.expect(find(br4.text, "\"variables\":oops {{") >= 0, "verbatim splice")
     testing.expect(find(br4.text, "operationName") < 0, "op omitted")
+    // upstream document() always emits query, even when empty; only
+    // blank variables and operationName are omitted.
+    testing.expect_streq(gql_document("", "", ""), "{\"query\":\"\"}", "empty query still emitted")
+    // compaction is whitespace-only: upstream json.Compact preserves
+    // number lexemes and string escape spellings byte-for-byte.
+    testing.expect_streq(gql_document("q", "{ \"n\": 1e0, \"f\": 1.2300, \"s\": \"a\\nb\" }", ""), "{\"query\":\"q\",\"variables\":{\"n\":1e0,\"f\":1.2300,\"s\":\"a\\nb\"}}", "compact preserves lexemes")
 }
 
 fn test_plan_req_path_param_with_query_and_frag() {

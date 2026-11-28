@@ -331,7 +331,7 @@ fn test_method_menu() {
     dispatch(a, kev("t", true, false, false))
     dispatch(a, kev("q", false, false, false))
     testing.expect_eq(a.kind, KGraphql, "graphql kind")
-    testing.expect_eq(req_tab_count(a), 7, "graphql: Body→Params swap, still 7")
+    testing.expect_eq(req_tab_count(a), 8, "graphql: Query+Variables plus shared tabs")
     // back to http
     dispatch(a, kev("t", true, false, false))
     dispatch(a, kev("g", false, false, false))
