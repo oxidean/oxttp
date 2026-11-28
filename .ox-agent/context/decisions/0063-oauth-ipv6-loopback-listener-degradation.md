@@ -1,4 +1,4 @@
-# ADR-0058 — OAuth IPv6 loopback listener degradation
+# ADR-0063 — OAuth IPv6 loopback listener degradation
 
 - Status: accepted
 - Date: 2026-11-28
@@ -22,7 +22,7 @@ bind that IPv6 loopback address. The error must be explicit and must not
 silently fall back to IPv4, a wildcard v6 listener, or a hostname rewrite.
 
 IPv4 loopback redirect URIs remain supported within the constraints of
-ADR-0056 (`INADDR_ANY` binding, strict Host/state/path checks, short
+ADR-0061 (`INADDR_ANY` binding, strict Host/state/path checks, short
 lifetime).
 
 ## Consequences

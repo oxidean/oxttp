@@ -2,8 +2,8 @@
 
 Upstream: Posting `32c45669032342cf9b95d5758af47a0d93de0ad7`; corpus
 `docs/corpus/corpus-posting.md` §5.2, §7.6, §7.7, §9. Discovery and decision
-record: `artifacts/discovery.md`, `artifacts/brainstorm.md`, ADR-0054 through
-ADR-0057. Pin: oxl 0.26.0.
+record: `artifacts/discovery.md`, `artifacts/brainstorm.md`, ADR-0059 through
+ADR-0062. Pin: oxl 0.26.0.
 
 ## 1. Goal and scope
 
@@ -36,10 +36,10 @@ secret-safe integration.
 - Digest authentication, GraphQL/SSE behavior, gRPC transport, WebSocket
   transport. Those are separate work items. `core/oauth` must not prevent
   their later reuse, but WI-0022 acceptance is HTTP + Posting TUI/run.
-- OS credential-store persistence. oxl 0.26.0 lacks a safe API (ADR-0054).
-- Escape cancellation and fully asynchronous sends (ADR-0056).
+- OS credential-store persistence. oxl 0.26.0 lacks a safe API (ADR-0059).
+- Escape cancellation and fully asynchronous sends (ADR-0061).
 - Correcting Basic/Bearer explicit-Authorization precedence outside OAuth
-  (ADR-0057 scopes the correction to OAuth only).
+  (ADR-0062 scopes the correction to OAuth only).
 - curl import of `--oauth2-bearer` changes: it remains bearer-token import.
   OAuth *export refusal* is required when export exists on this branch.
 
@@ -131,7 +131,7 @@ Required structural properties:
    (case-normalized by URL parsing where upstream would normalize; default
    ports remain part of the URL host when explicit).
 3. Token fields: access token, token type, refresh token, expiry time or
-   no-expiry. Store values only in memory for this milestone (ADR-0054).
+   no-expiry. Store values only in memory for this milestone (ADR-0059).
 4. A token is valid when access token is non-empty and either no expiry is
    present or current time is before expiry minus 10 seconds. Expiry equality
    inside the 10-second window is invalid.
@@ -246,7 +246,7 @@ secret-bearing descriptions or bodies.
    failure is an authorization failure, never a fallback to weak randomness.
 9. oxl limitation: `std/net.listen` binds IPv4 `INADDR_ANY`; strict Host,
    state, and lifetime caps are required, and the limitation is documented
-   (ADR-0056). IPv6 loopback redirect execution may explicitly degrade.
+   (ADR-0061). IPv6 loopback redirect execution may explicitly degrade.
 
 ## 9. Resource request integration
 
@@ -301,7 +301,7 @@ secret-bearing descriptions or bodies.
 
 ## 11. `posting run` contract
 
-Per ADR-0055:
+Per ADR-0060:
 
 - Run uses non-interactive OAuth. Client-credentials acquires/reuses/refreshes
   tokens within the run process.
@@ -310,7 +310,7 @@ Per ADR-0055:
   request to authorize OAuth in your browser first`; no browser opens and no
   three-minute wait occurs.
 - Since the store is memory-only, a fresh process has no persisted TUI token.
-  This is documented and is not treated as a test failure of the ADR-0054
+  This is documented and is not treated as a test failure of the ADR-0059
   deviation.
 - OAuth authorization failures are per-request failures and participate in
   `--fail-fast`, text output, JSON output, and exit codes exactly like other
@@ -343,18 +343,18 @@ Required caps/rules:
 ## 14. Explicit deviations to record in implementation/review
 
 1. Memory-only tokens; no OS credential-store persistence in oxl 0.26.0
-   (ADR-0054).
+   (ADR-0059).
 2. `posting run` intentionally supports non-interactive client-credentials
    where pinned upstream fails all OAuth; browser-required code grants refuse
-   rather than opening a browser (ADR-0055).
+   rather than opening a browser (ADR-0060).
 3. No Escape cancellation because the TUI send/event loop is synchronous and
-   oxl lacks poll/select/cancellable stdin (ADR-0056).
+   oxl lacks poll/select/cancellable stdin (ADR-0061).
 4. Callback listener binds IPv4 `INADDR_ANY`, not the exact loopback host;
-   IPv6 loopback may explicitly degrade (ADR-0056 + implementation note).
+   IPv6 loopback may explicitly degrade (ADR-0061 + implementation note).
 5. Exact upstream vault key byte format is not reproduced because no vault
    interop exists; logical cache-key partitioning is preserved.
 6. Basic/Bearer explicit-Authorization precedence remains the pre-existing
-   oxttp behavior; only OAuth is corrected in this WI (ADR-0057).
+   oxttp behavior; only OAuth is corrected in this WI (ADR-0062).
 7. Browser launcher is a best-effort argv chain rather than terma/OpenURL;
    failure uses the upstream safe error.
 8. Cross-kind OAuth integration waits for WI-0020/WI-0021, though core APIs

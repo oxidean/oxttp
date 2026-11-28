@@ -1,4 +1,4 @@
-# ADR-0056 — synchronous browser flow, strict callback caps, documented oxl listener limit
+# ADR-0061 — synchronous browser flow, strict callback caps, documented oxl listener limit
 
 - Status: accepted
 - Date: 2026-11-28

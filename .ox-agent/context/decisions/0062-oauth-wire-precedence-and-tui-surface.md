@@ -1,4 +1,4 @@
-# ADR-0057 — OAuth bearer overrides Authorization; TUI edits config and exposes Forget
+# ADR-0062 — OAuth bearer overrides Authorization; TUI edits config and exposes Forget
 
 - Status: accepted
 - Date: 2026-11-28
@@ -37,4 +37,4 @@ sign-in. oxttp currently renders Auth read-only and has a degraded
   matters here, while Basic/Bearer stay on their existing behavior pending a
   focused correction.
 - TUI users can configure, sign in, reuse/refresh, and forget OAuth without
-  hand-editing YAML. Memory-only persistence remains governed by ADR-0054.
+  hand-editing YAML. Memory-only persistence remains governed by ADR-0059.

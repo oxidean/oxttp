@@ -1,4 +1,4 @@
-# ADR-0054 — `core/oauth` owns OAuth; oxl 0.26.0 tokens are session-memory only
+# ADR-0059 — `core/oauth` owns OAuth; oxl 0.26.0 tokens are session-memory only
 
 - Status: accepted
 - Date: 2026-11-28

@@ -1,4 +1,4 @@
-# ADR-0055 — `posting run` uses non-interactive OAuth
+# ADR-0060 — `posting run` uses non-interactive OAuth
 
 - Status: accepted
 - Date: 2026-11-28
@@ -33,6 +33,6 @@ Wire `posting run` to `core/oauth` with `interactive=false`:
 
 This is a deliberate positive deviation from pinned upstream behavior: oxttp
 supports client-credentials in `run` where upstream currently fails all
-OAuth. With ADR-0054's memory-only store, browser-authorized tokens cannot
+OAuth. With ADR-0059's memory-only store, browser-authorized tokens cannot
 yet survive across separate run processes, so first-time authorization-code
 use remains a TUI flow until persistent vault support exists.

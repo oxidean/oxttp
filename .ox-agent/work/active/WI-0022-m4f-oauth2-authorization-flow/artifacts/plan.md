@@ -1,7 +1,7 @@
 # WI-0022 plan — M4f OAuth2 authorization flow
 
 Spec: `artifacts/spec.md`. Discovery/brainstorm: `artifacts/discovery.md`,
-`artifacts/brainstorm.md`. Accepted decisions: ADR-0054 through ADR-0058.
+`artifacts/brainstorm.md`. Accepted decisions: ADR-0059 through ADR-0063.
 Implementation follows the corpus and spec; deviations must remain explicit.
 
 ## Implementation strategy
@@ -46,7 +46,7 @@ Work:
   redirect validation, resource URL validation, and exact upstream error
   strings from spec §§2–3.
 - Implement canonical cache-key encoding and SHA-256 digest; include IPv6
-  execution capability marker/result needed by ADR-0058 without attempting a
+  execution capability marker/result needed by ADR-0063 without attempting a
   socket bind.
 - Implement query escaping/form encoding, raw-url-base64 helper, fixed-loop
   state comparison, and CSPRNG state/PKCE generation wrappers.
@@ -141,7 +141,7 @@ Work:
   deadline, 64 extraneous connections, exact method/Host/path, state
   validation, duplicate/first-outcome behavior, no-store/no-referrer body,
   and guaranteed close.
-- Implement explicit IPv6-loopback unsupported execution error per ADR-0058.
+- Implement explicit IPv6-loopback unsupported execution error per ADR-0063.
 - Implement injectable argv browser opener: `xdg-open` then `open` on
   non-Windows; Windows argv launcher without shell interpolation.
 - Keep the 3-minute total budget in orchestration, but expose timing/cancel
@@ -352,17 +352,17 @@ Gate:
    Mitigate by keeping manager data flat/owned inside `core/oauth` and by
    adapting public signatures during S1/S4 before UI integration.
 2. **`std/net.listen` cannot bind exact loopback or IPv6.** Accepted in
-   ADR-0056/0058; do not attempt unsafe workarounds. Tests must pin strict
+   ADR-0061/0058; do not attempt unsafe workarounds. Tests must pin strict
    Host/state/path mitigation and explicit IPv6 failure.
 3. **Synchronous TUI blocking means waiting text may not repaint.** Accepted
-   in ADR-0056; implement best-effort text but do not invest in async rewrite.
+   in ADR-0061; implement best-effort text but do not invest in async rewrite.
 4. **Token response parser nuances.** Mirror x/oauth2 behavior from spec,
    especially `expires_in`; table-driven tests before integration.
 5. **Response cap may require transport surgery.** Keep it opt-in and small;
    if H1 architecture makes exact streaming enforcement costly, enforce at
    the OAuth read boundary while preserving transport behavior and document
    the precise mechanism.
-6. **Run behavior intentionally diverges from upstream.** ADR-0055 controls;
+6. **Run behavior intentionally diverges from upstream.** ADR-0060 controls;
    do not “fix” it back to upstream's headless failure.
 7. **Secret leakage through errors.** Sanitization is centralized in
    `core/oauth`; UI/run layers must display returned safe messages rather
