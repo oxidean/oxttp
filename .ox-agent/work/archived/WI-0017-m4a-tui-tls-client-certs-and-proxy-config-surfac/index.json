@@ -2,11 +2,10 @@
   "schema_version": 1,
   "id": "WI-0017",
   "title": "M4a TUI TLS client certs and proxy config surface",
-  "state": "blocked",
+  "state": "archived",
   "profile": "normal",
   "current_stage": "shipping",
-  "blocked_from": "shipping",
   "created_at": "2026-11-27T20:42:24Z",
-  "updated_at": "2026-11-27T23:02:15Z",
+  "updated_at": "2026-11-28T05:19:19Z",
   "git_baseline": "3a872a1488c95f7f8ebffb7e73332d4afdcceda5"
 }
