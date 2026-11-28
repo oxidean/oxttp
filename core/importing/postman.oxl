@@ -1,0 +1,1343 @@
+package importing
+
+// postman.oxl — port of internal/importing/postman/postman.go
+// (posting @32c4566). Converts Postman v2/v2.1 JSON collections and
+// environment exports. Deviations (ADR-0045): std json.Json keeps
+// the FIRST duplicate object key (encoding/json keeps last).
+import "std/encoding/json"
+import "std/errors"
+import "github.com/oxidean/oxttp/core/collection"
+import "github.com/oxidean/oxttp/core/model"
+
+// ---------- json DOM helpers ----------
+
+fn jpresent(n: ref json.Json) -> bool {
+    return n != nil && n.kind != 0
+}
+
+fn jstrv(n: ref json.Json) -> str {
+    if n == nil {
+        return ""
+    }
+    if n.kind == 3 {
+        return n.s
+    }
+    if n.kind == 1 {
+        if n.b {
+            return "true"
+        }
+        return "false"
+    }
+    if n.kind == 2 {
+        if n.f != 0.0 {
+            return ftoa(n.f)
+        }
+        return itoa(n.i)
+    }
+    if n.kind == 0 {
+        return ""
+    }
+    return json.tojson(n)
+}
+
+fn jgetk(o: ref json.Json, key: str) -> own json.Json {
+    if o == nil || o.kind != 4 {
+        return nil
+    }
+    return json.jget(o, key)
+}
+
+// jcl — jclone that tolerates absent (nil) nodes.
+fn jcl(n: ref json.Json) -> own json.Json {
+    if n == nil {
+        return nil
+    }
+    return json.jclone(n)
+}
+
+// ---------- postman shapes ----------
+
+struct PVar {
+    key: str,
+    id: str,
+    value: own json.Json,
+    disabled: bool,
+}
+
+fn pvar_name(v: PVar) -> str {
+    if len(v.key) > 0 {
+        return v.key
+    }
+    return v.id
+}
+
+struct PPair {
+    key: str,
+    value: own json.Json,
+    disabled: bool,
+}
+
+fn ppair_value(v: PPair) -> str {
+    if v.value == nil {
+        return ""
+    }
+    return jstrv(v.value)
+}
+
+fn ppair_of(n: ref json.Json) -> PPair {
+    pp := PPair{key: jstrv(jgetk(n, "key")), value: jcl(jgetk(n, "value")), disabled: false}
+    d := jgetk(n, "disabled")
+    if jpresent(d) && d.kind == 1 && !d.b {
+        pp.disabled = true
+    }
+    return pp
+}
+
+struct PParser {
+    res: own Result,
+    seen: []str,
+    defaults: []model.KV,
+    exp_bytes: int,
+    err: str,
+    warns: []str,
+}
+
+fn pwarn(p: ref PParser, where: str, msg: str) {
+    s := where + ": " + msg
+    i := 0
+    for i < len(p.seen) {
+        if p.seen[i] == s {
+            return
+        }
+        i = i + 1
+    }
+    p.seen = push(p.seen, s)
+    p.warns = push(p.warns, s)
+}
+
+fn is_ident_pm(s: str) -> bool {
+    if len(s) == 0 {
+        return false
+    }
+    c := byteat(s, 0)
+    ok := (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95
+    i := 1
+    for ok && i < len(s) {
+        c = byteat(s, i)
+        ok = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 95
+        i = i + 1
+    }
+    return ok
+}
+
+fn upper_ascii2(s: str) -> str {
+    b := mkslice(byte, len(s))
+    i := 0
+    for i < len(s) {
+        c := byteat(s, i)
+        if c >= 97 && c <= 122 {
+            c = c - 32
+        }
+        b[i] = c
+        i = i + 1
+    }
+    return b as str
+}
+
+fn trim_space2(s: str) -> str {
+    lo := 0
+    for lo < len(s) && (byteat(s, lo) == 32 || byteat(s, lo) == 9 || byteat(s, lo) == 10 || byteat(s, lo) == 13) {
+        lo = lo + 1
+    }
+    hi := len(s)
+    for hi > lo && (byteat(s, hi - 1) == 32 || byteat(s, hi - 1) == 9 || byteat(s, hi - 1) == 10 || byteat(s, hi - 1) == 13) {
+        hi = hi - 1
+    }
+    return substr(s, lo, hi)
+}
+
+// ---------- {{ref}} spans + template ----------
+
+// pref_spans — flat [start,end) pairs of each {{...}} occurrence.
+fn pref_spans(s: str) -> []int {
+    out := mkslice(int, 0)
+    i := 0
+    for i + 3 < len(s) {
+        if byteat(s, i) == 123 && byteat(s, i + 1) == 123 {
+            j := i + 2
+            found := false
+            for j + 1 < len(s) {
+                if byteat(s, j) == 125 && byteat(s, j + 1) == 125 {
+                    found = true
+                    break
+                }
+                j = j + 1
+            }
+            if found {
+                out = push(out, i)
+                out = push(out, j + 2)
+                i = j + 2
+                continue
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// dollar_escape — ReplaceAll(s, "$", "$$").
+fn dollar_escape(s: str) -> str {
+    if find(s, "$") < 0 {
+        return s
+    }
+    out := ""
+    i := 0
+    for i < len(s) {
+        if byteat(s, i) == 36 {
+            out = out + "$$"
+        } else {
+            out = out + chr1m(byteat(s, i))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn chr1m(c: int) -> str {
+    b := mkslice(byte, 1)
+    b[0] = c
+    return b as str
+}
+
+// pexpand — bounded {{name}} expansion against values.
+fn pexpand(p: ref PParser, s: str, values: []model.KV, stack: []str, where: str, budget: []int) -> str {
+    budget[0] = budget[0] - 1
+    if budget[0] < 0 {
+        pwarn(p, where, "variable expansion exceeds work limit; unresolved references retained")
+        return s
+    }
+    if len(p.err) > 0 {
+        return s
+    }
+    if len(stack) > 64 {
+        pwarn(p, where, "variable expansion exceeds 64 levels; unresolved references remain literal")
+        return s
+    }
+    spans := pref_spans(s)
+    out := ""
+    last := 0
+    si := 0
+    for si + 1 < len(spans) {
+        st := spans[si]
+        en := spans[si + 1]
+        si = si + 2
+        out = out + substr(s, last, st)
+        ref := substr(s, st, en)
+        name := substr(ref, 2, len(ref) - 2)
+        val := ""
+        found := false
+        vi := 0
+        for vi < len(values) {
+            if values[vi].name == name {
+                found = true
+                val = values[vi].value
+            }
+            vi = vi + 1
+        }
+        cyc := false
+        if found {
+            ci := 0
+            for ci < len(stack) {
+                if stack[ci] == name {
+                    cyc = true
+                }
+                ci = ci + 1
+            }
+        }
+        if found && !cyc {
+            stack = push(stack, name)
+            val = pexpand(p, val, values, stack, where, budget)
+            stack = stack[:len(stack) - 1]
+        } else {
+            val = ref
+            if found {
+                pwarn(p, where, "cyclic variable \"" + name + "\" remains unresolved")
+            }
+        }
+        if len(out) + len(val) > 1048576 {
+            pwarn(p, where, "variable expansion exceeds 1 MiB; original references retained")
+            return s
+        }
+        if found {
+            p.exp_bytes = p.exp_bytes + len(val)
+            if p.exp_bytes > 33554432 {
+                p.err = "postman: total variable expansion exceeds 32 MiB"
+                return s
+            }
+        }
+        out = out + val
+        last = en
+    }
+    out = out + substr(s, last, len(s))
+    return out
+}
+
+// ptemplate — expand local overrides, escape literal $, then
+// {{ident}} → ${ident} (others left literal + warning).
+fn ptemplate(p: ref PParser, s: str, local: []model.KV, where: str) -> str {
+    budget := mkslice(int, 1)
+    budget[0] = 1024
+    if local != nil {
+        s = pexpand(p, s, local, mkslice(str, 0), where, budget)
+    }
+    s = dollar_escape(s)
+    spans := pref_spans(s)
+    out := ""
+    last := 0
+    si := 0
+    for si + 1 < len(spans) {
+        st := spans[si]
+        en := spans[si + 1]
+        si = si + 2
+        out = out + substr(s, last, st)
+        ref := substr(s, st, en)
+        name := substr(ref, 2, len(ref) - 2)
+        if is_ident_pm(name) {
+            out = out + "${" + name + "}"
+        } else {
+            pwarn(p, where, "variable reference \"" + replace_all(ref, "$$", "$") + "\" is unsupported (dynamic, vault, or non-identifier name); left literal")
+            out = out + ref
+        }
+        last = en
+    }
+    out = out + substr(s, last, len(s))
+    return out
+}
+
+// ---------- variables ----------
+
+fn pvariables(p: ref PParser, in: []PVar, where: str) -> []model.KV {
+    out := mkslice(model.KV, 0)
+    names := mkslice(str, 0)
+    i := 0
+    for i < len(in) {
+        v := in[i]
+        i = i + 1
+        nm := pvar_name(v)
+        if v.disabled {
+            continue
+        }
+        if !is_ident_pm(nm) {
+            pwarn(p, where, "variable \"" + nm + "\" cannot be represented as a Posting variable; references remain literal")
+            continue
+        }
+        val := ptemplate(p, jstrv(v.value), nil, where)
+        found := -1
+        k := 0
+        for k < len(names) {
+            if names[k] == nm {
+                found = k
+            }
+            k = k + 1
+        }
+        if found >= 0 {
+            out[found].value = val
+            continue
+        }
+        names = push(names, nm)
+        out = push(out, model.KV{name: nm, value: val, enabled: true})
+    }
+    return out
+}
+
+// ---------- node helpers ----------
+
+fn pnode_vars(n: ref json.Json) -> []PVar {
+    out := mkslice(PVar, 0)
+    v := jgetk(n, "variable")
+    if !jpresent(v) {
+        return out
+    }
+    it := v.child
+    for it != nil {
+        pv := PVar{key: jstrv(jgetk(it, "key")), id: jstrv(jgetk(it, "id")), value: jcl(jgetk(it, "value")), disabled: false}
+        d := jgetk(it, "disabled")
+        if jpresent(d) && d.kind == 1 && d.b {
+            pv.disabled = true
+        }
+        out = push(out, pv)
+        it = it.next
+    }
+    return out
+}
+
+fn pnode_events_present(n: ref json.Json) -> bool {
+    v := jgetk(n, "event")
+    return jpresent(v) && v.kind == 5 && v.child != nil
+}
+
+fn pnode_ppb_present(n: ref json.Json) -> bool {
+    v := jgetk(n, "protocolProfileBehavior")
+    if !jpresent(v) {
+        return false
+    }
+    return json.tojson(v) != "{}"
+}
+
+// ---------- walk ----------
+
+fn kv_set_last(list: []model.KV, name: str, value: str) -> []model.KV {
+    i := 0
+    for i < len(list) {
+        if list[i].name == name {
+            list[i].value = value
+            return list
+        }
+        i = i + 1
+    }
+    return push(list, model.KV{name: name, value: value, enabled: true})
+}
+
+fn pwalk(p: ref PParser, arr: own json.Json, dirs: []str, auth: own json.Json, local: []model.KV, depth: int) -> str {
+    if depth > 128 {
+        return "postman: folder nesting exceeds 128 levels"
+    }
+    i := 0
+    it := arr.child
+    for it != nil {
+        if len(p.err) > 0 {
+            return p.err
+        }
+        name := jstrv(jgetk(it, "name"))
+        if len(name) == 0 {
+            name = "Untitled " + itoa(i + 1)
+        }
+        parts := append_slice(append_slice(mkslice(str, 0), dirs), s1(name))
+        where := str_join(parts, "/")
+        scp := mkslice(model.KV, 0)
+        scp = append_kv(scp, local)
+        ivars := pnode_vars(it)
+        vi := 0
+        for vi < len(ivars) {
+            if ivars[vi].disabled {
+                vi = vi + 1
+                continue
+            }
+            scp = kv_set_last(scp, pvar_name(ivars[vi]), jstrv(ivars[vi].value))
+            vi = vi + 1
+        }
+        inherited := auth
+        ia := jgetk(it, "auth")
+        if jpresent(ia) {
+            inherited = ia
+        }
+        if pnode_events_present(it) {
+            pwarn(p, where, "scripts and tests are not imported or executed")
+        }
+        if pnode_ppb_present(it) {
+            pwarn(p, where, "Postman protocol settings are not imported; Posting defaults apply")
+        }
+        children := jgetk(it, "item")
+        rq := jgetk(it, "request")
+        has_children := jpresent(children) && children.kind == 5 && children.child != nil
+        if has_children {
+            if jpresent(rq) {
+                return "postman: " + where + " has both request and child items"
+            }
+            err := pwalk(p, children, parts, inherited, scp, depth + 1)
+            if len(err) > 0 {
+                return err
+            }
+            i = i + 1
+            it = it.next
+            continue
+        }
+        if !jpresent(rq) {
+            return "postman: " + where + " has neither a request nor a folder item array"
+        }
+        // scopedAliases: materialize defaults that transitively
+        // reference a scoped name (upstream scopedAliases).
+        eff := pscoped_aliases(p, scp)
+        [preq, cerr2] = pconvert(p, rq, inherited, eff, where)
+        if cerr2 != nil {
+            return "postman: " + where + ": " + errors.msg(cerr2)
+        }
+        preq.name = name
+        path := str_join(parts, "/") + ".posting.yaml"
+        ir := ImpRequest{file: path, req: preq}
+        p.res.requests = push(p.res.requests, ir)
+        i = i + 1
+        it = it.next
+    }
+    return ""
+}
+
+// pscoped_aliases — local ∪ {defaults referencing (transitively) a
+// local name}, fixpoint ≤64 passes, keys in sorted order upstream;
+// order doesn't affect semantics here.
+fn pscoped_aliases(p: ref PParser, local: []model.KV) -> []model.KV {
+    if len(local) == 0 {
+        return local
+    }
+    out := append_kv(mkslice(model.KV, 0), local)
+    pass := 0
+    for pass < 64 {
+        changed := false
+        di := 0
+        for di < len(p.defaults) {
+            d := p.defaults[di]
+            di = di + 1
+            // skip if already in out
+            have := false
+            oi := 0
+            for oi < len(out) {
+                if out[oi].name == d.name {
+                    have = true
+                }
+                oi = oi + 1
+            }
+            if have {
+                continue
+            }
+            refs := pref_spans(d.value)
+            ri := 0
+            hit := false
+            for ri + 1 < len(refs) {
+                nm := substr(d.value, refs[ri] + 2, refs[ri + 1] - 2)
+                oi = 0
+                for oi < len(out) {
+                    if out[oi].name == nm {
+                        hit = true
+                    }
+                    oi = oi + 1
+                }
+                ri = ri + 2
+            }
+            if hit {
+                out = push(out, d)
+                changed = true
+            }
+        }
+        if !changed {
+            break
+        }
+        pass = pass + 1
+    }
+    return out
+}
+
+fn append_slice(a: []str, b: []str) -> []str {
+    i := 0
+    for i < len(b) {
+        a = push(a, b[i])
+        i = i + 1
+    }
+    return a
+}
+
+fn append_kv(a: []model.KV, b: []model.KV) -> []model.KV {
+    i := 0
+    for i < len(b) {
+        a = push(a, b[i])
+        i = i + 1
+    }
+    return a
+}
+
+// ---------- URL ----------
+
+struct CutRes { before: str, after: str, ok: bool }
+
+// cut_outside_reference — first delimiter NOT inside {{...}}.
+fn cut_outside_reference(s: str, delim: str) -> own CutRes {
+    r := new(CutRes)
+    i := 0
+    for i < len(s) {
+        if i + 1 < len(s) && byteat(s, i) == 123 && byteat(s, i + 1) == 123 {
+            j := i + 2
+            for j + 1 < len(s) {
+                if byteat(s, j) == 125 && byteat(s, j + 1) == 125 {
+                    break
+                }
+                j = j + 1
+            }
+            if j + 1 < len(s) {
+                i = j + 3
+                continue
+            }
+        }
+        if substr(s, i, i + 1) == delim {
+            r.before = substr(s, 0, i)
+            r.after = substr(s, i + 1, len(s))
+            r.ok = true
+            return r
+        }
+        i = i + 1
+    }
+    r.before = s
+    r.after = ""
+    r.ok = false
+    return r
+}
+
+fn split_outside_reference(s: str, delim: str) -> []str {
+    out := mkslice(str, 0)
+    cur := s
+    for true {
+        c := cut_outside_reference(cur, delim)
+        out = push(out, c.before)
+        if !c.ok {
+            return out
+        }
+        cur = c.after
+    }
+}
+
+// escape_encoded_dollars — %24 → $$ (decoded dollars stay literal).
+fn escape_encoded_dollars(s: str) -> str {
+    return replace_all(s, "%24", "$$")
+}
+
+// join_url_parts — string or array of strings/{value} joined by sep.
+fn join_url_parts(n: ref json.Json, sep: str) -> [str, err] {
+    if n == nil {
+        return "", nil
+    }
+    if n.kind == 3 {
+        return n.s, nil
+    }
+    if n.kind != 5 {
+        return "", errors.new("URL parts must be strings or an array")
+    }
+    vals := mkslice(str, 0)
+    it := n.child
+    for it != nil {
+        if !jpresent(it) {
+            return "", errors.new("URL parts cannot be null")
+        }
+        if it.kind == 3 {
+            vals = push(vals, it.s)
+        } else {
+            v := jgetk(it, "value")
+            if v == nil || v.kind != 3 {
+                return "", errors.new("expected strings or path objects with a value")
+            }
+            vals = push(vals, v.s)
+        }
+        it = it.next
+    }
+    return str_join(vals, sep), nil
+}
+
+// pread_url — url string or structured object → req.url/params/
+// path_params. scope = effective template scope.
+fn pread_url(p: ref PParser, req: ref collection.PRequest, raw: ref json.Json, scp: []model.KV, where: str) -> err {
+    if !jpresent(raw) {
+        return errors.new("request URL is missing")
+    }
+    text := ""
+    structured_query := false
+    query_pairs := json.jnull()
+    uvars := mkslice(PVar, 0)
+    if raw.kind == 3 {
+        text = raw.s
+    } else if raw.kind == 4 {
+        u := raw
+        text = jstrv(jgetk(u, "raw"))
+        host := jgetk(u, "host")
+        if jpresent(host) {
+            [h, herr] = join_url_parts(host, ".")
+            if herr != nil {
+                return errors.new("invalid URL host: " + errors.msg(herr))
+            }
+            text = h
+            authn := jgetk(u, "auth")
+            if jpresent(authn) {
+                text = jstrv(jgetk(authn, "user")) + ":" + jstrv(jgetk(authn, "password")) + "@" + text
+            }
+            proto := jstrv(jgetk(u, "protocol"))
+            if len(proto) > 0 {
+                // trim :// suffix
+                if has_suffix(proto, "://") {
+                    proto = substr(proto, 0, len(proto) - 3)
+                }
+                text = proto + "://" + text
+            }
+            port := jstrv(jgetk(u, "port"))
+            if len(port) > 0 {
+                text = text + ":" + port
+            }
+            pathn := jgetk(u, "path")
+            if jpresent(pathn) {
+                [pv, perr] = join_url_parts(pathn, "/")
+                if perr != nil {
+                    return errors.new("invalid URL path: " + errors.msg(perr))
+                }
+                // path given as JSON string keeps leading slash?
+                // upstream trims prefix when raw Path is a string
+                if pathn.kind == 3 {
+                    pv = trim_prefix_slash(pv)
+                }
+                text = text + "/" + pv
+            }
+            hash := jstrv(jgetk(u, "hash"))
+            if len(hash) > 0 {
+                text = text + "#" + hash
+            }
+        }
+        q := jgetk(u, "query")
+        if jpresent(q) {
+            structured_query = true
+            if q.kind != 5 {
+                return errors.new("URL query must be an array")
+            }
+            query_pairs = q
+        }
+        uvars = pnode_vars(u)
+    } else {
+        return errors.new("invalid URL")
+    }
+    c1 := cut_outside_reference(text, "#")
+    base := c1.before
+    frag := c1.after
+    c2 := cut_outside_reference(base, "?")
+    base = c2.before
+    rawq := c2.after
+    hasq := c2.ok
+    if structured_query {
+        qm := query_pairs.child
+        for qm != nil {
+            pp := ppair_of(qm)
+            if pp.value == nil {
+                pwarn(p, where, "query parameters without '=' are normalized to empty values")
+            }
+            qm = qm.next
+        }
+        req.params = convert_pairs_p(p, query_pairs, scp, where, true)
+    } else if hasq {
+        parts := split_outside_reference(rawq, "&")
+        i := 0
+        for i < len(parts) {
+            part := parts[i]
+            if len(part) == 0 {
+                i = i + 1
+                continue
+            }
+            cq := cut_outside_reference(part, "=")
+            k := cq.before
+            v := cq.after
+            if !cq.ok {
+                pwarn(p, where, "query parameters without '=' are normalized to empty values")
+            }
+            kk := decode_query(escape_encoded_dollars(ptemplate(p, k, scp, where)))
+            vv := decode_query(escape_encoded_dollars(ptemplate(p, v, scp, where)))
+            req.params = push(req.params, model.KV{name: kk, value: vv, enabled: true})
+            i = i + 1
+        }
+    }
+    req.url = ptemplate(p, base, scp, where)
+    if len(frag) > 0 {
+        req.url = req.url + "#" + ptemplate(p, frag, scp, where)
+    }
+    // path params from url.variable[]
+    vi := 0
+    for vi < len(uvars) {
+        v := uvars[vi]
+        vi = vi + 1
+        if v.disabled {
+            continue
+        }
+        nm := pvar_name(v)
+        segments := model.path_param_names(req.url)
+        si := 0
+        for si < len(segments) {
+            seg := segments[si]
+            si = si + 1
+            // :id.json → root "id" + suffix ".json"
+            dot := find(seg, ".")
+            root := seg
+            suffix := ""
+            has_suf := false
+            if dot >= 0 {
+                root = substr(seg, 0, dot)
+                suffix = substr(seg, dot, len(seg))
+                has_suf = true
+            }
+            if root != nm {
+                continue
+            }
+            value := jstrv(v.value)
+            if has_suf && len(value) > 0 {
+                value = value + suffix
+            }
+            value = ptemplate(p, value, scp, where)
+            value = decode_path(escape_encoded_dollars(value))
+            req.path_params = push(req.path_params, collection.PathParam{name: seg, value: value})
+        }
+    }
+    return nil
+}
+
+fn trim_prefix_slash(s: str) -> str {
+    if len(s) > 0 && byteat(s, 0) == 47 {
+        return substr(s, 1, len(s))
+    }
+    return s
+}
+
+// decode_query — url.QueryUnescape equivalent (stdlib net/url).
+fn decode_query(s: str) -> str {
+    // minimal %XX + '+' decode; invalid sequences left literal
+    out := ""
+    i := 0
+    for i < len(s) {
+        c := byteat(s, i)
+        if c == 37 && i + 2 < len(s) {
+            h1 := hexval(byteat(s, i + 1))
+            h2 := hexval(byteat(s, i + 2))
+            if h1 >= 0 && h2 >= 0 {
+                out = out + chr1m(h1 * 16 + h2)
+                i = i + 3
+                continue
+            }
+        }
+        if c == 43 {
+            out = out + " "
+        } else {
+            out = out + chr1m(c)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn decode_path(s: str) -> str {
+    return decode_query_noplus(s)
+}
+
+fn decode_query_noplus(s: str) -> str {
+    out := ""
+    i := 0
+    for i < len(s) {
+        c := byteat(s, i)
+        if c == 37 && i + 2 < len(s) {
+            h1 := hexval(byteat(s, i + 1))
+            h2 := hexval(byteat(s, i + 2))
+            if h1 >= 0 && h2 >= 0 {
+                out = out + chr1m(h1 * 16 + h2)
+                i = i + 3
+                continue
+            }
+        }
+        out = out + chr1m(c)
+        i = i + 1
+    }
+    return out
+}
+
+fn hexval(c: int) -> int {
+    if c >= 48 && c <= 57 {
+        return c - 48
+    }
+    if c >= 97 && c <= 102 {
+        return c - 87
+    }
+    if c >= 65 && c <= 70 {
+        return c - 55
+    }
+    return -1
+}
+
+// convert_pairs_p — pairs → KV with template transform; encoded
+// decodes %XX after escaping (upstream convertPairs encoded=true).
+fn convert_pairs_p(p: ref PParser, arr: own json.Json, scp: []model.KV, where: str, encoded: bool) -> []model.KV {
+    out := mkslice(model.KV, 0)
+    it := arr.child
+    for it != nil {
+        pp := ppair_of(it)
+        it = it.next
+        k := ptemplate(p, pp.key, scp, where)
+        v := ptemplate(p, ppair_value(pp), scp, where)
+        if encoded {
+            k = decode_query(escape_encoded_dollars(k))
+            v = decode_query(escape_encoded_dollars(v))
+        }
+        out = push(out, model.KV{name: k, value: v, enabled: !pp.disabled})
+    }
+    return out
+}
+
+// ---------- auth ----------
+
+// pread_auth — auth.type dispatch: basic/digest/bearer/apikey;
+// attrs from {type:{key,value}} list or object map.
+fn pread_auth(p: ref PParser, req: ref collection.PRequest, raw: ref json.Json, scp: []model.KV, where: str) -> err {
+    if !jpresent(raw) {
+        return nil
+    }
+    if raw.kind != 4 {
+        return errors.new("invalid auth")
+    }
+    kd := jgetk(raw, "type")
+    if kd == nil || kd.kind != 3 {
+        return errors.new("auth type must be a string")
+    }
+    kind := kd.s
+    if kind == "noauth" {
+        return nil
+    }
+    attrs := mkslice(model.KV, 0)
+    blk := jgetk(raw, kind)
+    if jpresent(blk) {
+        if blk.kind == 5 {
+            // v2.1 attr list [{key,value}]
+            it := blk.child
+            for it != nil {
+                pv := PVar{key: jstrv(jgetk(it, "key")), id: "", value: jcl(jgetk(it, "value")), disabled: false}
+                attrs = kv_set_last(attrs, pvar_name(pv), jstrv(pv.value))
+                it = it.next
+            }
+        } else if blk.kind == 4 {
+            // v2.0 attr object
+            pm := jarr_items_obj(blk).child
+            for pm != nil {
+                attrs = kv_set_last(attrs, jstrv(jgetk(pm, "key")), jstrv(jgetk(pm, "value")))
+                pm = pm.next
+            }
+        } else {
+            return errors.new("invalid " + kind + " auth attributes")
+        }
+    }
+    if kind == "basic" || kind == "digest" {
+        auth := new(collection.PAuth)
+        auth.type = kind
+        if kind == "basic" {
+            b := new(collection.PBasic)
+            b.username = ptemplate(p, kv_get(attrs, "username"), scp, where)
+            b.password = ptemplate(p, kv_get(attrs, "password"), scp, where)
+            auth.basic = b
+        } else {
+            b := new(collection.PBasic)
+            b.username = ptemplate(p, kv_get(attrs, "username"), scp, where)
+            b.password = ptemplate(p, kv_get(attrs, "password"), scp, where)
+            auth.digest = b
+        }
+        req.auth = auth
+        if kind == "digest" && len(attrs) > 2 {
+            pwarn(p, where, "Digest challenge overrides are not imported; Posting negotiates with the server")
+        }
+        return nil
+    }
+    if kind == "bearer" {
+        auth := new(collection.PAuth)
+        auth.type = "bearer_token"
+        bb := new(collection.PBearer)
+        bb.token = ptemplate(p, kv_get(attrs, "token"), scp, where)
+        auth.bearer_token = bb
+        req.auth = auth
+        return nil
+    }
+    if kind == "apikey" {
+        kv := model.KV{name: ptemplate(p, kv_get(attrs, "key"), scp, where), value: ptemplate(p, kv_get(attrs, "value"), scp, where), enabled: true}
+        if len(kv.name) == 0 && len(kv.value) == 0 {
+            return nil
+        }
+        if len(model.find_variables(kv.name)) > 0 {
+            pwarn(p, where, "API key name uses variables; existing-field override is based on imported defaults and should be reviewed if the name changes")
+        }
+        // `in` resolved against collection defaults (upstream
+        // Substitute(transform(attrs["in"]), MapLookup(defaults)))
+        inres := substitute_kv(ptemplate(p, kv_get(attrs, "in"), scp, where), p.defaults)
+        query_target := inres == "query"
+        if query_target {
+            kv.name = decode_query(escape_encoded_dollars(kv.name))
+            kv.value = decode_query(escape_encoded_dollars(kv.value))
+        }
+        // remove existing matching fields, then append (Postman
+        // authorizer semantics); header match is case-insensitive
+        resolved_key := substitute_kv(kv.name, result_defaults_kv(p))
+        kept_h := mkslice(model.KV, 0)
+        hi := 0
+        for hi < len(req.headers) {
+            h := req.headers[hi]
+            hi = hi + 1
+            hn := substitute_kv(h.name, result_defaults_kv(p))
+            if !case_eq_fold(hn, resolved_key) {
+                kept_h = push(kept_h, h)
+            }
+        }
+        req.headers = kept_h
+        kept_q := mkslice(model.KV, 0)
+        qi := 0
+        for qi < len(req.params) {
+            q := req.params[qi]
+            qi = qi + 1
+            qn := substitute_kv(q.name, result_defaults_kv(p))
+            if qn != resolved_key {
+                kept_q = push(kept_q, q)
+            }
+        }
+        req.params = kept_q
+        if query_target {
+            req.params = push(req.params, kv)
+        } else {
+            req.headers = push(req.headers, kv)
+        }
+        return nil
+    }
+    pwarn(p, where, "auth type \"" + kind + "\" is unsupported; configure authentication manually")
+    return nil
+}
+
+// jarr_items_obj — object members as [{key,value}] Json nodes for
+// uniform handling.
+fn jarr_items_obj(o: ref json.Json) -> own json.Json {
+    b := json.jarrb()
+    if o == nil || o.kind != 4 {
+        return json.jarrb_arr(b)
+    }
+    m := o.child
+    for m != nil {
+        wrap := json.jobj()
+        json.jadd(wrap, "key", json.jstr(m.key))
+        json.jadd(wrap, "value", json.jclone(m))
+        json.jarrb_add(b, wrap)
+        m = m.next
+    }
+    return json.jarrb_arr(b)
+}
+
+fn kv_get(list: []model.KV, name: str) -> str {
+    i := len(list) - 1
+    for i >= 0 {
+        if list[i].name == name {
+            return list[i].value
+        }
+        i = i - 1
+    }
+    return ""
+}
+
+// result_defaults_kv — p.result.Variables as KV (name→value).
+fn result_defaults_kv(p: ref PParser) -> []model.KV {
+    return p.res.variables
+}
+
+// substitute_kv — model.Substitute over a KV list.
+fn substitute_kv(s: str, vars: []model.KV) -> str {
+    return model.substitute(s, vars)
+}
+
+fn case_eq_fold(a: str, b: str) -> bool {
+    if len(a) != len(b) {
+        return false
+    }
+    i := 0
+    for i < len(a) {
+        ca := byteat(a, i)
+        cb := byteat(b, i)
+        if ca >= 65 && ca <= 90 {
+            ca = ca + 32
+        }
+        if cb >= 65 && cb <= 90 {
+            cb = cb + 32
+        }
+        if ca != cb {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// ---------- body ----------
+
+fn pconvert_body(p: ref PParser, req: ref collection.PRequest, b: ref json.Json, mode: str, scp: []model.KV, where: str) -> str {
+    if mode == "" || mode == "raw" {
+        body := new(collection.PBody)
+        body.has_content = true
+        body.content = ptemplate(p, jstrv(jgetk(b, "raw")), scp, where)
+        body.content_type = "text/plain"
+        lang := jstrv(jgetk(jgetk(jgetk(b, "options"), "raw"), "language"))
+        if lang == "json" {
+            body.content_type = "application/json"
+        } else if lang == "xml" {
+            body.content_type = "application/xml"
+        } else if lang == "html" {
+            body.content_type = "text/html"
+        } else if lang == "javascript" {
+            body.content_type = "application/javascript"
+        }
+        hi := 0
+        for hi < len(req.headers) {
+            h := req.headers[hi]
+            hi = hi + 1
+            if h.enabled && lower_ascii3(h.name) == "content-type" {
+                body.content_type = h.value
+            }
+        }
+        req.body = body
+        return ""
+    }
+    if mode == "urlencoded" {
+        uarr := jgetk(b, "urlencoded")
+        body := new(collection.PBody)
+        body.has_form_data = true
+        body.content_type = "application/x-www-form-urlencoded"
+        um := uarr.child
+        for um != nil {
+            pp := ppair_of(um)
+            body.form_data = push(body.form_data, model.KV{name: ptemplate(p, pp.key, scp, where), value: ptemplate(p, ppair_value(pp), scp, where), enabled: !pp.disabled})
+            um = um.next
+        }
+        req.body = body
+        return ""
+    }
+    if mode == "graphql" {
+        if req.method != "POST" {
+            pwarn(p, where, "GraphQL request uses " + req.method + "; Posting sends GraphQL requests as POST")
+        }
+        g := new(collection.PGraphQL)
+        g.query = braced_only(ptemplate(p, jstrv(jgetk(jgetk(b, "graphql"), "query")), scp, where))
+        gvars := jgetk(jgetk(b, "graphql"), "variables")
+        varv := ""
+        if gvars != nil {
+            if gvars.kind == 3 {
+                varv = gvars.s
+            } else if jpresent(gvars) {
+                varv = json.tojson(gvars)
+            }
+        }
+        vt := ptemplate(p, varv, scp, where)
+        g.variables = json.jparse(vt)
+        req.graphql = g
+        return ""
+    }
+    pwarn(p, where, "body mode \"" + mode + "\" is unsupported; body omitted (multipart/files require manual conversion)")
+    return ""
+}
+
+// ---------- convert ----------
+
+fn http_methods() -> []str {
+    m := mkslice(str, 0)
+    m = push(m, "GET"); m = push(m, "POST"); m = push(m, "PUT")
+    m = push(m, "PATCH"); m = push(m, "DELETE"); m = push(m, "HEAD")
+    m = push(m, "OPTIONS"); m = push(m, "TRACE")
+    return m
+}
+
+fn s1(x: str) -> []str {
+    return push(mkslice(str, 0), x)
+}
+
+fn pconvert(p: ref PParser, raw: ref json.Json, inherited: own json.Json, scp: []model.KV, where: str) -> [own collection.PRequest, err] {
+    req := new(collection.PRequest)
+    req.method = "GET"
+    req.kind = "http"
+    node := json.jclone(raw)
+    if node.kind == 3 {
+        // URL-string shorthand → {url: raw}
+        wrapped := json.jobj()
+        json.jadd(wrapped, "url", json.jstr(node.s))
+        node = wrapped
+    }
+    method := jstrv(jgetk(node, "method"))
+    if len(method) > 0 {
+        req.method = upper_ascii2(method)
+    }
+    okm := false
+    mi := 0
+    ms := http_methods()
+    for mi < len(ms) {
+        if ms[mi] == req.method {
+            okm = true
+        }
+        mi = mi + 1
+    }
+    if !okm {
+        return nil, errors.new("HTTP method \"" + method + "\" is not supported by Posting")
+    }
+    uerr := pread_url(p, req, jgetk(node, "url"), scp, where)
+    if uerr != nil {
+        return nil, uerr
+    }
+    if len(trim_space2(req.url)) == 0 {
+        return nil, errors.new("request URL is empty")
+    }
+    d := jgetk(node, "description")
+    if jpresent(d) {
+        if d.kind == 3 {
+            req.description = d.s
+        } else {
+            req.description = jstrv(jgetk(d, "content"))
+        }
+    }
+    h := jgetk(node, "header")
+    if jpresent(h) {
+        if h.kind == 5 {
+            req.headers = convert_pairs_p(p, h, scp, where, false)
+        } else if h.kind == 3 {
+            // raw header block
+            block := replace_all(h.s, "\r\n", "\n")
+            start := 0
+            li := 0
+            for li <= len(block) {
+                if li == len(block) || byteat(block, li) == 10 {
+                    line := substr(block, start, li)
+                    start = li + 1
+                    if trim_space2(line) == "" {
+                        li = li + 1
+                        continue
+                    }
+                    ci := find(line, ":")
+                    if ci < 0 {
+                        return nil, errors.new("invalid header line \"" + line + "\"")
+                    }
+                    val := trim_space2(substr(line, ci + 1, len(line)))
+                    req.headers = push(req.headers, model.KV{name: trim_space2(substr(line, 0, ci)), value: ptemplate(p, val, scp, where), enabled: true})
+                }
+                li = li + 1
+            }
+        } else {
+            return nil, errors.new("headers must be an array or string")
+        }
+    }
+    b := jgetk(node, "body")
+    if jpresent(b) {
+        mode := jstrv(jgetk(b, "mode"))
+        disabled := false
+        bd := jgetk(b, "disabled")
+        if jpresent(bd) && bd.kind == 1 && !bd.b {
+            disabled = true
+        }
+        if !disabled {
+            pconvert_body(p, req, b, mode, scp, where)
+        }
+    }
+    a := inherited
+    ia := jgetk(node, "auth")
+    if jpresent(ia) {
+        a = ia
+    }
+    aerr := pread_auth(p, req, a, scp, where)
+    if aerr != nil {
+        return nil, aerr
+    }
+    if jpresent(jgetk(node, "proxy")) {
+        pwarn(p, where, "proxy configuration is not imported")
+    }
+    if jpresent(jgetk(node, "certificate")) {
+        pwarn(p, where, "client certificate configuration is not imported")
+    }
+    return req, nil
+}
+
+// ---------- entry points ----------
+
+// pparse — Parse(data): collection JSON text → Result.
+fn pparse(data: str) -> [own Result, err] {
+    doc := json.jparse(data)
+    trimmed := trim_space2(data)
+    if doc == nil || (doc.kind == 0 && trimmed != "null") {
+        return nil, errors.new("postman: invalid collection JSON")
+    }
+    info := jgetk(doc, "info")
+    itemsn := jgetk(doc, "item")
+    if !jpresent(info) || !jpresent(itemsn) || itemsn.kind != 5 {
+        return nil, errors.new("postman: expected a v2/v2.1 collection with info and item array")
+    }
+    schema := jstrv(jgetk(info, "schema"))
+    if len(schema) > 0 && find(schema, "/v2.0.0/") < 0 && find(schema, "/v2.1.0/") < 0 {
+        return nil, errors.new("postman: unsupported collection schema \"" + schema + "\" (expected v2.0 or v2.1)")
+    }
+    p := new(PParser)
+    p.res = new(Result)
+    p.res.name = jstrv(jgetk(info, "name"))
+    p.res.requests = mkslice(ImpRequest, 0)
+    p.res.variables = mkslice(model.KV, 0)
+    p.res.envs = mkslice(Env, 0)
+    p.seen = mkslice(str, 0)
+    p.defaults = mkslice(model.KV, 0)
+    p.warns = mkslice(str, 0)
+    // collection variables: defaults (raw scalar) + result vars
+    cvars := pnode_vars(doc)
+    i := 0
+    for i < len(cvars) {
+        if !cvars[i].disabled {
+            p.defaults = kv_set_last(p.defaults, pvar_name(cvars[i]), jstrv(cvars[i].value))
+        }
+        i = i + 1
+    }
+    p.res.variables = pvariables(p, cvars, "collection")
+    if pnode_events_present(doc) {
+        pwarn(p, "collection", "scripts and tests are not imported or executed")
+    }
+    if pnode_ppb_present(doc) {
+        pwarn(p, "collection", "Postman protocol settings are not imported; Posting defaults apply")
+    }
+    // top-level auth inherited by all items
+    topauth := jcl(jgetk(doc, "auth"))
+    werr := pwalk(p, itemsn, mkslice(str, 0), topauth, mkslice(model.KV, 0), 0)
+    if len(werr) > 0 {
+        return nil, errors.new(werr)
+    }
+    if len(p.err) > 0 {
+        return nil, errors.new(p.err)
+    }
+    if len(p.res.requests) == 0 {
+        return nil, errors.new("postman: collection contains no requests")
+    }
+    p.res.warns = p.warns
+    return p.res, nil
+}
+
+struct PEnvOut { env: own Env, warns: []str, err: str }
+
+// pparse_env — ParseEnvironment(data): env export → Env + warnings.
+fn pparse_env(data: str) -> own PEnvOut {
+    o := new(PEnvOut)
+    o.warns = mkslice(str, 0)
+    doc := json.jparse(data)
+    trimmed := trim_space2(data)
+    if doc == nil || (doc.kind == 0 && trimmed != "null") {
+        o.err = "postman: invalid environment JSON"
+        return o
+    }
+    scp := jstrv(jgetk(doc, "_postman_variable_scope"))
+    if scp == "globals" {
+        o.err = "postman: globals exports are not supported; import an environment or collection instead"
+        return o
+    }
+    vals := jgetk(doc, "values")
+    if !jpresent(vals) || vals.kind != 5 {
+        o.err = "postman: expected an environment with a values array"
+        return o
+    }
+    p := new(PParser)
+    p.seen = mkslice(str, 0)
+    p.defaults = mkslice(model.KV, 0)
+    p.warns = mkslice(str, 0)
+    vars := mkslice(PVar, 0)
+    it := vals.child
+    for it != nil {
+        en := jgetk(it, "enabled")
+        dis := false
+        if jpresent(en) && en.kind == 1 && !en.b {
+            dis = true
+        }
+        vars = push(vars, PVar{key: jstrv(jgetk(it, "key")), id: "", value: jcl(jgetk(it, "value")), disabled: dis})
+        it = it.next
+    }
+    where := "environment"
+    nm := jstrv(jgetk(doc, "name"))
+    if len(nm) > 0 {
+        where = where + " " + nm
+    }
+    e := new(Env)
+    e.name = nm
+    e.variables = pvariables(p, vars, where)
+    o.env = e
+    o.warns = p.warns
+    return o
+}

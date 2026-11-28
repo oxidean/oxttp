@@ -1,0 +1,244 @@
+package model
+
+// Variable references and path params — port of upstream
+// internal/model/variables.go + pathparams.go (posting @32c4566),
+// WI-0019. Posting placeholder syntax: $NAME, ${NAME}, ${$name};
+// "$$" is an escaped literal dollar. Used by the import engines for
+// dependency ordering, dotenv encoding and template checks.
+
+// VarRef is one $NAME / ${NAME} / ${$name} reference: Name excludes
+// sigils ($-prefixed generated names keep their "$"), Start/End are
+// byte offsets of the whole reference.
+struct VarRef { name: str, start: int, end: int }
+
+fn is_ident_byte(c: int, first: bool) -> bool {
+    if c == 95 || (c >= 97 && c <= 122) || (c >= 65 && c <= 90) {
+        return true
+    }
+    if c >= 48 && c <= 57 {
+        return !first
+    }
+    return false
+}
+
+fn is_identifier(s: str) -> bool {
+    if len(s) == 0 {
+        return false
+    }
+    i := 0
+    for i < len(s) {
+        if !is_ident_byte(byteat(s, i), i == 0) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// find_variables returns every variable reference in s, in order.
+// "$$" never starts a reference; "${" without a closing "}" is
+// literal; "${name}" requires identifier or $identifier name.
+fn find_variables(s: str) -> []VarRef {
+    refs := mkslice(VarRef, 0)
+    i := 0
+    for i < len(s) {
+        if byteat(s, i) != 36 { // '$'
+            i = i + 1
+            continue
+        }
+        if i + 1 < len(s) && byteat(s, i + 1) == 36 {
+            i = i + 2
+            continue
+        }
+        if i + 1 < len(s) && byteat(s, i + 1) == 123 { // '{'
+            // find closing '}'
+            j := i + 2
+            end := -1
+            for j < len(s) {
+                if byteat(s, j) == 125 {
+                    end = j
+                    break
+                }
+                j = j + 1
+            }
+            if end < 0 {
+                i = i + 1
+                continue
+            }
+            name := substr(s, i + 2, end)
+            if is_identifier(name) || (len(name) > 1 && byteat(name, 0) == 36 && is_identifier(substr(name, 1, len(name)))) {
+                refs = push(refs, VarRef{name: name, start: i, end: end + 1})
+            }
+            i = end + 1
+            continue
+        }
+        j := i + 1
+        for j < len(s) && is_ident_byte(byteat(s, j), j == i + 1) {
+            j = j + 1
+        }
+        if j > i + 1 {
+            refs = push(refs, VarRef{name: substr(s, i + 1, j), start: i, end: j})
+            i = j
+            continue
+        }
+        i = i + 1
+    }
+    return refs
+}
+
+// find_braced_variables — ${NAME} refs only ($NAME skipped), for
+// text where a bare $name means something else (GraphQL vars).
+fn find_braced_variables(s: str) -> []VarRef {
+    refs := mkslice(VarRef, 0)
+    all := find_variables(s)
+    i := 0
+    for i < len(all) {
+        if byteat(s, all[i].start + 1) == 123 {
+            refs = push(refs, all[i])
+        }
+        i = i + 1
+    }
+    return refs
+}
+
+// VRes is a variable lookup result — ok=false leaves the reference
+// literal (upstream's (string,bool) lookup return).
+struct VRes { ok: bool, value: str }
+
+// kv_lookup — last-wins name→value over an ordered KV list
+// (model.Values/MapLookup equivalent for oxl's map-less world).
+fn kv_lookup(vars: []KV, name: str) -> VRes {
+    i := len(vars) - 1
+    for i >= 0 {
+        if vars[i].name == name {
+            return VRes{ok: true, value: vars[i].value}
+        }
+        i = i - 1
+    }
+    return VRes{ok: false, value: ""}
+}
+
+fn kv_lookup_braced(vars: []KV, name: str) -> VRes {
+    return kv_lookup(vars, name)
+}
+
+// substitute_refs renders s with refs resolved through lookup over
+// vars: "$$" collapses to "$" outside references, unknown refs stay
+// literal. vars is the merged value set (last occurrence wins).
+fn substitute_refs(s: str, refs: []VarRef, vars: []KV, braced_only: bool) -> str {
+    if find(s, "$") < 0 {
+        return s
+    }
+    if braced_only {
+        refs = find_braced_variables(s)
+    }
+    out := ""
+    last := 0
+    i := 0
+    for i < len(refs) {
+        seg := substr(s, last, refs[i].start)
+        out = out + unescape_dollars(seg)
+        res := kv_lookup(vars, refs[i].name)
+        if res.ok {
+            out = out + res.value
+        } else {
+            out = out + substr(s, refs[i].start, refs[i].end)
+        }
+        last = refs[i].end
+        i = i + 1
+    }
+    out = out + unescape_dollars(substr(s, last, len(s)))
+    return out
+}
+
+// substitute — upstream model.Substitute over a KV value set.
+fn substitute(s: str, vars: []KV) -> str {
+    return substitute_refs(s, find_variables(s), vars, false)
+}
+
+// substitute_braced — upstream SubstituteBraced ($NAME literal).
+fn substitute_braced(s: str, vars: []KV) -> str {
+    return substitute_refs(s, find_braced_variables(s), vars, true)
+}
+
+// unescape_dollars turns "$$" into "$" in literal (non-reference)
+// spans — upstream substitute's strings.ReplaceAll(s,"$$","$").
+fn unescape_dollars(s: str) -> str {
+    if find(s, "$$") < 0 {
+        return s
+    }
+    out := ""
+    i := 0
+    for i < len(s) {
+        if i + 1 < len(s) && byteat(s, i) == 36 && byteat(s, i + 1) == 36 {
+            out = out + "$"
+            i = i + 2
+            continue
+        }
+        out = out + chr_(byteat(s, i))
+        i = i + 1
+    }
+    return out
+}
+
+fn chr_(c: int) -> str {
+    b := mkslice(byte, 1)
+    b[0] = c
+    return b as str
+}
+
+// path_param_names — names of ":param" path segments in order,
+// deduped; "::name" is an escaped literal colon; query/fragment
+// excluded; host portion excluded.
+fn path_param_names(raw_url: str) -> []str {
+    path := raw_url
+    if find(path, "://") >= 0 {
+        i := find(path, "://") + 3
+        j := i
+        for j < len(path) && byteat(path, j) != 47 {
+            j = j + 1
+        }
+        if j >= len(path) {
+            return mkslice(str, 0)
+        }
+        path = substr(path, j, len(path))
+    }
+    qi := find(path, "?")
+    fi := find(path, "#")
+    cut := len(path)
+    if qi >= 0 && qi < cut {
+        cut = qi
+    }
+    if fi >= 0 && fi < cut {
+        cut = fi
+    }
+    path = substr(path, 0, cut)
+    names := mkslice(str, 0)
+    // split on '/'
+    i := 0
+    for i <= len(path) {
+        j := i
+        for j < len(path) && byteat(path, j) != 47 {
+            j = j + 1
+        }
+        seg := substr(path, i, j)
+        if len(seg) > 1 && byteat(seg, 0) == 58 && byteat(seg, 1) != 58 {
+            nm := substr(seg, 1, len(seg))
+            if len(nm) > 0 {
+                seen := false
+                k := 0
+                for k < len(names) {
+                    if names[k] == nm {
+                        seen = true
+                    }
+                    k = k + 1
+                }
+                if !seen {
+                    names = push(names, nm)
+                }
+            }
+        }
+        i = j + 1
+    }
+    return names
+}

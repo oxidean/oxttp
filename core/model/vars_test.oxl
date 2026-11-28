@@ -1,0 +1,65 @@
+package model
+
+// vars.oxl — upstream variables.go/pathparams.go ports (WI-0019).
+import "std/testing"
+
+fn vnames(refs: []VarRef) -> []str {
+    out := mkslice(str, 0)
+    i := 0
+    for i < len(refs) {
+        out = push(out, refs[i].name)
+        i = i + 1
+    }
+    return out
+}
+
+fn test_find_variables() {
+    r := find_variables("a $X b ${Y} c $$Z d ${$gen} e $9f ${unclosed")
+    names := vnames(r)
+    testing.expect_eq(len(names), 3, "ref count")
+    testing.expect_streq(names[0], "X", "bare name")
+    testing.expect_streq(names[1], "Y", "braced name")
+    testing.expect_streq(names[2], "$gen", "generated name")
+}
+
+fn test_find_variables_exact() {
+    // $9 is not a valid start → skipped entirely
+    r := find_variables("$9f and $ok")
+    names := vnames(r)
+    testing.expect_eq(len(names), 1, "only $ok")
+    testing.expect_streq(names[0], "ok", "name")
+    // $$ escapes
+    r2 := find_variables("$$X ${A}")
+    names2 := vnames(r2)
+    testing.expect_eq(len(names2), 1, "escaped dollar")
+    testing.expect_streq(names2[0], "A", "braced survives")
+    // ${unclosed literal
+    r3 := find_variables("x ${unclosed")
+    testing.expect_eq(len(r3), 0, "unclosed brace literal")
+    // ${not-ident!} literal
+    r4 := find_variables("${a b}")
+    testing.expect_eq(len(r4), 0, "space name literal")
+}
+
+fn test_substitute() {
+    vars := mkslice(KV, 0)
+    vars = push(vars, KV{name: "A", value: "1", enabled: true})
+    vars = push(vars, KV{name: "B", value: "x$A", enabled: true})
+    testing.expect_streq(substitute("v=$A w=${B} z=$$Q u=$MISSING", vars), "v=1 w=x$A z=$Q u=$MISSING", "substitute all")
+    testing.expect_streq(substitute_braced("$A ${B} $$", vars), "$A x$A $", "braced only")
+    // last-wins
+    vars = push(vars, KV{name: "A", value: "2", enabled: true})
+    testing.expect_streq(substitute("$A", vars), "2", "last wins")
+}
+
+fn test_path_param_names() {
+    n := path_param_names("http://h:8080/a/:id/b/:id.json?x=:q#f")
+    testing.expect_eq(len(n), 2, "dedup + query excluded")
+    testing.expect_streq(n[0], "id", "first")
+    testing.expect_streq(n[1], "id.json", "suffixed segment kept whole")
+    n2 := path_param_names("https://h/p::lit/:x")
+    testing.expect_eq(len(n2), 1, "escaped colon skipped")
+    testing.expect_streq(n2[0], "x", "real param")
+    n3 := path_param_names("http://h")
+    testing.expect_eq(len(n3), 0, "no path")
+}

@@ -1,0 +1,372 @@
+package importing
+
+// WI-0019 — port of internal/importing/{result,write,layers}.go +
+// the postman engine (internal/importing/postman/postman.go) per
+// ADR-0044/0045. Requests are collection.PRequest; each carries a
+// suggested collection-relative file path (write.go sanitizes).
+import "std/os"
+import "std/errors"
+import "github.com/oxidean/oxttp/core/collection"
+import "github.com/oxidean/oxttp/core/env"
+import "github.com/oxidean/oxttp/core/model"
+
+// ImpRequest is one converted request plus its suggested path
+// (upstream model.Request.File — PRequest has no File field).
+struct ImpRequest {
+    file: str,
+    req: own collection.PRequest,
+}
+
+struct Env {
+    name: str,
+    variables: []model.KV,
+}
+
+struct Result {
+    name: str,
+    requests: []ImpRequest,
+    variables: []model.KV,   // base layer → posting.env
+    envs: []Env,             // named layers → <name>.env
+    warns: []str,
+    deferred: bool,          // bruno only; postman never sets it
+}
+
+struct WEnv {
+    name: str,
+    file: str,
+    base: bool,
+}
+
+struct BaseOut { vars: []model.KV, warns: []str }
+
+struct Written {
+    files: []str,
+    envs: []WEnv,
+    warns: []str,
+}
+
+// braced_only — upstream importing.BracedOnly: un-escape "$$"→"$"
+// for text where only ${NAME} substitutes (GraphQL query).
+fn braced_only(escaped: str) -> str {
+    if find(escaped, "$$") < 0 {
+        return escaped
+    }
+    out := ""
+    i := 0
+    for i < len(escaped) {
+        if byteat(escaped, i) != 36 {
+            j := i + 1
+            for j < len(escaped) && byteat(escaped, j) != 36 {
+                j = j + 1
+            }
+            out = out + substr(escaped, i, j)
+            i = j
+            continue
+        }
+        j := i
+        for j < len(escaped) && byteat(escaped, j) == 36 {
+            j = j + 1
+        }
+        run := substr(escaped, i, j)
+        if run == "$$" && (j == len(escaped) || byteat(escaped, j) != 123) {
+            run = "$"
+        }
+        out = out + run
+        i = j
+    }
+    return out
+}
+
+// directory_name — safePart(name): the import output dir name.
+fn directory_name(name: str) -> str {
+    return safe_part(name)
+}
+
+// safe_part — upstream safePart: control + <>:"/\|?* → '-', 120-byte
+// cap, trim " .\t", empty→"untitled", reserved device names '_'+name.
+fn safe_part(name: str) -> str {
+    out := ""
+    i := 0
+    n := 0 // rune count approximated by bytes; upstream caps runes —
+           // byte cap is stricter for multibyte, matching intent
+    for i < len(name) {
+        c := byteat(name, i)
+        // consume one UTF-8 sequence for the control/rune checks
+        rl := utf8_len(name, i)
+        r := substr(name, i, i + rl)
+        bad := c < 32 || c == 127
+        if !bad {
+            k := 0
+            for k < len(r) {
+                bad = bad || byteat(r, k) == 60 || byteat(r, k) == 62 || byteat(r, k) == 58 || byteat(r, k) == 34 || byteat(r, k) == 47 || byteat(r, k) == 92 || byteat(r, k) == 124 || byteat(r, k) == 63 || byteat(r, k) == 42
+                k = k + 1
+            }
+        }
+        if bad {
+            r = "-"
+        }
+        if n + rl > 120 {
+            break
+        }
+        out = out + r
+        n = n + rl
+        i = i + rl
+    }
+    // trim " .\t" both ends
+    lo := 0
+    for lo < len(out) && (byteat(out, lo) == 32 || byteat(out, lo) == 46 || byteat(out, lo) == 9) {
+        lo = lo + 1
+    }
+    hi := len(out)
+    for hi > lo && (byteat(out, hi - 1) == 32 || byteat(out, hi - 1) == 46 || byteat(out, hi - 1) == 9) {
+        hi = hi - 1
+    }
+    name = substr(out, lo, hi)
+    if len(name) == 0 {
+        name = "untitled"
+    }
+    // reserved device names (stem before first '.')
+    dot := find(name, ".")
+    stem := name
+    if dot >= 0 {
+        stem = substr(name, 0, dot)
+    }
+    up := upper_ascii2(stem)
+    res := mkslice(str, 0)
+    res = push(res, "CON")
+    res = push(res, "PRN")
+    res = push(res, "AUX")
+    res = push(res, "NUL")
+    res = push(res, "COM1")
+    res = push(res, "COM2")
+    res = push(res, "COM3")
+    res = push(res, "COM4")
+    res = push(res, "COM5")
+    res = push(res, "COM6")
+    res = push(res, "COM7")
+    res = push(res, "COM8")
+    res = push(res, "COM9")
+    res = push(res, "LPT1")
+    res = push(res, "LPT2")
+    res = push(res, "LPT3")
+    res = push(res, "LPT4")
+    res = push(res, "LPT5")
+    res = push(res, "LPT6")
+    res = push(res, "LPT7")
+    res = push(res, "LPT8")
+    res = push(res, "LPT9")
+    k := 0
+    for k < len(res) {
+        if up == res[k] {
+            return "_" + name
+        }
+        k = k + 1
+    }
+    return name
+}
+
+fn utf8_len(s: str, i: int) -> int {
+    c := byteat(s, i)
+    if c < 128 {
+        return 1
+    }
+    if c >= 240 {
+        return 4
+    }
+    if c >= 224 {
+        return 3
+    }
+    return 2
+}
+
+fn upper_ascii2(s: str) -> str {
+    b := mkslice(byte, len(s))
+    i := 0
+    for i < len(s) {
+        c := byteat(s, i)
+        if c >= 97 && c <= 122 {
+            c = c - 32
+        }
+        b[i] = c
+        i = i + 1
+    }
+    return b as str
+}
+
+// safe_path — split on BOTH separators, safePart each, rejoin.
+fn safe_path(name: str) -> str {
+    name = replace_all(name, "\\", "/")
+    parts := mkslice(str, 0)
+    i := 0
+    start := 0
+    for i <= len(name) {
+        if i == len(name) || byteat(name, i) == 47 {
+            parts = push(parts, safe_part(substr(name, start, i)))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    out := ""
+    j := 0
+    for j < len(parts) {
+        if j > 0 {
+            out = out + "/"
+        }
+        out = out + parts[j]
+        j = j + 1
+    }
+    return out
+}
+
+fn replace_all(s: str, old: str, repl: str) -> str {
+    if len(old) == 0 {
+        return s
+    }
+    out := ""
+    i := 0
+    for i < len(s) {
+        if i + len(old) <= len(s) && substr(s, i, i + len(old)) == old {
+            out = out + repl
+            i = i + len(old)
+            continue
+        }
+        out = out + chr1(byteat(s, i))
+        i = i + 1
+    }
+    return out
+}
+
+fn chr1(c: int) -> str {
+    b := mkslice(byte, 1)
+    b[0] = c
+    return b as str
+}
+
+// numbered_name — name, or name-2/name-3… before the suffix
+// (.posting.yaml keeps its full suffix).
+fn numbered_name(name: str, n: int) -> str {
+    if n == 1 {
+        return name
+    }
+    suffix := ""
+    dot := find(name, ".")
+    if dot >= 0 {
+        suffix = substr(name, dot, len(name))
+    }
+    if has_suffix(name, ".posting.yaml") {
+        suffix = ".posting.yaml"
+    }
+    return substr(name, 0, len(name) - len(suffix)) + "-" + itoa(n) + suffix
+}
+
+fn has_suffix(s: str, suf: str) -> bool {
+    return len(s) >= len(suf) && substr(s, len(s) - len(suf), len(s)) == suf
+}
+
+// environment_file — <name>.env with the layering-convention fixes:
+// "posting"→"-environment" suffix, ".local"→"-local".
+fn environment_file(name: str) -> str {
+    name = safe_part(name)
+    lower := lower_ascii3(name)
+    if lower == "posting" {
+        name = name + "-environment"
+    } else if has_suffix(lower, ".local") {
+        name = substr(name, 0, len(name) - 6) + "-local"
+    }
+    return name + ".env"
+}
+
+fn lower_ascii3(s: str) -> str {
+    b := mkslice(byte, len(s))
+    i := 0
+    for i < len(s) {
+        c := byteat(s, i)
+        if c >= 65 && c <= 90 {
+            c = c + 32
+        }
+        b[i] = c
+        i = i + 1
+    }
+    return b as str
+}
+
+// dotenv_value — encode a template so loading yields what
+// model.substitute would: no refs → single-quoted literal ('\\'→'\\\\',
+// '\''→'\\'', "$$"→"$"); refs → double-quoted with ${NAME} segments and
+// "${"→"${:-$}{" escaping.
+fn dotenv_value(template: str) -> str {
+    refs := model.find_variables(template)
+    if len(refs) == 0 {
+        lit := replace_all(template, "$$", "$")
+        lit = replace_all(lit, "\\", "\\\\")
+        lit = replace_all(lit, "'", "\\'")
+        return "'" + lit + "'"
+    }
+    out := "\""
+    last := 0
+    i := 0
+    for i < len(refs) {
+        seg := substr(template, last, refs[i].start)
+        seg = replace_all(seg, "$$", "$")
+        seg = replace_all(seg, "\\", "\\\\")
+        seg = replace_all(seg, "\"", "\\\"")
+        seg = replace_all(seg, "\n", "\\n")
+        seg = replace_all(seg, "\r", "\\r")
+        seg = replace_all(seg, "${", "${:-$}{")
+        out = out + seg + "${" + refs[i].name + "}"
+        last = refs[i].end
+        i = i + 1
+    }
+    seg := substr(template, last, len(template))
+    seg = replace_all(seg, "$$", "$")
+    seg = replace_all(seg, "\\", "\\\\")
+    seg = replace_all(seg, "\"", "\\\"")
+    seg = replace_all(seg, "\n", "\\n")
+    seg = replace_all(seg, "\r", "\\r")
+    seg = replace_all(seg, "${", "${:-$}{")
+    out = out + seg + "\""
+    return out
+}
+
+// environment_data — NAME=dotenv_value lines for one variable layer.
+fn environment_data(vars: []model.KV) -> [str, err] {
+    out := ""
+    i := 0
+    for i < len(vars) {
+        // upstream rejects names that can't round-trip as ${NAME}
+        refs := model.find_variables("${" + vars[i].name + "}")
+        if len(refs) != 1 || refs[0].name != vars[i].name {
+            return "", errors.new("cannot save environment variable named \"" + vars[i].name + "\"")
+        }
+        out = out + vars[i].name + "=" + dotenv_value(vars[i].value) + "\n"
+        i = i + 1
+    }
+    return out, nil
+}
+
+// existing_base — base vars already in dir/posting.env, so added
+// environments can repeat dependent base vars (upstream existingBase).
+// Returns vars + warnings; missing/unparseable file → empty.
+fn existing_base(dir: str) -> own BaseOut {
+    bo := new(BaseOut)
+    bo.vars = mkslice(model.KV, 0)
+    bo.warns = mkslice(str, 0)
+    path := dir + "/posting.env"
+    if !os.exists(path) {
+        return bo
+    }
+    text := os.readfile_(path)
+    prior := new(env.EnvSet)
+    [dp, perr] = env.parse_dotenv(text, prior)
+    if perr != nil {
+        return bo
+    }
+    // upstream warns about ${NAME:-default} templates we can't keep
+    // verbatim; our dotenv keeps raw values so no warning needed.
+    i := 0
+    for i < len(dp.vars) {
+        bo.vars = push(bo.vars, dp.vars[i])
+        i = i + 1
+    }
+    return bo
+}

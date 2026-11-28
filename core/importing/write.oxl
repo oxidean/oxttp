@@ -1,0 +1,205 @@
+package importing
+
+// write.oxl — port of internal/importing/write.go: encode everything
+// before writing anything, verify each request round-trips through
+// collection.decode, never overwrite (O_EXCL + -N suffix loop),
+// env files via layers(), cleanup created files on failure.
+import "std/os"
+import "std/errors"
+import "github.com/oxidean/oxttp/core/collection"
+import "github.com/oxidean/oxttp/core/model"
+import "github.com/oxidean/oxttp/core/yaml"
+
+fn write(result: ref Result, dir: str) -> [own Written, err] {
+    w := new(Written)
+    w.files = mkslice(str, 0)
+    w.envs = mkslice(WEnv, 0)
+    w.warns = mkslice(str, 0)
+    // encode phase — collect name+data for every entry first
+    names := mkslice(str, 0)
+    datas := mkslice(str, 0)
+    is_env := mkslice(bool, 0)
+    is_base := mkslice(bool, 0)
+    ri := 0
+    for ri < len(result.requests) {
+        rq := result.requests[ri]
+        ri = ri + 1
+        nm := rq.file
+        if len(nm) == 0 {
+            nm = rq.req.name
+        }
+        // trim .posting.yaml suffix then re-add via safe_path
+        nm = trim_suffix(nm, ".posting.yaml")
+        nm = safe_path(nm) + ".posting.yaml"
+        data := collection.marshal(rq.req)
+        // verify round-trip before any file is created
+        [yn, ye] = yaml.parse(data)
+        if ye != nil {
+            return nil, errors.new("encode \"" + rq.req.name + "\": " + errors.msg(ye))
+        }
+        [back, de] = collection.decode(yn)
+        if de != nil {
+            return nil, errors.new("encode \"" + rq.req.name + "\": " + errors.msg(de))
+        }
+        names = push(names, nm)
+        datas = push(datas, data)
+        is_env = push(is_env, false)
+        is_base = push(is_base, false)
+    }
+    base := result.variables
+    lwarns := mkslice(str, 0)
+    if len(base) == 0 && len(result.envs) > 0 {
+        bo := existing_base(dir)
+        base = bo.vars
+        w.warns = bo.warns
+    }
+    files := mkslice(VList, 0)
+    if result.deferred {
+        files = make_files1(base)
+        ei := 0
+        for ei < len(result.envs) {
+            files = push(files, VList{vars: result.envs[ei].variables})
+            ei = ei + 1
+        }
+    } else {
+        envs_as := envs_of(result)
+        lo := layers(base, envs_as)
+        files = lo.files
+        w.warns = append_all(w.warns, lo.warns)
+    }
+    if len(result.variables) > 0 {
+        [d1, e1] = environment_data(files[0].vars)
+        if e1 != nil {
+            return nil, e1
+        }
+        names = push(names, "posting.env")
+        datas = push(datas, d1)
+        is_env = push(is_env, true)
+        is_base = push(is_base, true)
+    }
+    ei := 0
+    for ei < len(result.envs) {
+        [d2, e2] = environment_data(files[ei + 1].vars)
+        if e2 != nil {
+            return nil, errors.new("environment \"" + result.envs[ei].name + "\": " + errors.msg(e2))
+        }
+        names = push(names, environment_file(result.envs[ei].name))
+        datas = push(datas, d2)
+        is_env = push(is_env, true)
+        is_base = push(is_base, false)
+        ei = ei + 1
+    }
+    if len(names) == 0 {
+        return nil, errors.new("source contains no importable requests, variables or environments")
+    }
+    me := os.mkdir_all(dir)
+    if me != nil {
+        return nil, me
+    }
+    // never overwrite: used-set + O_EXCL retry with -N suffix
+    used := mkslice(str, 0)
+    created := mkslice(str, 0)
+    ok := true
+    i := 0
+    for i < len(names) && ok {
+        nm := ""
+        data := datas[i]
+        n := 1
+        for true {
+            cand := numbered_name(names[i], n)
+            low := lower_ascii3(cand)
+            dup := false
+            u := 0
+            for u < len(used) {
+                if used[u] == low {
+                    dup = true
+                }
+                u = u + 1
+            }
+            if dup {
+                n = n + 1
+                continue
+            }
+            path := dir + "/" + cand
+            // exists-check + write (O_EXCL equivalent; ADR-0045
+            // records the fs-confinement deviation)
+            if os.exists(path) {
+                n = n + 1
+                continue
+            }
+            if os.writefile_(path, data) < 0 {
+                ok = false
+                break
+            }
+            nm = cand
+            break
+        }
+        if !ok {
+            break
+        }
+        used = push(used, lower_ascii3(nm))
+        created = push(created, nm)
+        if is_env[i] {
+            en := WEnv{name: env_name_of(nm), file: nm, base: is_base[i]}
+            w.envs = push(w.envs, en)
+            if is_base[i] && nm != "posting.env" {
+                w.warns = push(w.warns, "posting.env already exists, so the imported base variables were written to " + nm + "; Posting loads that file as an environment named " + en.name + ", not as the base")
+            }
+        } else {
+            w.files = push(w.files, nm)
+        }
+        i = i + 1
+    }
+    if !ok {
+        // cleanup created files (reverse order)
+        ci := len(created) - 1
+        for ci >= 0 {
+            os.remove(dir + "/" + created[ci])
+            ci = ci - 1
+        }
+        return nil, errors.new("write failed")
+    }
+    return w, nil
+}
+
+fn envs_of(r: ref Result) -> []Env {
+    return r.envs
+}
+
+fn make_files1(base: []model.KV) -> []VList {
+    out := mkslice(VList, 1)
+    out[0] = VList{vars: base}
+    return out
+}
+
+fn append_all(a: []str, b: []str) -> []str {
+    i := 0
+    for i < len(b) {
+        a = push(a, b[i])
+        i = i + 1
+    }
+    return a
+}
+
+// env_name_of — upstream env.Name([]str{file}): stem of the env
+// file for display ("staging" for staging.env, "posting" for base).
+fn env_name_of(file: str) -> str {
+    nm := file
+    if has_suffix(nm, ".env") {
+        nm = substr(nm, 0, len(nm) - 4)
+    }
+    if has_suffix(nm, ".local") {
+        nm = substr(nm, 0, len(nm) - 6)
+    }
+    if nm == "posting" {
+        return "posting"
+    }
+    return nm
+}
+
+fn trim_suffix(s: str, suf: str) -> str {
+    if has_suffix(s, suf) {
+        return substr(s, 0, len(s) - len(suf))
+    }
+    return s
+}
