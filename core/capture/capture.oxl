@@ -11,8 +11,10 @@ package capture
 // literals, singular+full path operands, and functions
 // length/count/value/match/search. Matches are root-relative PATHS
 // (ADR-0050) — never shared node refs.
+import "std/collections"
 import "std/errors"
 import "std/regexp"
+import "std/sort"
 import "std/strconv"
 import "std/unicode/utf8"
 import "github.com/oxidean/oxttp/core/model"
@@ -139,20 +141,22 @@ fn jchild_paths(root: ref JVal, p: JPath) -> []JPath {
         }
         return out
     }
-    // object: enumerate child positions; keep only last occurrence
-    // of each key.
+    // object: keep only the last occurrence of each key. Record the
+    // last position in a hash map, then emit in document order — linear
+    // in the member count even for very wide objects.
+    seen := collections.map_new()
     pos := 0
     m := cur.child
     for m != nil {
-        later := m.next
-        dup := false
-        for later != nil {
-            if later.key == m.key {
-                dup = true
-            }
-            later = later.next
-        }
-        if !dup {
+        collections.map_set(seen, m.key, pos)
+        pos = pos + 1
+        m = m.next
+    }
+    pos = 0
+    m = cur.child
+    for m != nil {
+        [last, le] = collections.map_get(seen, m.key)
+        if le == nil && last == pos {
             cp := jpath_push(p, JStep{is_idx: false, name: m.key, idx: 0})
             out = push(out, cp)
         }
@@ -989,46 +993,42 @@ fn pij_parse_selectors(p: mut PCur) -> [own JPSel, err] {
 // pij_parse_slice_rest — after "start:" or ":" parse end/step ints
 // until ']' or ','. sel already has kind=SK_SLICE.
 fn pij_parse_slice_rest(p: mut PCur, sel: own JPSel, start_empty: bool) -> [own JPSel, err] {
-    // components: end then optional :step — positionally args[1],args[2]
-    // per upstream parseSlice (the consumed ':' already passed args[0]).
-    comp := 1
-    for comp < 3 {
-        pij_skip(p)
-        c := pij_peek(p, 0)
-        if c == 93 || c == 44 {
-            return sel, nil
+    // The opening colon has already been consumed. Parse the optional
+    // end, then an optional second colon plus optional step. The step
+    // is not another positional component delimiter: once it is read,
+    // only the union/bracket terminator may follow.
+    pij_skip(p)
+    c := pij_peek(p, 0)
+    if c == 45 || pij_is_dig(c) {
+        tok := pij_scan_int(p)
+        if p.err != 0 {
+            return nil, errors.new("jsonpath: bad slice index")
         }
-        if c == 58 {
-            p.pos = p.pos + 1
-            comp = comp + 1
-        } else if c == 45 || pij_is_dig(c) {
-            tok := pij_scan_int(p)
+        sel.has_end = true
+        sel.s_end = pij_path_int(tok, p)
+        pij_skip(p)
+        c = pij_peek(p, 0)
+    }
+    if c == 58 {
+        p.pos = p.pos + 1
+        pij_skip(p)
+        c = pij_peek(p, 0)
+        if c == 45 || pij_is_dig(c) {
+            tok2 := pij_scan_int(p)
             if p.err != 0 {
                 return nil, errors.new("jsonpath: bad slice index")
             }
-            v := pij_path_int(tok, p)
-            if comp == 1 {
-                sel.has_end = true
-                sel.s_end = v
-            } else if comp == 2 {
-                sel.has_step = true
-                sel.s_step = v
-            }
-        } else {
-            pperr(p, "expected slice part")
-            return nil, errors.new("jsonpath: expected slice part")
-        }
-        pij_skip(p)
-        c2 := pij_peek(p, 0)
-        if c2 == 93 || c2 == 44 {
-            return sel, nil
-        }
-        if c2 != 58 {
-            pperr(p, "expected slice separator")
-            return nil, errors.new("jsonpath: expected slice separator")
+            sel.has_step = true
+            sel.s_step = pij_path_int(tok2, p)
+            pij_skip(p)
+            c = pij_peek(p, 0)
         }
     }
-    return sel, nil
+    if c == 93 || c == 44 {
+        return sel, nil
+    }
+    pperr(p, "expected slice separator")
+    return nil, errors.new("jsonpath: expected slice separator")
 }
 
 // ---------- filter expression parser (cont.) ----------
@@ -2178,6 +2178,22 @@ fn regex_dot_rewrite(pat: str) -> str {
             i = i + 1
             continue
         }
+        if inclass && c == 91 && i + 1 < len(pat) && byteat(pat, i + 1) == 58 {
+            // POSIX character class inside the bracket expression
+            // (for example [[:alpha:]]): its inner ']' does not close
+            // the outer class, so copy it atomically.
+            out = push(out, c)
+            i = i + 1
+            for i < len(pat) {
+                pc := byteat(pat, i)
+                out = push(out, pc)
+                i = i + 1
+                if pc == 93 && i >= 2 && byteat(pat, i - 2) == 58 {
+                    break
+                }
+            }
+            continue
+        }
         if c == 91 {
             inclass = true
         } else if c == 93 {
@@ -2482,6 +2498,20 @@ fn capture_values(captures: []model.KV, body: []byte) -> [[]model.KV, err] {
     return out, nil
 }
 
+fn jpath_obj_key(p: JPath) -> str {
+    return p.steps[len(p.steps) - 1].name
+}
+
+fn jpath_lt(a: JPath, b: JPath) -> bool {
+    return jpath_obj_key(a) < jpath_obj_key(b)
+}
+
+fn jsort_obj_paths(kids: []JPath) -> []JPath {
+    // encoding/json marshals Go map keys in byte-lexicographic order.
+    sort.sortfn(kids, jpath_lt)
+    return kids
+}
+
 // jemit_path — compact JSON emit of the node at path (jemit parity
 // without a ref return).
 fn jemit_path(root: ref JVal, p: JPath) -> str {
@@ -2511,6 +2541,7 @@ fn jemit_path_into(root: ref JVal, p: JPath, b: []byte) -> []byte {
     }
     kids := jchild_paths(root, p)
     if kind == 4 {
+        kids = jsort_obj_paths(kids)
         b = push(b, 123)
     } else {
         b = push(b, 91)

@@ -1192,9 +1192,13 @@ fn install_resp(a: mut App, resp: model.Resp, req_url: str) {
             m = a.pending.method
             u = a.pending.url
         }
+        [req_yaml, rye] = collection.marshal(a.pending_preq)
+        if rye != nil {
+            req_yaml = ""
+        }
         he := HistEnt{id: 0, persisted: false, title: a.pending_name, method: m, url: u,
             status: resp.status, reason: resp.reason, elapsed_ms: resp.elapsed_ms,
-            size: a.resp_size, req_yaml: collection.marshal(a.pending_preq),
+            size: a.resp_size, req_yaml: req_yaml,
             resp_text: text, resp_hdr_rows: hs, resp_ck_rows: cks, resp_tr_rows: trs}
         a.history = push(a.history, he)
         if len(a.history) > 100 {
@@ -1219,7 +1223,7 @@ fn install_resp(a: mut App, resp: model.Resp, req_url: str) {
     if a.pending_preq != nil && len(a.pending_preq.captures) > 0 {
         [cvals, ce] = capture.capture_values(a.pending_preq.captures, resp.body)
         if ce != nil {
-            a.toast(1, "Couldn't capture response: " + errors.msg(ce))
+            a.toast(2, "Couldn't capture response: " + errors.msg(ce))
         } else {
             ci := 0
             for ci < len(cvals) {

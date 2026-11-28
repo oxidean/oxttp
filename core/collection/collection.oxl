@@ -1239,7 +1239,11 @@ fn jnode(j: ref json.Json) -> own yaml.YNode {
 
 // encode renders a PRequest into a YNode DOM — corpus key order,
 // omitempty throughout (only non-defaults written).
-fn encode(r: ref PRequest) -> own yaml.YNode {
+fn encode(r: ref PRequest) -> [own yaml.YNode, err] {
+    ve0 := capture.validate(r.captures)
+    if ve0 != nil {
+        return nil, ve0
+    }
     root := new(yaml.YNode)
     root.kind = 1
     if len(r.name) > 0 {
@@ -1472,12 +1476,16 @@ fn encode(r: ref PRequest) -> own yaml.YNode {
         yput(vm, "variables", inner)
         yput(root, "variable_scope", vm)
     }
-    return root
+    return root, nil
 }
 
 // marshal renders a request to .posting.yaml text.
-fn marshal(r: ref PRequest) -> str {
-    return yaml.emit(encode(r))
+fn marshal(r: ref PRequest) -> [str, err] {
+    [n, e] = encode(r)
+    if e != nil {
+        return "", e
+    }
+    return yaml.emit(n), nil
 }
 
 // --- file IO + tree scan (§5.1) ---
@@ -1511,10 +1519,6 @@ fn path_dir(p: str) -> str {
 
 // save_file marshals r to path, creating parent dirs (§5.2 save).
 fn save_file(path: str, r: ref PRequest) -> err {
-    sv := capture.validate(r.captures)
-    if sv != nil {
-        return cerr(errors.msg(sv))
-    }
     d := path_dir(path)
     if len(d) > 0 {
         me := os.mkdir_all(d)
@@ -1522,7 +1526,11 @@ fn save_file(path: str, r: ref PRequest) -> err {
             return me
         }
     }
-    if os.writefile_(path, marshal(r)) < 0 {
+    [text, merr] = marshal(r)
+    if merr != nil {
+        return cerr(errors.msg(merr))
+    }
+    if os.writefile_(path, text) < 0 {
         return cerr("cannot write " + path)
     }
     return nil

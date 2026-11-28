@@ -193,7 +193,8 @@ fn test_draft_roundtrip() {
     testing.expect_eq(len(r.headers), 2, "empty sentinel dropped")
     testing.expect_eq(len(r.params), 1, "param carried")
     // marshal → parse → decode roundtrip keeps the file's fields
-    y := collection.marshal(r)
+    [y, mye] = collection.marshal(r)
+    testing.expect(mye == nil, "marshal valid")
     [n, pe] = yaml.parse(y)
     testing.expect(pe == nil, "marshal parses")
     [r2, de] = collection.decode(n)

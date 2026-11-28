@@ -224,3 +224,66 @@ fn test_jsonpath_singular_query_segment_whitespace() {
 fn test_json_emit_preserves_kannada() {
     expect_val("{\"o\":{\"x\":\"ಜಝ\"}}", "$.o", "{\"x\":\"ಜಝ\"}")
 }
+
+
+fn test_jsonpath_explicit_step_slices() {
+    expect_val("[10,20]", "$[0:3:2]", "10")
+    expect_val("[10]", "$[::2]", "10")
+    expect_val("[10]", "$[::-1]", "10")
+    expect_val("[10,20,30]", "$[2:0:-2]", "30")
+    [_, e] = capture_path("$[1:::]")
+    testing.expect(e != nil, "repeated colon rejected")
+}
+
+fn test_capture_big_numbers_and_roots() {
+    expect_val("{\"x\":9007199254740993}", "$.x", "9007199254740993")
+    expect_val("[12345678901234567890,1.234567890123456789,1e400]", "$", "[12345678901234567890,1.234567890123456789,1e400]")
+    expect_val("[1,2]", "$[1]", "2")
+    expect_val("\"root\"", "$", "root")
+}
+
+fn test_capture_quoted_empty_key_and_mixed_union() {
+    expect_val("{\"unusual.key\":{\"\":4}}", "$['unusual.key']['']", "4")
+    expect_val("[7]", "$[0,'a']", "7")
+    expect_val("{\"a\":8}", "$[0,'a']", "8")
+}
+
+fn test_capture_missing_value_comparison() {
+    body := "{\"items\":[{\"id\":1},{\"id\":2,\"x\":1}]}"
+    expect_val(body, "$.items[?(@.x != 1)].id", "1")
+}
+
+fn test_capture_object_emit_sorts_keys() {
+    expect_val("{\"o\":{\"z\":1,\"a\":{\"z\":2,\"b\":3}}}", "$.o", "{\"a\":{\"b\":3,\"z\":2},\"z\":1}")
+    expect_val("{\"o\":{\"b\":1,\"a\":1,\"a\":2}}", "$.o", "{\"a\":2,\"b\":1}")
+}
+
+fn test_regex_dot_rewrite_posix_class() {
+    testing.expect_streq(regex_dot_rewrite("[[:alpha:].]"), "[[:alpha:].]", "posix class preserved")
+    testing.expect_streq(regex_dot_rewrite("a.b"), "a[^\\n\\r]b", "bare dot rewritten")
+    body := "{\"items\":[{\"n\":\"a\"},{\"n\":\"1\"}]}"
+    expect_val(body, "$.items[?(match(@.n, \"[[:alpha:].]\"))].n", "a")
+}
+
+fn test_wide_object_capture_completes() {
+    bs := mkslice(byte, 0)
+    bs = push(bs, 123)
+    i := 0
+    for i < 3000 {
+        if i > 0 {
+            bs = push(bs, 44)
+        }
+        pad := itoa(i)
+        for len(pad) < 4 {
+            pad = "0" + pad
+        }
+        bs = bpush(bs, "\"k" + pad + "\":1")
+        i = i + 1
+    }
+    bs = bpush(bs, ",\"k0000\":2}")
+    caps := mkcaps()
+    caps = push(caps, cap1("W", "$"))
+    [out, e] = capture_values(caps, bs)
+    testing.expect(e == nil, "wide object captures")
+    testing.expect_eq(len(out), 1, "wide object count")
+}
