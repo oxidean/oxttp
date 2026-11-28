@@ -1,6 +1,6 @@
 # WI-0017 spec — M4a TUI TLS client certs and proxy config surface
 
-Direction locked by `artifacts/brainstorm.md` + ADR-0044/0045.
+Direction locked by `artifacts/brainstorm.md` + ADR-0044/0045/0046/0047.
 Corpus: `docs/corpus/corpus-posting.md` §1.1/§2.2/§5.2/§7.1,
 `docs/corpus/corpus-xh.md` §4.5. Transport machinery verified
 first-hand in `artifacts/discovery.md` (oxl 0.26.0 std sources +
@@ -26,27 +26,35 @@ package — implementer's choice; keep `collection.oxl` cohesive).
    - `trim(proxy_url)` non-empty → `proxies = ["all:" + trimmed]`,
      `env = nil`, `no_proxy = ""`. Env is NOT consulted (corpus
      "proxy_url else env"; xh `--proxy` parity).
-   - else scan `pairs` for the canonical names and build:
-     - `HTTPS_PROXY`/`https_proxy` → `env` entries (both pushed when
-       both present; pick_proxy lowercases names, first scheme match
-       wins — capture order uppercase-then-lowercase per name group:
-       HTTPS, https, HTTP, http, ALL, all).
-     - `HTTP_PROXY`/`http_proxy` → same, BUT skipped entirely when a
-       `REQUEST_METHOD` pair is present and non-empty (httpoxy/CGI
-       guard — cli/sem.oxl parity).
-     - `ALL_PROXY`/`all_proxy` → same.
+   - else scan `pairs` for the canonical Go `httpproxy` names and
+     build (ADR-0047 — posting is a Go application):
+     - `HTTPS_PROXY`/`https_proxy` → one canonical lowercase
+       `https_proxy=<value>` entry; lowercase wins when both cases
+       are non-empty (`getEnvAny`), uppercase is fallback only.
+     - `HTTP_PROXY`/`http_proxy` → one canonical lowercase
+       `http_proxy=<value>` entry with the same precedence. A raw
+       non-empty `REQUEST_METHOD` sets the transport CGI flag instead
+       of suppressing capture; the transport errors before using that
+       proxy on an `http:` hop (Go `proxyForURL` behavior).
+     - `ALL_PROXY`/`all_proxy` are not captured — Go `httpproxy` has
+       no ALL_PROXY variable (they remain xh/reqwest-only).
+     - Schemeless values normalize to `http://host[:port]`; complete
+       URLs pass through.
      - `NO_PROXY`/`no_proxy` → `no_proxy` = first non-empty value
-       (uppercase preferred); empty/whitespace-only counts unset.
+       (lowercase preferred, uppercase fallback);
+       empty/whitespace-only counts unset.
    - Only non-empty-after-trim values are pushed to `env` (Go treats
      set-but-empty as unset; pick_proxy also skips explicit-empty
      `*_proxy` but keeping `env` clean preserves intent).
    - `pairs` entries without `=` or with empty names are ignored.
 2. New `collect_proxy_env() -> []str`: emits `"NAME=value"` pairs for
    the fixed name list via `os.getenv` — `REQUEST_METHOD`,
-   `HTTPS_PROXY`, `https_proxy`, `HTTP_PROXY`, `http_proxy`,
-   `ALL_PROXY`, `all_proxy`, `NO_PROXY`, `no_proxy`. `os.getenv`
-   can't distinguish unset from empty; empty ⇒ omit (repo convention,
-   cli/main.oxl `os_envpairs` doc).
+   `https_proxy`, `HTTPS_PROXY`, `http_proxy`, `HTTP_PROXY`,
+   `no_proxy`, `NO_PROXY`. `os.getenv` can't distinguish unset from
+   empty; empty ⇒ omit (repo convention, cli/main.oxl `os_envpairs`
+   doc). `proxy_url` is substituted through the scoped env layers like
+   URL/headers before `proxy_pick` runs; substitution errors are plan
+   errors.
 3. `plan_req` replaces the warn branch (~L2097):
    `pk := proxy_pick(proxy, collect_proxy_env())` then
    `rq.proxies = pk.proxies`, `rq.proxy_env = pk.env`,
@@ -99,10 +107,11 @@ New `*_test.oxl` coverage (existing suites must stay green):
     `proxies==["all:http://p:8080"]`, env/no_proxy empty EVEN when
     pairs contain proxy vars; whitespace-padded url trimmed;
     whitespace-only url → env path.
-  - env path: scheme-specific over all_proxy; lowercase names;
-    empty values skipped; `REQUEST_METHOD=GET` suppresses
-    HTTP_PROXY/http_proxy but not HTTPS_PROXY/ALL_PROXY;
-    NO_PROXY/no_proxy precedence (uppercase first, first non-empty);
+  - env path: scheme-specific canonical selection; lowercase names;
+    empty values skipped; lowercase-first `getEnvAny` precedence;
+    `REQUEST_METHOD=GET` sets the CGI flag while HTTP_PROXY capture
+    remains for the send-time error; ALL_PROXY is ignored;
+    NO_PROXY/no_proxy precedence (lowercase first, first non-empty);
     pairs without `=` ignored.
   - `plan_req` end-to-end: a `PRequest` with `options.proxy_url` set
     yields `req.proxies==["all:..."]`; with options absent yields env
@@ -132,9 +141,11 @@ New `*_test.oxl` coverage (existing suites must stay green):
 2. A `.posting.yaml` request with `options.proxy_url: http://127.0.0.1:P`
    routes through the proxy (absolute-form for http targets; CONNECT
    for https) in BOTH interactive send and `oxttp-tui run`.
-3. With no `proxy_url`, `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`/
-   `NO_PROXY` env vars are honored per send; `REQUEST_METHOD` set
-   suppresses `HTTP_PROXY`.
+3. With no `proxy_url`, `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` env
+   vars are honored per send under Go `httpproxy` semantics;
+   `REQUEST_METHOD` set makes use of `HTTP_PROXY` on an `http:` hop a
+   send-time error. `ALL_PROXY` is intentionally ignored (not a Go
+   variable).
 4. `ssl.certificate_path`/`key_file`/`ca_bundle` behavior unchanged
    (already landed); missing files still abort the send with the
    corpus send-time error.
@@ -160,9 +171,10 @@ New `*_test.oxl` coverage (existing suites must stay green):
 - **D3** `proxy_url` is scoped `all:` — corpus defines one proxy for
   all requests; per-scheme proxy config doesn't exist upstream either.
 - **D4** Env proxy capture is per-send `os.getenv` of the canonical
-  names (both cases) — Go's `ProxyFromEnvironment` equivalent;
+  Go names (both cases) — Go's `ProxyFromEnvironment` equivalent;
   `os` has no environ iteration so only named vars are read (same
-  limitation class as cli `os_envpairs`).
+  limitation class as cli `os_envpairs`). Unlike the xh CLI path,
+  `ALL_PROXY` is not read because Go `httpproxy` does not define it.
 - **D5** `NO_PROXY` is not consulted when `proxy_url` is set —
   corpus "proxy_url else env" reads as full env replacement
   (preserved brainstorm disagreement; upstream posting source not
@@ -174,3 +186,8 @@ New `*_test.oxl` coverage (existing suites must stay green):
   send failures (toast `send_failed` / run FAILED row), not plan-
   time toasts — corpus "reported at send time" holds; layering kept
   (`core/collection` gains no `net/tls` import).
+
+- **D8** `NO_PROXY` matching differs by client: posting/TUI uses the
+  Go matcher (localhost/loopback bypass, port-aware entries, CIDR,
+  leading-dot subdomain-only); xh keeps the reqwest matcher. Both
+  support IPv4 CIDR entries.

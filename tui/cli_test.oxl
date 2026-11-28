@@ -5,6 +5,7 @@ package main
 
 import "std/testing"
 import "std/os"
+import "std/net/tls"
 import "github.com/oxidean/oxttp/core/model"
 
 fn test_cli_version() {
@@ -289,7 +290,7 @@ fn test_run_ssl_password_and_tls12_warn() {
     o.target = dir
     o.cfg_file = cfg
     r := fake_resp(200, "text/plain", "hi", nil)
-    r.tls_ver = 771 // tls.V12
+    r.tls_ver = tls.V12
     fx := FakeSend{resp: r, fail: ""}
     rep := run_exec(o, fx)
     testing.expect(rep.code == 0, "run passes: " + rep.err)
