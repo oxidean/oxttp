@@ -261,10 +261,10 @@ fn o_version_ok(v: str) -> bool {
     if len(v) < 4 {
         return false
     }
-    if substr(v, 0, 3) != "3." {
+    if substr(v, 0, 2) != "3." {
         return false
     }
-    i := 3
+    i := 2
     if byteat(v, i) != 48 && byteat(v, i) != 49 {
         return false
     }
@@ -375,8 +375,8 @@ fn op_operation(p: ref OParser, path: str, method: str, item: ref json.Json, op:
     base := op_server(p, servers, context)
     req.url = oliteral(o_trimrs(op_replace(op_replace(base, "/:", "/::"), "", ""))) + oescape_path(path)
     // BASE_URL is introduced by the importer, not a literal source string.
-    if len(base) >= 10 && substr(base, 0, 10) == "${BASE_URL}" {
-        rest := oliteral(o_trimrs(op_replace(op_replace(substr(base, 10, len(base)), "/:", "/::"), "", "")))
+    if len(base) >= 11 && substr(base, 0, 11) == "${BASE_URL}" {
+        rest := oliteral(o_trimrs(op_replace(op_replace(substr(base, 11, len(base)), "/:", "/::"), "", "")))
         req.url = "${BASE_URL}" + rest + oescape_path(path)
     }
     params := op_parameters(p, ogetm(item, "parameters"), context)
@@ -987,10 +987,10 @@ fn op_body(p: ref OParser, r: ref collection.PRequest, body: ref json.Json, cont
             owarnf(p, context + ": form body example must be an object; body omitted")
             return
         }
-        b := new(collection.PBody)
-        b.has_form_data = true
-        b.content_type = "application/x-www-form-urlencoded"
-        if media != b.content_type {
+        r.body = new(collection.PBody)
+        r.body.has_form_data = true
+        r.body.content_type = "application/x-www-form-urlencoded"
+        if media != r.body.content_type {
             r.headers = push(r.headers, model.KV{name: "Content-Type", value: oliteral(media), enabled: true})
         }
         encoding := ogetm(definition, "encoding")
@@ -1009,15 +1009,13 @@ fn op_body(p: ref OParser, r: ref collection.PRequest, body: ref json.Json, cont
             }
             fi := 0
             for fi < len(fields) {
-                b.form_data = push(b.form_data, fields[fi])
+                r.body.form_data = push(r.body.form_data, fields[fi])
                 fi = fi + 1
             }
             if len(p.err) > 0 || !ocheck_request_budget(p, r) {
-                r.body = b
                 return
             }
         }
-        r.body = b
         return
     }
     raw := ""
@@ -1399,7 +1397,10 @@ fn o_resolve_object(p: ref OParser, raw: ref json.Json, context: str, allow_bool
             ofail(p, context + ": reference \"" + ref + "\" is not a JSON pointer; anchors are unsupported")
             return nil
         }
-        target := json.jclone(p.root)
+        // Walk the immutable document tree directly. Cloning the root at
+        // every hop makes each local reference proportional to the whole
+        // document; only the resolved node needs an owned copy below.
+        target := p.root
         if len(pointer) > 0 {
             parts := osplit(substr(pointer, 1, len(pointer)), "/")
             pi := 0
@@ -1413,12 +1414,15 @@ fn o_resolve_object(p: ref OParser, raw: ref json.Json, context: str, allow_bool
                 }
                 part = replace_all(replace_all(part, "~1", "/"), "~0", "~")
                 if ois_obj(target) {
-                    tv := ogetm(target, part)
-                    if tv == nil {
+                    cm := target.child
+                    for cm != nil && cm.key != part {
+                        cm = cm.next
+                    }
+                    if cm == nil {
                         ofail(p, context + ": unresolved reference \"" + ref + "\"")
                         return nil
                     }
-                    target = tv
+                    target = cm
                 } else if ois_arr(target) {
                     idx := o_atoi_strict(part)
                     if idx < 0 {
@@ -1435,14 +1439,14 @@ fn o_resolve_object(p: ref OParser, raw: ref json.Json, context: str, allow_bool
                         ofail(p, context + ": invalid array reference \"" + ref + "\"")
                         return nil
                     }
-                    target = json.jclone(cm)
+                    target = cm
                 } else {
                     ofail(p, context + ": unresolved reference \"" + ref + "\"")
                     return nil
                 }
             }
         }
-        cur = target
+        cur = json.jclone(target)
         depth = depth + 1
     }
     ofail(p, context + ": reference chain exceeds 64 levels")

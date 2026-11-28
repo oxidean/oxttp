@@ -41,6 +41,7 @@ fn is_identifier(s: str) -> bool {
 fn find_variables(s: str) -> []VarRef {
     refs := mkslice(VarRef, 0)
     i := 0
+    no_close := false
     for i < len(s) {
         if byteat(s, i) != 36 { // '$'
             i = i + 1
@@ -50,7 +51,7 @@ fn find_variables(s: str) -> []VarRef {
             i = i + 2
             continue
         }
-        if i + 1 < len(s) && byteat(s, i + 1) == 123 { // '{'
+        if i + 1 < len(s) && byteat(s, i + 1) == 123 && !no_close { // '{'
             // find closing '}'
             j := i + 2
             end := -1
@@ -62,6 +63,10 @@ fn find_variables(s: str) -> []VarRef {
                 j = j + 1
             }
             if end < 0 {
+                // There is no closing brace anywhere in the remainder;
+                // later `${` openings cannot close either. Keep scanning
+                // byte-by-byte so a following bare $NAME is still found.
+                no_close = true
                 i = i + 1
                 continue
             }

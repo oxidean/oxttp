@@ -14,16 +14,15 @@ behavioral evidence, not just compilation.
 
 ## Decision
 
-1. Unit tests live beside each engine
-   (`core/importing/{result,write,layers,openapi,postman,bruno}_test.oxl`)
-   and port the *assertions* of upstream `*_test.go` /
-   `probe_test.go` / `write_test.go` / `environment_test.go` /
-   `scope_roundtrip_test.go` — same inputs, same expected
-   requests/warnings/errors — rather than inventing new cases.
-2. Multi-file fixtures (Postman collection+env, Bruno
-   bruno.json/collection.bru/folder.bru/request.bru/environments/,
-   OpenAPI JSON+YAML docs) are committed under
-   `core/importing/testdata/` mirroring upstream `testdata/` layout.
+1. Unit tests live beside the engines in `core/importing/`. At this
+   revision they are consolidated in `bruno_test.oxl`; that file covers
+   the Bruno parser/loader plus focused writer, layering, Postman, and
+   OpenAPI regression vectors. The long-term split into per-engine
+   `*_test.oxl` files remains desirable but is not claimed as present.
+2. Multi-file fixtures are constructed in test scratch directories.
+   No committed `core/importing/testdata/` tree exists at this
+   revision; if one is added later it should mirror upstream
+   `testdata/` layout.
 3. CLI-level coverage extends `tui/cli_test.oxl` for the arg-parsing,
    exit-code, and stdout/stderr contract (Out fields), including the
    S2/S3 fidelity fixes.

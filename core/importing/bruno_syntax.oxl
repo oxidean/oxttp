@@ -104,16 +104,18 @@ fn bsplit(s: str, sep: str) -> []str {
     if len(sep) == 0 {
         return push(out, s)
     }
-    pos := 0
-    for pos <= len(s) {
-        i := find(substr(s, pos, len(s)), sep)
-        if i < 0 {
-            out = push(out, substr(s, pos, len(s)))
-            break
+    start := 0
+    i := 0
+    for i + len(sep) <= len(s) {
+        if substr(s, i, i + len(sep)) == sep {
+            out = push(out, substr(s, start, i))
+            start = i + len(sep)
+            i = start
+            continue
         }
-        out = push(out, substr(s, pos, pos + i))
-        pos = pos + i + len(sep)
+        i = i + 1
     }
+    out = push(out, substr(s, start, len(s)))
     return out
 }
 
@@ -150,11 +152,19 @@ fn valid_utf8(s: str) -> bool {
             if i + 2 >= len(s) || byteat(s, i + 1) < 128 || byteat(s, i + 1) > 191 || byteat(s, i + 2) < 128 || byteat(s, i + 2) > 191 {
                 return false
             }
+            c1 := byteat(s, i + 1)
+            if (c == 224 && c1 < 160) || (c == 237 && c1 > 159) {
+                return false
+            }
             i = i + 3
             continue
         }
         if c >= 240 && c <= 244 {
             if i + 3 >= len(s) || byteat(s, i + 1) < 128 || byteat(s, i + 1) > 191 || byteat(s, i + 2) < 128 || byteat(s, i + 2) > 191 || byteat(s, i + 3) < 128 || byteat(s, i + 3) > 191 {
+                return false
+            }
+            c1 := byteat(s, i + 1)
+            if (c == 240 && c1 < 144) || (c == 244 && c1 > 143) {
                 return false
             }
             i = i + 4
@@ -175,6 +185,40 @@ fn bvalue(rows: []model.KV, name: str) -> str {
         i = i - 1
     }
     return ""
+}
+
+// bcat appends without repeatedly copying an accumulated string prefix.
+fn bcat(b: []byte, s: str) -> []byte {
+    sb := s as []byte
+    i := 0
+    for i < len(sb) {
+        b = push(b, sb[i])
+        i = i + 1
+    }
+    return b
+}
+
+fn bconcat(parts: []str) -> str {
+    b := mkslice(byte, 0)
+    i := 0
+    for i < len(parts) {
+        b = bcat(b, parts[i])
+        i = i + 1
+    }
+    return b as str
+}
+
+fn bjoin_lines(lines: []str, start: int, end: int) -> str {
+    b := mkslice(byte, 0)
+    i := start
+    for i < end {
+        if i > start {
+            b = push(b, 10)
+        }
+        b = bcat(b, lines[i])
+        i = i + 1
+    }
+    return b as str
 }
 
 // ---------- document ----------
@@ -231,7 +275,7 @@ fn parse_document(data: str) -> [[]BBlock, err] {
             ni = ni + 1
         }
         if closing == "]" {
-            content := ""
+            cparts := mkslice(str, 0)
             part := substr(line, p + 1, len(line))
             closed := false
             for !closed {
@@ -241,17 +285,19 @@ fn parse_document(data: str) -> [[]BBlock, err] {
                     if btrim(tail) != "" {
                         return nil, errors.new("line " + itoa(i + 1) + ": unexpected text after block")
                     }
-                    content = content + substr(part, 0, end)
+                    cparts = push(cparts, substr(part, 0, end))
                     closed = true
                     break
                 }
-                content = content + part + "\n"
+                cparts = push(cparts, part)
+                cparts = push(cparts, "\n")
                 i = i + 1
                 if i == len(lines) {
                     return nil, errors.new("unclosed " + nm + " block")
                 }
                 part = lines[i]
             }
+            content := bconcat(cparts)
             i = i + 1
             if !closed {
                 return nil, errors.new("unclosed " + nm + " block")
@@ -287,15 +333,7 @@ fn parse_document(data: str) -> [[]BBlock, err] {
         if i == len(lines) {
             return nil, errors.new("unclosed " + nm + " block")
         }
-        content := ""
-        k := start
-        for k < i {
-            if k > start {
-                content = content + "\n"
-            }
-            content = content + lines[k]
-            k = k + 1
-        }
+        content := bjoin_lines(lines, start, i)
         inline := substr(line, p + 1, len(line))
         if btrim(inline) != "" {
             if start < i {

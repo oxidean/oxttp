@@ -7,6 +7,7 @@ package main
 
 import "std/os"
 import "std/errors"
+import "std/io"
 import "std/net/tls"
 import "std/time"
 import "std/encoding/json"
@@ -330,6 +331,7 @@ fn cli_lower_ascii(s: str) -> str {
 fn cli_import_args(args: []str) -> Out {
     i := 1
     typ := ""
+    output := ""
     flags := true
     let srcs: []str = nil
     for i < len(args) {
@@ -352,15 +354,19 @@ fn cli_import_args(args: []str) -> Out {
             typ = substr(a, 3, len(a))
             continue
         }
-        // Output forms are consumed here and recovered from args in
-        // import_run, which owns the env-only output requirement.
+        // Output forms are consumed here and passed to import_run, which
+        // owns the env-only output requirement. Raw args are never rescanned:
+        // option-looking text after `--` is a source, not an output override.
         if flags && len(a) >= 9 && substr(a, 0, 9) == "--output=" {
+            output = substr(a, 9, len(a))
             continue
         }
         if flags && len(a) >= 8 && substr(a, 0, 8) == "-output=" {
+            output = substr(a, 8, len(a))
             continue
         }
         if flags && len(a) >= 3 && substr(a, 0, 3) == "-o=" {
+            output = substr(a, 3, len(a))
             continue
         }
         if flags && (a == "-t" || a == "--type" || a == "-type") {
@@ -373,6 +379,7 @@ fn cli_import_args(args: []str) -> Out {
             if i >= len(args) {
                 return Out{code: 2, stdout: "", stderr: "posting import: --output needs a value\n"}
             }
+            output = args[i]
             i = i + 1
         } else if flags && (a == "-h" || a == "--help") {
             return Out{code: 0, stdout: "usage: posting import [-t openapi|postman|bruno] [-o DIR] SOURCE...\n", stderr: ""}
@@ -389,7 +396,7 @@ fn cli_import_args(args: []str) -> Out {
     if len(srcs) == 0 {
         return Out{code: 2, stdout: "", stderr: "posting import: no input files\n"}
     }
-    return import_run(srcs, typ, args)
+    return import_run(srcs, typ, output)
 }
 
 // ---------- import engine ----------
@@ -471,9 +478,8 @@ fn imp_detect(src: str, data: str) -> str {
     if has_oas {
         return "openapi"
     }
-    if has_info && has_item {
-        return "postman"
-    }
+    // Postman collections are JSON-only in the parser; do not label a
+    // YAML lookalike as Postman and then reject it as malformed JSON.
     return ""
 }
 
@@ -552,7 +558,56 @@ fn imp_abspath(p: str) -> str {
     return cwd + "/" + p
 }
 
-fn import_run(sources: []str, format: str, args: []str) -> Out {
+// imp_read_bounded reads at most limit+1 bytes. Unlike os.readfile_,
+// the import size cap is enforced before allocating for the whole file;
+// an empty result from a failed open remains an error rather than an
+// empty source.
+fn imp_read_bounded(path: str, limit: int) -> [str, err] {
+    [f, fe] = os.open(path)
+    if fe != nil {
+        return "", fe
+    }
+    out := mkslice(byte, 0)
+    remaining := limit + 1
+    bad := false
+    errmsg := ""
+    for remaining > 0 && !bad {
+        want := remaining
+        if want > 65536 {
+            want = 65536
+        }
+        buf := mkslice(byte, want)
+        [n, re] = f.read(buf)
+        if n > 0 {
+            bi := 0
+            for bi < n {
+                out = push(out, buf[bi])
+                bi = bi + 1
+            }
+            remaining = remaining - n
+        }
+        if re != nil {
+            if re == io.eof() {
+                break
+            }
+            errmsg = errors.msg(re)
+            bad = true
+        }
+        if n <= 0 {
+            break
+        }
+    }
+    ce := f.close()
+    if bad {
+        return "", errors.new("read " + path + ": " + errmsg)
+    }
+    if ce != nil {
+        return "", ce
+    }
+    return out as str, nil
+}
+
+fn import_run(sources: []str, format: str, output_opt: str) -> Out {
     coll := new(importing.Result)
     coll.requests = mkslice(importing.ImpRequest, 0)
     coll.variables = mkslice(model.KV, 0)
@@ -562,6 +617,7 @@ fn import_run(sources: []str, format: str, args: []str) -> Out {
     coll_src := ""
     coll_fmt := ""
     all_warns := mkslice(str, 0)
+    export_envs := mkslice(importing.Env, 0)
     si := 0
     for si < len(sources) {
         src := sources[si]
@@ -586,7 +642,10 @@ fn import_run(sources: []str, format: str, args: []str) -> Out {
         if !os.exists(src) {
             return Out{code: 1, stdout: "", stderr: "posting import: " + imp_diag(src) + ": no such file\n"}
         }
-        data := os.readfile_(src)
+        [data, drerr] = imp_read_bounded(src, 33554432)
+        if drerr != nil {
+            return Out{code: 1, stdout: "", stderr: "posting import: " + imp_diag(src) + ": " + imp_diag(errors.msg(drerr)) + "\n"}
+        }
         if len(data) > 33554432 {
             return Out{code: 1, stdout: "", stderr: "posting import: " + imp_diag(src) + ": source exceeds the 32 MiB import limit\n"}
         }
@@ -600,7 +659,7 @@ fn import_run(sources: []str, format: str, args: []str) -> Out {
                 if ev.name == "" {
                     ev.name = imp_trim_suffix(imp_trim_suffix(imp_base(src), ".json"), ".postman_environment")
                 }
-                coll.envs = push(coll.envs, ev)
+                export_envs = push(export_envs, ev)
             }
             all_warns = append_kv_warns(all_warns, eo.warns)
             continue
@@ -616,6 +675,17 @@ fn import_run(sources: []str, format: str, args: []str) -> Out {
         }
         coll = po.res
         coll_fmt = po.format
+        if po.format == "bruno" && len(coll.requests) == 1 {
+            bn := imp_trim_suffix(imp_base(src), ".bru")
+            coll.requests[0].file = bn + ".posting.yaml"
+        }
+    }
+    // Environment exports are independent of the collection source order:
+    // loading a later collection must not discard an export seen earlier.
+    ei := 0
+    for ei < len(export_envs) {
+        coll.envs = push(coll.envs, export_envs[ei])
+        ei = ei + 1
     }
     // merge env-export warnings into result warnings
     i := 0
@@ -623,26 +693,7 @@ fn import_run(sources: []str, format: str, args: []str) -> Out {
         coll.warns = push(coll.warns, all_warns[i])
         i = i + 1
     }
-    output := ""
-    // -o/--output value was consumed by the flag parser; recover it
-    // from the raw args (last occurrence wins).
-    ai := 1
-    for ai < len(args) {
-        a := args[ai]
-        ai = ai + 1
-        if a == "-o" || a == "--output" || a == "-output" {
-            if ai < len(args) {
-                output = args[ai]
-                ai = ai + 1
-            }
-        } else if len(a) >= 3 && substr(a, 0, 3) == "-o=" {
-            output = substr(a, 3, len(a))
-        } else if len(a) >= 8 && substr(a, 0, 8) == "-output=" {
-            output = substr(a, 8, len(a))
-        } else if len(a) >= 9 && substr(a, 0, 9) == "--output=" {
-            output = substr(a, 9, len(a))
-        }
-    }
+    output := output_opt
     if coll_fmt == "" && len(sources) > 0 && output == "" {
         return Out{code: 2, stdout: "", stderr: "posting import: importing only environments requires --output DIR, the collection to add them to\n"}
     }
@@ -722,11 +773,17 @@ fn imp_rep(s: str, old: str, repl: str) -> str {
 
 // imp_quote — curl.Quote approximation: single-quote when needed.
 fn imp_quote(s: str) -> str {
-    need := false
+    // POSIX-shell single-quote encoding. Keep only the conventional
+    // portable bareword characters unquoted; metacharacters such as &,
+    // ;, |, <, >, $, `, (), and glob characters must not reach a copied
+    // shell command. Empty strings need explicit quotes too.
+    need := len(s) == 0
     i := 0
     for i < len(s) {
         c := byteat(s, i)
-        if c <= 32 || c == 39 || c == 34 || c == 92 {
+        safe := (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57)
+        safe = safe || c == 95 || c == 45 || c == 46 || c == 47 || c == 58 || c == 61 || c == 64 || c == 43 || c == 44 || c == 37
+        if !safe {
             need = true
         }
         i = i + 1
@@ -1007,7 +1064,9 @@ fn run_exec(o: ref RunOpts, t: http.Transport) -> own RunRep {
         target = o.coll + "/" + target
     }
     if !is_abs2(target) {
-        target = os.fullpath(target)
+        // Lexical absolutization keeps the missing path in diagnostics;
+        // os.fullpath is realpath-backed and returns empty for absent files.
+        target = imp_abspath(target)
     }
     if !os.exists(target) {
         rep.err = "stat " + target + ": no such file or directory"
@@ -1025,7 +1084,7 @@ fn run_exec(o: ref RunOpts, t: http.Transport) -> own RunRep {
         }
     }
     if !is_abs2(root) {
-        root = os.fullpath(root)
+        root = imp_abspath(root)
     }
     if !os.isdir(root) {
         rep.err = "collection " + root + " is not a directory"
@@ -1339,11 +1398,60 @@ fn run_exec(o: ref RunOpts, t: http.Transport) -> own RunRep {
 
 // ---------- run helpers ----------
 
+// clean_path_lex — lexical slash-path cleanup for report comparisons:
+// duplicate slashes and `.` segments vanish, `..` pops one prior segment
+// without touching the filesystem.
+fn clean_path_lex(p: str) -> str {
+    abs := len(p) > 0 && byteat(p, 0) == 47
+    parts := mkslice(str, 0)
+    start := 0
+    i := 0
+    for i <= len(p) {
+        if i == len(p) || byteat(p, i) == 47 {
+            part := substr(p, start, i)
+            start = i + 1
+            if len(part) == 0 || part == "." {
+                i = i + 1
+                continue
+            }
+            if part == ".." {
+                if len(parts) > 0 {
+                    parts = parts[:len(parts) - 1]
+                }
+                i = i + 1
+                continue
+            }
+            parts = push(parts, part)
+        }
+        i = i + 1
+    }
+    out := ""
+    if abs {
+        out = "/"
+    }
+    j := 0
+    for j < len(parts) {
+        if j > 0 {
+            out = out + "/"
+        }
+        out = out + parts[j]
+        j = j + 1
+    }
+    if len(out) == 0 {
+        if abs {
+            return "/"
+        }
+        return "."
+    }
+    return out
+}
+
 // rel_to_root — filepath.Rel(root, path) for the run report's file
 // field: path under root → slash-relative; else the path unchanged.
 fn rel_to_root(root: str, path: str) -> str {
-    pre := root
-    if len(pre) > 0 && byteat(pre, len(pre) - 1) == 47 {
+    pre := clean_path_lex(root)
+    path = clean_path_lex(path)
+    if len(pre) > 1 && byteat(pre, len(pre) - 1) == 47 {
         pre = substr(pre, 0, len(pre) - 1)
     }
     if len(path) > len(pre) + 1 && substr(path, 0, len(pre) + 1) == pre + "/" {

@@ -130,6 +130,21 @@ fn write(result: ref Result, dir: str) -> [own Written, err] {
                 n = n + 1
                 continue
             }
+            slash := -1
+            si := 0
+            for si < len(cand) {
+                if byteat(cand, si) == 47 {
+                    slash = si
+                }
+                si = si + 1
+            }
+            if slash > 0 {
+                md := os.mkdir_all(dir + "/" + substr(cand, 0, slash))
+                if md != nil {
+                    ok = false
+                    break
+                }
+            }
             if os.writefile_(path, data) < 0 {
                 ok = false
                 break

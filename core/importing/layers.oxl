@@ -133,6 +133,10 @@ fn ordered_vars(vars: []model.KV) -> own OrdOut {
         deps[i] = IVec{items: mkslice(int, 0)}
         dependents[i] = IVec{items: mkslice(int, 0)}
         pending[i] = 0
+        i = i + 1
+    }
+    i = 0
+    for i < n {
         // collect this var's refs
         refs := model.find_variables(vars[i].value)
         seen := mkslice(int, 0)

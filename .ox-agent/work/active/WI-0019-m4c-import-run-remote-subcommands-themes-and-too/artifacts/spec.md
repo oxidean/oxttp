@@ -358,9 +358,11 @@ rewritten to upstream `parseImportOptions`/`readImports`/
 
 1. `oxl build ./tui` and `oxl test ./tui` green; `oxl test
    ./core/importing` (new pkg) green; `oxl test ./core/model`
-   green; full `oxl test ./cli && ./tui && ./core/session` green.
-2. `posting import --help`, bad type, env-only-no-output, unknown
-   flag → exit 2 with upstream-shaped stderr.
+   green; full `oxl test ./cli && oxl test ./tui && oxl test
+   ./core/session` green.
+2. `posting import --help` → usage on stdout with exit 0; bad type,
+   env-only-no-output, and unknown flag → exit 2 with upstream-shaped
+   stderr.
 3. Postman fixture collection+env → writes `<dir>/posting.env`,
    `<name>.env`, request files; stdout `Imported N postman
    request(s) into "…"` + `Environments:` + `Open with:` lines;

@@ -356,13 +356,13 @@ fn existing_base(dir: str) -> own BaseOut {
         return bo
     }
     text := os.readfile_(path)
-    prior := new(env.EnvSet)
-    [dp, perr] = env.parse_dotenv(text, prior)
+    [dp, perr] = env.parse_dotenv_templates(text)
     if perr != nil {
         return bo
     }
-    // upstream warns about ${NAME:-default} templates we can't keep
-    // verbatim; our dotenv keeps raw values so no warning needed.
+    // Templates deliberately stay unexpanded here: repeated base vars in
+    // an added environment must continue following the base variable they
+    // reference, not the value that happened to expand during this import.
     i := 0
     for i < len(dp.vars) {
         bo.vars = push(bo.vars, dp.vars[i])

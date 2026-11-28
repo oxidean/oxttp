@@ -63,3 +63,12 @@ fn test_path_param_names() {
     n3 := path_param_names("http://h")
     testing.expect_eq(len(n3), 0, "no path")
 }
+
+fn test_unmatched_brace_scan_still_finds_bare_refs() {
+    r := find_variables("${unclosed $AFTER")
+    names := vnames(r)
+    testing.expect_eq(len(names), 1, "bare ref after unmatched opening")
+    if len(names) == 1 {
+        testing.expect_streq(names[0], "AFTER", "bare ref name")
+    }
+}

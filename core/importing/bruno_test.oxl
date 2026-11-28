@@ -6,7 +6,9 @@ package importing
 // os.temp_dir + writefile_ (ADR-0045 approximations).
 import "std/os"
 import "std/testing"
+import "std/time"
 import "github.com/oxidean/oxttp/core/collection"
+import "github.com/oxidean/oxttp/core/model"
 import "github.com/oxidean/oxttp/core/yaml"
 
 let BRUNO_SAMPLE = "meta {\n  name: Send event\n  type: http\n}\npost {\n  url: {{base}}/events/:id?repeat=1&repeat=2#top\n  body: json\n  auth: basic\n}\nheaders {\n  \"x:quoted\": yes\n  ~\"disabled:key\": retained\n  X-Token: {{token}}\n}\nparams:query {\n  ~off: disabled\n}\nparams:path {\n  id: {{id}}\n}\nauth:basic {\n  username: user\n  password: $literal\n}\nvars:pre-request {\n  base: https://example.test\n  id: 42\n}\nbody:json {\n  {\n    \"name\": \"{{name}}\",\n    \"value\": \"$literal\"\n  }\n}\ndocs {\n  Request documentation.\n}\n"
@@ -66,8 +68,11 @@ fn test_raw_bodies_use_bru_indentation() {
     testing.expect_streq(res.requests[0].req.body.content, "}\n  deeper\ntrailing  \n", "raw body")
     [back, derr] = roundtrip(res.requests[0].req)
     testing.expect(derr == nil, "rt")
-    if derr == nil && back.body != nil {
-        testing.expect_streq(back.body.content, res.requests[0].req.body.content, "rt body")
+    if derr == nil {
+        testing.expect(back.body != nil, "rt body present")
+        if back.body != nil {
+            testing.expect_streq(back.body.content, res.requests[0].req.body.content, "rt body")
+        }
     }
 }
 
@@ -219,11 +224,8 @@ fn bwrite(path: str, data: str) {
 }
 
 fn test_collection_inheritance() {
-    dir := os.temp_dir() + "/bcol_test"
+    dir := os.temp_dir() + "/bcol_test_" + itoa(time.unix_ms())
     os.mkdir_all(dir)
-    os.remove_all(dir + "/A")
-    os.remove_all(dir + "/B")
-    os.remove_all(dir + "/environments")
     bwrite(dir + "/bruno.json", "{\"name\":\"Example\",\"type\":\"collection\"}")
     bwrite(dir + "/collection.bru", "auth {\n  mode: basic\n}\nauth:basic {\n  username: {{who}}\n  password: root\n}\nheaders {\n  X-Test: root\n}\nvars:pre-request {\n  base: https://example.test\n  who: root\n}\n")
     bwrite(dir + "/A/folder.bru", "auth {\n  mode: none\n}\nvars:pre-request {\n  who: A\n}\nheaders {\n  x-test: A\n}\n")
@@ -273,4 +275,168 @@ fn test_collection_inheritance() {
             testing.expect(!res.requests[bi].req.headers[1].enabled, "b h1 disabled")
         }
     }
+    os.remove_all(dir)
+}
+
+
+fn review_scratch(name: str) -> str {
+    return os.temp_dir() + "/oxttp-import-review-" + name + "-" + itoa(time.unix_ms())
+}
+
+fn test_review_layers_forward_reference_order() {
+    base := mkslice(model.KV, 0)
+    base = push(base, model.KV{name: "A", value: "$B", enabled: true})
+    base = push(base, model.KV{name: "B", value: "value", enabled: true})
+    lo := layers(base, mkslice(Env, 0))
+    testing.expect_eq(len(lo.files), 1, "one layer")
+    testing.expect_eq(len(lo.files[0].vars), 2, "two vars")
+    if len(lo.files[0].vars) == 2 {
+        testing.expect_streq(lo.files[0].vars[0].name, "B", "dependency first")
+        testing.expect_streq(lo.files[0].vars[1].name, "A", "dependent second")
+    }
+}
+
+fn test_review_existing_base_keeps_template() {
+    dir := review_scratch("base")
+    os.mkdir_all(dir)
+    os.writefile_(dir + "/posting.env", "HOST=example.test\nAPI=\"https://${HOST}/v1\"\nLIT='${HOST}'\nOPEN=\"${MISSING}\"\n")
+    bo := existing_base(dir)
+    testing.expect_eq(len(bo.vars), 4, "base vars")
+    if len(bo.vars) == 4 {
+        testing.expect_streq(bo.vars[1].name, "API", "api name")
+        testing.expect_streq(bo.vars[1].value, "https://${HOST}/v1", "template retained")
+        testing.expect_streq(bo.vars[2].value, "${HOST}", "single-quoted literal retained")
+        testing.expect_streq(bo.vars[3].value, "${MISSING}", "unresolved reference retained")
+    }
+    os.remove_all(dir)
+}
+
+fn review_postman_collection() -> str {
+    return "{\"info\":{\"name\":\"Review\",\"schema\":\"https://schema.getpostman.com/json/collection/v2.1.0/collection.json\"}," +
+        "\"variable\":[{\"key\":\"TARGET\",\"value\":\"query\"},{\"key\":\"PLACEMENT\",\"value\":\"{{TARGET}}\"}]," +
+        "\"item\":[" +
+        "{\"name\":\"empty\",\"item\":[]}," +
+        "{\"name\":\"folder\",\"item\":[{\"name\":\"get\",\"request\":{\"method\":\"GET\",\"url\":\"https://example.test/?a={{term}}&b=2\",\"header\":[{\"key\":\"X-Off\",\"value\":\"v\",\"disabled\":true}]}}]}," +
+        "{\"name\":\"body off\",\"request\":{\"method\":\"POST\",\"url\":\"https://example.test\",\"body\":{\"mode\":\"raw\",\"raw\":\"secret\",\"disabled\":true}}}," +
+        "{\"name\":\"key\",\"request\":{\"method\":\"GET\",\"url\":\"https://example.test\",\"auth\":{\"type\":\"apikey\",\"apikey\":[{\"key\":\"key\",\"value\":\"X-Key\"},{\"key\":\"value\",\"value\":\"abc\"},{\"key\":\"in\",\"value\":\"{{PLACEMENT}}\"}]}}}," +
+        "{\"name\":\"trace\",\"request\":{\"method\":\"TRACE\",\"url\":\"https://example.test\"}}" +
+        "]}"
+}
+
+fn test_review_postman_regressions() {
+    [res, err] = pparse(review_postman_collection())
+    testing.expect(err == nil, "postman parses")
+    if err != nil {
+        return
+    }
+    testing.expect_eq(len(res.requests), 3, "trace skipped, others kept")
+    testing.expect(contains(str_join(res.warns, "\n"), "TRACE is not supported"), "trace warning")
+    gi := -1
+    bi := -1
+    ki := -1
+    i := 0
+    for i < len(res.requests) {
+        if res.requests[i].file == "folder/get.posting.yaml" {
+            gi = i
+        }
+        if res.requests[i].req.name == "body off" {
+            bi = i
+        }
+        if res.requests[i].req.name == "key" {
+            ki = i
+        }
+        i = i + 1
+    }
+    testing.expect(gi >= 0 && bi >= 0 && ki >= 0, "requests present")
+    if gi >= 0 {
+        testing.expect_eq(len(res.requests[gi].req.params), 2, "delimiter splits query")
+        if len(res.requests[gi].req.params) == 2 {
+            testing.expect_streq(res.requests[gi].req.params[0].name, "a", "q0 name")
+            testing.expect_streq(res.requests[gi].req.params[0].value, "${term}", "q0 value")
+            testing.expect_streq(res.requests[gi].req.params[1].name, "b", "q1 name")
+        }
+        testing.expect_eq(len(res.requests[gi].req.headers), 1, "header present")
+        if len(res.requests[gi].req.headers) == 1 {
+            testing.expect(!res.requests[gi].req.headers[0].enabled, "disabled header remains disabled")
+        }
+    }
+    if bi >= 0 {
+        testing.expect(res.requests[bi].req.body == nil, "disabled body omitted")
+    }
+    if ki >= 0 {
+        testing.expect_eq(len(res.requests[ki].req.params), 1, "api key query")
+        testing.expect_eq(len(res.requests[ki].req.headers), 0, "api key not header")
+        if len(res.requests[ki].req.params) == 1 {
+            testing.expect_streq(res.requests[ki].req.params[0].name, "X-Key", "api key name")
+        }
+    }
+}
+
+fn test_review_write_creates_request_parent_dirs() {
+    [res, err] = pparse(review_postman_collection())
+    testing.expect(err == nil, "postman parses")
+    if err != nil {
+        return
+    }
+    dir := review_scratch("write")
+    [w, werr] = write(res, dir)
+    testing.expect(werr == nil, "write succeeds")
+    if werr == nil {
+        testing.expect(os.exists(dir + "/folder/get.posting.yaml"), "nested request written")
+    }
+    os.remove_all(dir)
+}
+
+fn test_review_openapi_version_and_base_url() {
+    data := "{\"openapi\":\"3.0.3\",\"info\":{\"title\":\"Review API\",\"version\":\"1\"},\"paths\":{\"/pets\":{\"get\":{\"operationId\":\"listPets\",\"responses\":{\"200\":{\"description\":\"ok\"}}}}}}"
+    [res, err] = oparse(data)
+    testing.expect(err == nil, "OpenAPI 3.0.3 accepted")
+    if err != nil {
+        return
+    }
+    testing.expect_eq(len(res.requests), 1, "one operation")
+    if len(res.requests) == 1 {
+        testing.expect_streq(res.requests[0].req.url, "${BASE_URL}/pets", "active BASE_URL ref")
+    }
+    bad := "{\"openapi\":\"3.2.0\",\"info\":{\"title\":\"Bad\",\"version\":\"1\"},\"paths\":{}}"
+    [_rb, be] = oparse(bad)
+    testing.expect(be != nil, "OpenAPI 3.2 rejected")
+    trailing := "{\"openapi\":\"3.1.\",\"info\":{\"title\":\"Bad\",\"version\":\"1\"},\"paths\":{}}"
+    [_rt, te] = oparse(trailing)
+    testing.expect(te != nil, "malformed OpenAPI version rejected")
+}
+
+fn test_review_openapi_local_ref_resolution() {
+    data := "{\"openapi\":\"3.1.0\",\"info\":{\"title\":\"Refs\",\"version\":\"1\"},\"components\":{\"parameters\":{\"Id\":{\"name\":\"id\",\"in\":\"query\",\"schema\":{\"type\":\"string\"}}}},\"paths\":{\"/thing\":{\"get\":{\"operationId\":\"getThing\",\"parameters\":[{\"$ref\":\"#/components/parameters/Id\"}],\"responses\":{\"200\":{\"description\":\"ok\"}}}}}}"
+    [res, err] = oparse(data)
+    testing.expect(err == nil, "local ref document parses")
+    if err != nil {
+        return
+    }
+    testing.expect_eq(len(res.requests), 1, "one ref operation")
+    if len(res.requests) == 1 {
+        testing.expect_eq(len(res.requests[0].req.params), 1, "resolved query parameter")
+        if len(res.requests[0].req.params) == 1 {
+            testing.expect_streq(res.requests[0].req.params[0].name, "id", "resolved parameter name")
+        }
+    }
+}
+
+fn test_review_utf8_rejects_surrogate_and_out_of_range() {
+    testing.expect(!valid_utf8("\xed\xa0\x80"), "UTF-8 surrogate rejected")
+    testing.expect(!valid_utf8("\xf4\x90\x80\x80"), "above U+10FFFF rejected")
+    testing.expect(valid_utf8("\xed\x9f\xbf"), "U+D7FF accepted")
+    testing.expect(valid_utf8("\xf4\x8f\xbf\xbf"), "U+10FFFF accepted")
+}
+
+fn test_review_constant_chain_memoized() {
+    vars := mkslice(model.KV, 0)
+    i := 0
+    for i < 28 {
+        vars = push(vars, model.KV{name: "v" + itoa(i), value: "{{v" + itoa(i + 1) + "}}{{v" + itoa(i + 1) + "}}", enabled: true})
+        i = i + 1
+    }
+    vars = push(vars, model.KV{name: "v28", value: "x", enabled: true})
+    out := scope_constants(vars)
+    testing.expect_eq(len(out), 29, "constant chain classified once")
 }

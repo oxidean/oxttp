@@ -87,7 +87,7 @@ fn ppair_value(v: PPair) -> str {
 fn ppair_of(n: ref json.Json) -> PPair {
     pp := PPair{key: jstrv(jgetk(n, "key")), value: jcl(jgetk(n, "value")), disabled: false}
     d := jgetk(n, "disabled")
-    if jpresent(d) && d.kind == 1 && !d.b {
+    if jpresent(d) && d.kind == 1 && d.b {
         pp.disabled = true
     }
     return pp
@@ -264,7 +264,12 @@ fn pexpand(p: ref PParser, s: str, values: []model.KV, stack: []str, where: str,
         out = out + val
         last = en
     }
-    out = out + substr(s, last, len(s))
+    suffix := substr(s, last, len(s))
+    if len(out) + len(suffix) > 1048576 {
+        pwarn(p, where, "variable expansion exceeds 1 MiB; original references retained")
+        return s
+    }
+    out = out + suffix
     return out
 }
 
@@ -423,7 +428,7 @@ fn pwalk(p: ref PParser, arr: own json.Json, dirs: []str, auth: own json.Json, l
         }
         children := jgetk(it, "item")
         rq := jgetk(it, "request")
-        has_children := jpresent(children) && children.kind == 5 && children.child != nil
+        has_children := jpresent(children) && children.kind == 5
         if has_children {
             if jpresent(rq) {
                 return "postman: " + where + " has both request and child items"
@@ -438,6 +443,13 @@ fn pwalk(p: ref PParser, arr: own json.Json, dirs: []str, auth: own json.Json, l
         }
         if !jpresent(rq) {
             return "postman: " + where + " has neither a request nor a folder item array"
+        }
+        rmethod := upper_ascii2(jstrv(jgetk(rq, "method")))
+        if rmethod == "TRACE" {
+            pwarn(p, where, "TRACE is not supported by Posting; request skipped")
+            i = i + 1
+            it = it.next
+            continue
         }
         // scopedAliases: materialize defaults that transitively
         // reference a scoped name (upstream scopedAliases).
@@ -546,7 +558,7 @@ fn cut_outside_reference(s: str, delim: str) -> own CutRes {
                 j = j + 1
             }
             if j + 1 < len(s) {
-                i = j + 3
+                i = j + 2
                 continue
             }
         }
@@ -931,40 +943,47 @@ fn pread_auth(p: ref PParser, req: ref collection.PRequest, raw: ref json.Json, 
         }
         // `in` resolved against collection defaults (upstream
         // Substitute(transform(attrs["in"]), MapLookup(defaults)))
-        inres := substitute_kv(ptemplate(p, kv_get(attrs, "in"), scp, where), p.defaults)
+        inbudget := mkslice(int, 1)
+        inbudget[0] = 1024
+        inexpanded := pexpand(p, kv_get(attrs, "in"), p.defaults, mkslice(str, 0), where, inbudget)
+        inres := substitute_kv(ptemplate(p, inexpanded, scp, where), p.defaults)
+        if inres != "query" && inres != "header" {
+            pwarn(p, where, "API key location \"" + inres + "\" is unresolved or unsupported; header used")
+        }
         query_target := inres == "query"
         if query_target {
             kv.name = decode_query(escape_encoded_dollars(kv.name))
             kv.value = decode_query(escape_encoded_dollars(kv.value))
         }
-        // remove existing matching fields, then append (Postman
-        // authorizer semantics); header match is case-insensitive
+        // remove an existing matching field only from the credential's
+        // destination list, then append (Postman authorizer semantics);
+        // header matching is case-insensitive, query matching exact.
         resolved_key := substitute_kv(kv.name, result_defaults_kv(p))
-        kept_h := mkslice(model.KV, 0)
-        hi := 0
-        for hi < len(req.headers) {
-            h := req.headers[hi]
-            hi = hi + 1
-            hn := substitute_kv(h.name, result_defaults_kv(p))
-            if !case_eq_fold(hn, resolved_key) {
-                kept_h = push(kept_h, h)
-            }
-        }
-        req.headers = kept_h
-        kept_q := mkslice(model.KV, 0)
-        qi := 0
-        for qi < len(req.params) {
-            q := req.params[qi]
-            qi = qi + 1
-            qn := substitute_kv(q.name, result_defaults_kv(p))
-            if qn != resolved_key {
-                kept_q = push(kept_q, q)
-            }
-        }
-        req.params = kept_q
         if query_target {
+            kept_q := mkslice(model.KV, 0)
+            qi := 0
+            for qi < len(req.params) {
+                q := req.params[qi]
+                qi = qi + 1
+                qn := substitute_kv(q.name, result_defaults_kv(p))
+                if qn != resolved_key {
+                    kept_q = push(kept_q, q)
+                }
+            }
+            req.params = kept_q
             req.params = push(req.params, kv)
         } else {
+            kept_h := mkslice(model.KV, 0)
+            hi := 0
+            for hi < len(req.headers) {
+                h := req.headers[hi]
+                hi = hi + 1
+                hn := substitute_kv(h.name, result_defaults_kv(p))
+                if !case_eq_fold(hn, resolved_key) {
+                    kept_h = push(kept_h, h)
+                }
+            }
+            req.headers = kept_h
             req.headers = push(req.headers, kv)
         }
         return nil
@@ -1192,7 +1211,7 @@ fn pconvert(p: ref PParser, raw: ref json.Json, inherited: own json.Json, scp: [
         mode := jstrv(jgetk(b, "mode"))
         disabled := false
         bd := jgetk(b, "disabled")
-        if jpresent(bd) && bd.kind == 1 && !bd.b {
+        if jpresent(bd) && bd.kind == 1 && bd.b {
             disabled = true
         }
         if !disabled {

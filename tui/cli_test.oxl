@@ -5,6 +5,7 @@ package main
 
 import "std/testing"
 import "std/os"
+import "std/time"
 import "std/net/tls"
 import "github.com/oxidean/oxttp/core/model"
 
@@ -117,11 +118,13 @@ fn test_cli_remote_instance_and_json() {
 }
 
 fn test_cli_import() {
+    root := os.temp_dir() + "/oxttp-cli-import-" + itoa(time.unix_ms())
+    os.mkdir_all(root)
     let a: []str = nil
     a = push(a, "import")
     a = push(a, "-t")
     a = push(a, "postman")
-    a = push(a, "file.json")
+    a = push(a, root + "/missing-file.json")
     r := cli_import_args(a)
     testing.expect(r.code == 1, "missing source errors")
     testing.expect(find(r.stderr, "no such file") >= 0, "missing source text")
@@ -136,12 +139,8 @@ fn test_cli_import() {
     r = cli_import_args(a)
     testing.expect(r.code == 2, "no sources usage")
     // --type=x / --output=x forms parse and wire the real engine.
-    src := "/tmp/oxttp-cli-import.postman.json"
-    outdir := "/tmp/oxttp-cli-import-out"
-    os.remove_all(outdir)
-    os.remove_all(outdir + "-detect")
-    os.remove_all(outdir + "-single")
-    os.remove_all(outdir + "-env")
+    src := root + "/import.postman.json"
+    outdir := root + "/out"
     os.writefile_(src, "{\"info\":{\"name\":\"CLI Import\",\"schema\":\"https://schema.getpostman.com/json/collection/v2.1.0/collection.json\"},\"item\":[{\"name\":\"Get\",\"request\":{\"method\":\"GET\",\"url\":\"https://example.test\"}}]}")
     a = nil
     a = push(a, "import")
@@ -170,7 +169,7 @@ fn test_cli_import() {
     testing.expect(r.code == 0, "single-dash import success")
     // Postman environment exports may accompany a collection, but an
     // env-only import must name the output collection explicitly.
-    envsrc := "/tmp/oxttp-cli-import.postman_environment.json"
+    envsrc := root + "/import.postman_environment.json"
     os.writefile_(envsrc, "{\"name\":\"dev\",\"values\":[{\"key\":\"TOKEN\",\"value\":\"abc\",\"enabled\":true}]}")
     a = nil
     a = push(a, "import")
@@ -185,6 +184,74 @@ fn test_cli_import() {
     r = cli_import_args(a)
     testing.expect(r.code == 0, "env-only with output")
     testing.expect(find(r.stdout, "Imported 1 environment(s)") >= 0, "env-only success text")
+    os.remove_all(root)
+}
+
+
+fn test_cli_import_env_before_collection_and_bruno_name() {
+    root := os.temp_dir() + "/oxttp-cli-review-" + itoa(time.unix_ms())
+    os.mkdir_all(root)
+    collsrc := root + "/collection.json"
+    envsrc := root + "/dev.postman_environment.json"
+    outdir := root + "/out"
+    os.writefile_(collsrc, "{\"info\":{\"name\":\"CLI Import\",\"schema\":\"https://schema.getpostman.com/json/collection/v2.1.0/collection.json\"},\"item\":[{\"name\":\"Get\",\"request\":{\"method\":\"GET\",\"url\":\"https://example.test\"}}]}")
+    os.writefile_(envsrc, "{\"name\":\"dev\",\"values\":[{\"key\":\"TOKEN\",\"value\":\"abc\",\"enabled\":true}]}")
+    let a: []str = nil
+    a = push(a, "import")
+    a = push(a, "--output=" + outdir)
+    a = push(a, envsrc)
+    a = push(a, collsrc)
+    r := cli_import_args(a)
+    testing.expect(r.code == 0, "env-before-collection import: " + r.stderr)
+    testing.expect(os.exists(outdir + "/dev.env"), "environment retained after collection")
+    // Standalone Bruno files use the source basename for the output file,
+    // while meta.name remains only the display name.
+    brusrc := root + "/status.bru"
+    brudir := root + "/bruno-out"
+    os.writefile_(brusrc, "meta {\n  name: Health check\n  type: http\n}\nget {\n  url: https://example.test\n}\n")
+    a = nil
+    a = push(a, "import")
+    a = push(a, "--output=" + brudir)
+    a = push(a, brusrc)
+    r = cli_import_args(a)
+    testing.expect(r.code == 0, "bruno import: " + r.stderr)
+    testing.expect(os.exists(brudir + "/status.posting.yaml"), "source basename output")
+    testing.expect(!os.exists(brudir + "/Health check.posting.yaml"), "display name not file name")
+    os.remove_all(root)
+}
+
+fn test_cli_import_output_comes_from_first_parse() {
+    // Output options before `--` are consumed as flags even when an
+    // option-looking source follows `--`; import_run must not rescan raw
+    // args and accidentally reinterpret that source as an output option.
+    root := os.temp_dir() + "/oxttp-cli-outparse-" + itoa(time.unix_ms())
+    os.mkdir_all(root)
+    collsrc := root + "/collection.json"
+    outdir := root + "/wanted"
+    os.writefile_(collsrc, "{\"info\":{\"name\":\"CLI Import\"},\"item\":[{\"name\":\"Get\",\"request\":{\"method\":\"GET\",\"url\":\"https://example.test\"}}]}")
+    let a: []str = nil
+    a = push(a, "import")
+    a = push(a, "-o")
+    a = push(a, outdir)
+    a = push(a, collsrc)
+    r := cli_import_args(a)
+    testing.expect(r.code == 0, "first-parse output used: " + r.stderr)
+    testing.expect(os.exists(outdir + "/Get.posting.yaml"), "request in wanted output")
+    os.remove_all(root)
+}
+
+fn test_cli_report_path_quote_and_missing_target_regressions() {
+    testing.expect_streq(rel_to_root("/tmp/api/.", "/tmp/api/get.posting.yaml"), "get.posting.yaml", "normalized report path")
+    testing.expect_streq(rel_to_root("/tmp/api", "/tmp/apisibling/get.posting.yaml"), "/tmp/apisibling/get.posting.yaml", "sibling not relative")
+    testing.expect_streq(imp_quote("qa&dev"), "'qa&dev'", "shell metachar quoted")
+    testing.expect_streq(imp_quote(""), "''", "empty shell arg quoted")
+    o := new(RunOpts)
+    o.coll = "/tmp/definitely-missing-oxttp-coll"
+    o.target = "missing.posting.yaml"
+    fx := FakeSend{resp: fake_resp(200, "text/plain", "hi", nil), fail: "", expect_path: ""}
+    rep := run_exec(o, fx)
+    testing.expect(rep.code == 1, "missing target fails")
+    testing.expect(find(rep.err, "missing.posting.yaml") >= 0, "missing path retained: " + rep.err)
 }
 
 fn test_run_parse() {

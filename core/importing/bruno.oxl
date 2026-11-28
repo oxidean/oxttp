@@ -439,14 +439,18 @@ fn bexpand_mode(e: ref BExp, res: ref Result, s0: str, stack: []str, json_body: 
 
 // scopeConstants — vars that can be materialized with Bruno's JSON
 // escaping; values depending on env/host vars wait until send.
+struct BConstMemo { names: []str, states: []int, work: int }
+
 fn scope_constants(vars: []model.KV) -> []model.KV {
-    // state: 0 unknown, 1 visiting, 2 constant, 3 not constant
-    states := mkslice(int, 0)
-    snames := mkslice(str, 0)
+    // state: 1 visiting, 2 constant, 3 not constant
+    memo := new(BConstMemo)
+    memo.names = mkslice(str, 0)
+    memo.states = mkslice(int, 0)
+    memo.work = 0
     out := mkslice(model.KV, 0)
     ci := 0
     for ci < len(vars) {
-        if bconst(vars, vars[ci].name, 0, snames, states) == 2 {
+        if bconst(vars, vars[ci].name, 0, memo) == 2 {
             out = push(out, vars[ci])
         }
         ci = ci + 1
@@ -465,23 +469,28 @@ fn bconst_lookup(vars: []model.KV, name: str) -> str {
     return "\x00absent"
 }
 
-fn bconst(vars: []model.KV, name: str, depth: int, snames: []str, states: []int) -> int {
-    // memo tables parallel to snames/states
+fn bconst(vars: []model.KV, name: str, depth: int, memo: ref BConstMemo) -> int {
+    memo.work = memo.work + 1
+    if memo.work > 100000 {
+        return 3
+    }
+    // memo tables are shared across every recursive call; completed
+    // states must not be recomputed by sibling references.
     mi := 0
-    for mi < len(snames) {
-        if snames[mi] == name {
-            return states[mi]
+    for mi < len(memo.names) {
+        if memo.names[mi] == name {
+            return memo.states[mi]
         }
         mi = mi + 1
     }
     val := bconst_lookup(vars, name)
     if val == "\x00absent" || depth >= 32 {
-        snames = push(snames, name)
-        states = push(states, 3)
+        memo.names = push(memo.names, name)
+        memo.states = push(memo.states, 3)
         return 3
     }
-    snames = push(snames, name)
-    states = push(states, 1)
+    memo.names = push(memo.names, name)
+    memo.states = push(memo.states, 1)
     // scan {{...}} refs inside value
     refs := mkslice(str, 0)
     i := 0
@@ -504,21 +513,21 @@ fn bconst(vars: []model.KV, name: str, depth: int, snames: []str, states: []int)
     ok := true
     ri := 0
     for ri < len(refs) {
-        if bconst(vars, refs[ri], depth + 1, snames, states) != 2 {
+        if bconst(vars, refs[ri], depth + 1, memo) != 2 {
             ok = false
         }
         ri = ri + 1
     }
     // update memo entry (last pushed for this name is index len-1)
-    idx := len(states) - 1
-    for idx >= 0 && snames[idx] != name {
+    idx := len(memo.states) - 1
+    for idx >= 0 && memo.names[idx] != name {
         idx = idx - 1
     }
     if idx >= 0 {
         if ok {
-            states[idx] = 2
+            memo.states[idx] = 2
         } else {
-            states[idx] = 3
+            memo.states[idx] = 3
         }
     }
     if ok {
