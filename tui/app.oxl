@@ -588,7 +588,7 @@ fn resp_pane_bindings(a: ref App) -> []Binding {
     bs = push(bs, bind("alt+z", "expand-section"))
     ts := resp_tabs()
     name := ts[a.resp_tab]
-    if name == "Body" && len(a.resp_events) > 0 {
+    if name == "Body" && a.resp_events != nil && len(a.resp_events) > 0 {
         if a.msg_detail < 0 {
             // Messages/Events log (corpus §4.15): cursor rows + follow +
             // inspect; f re-pins to latest, enter opens the event body.
@@ -598,7 +598,6 @@ fn resp_pane_bindings(a: ref App) -> []Binding {
             bs = push(bs, bind("j", "rows-down"))
             bs = push(bs, bind("enter", "msg-inspect"))
             bs = push(bs, bind("f", "msg-follow"))
-            bs = push(bs, bind("escape", "msg-back"))
             bs = push(bs, bind("g", "rows-home"))
             bs = push(bs, bind("G", "rows-end"))
             return bs
@@ -1701,7 +1700,7 @@ fn rows_cur(a: mut App) -> int {
 }
 
 fn msg_log_active(a: ref App) -> bool {
-    return a.focus == FRespPane && a.resp_tab == 0 && len(a.resp_events) > 0 && a.msg_detail < 0
+    return a.focus == FRespPane && a.resp_tab == 0 && a.resp_events != nil && len(a.resp_events) > 0 && a.msg_detail < 0
 }
 
 fn rows_move(a: mut App, d: int, shift: bool) {

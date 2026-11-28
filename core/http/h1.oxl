@@ -625,6 +625,7 @@ fn finish_roundtrip(req: ref model.Req, br: own bufio.Reader, dlcell: shared, ca
     // wins over Content-Length; no framing at all reads to EOF.
     body := mkslice(byte, 0)
     raw_trunc := false
+    body_err := ""
     if !bodyless(req.method, h.status) {
         te := lwr(hdr_get(h.headers, "transfer-encoding"))
         [cl, cle] = content_length(h.headers)
@@ -635,7 +636,7 @@ fn finish_roundtrip(req: ref model.Req, br: own bufio.Reader, dlcell: shared, ca
             if sse {
                 [ccb, ce2] = read_chunked_cap(br, sse_max_body)
                 if ce2 != nil {
-                    return bad, ce2
+                    body_err = errors.msg(ce2)
                 }
                 if ccb.hit {
                     raw_trunc = true
@@ -662,7 +663,7 @@ fn finish_roundtrip(req: ref model.Req, br: own bufio.Reader, dlcell: shared, ca
             if sse {
                 [cr, ce3] = read_eof_capped(br, sse_max_body)
                 if ce3 != nil {
-                    return bad, ce3
+                    body_err = errors.msg(ce3)
                 }
                 if cr.hit {
                     raw_trunc = true
@@ -681,16 +682,24 @@ fn finish_roundtrip(req: ref model.Req, br: own bufio.Reader, dlcell: shared, ca
                 rd = sse_max_body
                 raw_trunc = true
             }
-            [b3, e3] = read_exact(br, rd)
-            if e3 != nil {
-                return bad, e3
+            if sse {
+                [pr, e3] = read_exact_partial(br, rd)
+                body = pr.data
+                if e3 != nil {
+                    body_err = errors.msg(e3)
+                }
+            } else {
+                [b3, e3] = read_exact(br, rd)
+                if e3 != nil {
+                    return bad, e3
+                }
+                body = b3
             }
-            body = b3
         } else {
             if sse {
                 [cr2, ce4] = read_eof_capped(br, sse_max_body)
                 if ce4 != nil {
-                    return bad, ce4
+                    body_err = errors.msg(ce4)
                 }
                 if cr2.hit {
                     raw_trunc = true
@@ -712,12 +721,31 @@ fn finish_roundtrip(req: ref model.Req, br: own bufio.Reader, dlcell: shared, ca
     cap.body = body
     cap.elapsed_ms = itof(now_ms() - t0)
     tr.recv_body_ms = itof(now_ms() - c0)
-    [db, dbe] = decode_body(body, hdr_get(h.headers, "content-encoding"))
-    if dbe != nil {
-        return bad, dbe
+    let bodyb: []byte = nil
+    if sse {
+        [dc, dbe] = decode_body_capped(body, hdr_get(h.headers, "content-encoding"), sse_max_body)
+        bodyb = dc.data
+        if dc.hit {
+            raw_trunc = true
+        }
+        if dbe != nil {
+            if len(bodyb) == 0 {
+                return bad, dbe
+            }
+            if len(body_err) > 0 {
+                body_err = body_err + "; " + errors.msg(dbe)
+            } else {
+                body_err = errors.msg(dbe)
+            }
+        }
+    } else {
+        [db, dbe] = decode_body(body, hdr_get(h.headers, "content-encoding"))
+        if dbe != nil {
+            return bad, dbe
+        }
+        bodyb = db
     }
     tr.closed_ms = itof(now_ms() - c0)
-    let bodyb: []byte = db
     serr := ""
     resp := model.Resp{status: h.status, reason: h.reason, headers: h.headers, body: bodyb, elapsed_ms: itof(now_ms() - t0), remote: remote, version: h.version, hops: nil, req_head: "", trace: tr, tls_ver: tls_ver, events: nil, stream_error: ""}
     if sse {
@@ -727,7 +755,7 @@ fn finish_roundtrip(req: ref model.Req, br: own bufio.Reader, dlcell: shared, ca
             dec_trunc = true
         }
         resp.body = bodyb
-        [evs, serr_e] = sse_finish(bodyb, dec_trunc)
+        [evs, serr_e] = sse_finish_err(bodyb, dec_trunc, body_err)
         if serr_e != nil {
             serr = errors.msg(serr_e)
         }
@@ -905,15 +933,23 @@ fn h2_exchange(req: ref model.Req, rw: io.ReadWriter, fd: int, hdrs: []model.Hea
     body := mkslice(byte, 0)
     wire_bytes := 0
     sse_raw_over := false
+    body_err := ""
     got_final := false
     done := false
     for !done {
         [ev, ee] = c2.next_event()
         if ee != nil {
-            return bad, ee
+            body_err = errors.msg(ee)
+            done = true
+            continue
         }
         if ev.kind == 7 { // GOAWAY
             if ev.last_stream_id < sid {
+                if got_final {
+                    body_err = "http: connection closed by GOAWAY before response completed"
+                    done = true
+                    continue
+                }
                 return bad, errors.new("http: connection closed by GOAWAY before response")
             }
             continue
@@ -922,7 +958,9 @@ fn h2_exchange(req: ref model.Req, rw: io.ReadWriter, fd: int, hdrs: []model.Hea
             continue
         }
         if ev.kind == 3 { // RST_STREAM
-            return bad, errors.new("http: stream reset by peer")
+            body_err = "http: stream reset by peer"
+            done = true
+            continue
         }
         if ev.kind == 1 { // HEADERS
             if ev.trailers {
@@ -1004,22 +1042,46 @@ fn h2_exchange(req: ref model.Req, rw: io.ReadWriter, fd: int, hdrs: []model.Hea
     if n_rh_head >= 0 {
         hdr_scope = rh[:n_rh_head]
     }
-    le := h2_check_length(req.method, status, hdr_scope, wire_bytes)
-    if le != nil {
-        return bad, le
+    if len(body_err) == 0 {
+        le := h2_check_length(req.method, status, hdr_scope, wire_bytes)
+        if le != nil {
+            return bad, le
+        }
     }
-    [db, dbe] = decode_body(body, hdr_get(rh, "content-encoding"))
-    if dbe != nil {
-        return bad, dbe
+    is_sse := sse_is_stream(rh, req.method)
+    if !is_sse && len(body_err) > 0 {
+        return bad, errors.new(body_err)
+    }
+    let bodyb: []byte = nil
+    decoded_over := false
+    if is_sse {
+        [dc, dbe] = decode_body_capped(body, hdr_get(rh, "content-encoding"), sse_max_body)
+        bodyb = dc.data
+        if dbe != nil {
+            if len(bodyb) == 0 {
+                return bad, dbe
+            }
+            if len(body_err) > 0 {
+                body_err = body_err + "; " + errors.msg(dbe)
+            } else {
+                body_err = errors.msg(dbe)
+            }
+        }
+        decoded_over = dc.hit
+    } else {
+        [db, dbe] = decode_body(body, hdr_get(rh, "content-encoding"))
+        if dbe != nil {
+            return bad, dbe
+        }
+        bodyb = db
     }
     tr.closed_ms = itof(now_ms() - c0)
-    let bodyb: []byte = db
     // SSE over h2 parses events identically; the deadline is NOT
     // lifted here (ADR-0055 D6 — h2 keeps the request budget).
     serr := ""
     resp := model.Resp{status: status, reason: "", headers: rh, body: bodyb, elapsed_ms: itof(now_ms() - t0), remote: remote, version: "2.0", hops: nil, req_head: "", trace: tr, tls_ver: tls_ver, events: nil, stream_error: ""}
-    if sse_is_stream(rh, req.method) {
-        over := sse_raw_over
+    if is_sse {
+        over := sse_raw_over || decoded_over
         if len(bodyb) > sse_max_body {
             bodyb = bodyb[0:sse_max_body]
             over = true
@@ -1028,7 +1090,7 @@ fn h2_exchange(req: ref model.Req, rw: io.ReadWriter, fd: int, hdrs: []model.Hea
             over = true
         }
         resp.body = bodyb
-        [evs, serr_e] = sse_finish(bodyb, over)
+        [evs, serr_e] = sse_finish_err(bodyb, over, body_err)
         if serr_e != nil {
             serr = errors.msg(serr_e)
         }

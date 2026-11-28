@@ -85,7 +85,7 @@ fn utf8_line(s: str) -> str {
 fn parse_sse(body: []byte) -> [own []model.StreamEvent, err] {
     s := body as str
     evs := mkslice(model.StreamEvent, 0)
-    data := ""
+    datab := mkslice(byte, 0)
     name := ""
     id := ""
     size := 0
@@ -118,14 +118,14 @@ fn parse_sse(body: []byte) -> [own []model.StreamEvent, err] {
         i = ni
         line = utf8_line(line)
         if len(line) == 0 {
-            if len(data) > 0 {
+            if len(datab) > 0 {
                 if count == sse_max_events {
                     // upstream retains the events already logged and
                     // marks the stream interrupted at the cap.
                     return new(evs), errors.new("SSE log reached 10000 events")
                 }
                 // accumulated data always ends with \n — drop it
-                db := substr(data, 0, len(data) - 1)
+                db := datab[0:len(datab) - 1] as str
                 ct := "text/plain"
                 if sse_json_ok(db) {
                     ct = "application/json"
@@ -137,7 +137,7 @@ fn parse_sse(body: []byte) -> [own []model.StreamEvent, err] {
                 evs = push(evs, model.StreamEvent{at_ms: time.unix_ms(), kind: 1, title: "", body: db as []byte, content_type: ct, event: evname, id: id})
                 count = count + 1
             }
-            data = ""
+            datab = mkslice(byte, 0)
             name = ""
             size = 0
             continue
@@ -163,7 +163,13 @@ fn parse_sse(body: []byte) -> [own []model.StreamEvent, err] {
             }
         }
         if field == "data" {
-            data = data + value + "\n"
+            vb := value as []byte
+            vi := 0
+            for vi < len(vb) {
+                datab = push(datab, vb[vi])
+                vi = vi + 1
+            }
+            datab = push(datab, 10)
         } else if field == "event" {
             name = value
         } else if field == "id" {
@@ -191,9 +197,16 @@ fn parse_sse(body: []byte) -> [own []model.StreamEvent, err] {
 // ended") or error ("Stream interrupted: <err>") event. over_cap marks
 // the 64 MiB body truncation — upstream's LimitedReader error.
 fn sse_finish(body: []byte, over_cap: bool) -> [own []model.StreamEvent, err] {
+    return sse_finish_err(body, over_cap, "")
+}
+
+// sse_finish_err is sse_finish with a transport/read error that
+// interrupted the body after a partial payload. The parsed prefix is
+// preserved and the terminal event carries the interruption.
+fn sse_finish_err(body: []byte, over_cap: bool, base_err: str) -> [own []model.StreamEvent, err] {
     t0 := time.unix_ms()
     all := mkslice(model.StreamEvent, 0)
-    all = push(all, model.StreamEvent{at_ms: t0, kind: 2, title: "Stream connected", body: nil, content_type: "", event: "", id: ""})
+    all = push(all, model.StreamEvent{at_ms: t0, kind: 2, title: "Stream connected", body: mkslice(byte, 0), content_type: "", event: "", id: ""})
     [evs, perr] = parse_sse(body)
     if evs != nil {
         i := 0
@@ -202,17 +215,21 @@ fn sse_finish(body: []byte, over_cap: bool) -> [own []model.StreamEvent, err] {
             i = i + 1
         }
     }
-    serr := ""
+    serr := base_err
     if perr != nil {
-        serr = errors.msg(perr)
+        if len(serr) > 0 {
+            serr = serr + "; " + errors.msg(perr)
+        } else {
+            serr = errors.msg(perr)
+        }
     }
     if over_cap {
         serr = "SSE response exceeded 64.00 MB"
     }
     if len(serr) > 0 {
-        all = push(all, model.StreamEvent{at_ms: time.unix_ms(), kind: 3, title: "Stream interrupted: " + serr, body: nil, content_type: "", event: "", id: ""})
+        all = push(all, model.StreamEvent{at_ms: time.unix_ms(), kind: 3, title: "Stream interrupted: " + serr, body: mkslice(byte, 0), content_type: "", event: "", id: ""})
     } else {
-        all = push(all, model.StreamEvent{at_ms: time.unix_ms(), kind: 2, title: "Stream ended", body: nil, content_type: "", event: "", id: ""})
+        all = push(all, model.StreamEvent{at_ms: time.unix_ms(), kind: 2, title: "Stream ended", body: mkslice(byte, 0), content_type: "", event: "", id: ""})
     }
     if len(serr) > 0 {
         return new(all), errors.new(serr)

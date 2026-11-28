@@ -750,13 +750,10 @@ fn resp_json(req: ref model.Req, resp: model.Resp, rts: int) -> str {
 }
 
 fn run_resp_failed(kind: str, resp: model.Resp) -> bool {
-    cls := model.status_class(resp.status)
-    if cls == 2 {
-        return true
-    }
-    // GraphQL warning: 2xx with a top-level errors array fails the run
-    // like upstream's warning status class.
-    return kind == "graphql" && cls == 0 && graphql_error_count(resp.body) > 0
+    // Headless runs fail on transport/status/capture outcomes only:
+    // corpus §1.4 explicitly keeps GraphQL/gRPC payload "error" states
+    // passing unless a declared capture fails.
+    return model.status_class(resp.status) == 2
 }
 
 fn events_json(evs: own []model.StreamEvent) -> str {
@@ -773,10 +770,9 @@ fn events_json(evs: own []model.StreamEvent) -> str {
         if len(ev.title) > 0 {
             out = out + ",\"title\":" + jesc(ev.title)
         }
-        if len(ev.body) > 0 {
-            // upstream []byte marshals base64 — keep that wire shape.
-            out = out + ",\"body\":" + jesc(base64.encode(ev.body))
-        }
+        // upstream []byte marshals base64 — keep that wire shape even
+        // for a legal empty event payload.
+        out = out + ",\"body\":" + jesc(base64.encode(ev.body))
         if len(ev.content_type) > 0 {
             out = out + ",\"contentType\":" + jesc(ev.content_type)
         }

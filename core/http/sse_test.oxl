@@ -258,6 +258,61 @@ fn test_sse_stream_error() {
     }
 }
 
+
+fn test_decode_body_capped_streams() {
+    // gzip.compress(b"hello oxttp", mtime=0); a small ceiling proves
+    // the cap is applied to decoded bytes while streaming, not to the
+    // compressed representation.
+    gz := hx_b("1f8b08000000000002ffcb48cdc9c957c8af28292900007692580c0b000000")
+    [dg, eg] = decode_body_capped(gz as []byte, "gzip", 5)
+    testing.expect(eg == nil, "gzip capped decode clean")
+    testing.expect(dg.hit, "gzip cap hit")
+    testing.expect_streq(dg.data as str, "hello", "gzip decoded prefix")
+    // zlib.compress(b"deflate me")
+    zl := hx_b("789c4b494dcb492c4955c84d0500156003c8")
+    [dz, ez] = decode_body_capped(zl as []byte, "deflate", 7)
+    testing.expect(ez == nil, "zlib capped decode clean")
+    testing.expect(dz.hit, "zlib cap hit")
+    testing.expect_streq(dz.data as str, "deflate", "zlib decoded prefix")
+    [di, ei] = decode_body_capped("exact" as []byte, "identity", 5)
+    testing.expect(ei == nil, "identity exact-fit clean")
+    testing.expect(!di.hit, "identity exact fit is not truncation")
+    [dx, ex] = decode_body_capped(gz as []byte, "gzip", 11)
+    testing.expect(ex == nil, "gzip exact-fit clean")
+    testing.expect(!dx.hit, "gzip exact fit is not truncation")
+    testing.expect_streq(dx.data as str, "hello oxttp", "gzip exact body")
+    rawfl := hx_b("4b494dcb492c4955c84d0500")
+    [df, ef] = decode_body_capped(rawfl as []byte, "deflate", 10)
+    testing.expect(ef == nil, "raw flate capped fallback clean")
+    testing.expect_streq(df.data as str, "deflate me", "raw flate fallback bytes")
+}
+
+fn test_sse_content_length_read_error_preserves_events() {
+    // The declared length is longer than the bytes the peer sends.
+    // The complete event before EOF survives; the partial trailing
+    // event does not dispatch, and the terminal log entry is the
+    // transport interruption rather than a clean stream end.
+    body := "data: kept\n\ndata: dropped"
+    resp := "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: " + itoa(len(body) + 20) + "\r\nConnection: close\r\n\r\n" + body
+    f := fx_start(one(resp))
+    defer f.stop()
+    let tr: Transport = H1{}
+    [r, e] = tr.send(sse_rq("GET", f.url() + "/sse"))
+    testing.expect(e == nil, "interrupted sse still returns response")
+    if e != nil {
+        return
+    }
+    testing.expect(r.events != nil, "events installed")
+    if r.events == nil {
+        return
+    }
+    testing.expect_eq(len(r.events), 3, "seed+complete event+interrupted")
+    testing.expect_streq(r.events[1].body as str, "kept", "complete prefix retained")
+    testing.expect_eq(r.events[2].kind, 3, "terminal error")
+    testing.expect(str_contains_i(r.events[2].title, "interrupted"), "interrupted title")
+    testing.expect(str_contains_i(r.stream_error, "truncated"), "transport error surfaced")
+}
+
 fn str_contains_i(h: str, n: str) -> bool {
     return find(h, n) >= 0
 }
