@@ -647,3 +647,89 @@ fn test_draft_keeps_loaded_content_type() {
     r2 := draft_to_request(a)
     testing.expect_streq(r2.body.content_type, "text/plain", "selector switch wins")
 }
+
+// WI-0022 S9 — OAuth editor surface: type selection projects conditional
+// rows, code-only fields hide for client credentials without losing values,
+// edits save through the nested YAML block, per-tab draft state survives, and
+// runtime tokens never enter the saved model.
+fn set_oauth_row(a: mut App, name: str, value: str) {
+    i := 0
+    for i < len(a.oauth_kv.rows) {
+        if a.oauth_kv.rows[i].name == name {
+            a.oauth_kv.rows[i].value = value
+            return
+        }
+        i = i + 1
+    }
+    testing.expect(false, "missing oauth row " + name)
+}
+
+fn has_oauth_row(a: ref App, name: str) -> bool {
+    i := 0
+    for i < len(a.oauth_kv.rows) {
+        if a.oauth_kv.rows[i].name == name {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn test_oauth_editor_conditional_roundtrip_and_tabs() {
+    a := new_app()
+    set_oauth_row(a, "type", "OAuth 2.0")
+    oauth_rebuild(a)
+    testing.expect(has_oauth_row(a, "grant_type"), "grant row visible")
+    testing.expect(has_oauth_row(a, "authorization_url"), "code auth URL visible")
+    testing.expect(has_oauth_row(a, "redirect_uri"), "code redirect visible")
+    set_oauth_row(a, "grant_type", "Client credentials")
+    oauth_rebuild(a)
+    testing.expect(!has_oauth_row(a, "authorization_url"), "client credentials hides auth URL")
+    testing.expect(!has_oauth_row(a, "redirect_uri"), "client credentials hides redirect")
+    set_oauth_row(a, "token_url", "https://issuer.test/token")
+    set_oauth_row(a, "client_id", "cid")
+    set_oauth_row(a, "client_secret", "$OAUTH_SECRET")
+    set_oauth_row(a, "scope", "read write")
+    set_oauth_row(a, "client_auth", "Basic header")
+    r := draft_to_request(a)
+    testing.expect(r.auth != nil, "auth emitted")
+    testing.expect_streq(r.auth.type, "oauth2", "oauth auth type")
+    testing.expect_streq(r.auth.oauth2.grant_type, "client_credentials", "grant saved as YAML enum")
+    testing.expect_streq(r.auth.oauth2.client_auth, "client_secret_basic", "client auth saved as YAML enum")
+    testing.expect_streq(r.auth.oauth2.client_secret, "$OAUTH_SECRET", "secret text editable/variable-preserving")
+    [y, me] = collection.marshal(r)
+    testing.expect(me == nil, "marshal oauth draft")
+    testing.expect(find(y, "oauth2:") >= 0, "nested yaml block")
+    testing.expect(find(y, "client_secret") >= 0, "configured secret saved")
+    testing.expect(find(y, "access_token") < 0, "no runtime token persisted")
+
+    // switching back restores hidden code-only values rather than dropping them
+    set_oauth_row(a, "grant_type", "Code + PKCE")
+    oauth_rebuild(a)
+    testing.expect(has_oauth_row(a, "authorization_url"), "code rows restore")
+    set_oauth_row(a, "authorization_url", "https://issuer.test/auth")
+    set_oauth_row(a, "redirect_uri", "http://127.0.0.1:0/cb")
+    d := draft_capture(a)
+    a.oauth_kv.rows[0].value = "none"
+    oauth_rebuild(a)
+    draft_restore(a, d)
+    testing.expect(has_oauth_row(a, "authorization_url"), "tab draft keeps code row")
+    testing.expect_streq(oauth_value(a, "authorization_url"), "https://issuer.test/auth", "tab draft keeps edit")
+    r2 := draft_to_request(a)
+    testing.expect_streq(r2.auth.oauth2.redirect_uri, "http://127.0.0.1:0/cb", "redirect round-trips")
+}
+
+fn test_oauth_auth_render_masking_and_file_seed() {
+    scratch_coll()
+    os.writefile_(COLL_SCRATCH + "/requests/oauth.posting.yaml",
+        "name: OA\nmethod: GET\nurl: https://api.example.test/x\nauth:\n  type: oauth2\n  oauth2:\n    grant_type: authorization_code\n    authorization_url: https://issuer.test/auth\n    token_url: https://issuer.test/token\n    client_id: cid\n    client_secret: literal-secret\n    redirect_uri: http://127.0.0.1:0/cb\n")
+    a := app_in(COLL_SCRATCH)
+    a.focus = FSidebar
+    a.coll.cur = node_idx(a, "OA")
+    tree_open(a)
+    testing.expect(has_oauth_row(a, "authorization_url"), "file seed shows code row")
+    testing.expect_streq(oauth_value(a, "token_url"), "https://issuer.test/token", "file token url")
+    testing.expect(str_contains(a.auth_text, "client_secret: ••••"), "summary masks configured secret")
+    r := draft_to_request(a)
+    testing.expect_streq(r.auth.oauth2.client_secret, "literal-secret", "masked summary does not alter editable model")
+}

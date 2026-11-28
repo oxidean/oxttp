@@ -1,0 +1,243 @@
+package oauth
+
+// WI-0022 S5 — bounded loopback OAuth callback listener. The listener owns
+// no token endpoint or browser policy; it validates one HTTP callback under
+// strict Host/path/state rules and bounded memory/time/connection caps.
+import "std/errors"
+import "std/net"
+import "std/net/url"
+
+let CallbackHeadCap = 16384
+let CallbackConnMs = 5000
+let CallbackExtraneousCap = 64
+let CallbackWaitMs = 180000
+
+// CallbackOutcome classifies the first eligible callback or the bounded
+// wait failure. error_code is internal metadata only; user-facing strings
+// are produced by the flow layer.
+struct CallbackOutcome {
+    kind: str, // success · denial · malformed · timeout · extraneous · listen_error
+    code: str,
+    error_code: str,
+    detail: str,
+}
+
+fn callback_write_all(c: net.Conn, s: str) {
+    b := s as []byte
+    off := 0
+    for off < len(b) {
+        [n, e] = c.write(b[off:])
+        if e != nil || n <= 0 {
+            return
+        }
+        off = off + n
+    }
+}
+
+fn callback_response(status: int, reason: str, body: str, eligible: bool) -> str {
+    hs := "HTTP/1.1 " + itoa(status) + " " + reason + "\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: " + itoa(len(body)) + "\r\nConnection: close\r\n"
+    // Upstream sets these on every callback response, including 404/400
+    // rows; eligible remains in the signature for readability at call sites.
+    hs = hs + "Cache-Control: no-store\r\nReferrer-Policy: no-referrer\r\n"
+    return hs + "\r\n" + body
+}
+
+fn callback_simple(c: net.Conn, status: int, reason: str, body: str, eligible: bool) {
+    callback_write_all(c, callback_response(status, reason, body, eligible))
+}
+
+fn trim_ows_cb(s: str) -> str {
+    lo := 0
+    for lo < len(s) && (byteat(s, lo) == 32 || byteat(s, lo) == 9) {
+        lo = lo + 1
+    }
+    hi := len(s)
+    for hi > lo && (byteat(s, hi - 1) == 32 || byteat(s, hi - 1) == 9) {
+        hi = hi - 1
+    }
+    return substr(s, lo, hi)
+}
+
+// read_callback_head reads through CRLFCRLF with a hard 16 KiB cap and a
+// whole-connection activity deadline. No request body is retained.
+fn read_callback_head(c: net.Conn, deadline_ms: int) -> [str, err] {
+    out := ""
+    scratch := mkslice(byte, 2048)
+    for find(out, "\r\n\r\n") < 0 {
+        rem := deadline_ms - now_ms()
+        if rem <= 0 {
+            return "", errors.new("callback connection timed out")
+        }
+        set_rcvtimo_ms(c.rawfd(), rem)
+        [n, e] = c.read(scratch)
+        if n > 0 {
+            out = out + scratch[0:n] as str
+            if len(out) > CallbackHeadCap {
+                return "", errors.new("callback head too large")
+            }
+        }
+        if e != nil {
+            return "", e
+        }
+        if n <= 0 {
+            return "", errors.new("callback connection made no progress")
+        }
+    }
+    return out, nil
+}
+
+fn header_count_value(lines: []str, name: str) -> [str, err] {
+    ln := lwr(name)
+    count := 0
+    value := ""
+    i := 0
+    for i < len(lines) {
+        line := lines[i]
+        i = i + 1
+        colon := find(line, ":")
+        if colon <= 0 {
+            continue
+        }
+        if lwr(substr(line, 0, colon)) == ln {
+            count = count + 1
+            value = trim_ows_cb(substr(line, colon + 1, len(line)))
+        }
+    }
+    if count != 1 {
+        return "", errors.new("callback Host header missing or duplicated")
+    }
+    return value, nil
+}
+
+fn split_lines_crlf(head: str) -> []str {
+    let out: []str = nil
+    pos := 0
+    for pos <= len(head) {
+        i := find(substr(head, pos, len(head)), "\r\n")
+        if i < 0 {
+            out = push(out, substr(head, pos, len(head)))
+            break
+        }
+        out = push(out, substr(head, pos, pos + i))
+        pos = pos + i + 2
+    }
+    return out
+}
+
+// handle_callback_conn services one accepted connection. The returned bool
+// reports whether the connection produced an outcome that ends the OAuth
+// wait; invalid state/nonmatching requests only count as extraneous.
+fn handle_callback_conn(c: net.Conn, expected: ref url.URL, state: str) -> [CallbackOutcome, err] {
+    none := CallbackOutcome{kind: "extraneous", code: "", error_code: "", detail: ""}
+    deadline := now_ms() + CallbackConnMs
+    [head, he] = read_callback_head(c, deadline)
+    if he != nil {
+        callback_simple(c, 400, "Bad Request", "Bad OAuth callback.", false)
+        return none, he
+    }
+    hend := find(head, "\r\n\r\n")
+    lines := split_lines_crlf(substr(head, 0, hend))
+    if len(lines) == 0 {
+        callback_simple(c, 400, "Bad Request", "Bad OAuth callback.", false)
+        return none, errors.new("empty callback head")
+    }
+    reqline := lines[0]
+    sp1 := find(reqline, " ")
+    if sp1 <= 0 {
+        callback_simple(c, 400, "Bad Request", "Bad OAuth callback.", false)
+        return none, errors.new("bad callback request line")
+    }
+    rest := substr(reqline, sp1 + 1, len(reqline))
+    sp2 := find(rest, " ")
+    if sp2 <= 0 {
+        callback_simple(c, 400, "Bad Request", "Bad OAuth callback.", false)
+        return none, errors.new("bad callback request line")
+    }
+    method := substr(reqline, 0, sp1)
+    target := substr(rest, 0, sp2)
+    [host, hvErr] = header_count_value(lines, "host")
+    eligible := method == "GET" && hvErr == nil && lwr(host) == lwr(expected.host)
+    rawpath := target
+    rawquery := ""
+    qi := find(target, "?")
+    if qi >= 0 {
+        rawpath = substr(target, 0, qi)
+        rawquery = substr(target, qi + 1, len(target))
+    }
+    if rawpath != expected.escapedpath() {
+        eligible = false
+    }
+    if !eligible {
+        callback_simple(c, 404, "Not Found", "Not found", false)
+        return none, nil
+    }
+
+    [qv, qe] = url.parsequery(rawquery)
+    if qe != nil {
+        callback_simple(c, 400, "Bad Request", "Invalid OAuth state. Return to the original authorization page.", true)
+        return none, nil
+    }
+    states := url.vgetall(qv, "state")
+    if len(states) != 1 || !state_equal(states[0], state) {
+        callback_simple(c, 400, "Bad Request", "Invalid OAuth state. Return to the original authorization page.", true)
+        return none, nil
+    }
+    // From here the state is valid, so success/denial/malformed code are
+    // eligible outcomes and the wait ends (first outcome wins).
+    if url.vhas(qv, "error") {
+        callback_simple(c, 200, "OK", "Authorization response received. Return to Posting.", true)
+        return CallbackOutcome{kind: "denial", code: "", error_code: url.vget(qv, "error"), detail: ""}, nil
+    }
+    codes := url.vgetall(qv, "code")
+    if len(codes) != 1 || len(codes[0]) == 0 {
+        // Upstream answers the browser with 400 but does not consume the
+        // one-shot authorization result: the user may return to the original
+        // page and complete a corrected callback within the wait budget.
+        callback_simple(c, 400, "Bad Request", "Missing authorization code.", true)
+        return none, nil
+    }
+    callback_simple(c, 200, "OK", "Authorization response received. Return to Posting.", true)
+    return CallbackOutcome{kind: "success", code: codes[0], error_code: "", detail: ""}, nil
+}
+
+// wait_callback accepts loopback callbacks until the first valid-state
+// outcome, timeout, or extraneous-connection cap. The caller owns listener
+// close so every flow path can close it exactly once.
+fn wait_callback(l: net.Listener, actual_redirect_uri: str, state: str, deadline_ms: int) -> CallbackOutcome {
+    out := CallbackOutcome{kind: "timeout", code: "", error_code: "", detail: ""}
+    [expected, pe] = url.parse(actual_redirect_uri)
+    if pe != nil {
+        out.kind = "listen_error"
+        out.detail = "bad redirect"
+        return out
+    }
+    extraneous := 0
+    for now_ms() < deadline_ms {
+        rem := deadline_ms - now_ms()
+        if rem > 1000 {
+            rem = 1000
+        }
+        if rem <= 0 {
+            break
+        }
+        set_rcvtimo_ms(l.rawfd(), rem)
+        [c, ae] = l.accept()
+        if ae != nil {
+            // accept timeout is the normal polling path; other accept errors
+            // are also bounded by the outer deadline rather than fatal here.
+            continue
+        }
+        [oc, he] = handle_callback_conn(c, expected, state)
+        c.close()
+        if he != nil || oc.kind == "extraneous" {
+            extraneous = extraneous + 1
+            if extraneous >= CallbackExtraneousCap {
+                out.kind = "extraneous"
+                return out
+            }
+            continue
+        }
+        return oc
+    }
+    return out
+}

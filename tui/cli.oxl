@@ -18,6 +18,7 @@ import "github.com/oxidean/oxttp/core/config"
 import "github.com/oxidean/oxttp/core/env"
 import "github.com/oxidean/oxttp/core/http"
 import "github.com/oxidean/oxttp/core/model"
+import "github.com/oxidean/oxttp/core/oauth"
 import "github.com/oxidean/oxttp/shared/version"
 
 struct Out { code: int, stdout: str, stderr: str }
@@ -524,6 +525,7 @@ fn run_exec(o: ref RunOpts, t: http.Transport) -> own RunRep {
     // (upstream run.go: model.Merge(variables, captureLayer) per
     // request; last write wins on name collisions).
     let jar: []JarEnt = nil
+    omgr := new(oauth.Manager)
     let capvars: []model.KV = nil
     sess_li := -1
 
@@ -596,6 +598,31 @@ fn run_exec(o: ref RunOpts, t: http.Transport) -> own RunRep {
             jresults = jappend(jresults, first_j, "{\"file\":" + jesc(n.rel) + ",\"name\":" + jesc(n.req.name) + ",\"outcome\":\"failed\",\"error\":" + jesc(cert_err) + "}")
             first_j = false
             continue
+        }
+        if sp.oauth != nil {
+            // posting run is non-interactive per ADR-0060: client credentials
+            // may acquire; browser-required code grants fail before send. Token
+            // endpoint traffic shares the injected transport but produces no
+            // report row.
+            ar := oauth.authorize(omgr, sp.oauth.cfg, sp.oauth.identity, sp.req, false, nil, t)
+            if len(ar.err) > 0 {
+                rep.lines = push(rep.lines, "FAILED " + n.rel + ": " + ar.err + "\n")
+                failed = failed + 1
+                if o.fail_fast { stop = true }
+                jresults = jappend(jresults, first_j, "{\"file\":" + jesc(n.rel) + ",\"name\":" + jesc(n.req.name) + ",\"outcome\":\"failed\",\"error\":" + jesc(ar.err) + "}")
+                first_j = false
+                continue
+            }
+            let ohs: []model.Header = nil
+            oi2 := 0
+            for oi2 < len(sp.req.headers) {
+                if !ascii_eq(sp.req.headers[oi2].name, "Authorization") {
+                    ohs = push(ohs, sp.req.headers[oi2])
+                }
+                oi2 = oi2 + 1
+            }
+            ohs = push(ohs, model.Header{name: "Authorization", value: "Bearer " + ar.bearer})
+            sp.req.headers = ohs
         }
         [resp, se] = t.send(sp.req)
         rts := time.unix_ms()

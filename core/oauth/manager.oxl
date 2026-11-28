@@ -1,0 +1,192 @@
+package oauth
+
+// WI-0022 S4 — session-local memory token manager, reuse/refresh rules,
+// client-credentials acquisition, non-interactive refusal, and Forget.
+// No package-global token state exists: every TUI app/run process owns a
+// Manager value.
+import "std/errors"
+import "github.com/oxidean/oxttp/core/http"
+import "github.com/oxidean/oxttp/core/model"
+
+// BrowserFlow is the interactive authorization seam implemented in S6.
+// Tests can inject a deterministic browser flow; non-interactive callers
+// never invoke it.
+interface BrowserFlow {
+    run(cfg: Config, resource: ref model.Req, tr: http.Transport) -> TokenResult
+}
+
+fn manager_now(m: ref Manager) -> int {
+    if m.now_unix != 0 {
+        return m.now_unix
+    }
+    return now()
+}
+
+// token_valid_at implements expiry minus ten seconds. Equality inside that
+// ten-second window is invalid; tokens without expiry do not expire.
+fn token_valid_at(t: Token, now_unix: int) -> bool {
+    if len(t.access_token) == 0 {
+        return false
+    }
+    if !t.has_expiry {
+        return true
+    }
+    return now_unix < t.expiry_unix - 10
+}
+
+fn token_valid(m: ref Manager, t: Token) -> bool {
+    return token_valid_at(t, manager_now(m))
+}
+
+struct ManagerLookup { token: Token, found: bool }
+
+fn manager_get(m: ref Manager, key: str) -> ManagerLookup {
+    z := Token{access_token: "", token_type: "", refresh_token: "", expiry_unix: 0, has_expiry: false}
+    i := 0
+    for i < len(m.entries) {
+        if m.entries[i].key == key {
+            return ManagerLookup{token: m.entries[i].token, found: true}
+        }
+        i = i + 1
+    }
+    return ManagerLookup{token: z, found: false}
+}
+
+// manager_put inserts or replaces one exact cache-key entry.
+fn manager_put(m: mut Manager, key: str, token: Token) {
+    i := 0
+    for i < len(m.entries) {
+        if m.entries[i].key == key {
+            m.entries[i].token = token
+            return
+        }
+        i = i + 1
+    }
+    m.entries = push(m.entries, TokenEntry{key: key, token: token})
+}
+
+// manager_delete removes exact key only; unlike a scope-wide clear, other
+// scopes/origins/configurations remain untouched.
+fn manager_delete(m: mut Manager, key: str) -> bool {
+    let out: []TokenEntry = nil
+    found := false
+    i := 0
+    for i < len(m.entries) {
+        if m.entries[i].key == key {
+            found = true
+        } else {
+            out = push(out, m.entries[i])
+        }
+        i = i + 1
+    }
+    m.entries = out
+    return found
+}
+
+fn manager_key(cfg: Config, ident: CacheIdentity) -> [str, err] {
+    return cache_key(ident.collection_root, ident.resource_url, cfg, ident.verify_ssl, ident.proxy_url)
+}
+
+// forget removes the same fully resolved cache-key entry and never contacts
+// the provider or claims consent revocation.
+fn forget(m: mut Manager, cfg: Config, ident: CacheIdentity) -> err {
+    [key, e] = manager_key(cfg, ident)
+    if e != nil {
+        return e
+    }
+    manager_delete(m, key)
+    return nil
+}
+
+fn auth_error_result(msg: str, class: str) -> AuthResult {
+    return AuthResult{bearer: "", notes: nil, err: msg, classification: class, status: 0, endpoint_code: ""}
+}
+
+fn auth_success_result(token: Token) -> AuthResult {
+    let notes: []str = nil
+    notes = push(notes, MemoryOnlyWarning)
+    return AuthResult{bearer: token.access_token, notes: notes, err: "", classification: "success", status: 0, endpoint_code: ""}
+}
+
+fn auth_from_token_result(trr: TokenResult) -> AuthResult {
+    if len(trr.err) > 0 {
+        out := auth_error_result(trr.err, trr.classification)
+        out.status = trr.status
+        out.endpoint_code = trr.endpoint_code
+        return out
+    }
+    return auth_success_result(trr.token)
+}
+
+fn rotate_refresh(old: Token, newer: Token) -> Token {
+    out := newer
+    if len(out.refresh_token) == 0 {
+        out.refresh_token = old.refresh_token
+    }
+    return out
+}
+
+// authorize implements cache reuse, client-credentials renewal, refresh
+// rotation, browser fallback, and non-interactive refusal. The resource
+// request is not sent until this returns success.
+fn authorize(m: mut Manager, cfg: Config, ident: CacheIdentity, resource: ref model.Req, interactive: bool, browser: BrowserFlow, tr: http.Transport) -> AuthResult {
+    c := with_defaults(cfg)
+    ve := validate_config(c, ident.resource_url)
+    if ve != nil {
+        return auth_error_result(errors.msg(ve), "validation")
+    }
+    [key, ke] = manager_key(c, ident)
+    if ke != nil {
+        return auth_error_result(errors.msg(ke), "validation")
+    }
+    lookup := manager_get(m, key)
+    old := lookup.token
+    nowu := manager_now(m)
+    if lookup.found && token_valid_at(old, nowu) {
+        return auth_success_result(old)
+    }
+
+    if c.grant_type == "client_credentials" {
+        // Client-credentials always performs a fresh grant on expiry, even
+        // when a refresh_token happens to be present in the old response.
+        rq := client_credentials_request(c, resource)
+        out := send_token_at(tr, rq, nowu)
+        if len(out.err) == 0 {
+            manager_put(m, key, out.token)
+        }
+        return auth_from_token_result(out)
+    }
+
+    if lookup.found && len(old.refresh_token) > 0 {
+        rr := refresh_request(c, resource, old.refresh_token)
+        refreshed := send_token_at(tr, rr, nowu)
+        if len(refreshed.err) == 0 {
+            merged := rotate_refresh(old, refreshed.token)
+            manager_put(m, key, merged)
+            return auth_success_result(merged)
+        }
+        // invalid_grant means consent/credential material is gone. Interactive
+        // callers may acquire a fresh authorization; non-interactive callers
+        // receive the sanitized endpoint failure rather than a browser wait.
+        if refreshed.endpoint_code == "invalid_grant" && interactive && browser != nil {
+            br := browser.run(c, resource, tr)
+            if len(br.err) == 0 {
+                manager_put(m, key, br.token)
+            }
+            return auth_from_token_result(br)
+        }
+        return auth_from_token_result(refreshed)
+    }
+
+    if !interactive {
+        return auth_error_result(NonInteractiveRefusal, "browser_required")
+    }
+    if browser == nil {
+        return auth_error_result(NonInteractiveRefusal, "browser_required")
+    }
+    br := browser.run(c, resource, tr)
+    if len(br.err) == 0 {
+        manager_put(m, key, br.token)
+    }
+    return auth_from_token_result(br)
+}

@@ -1,0 +1,196 @@
+package oauth
+
+// WI-0022 S4 tests — exact-key memory cache, expiry-minus-ten semantics,
+// refresh rotation/retention, client-credentials renewal, non-interactive
+// refusal, Forget, and cache isolation.
+import "std/errors"
+import "std/testing"
+import "github.com/oxidean/oxttp/core/http"
+import "github.com/oxidean/oxttp/core/model"
+
+struct SeqTransport {
+    hits: shared,
+    status: int,
+    ctype: str,
+    body1: str,
+    body2: str,
+    fail2: str,
+    expect_refresh: str,
+}
+
+fn seq_resp(status: int, ctype: str, body: str) -> model.Resp {
+    let hs: []model.Header = nil
+    if len(ctype) > 0 {
+        hs = push(hs, model.Header{name: "Content-Type", value: ctype})
+    }
+    return model.Resp{status: status, reason: "", headers: hs, body: body as []byte, elapsed_ms: 0.0, remote: "", version: "", req_head: "", hops: nil, trace: nil, tls_ver: 0}
+}
+
+fn (f SeqTransport) send(req: ref model.Req) -> [model.Resp, err] {
+    n := sget(f.hits)
+    sadd(f.hits, 1)
+    if len(f.expect_refresh) > 0 {
+        testing.expect(req.body.kind() == 1, "refresh request body")
+        if req.body.kind() == 1 {
+            rb := req.body as model.Body.Raw
+            testing.expect(find(rb.text, "refresh_token=" + f.expect_refresh) >= 0, "latest refresh token used: " + rb.text)
+        }
+    }
+    if n == 0 {
+        return seq_resp(f.status, f.ctype, f.body1), nil
+    }
+    if len(f.fail2) > 0 {
+        return seq_resp(0, "", ""), errors.new(f.fail2)
+    }
+    return seq_resp(f.status, f.ctype, f.body2), nil
+}
+
+struct FakeBrowser {
+    token: str,
+    calls: shared,
+}
+
+fn (f FakeBrowser) run(cfg: Config, resource: ref model.Req, tr: http.Transport) -> TokenResult {
+    sadd(f.calls, 1)
+    t := Token{access_token: f.token, token_type: "Bearer", refresh_token: "browser-refresh", expiry_unix: 0, has_expiry: false}
+    return token_success_result(t)
+}
+
+fn ident() -> CacheIdentity {
+    return CacheIdentity{collection_root: "/coll", resource_url: "https://api.example.test/data", verify_ssl: true, proxy_url: ""}
+}
+
+fn manager_resource() -> own model.Req {
+    return new(model.Req)
+}
+
+fn json_token(access: str, refresh: str, expires: int) -> str {
+    return "{\"access_token\":\"" + access + "\",\"token_type\":\"Bearer\",\"refresh_token\":\"" + refresh + "\",\"expires_in\":" + itoa(expires) + "}"
+}
+
+fn test_token_validity_ten_second_window() {
+    t := Token{access_token: "a", token_type: "Bearer", refresh_token: "", expiry_unix: 110, has_expiry: true}
+    testing.expect(token_valid_at(t, 99), "before expiry-10 valid")
+    testing.expect(!token_valid_at(t, 100), "expiry minus 10 equality invalid")
+    testing.expect(!token_valid_at(t, 109), "inside window invalid")
+    t2 := Token{access_token: "a", token_type: "Bearer", refresh_token: "", expiry_unix: 0, has_expiry: false}
+    testing.expect(token_valid_at(t2, 999999), "no-expiry valid")
+    t3 := Token{access_token: "", token_type: "Bearer", refresh_token: "", expiry_unix: 0, has_expiry: false}
+    testing.expect(!token_valid_at(t3, 0), "empty access invalid")
+}
+
+fn test_client_credentials_acquire_reuse_renew() {
+    m := new(Manager)
+    m.now_unix = 1000
+    tr := SeqTransport{hits: mkshared(0), status: 200, ctype: "application/json", body1: json_token("first", "unused", 60), body2: json_token("second", "unused", 60), fail2: "", expect_refresh: ""}
+    res := manager_resource()
+    c := basecfg()
+    browser := FakeBrowser{token: "never", calls: mkshared(0)}
+    out := authorize(m, c, ident(), res, false, browser, tr)
+    testing.expect_streq(out.err, "", "client credentials acquires non-interactively")
+    testing.expect_streq(out.bearer, "first", "first token")
+    testing.expect_eq(len(out.notes), 1, "memory-only warning note")
+    testing.expect_streq(out.notes[0], MemoryOnlyWarning, "memory warning exact")
+    testing.expect_eq(sget(tr.hits), 1, "one endpoint hit")
+
+    out2 := authorize(m, c, ident(), res, false, browser, tr)
+    testing.expect_streq(out2.bearer, "first", "valid cache reused")
+    testing.expect_eq(sget(tr.hits), 1, "reuse avoids endpoint")
+    testing.expect_eq(sget(browser.calls), 0, "browser never invoked")
+
+    m.now_unix = 1050 // expiry is 1060; equality with expiry-10 invalid
+    out3 := authorize(m, c, ident(), res, false, browser, tr)
+    testing.expect_streq(out3.bearer, "second", "expired-window token renews client credentials")
+    testing.expect_eq(sget(tr.hits), 2, "renewal hit endpoint")
+}
+
+fn test_refresh_rotation_and_retention() {
+    m := new(Manager)
+    m.now_unix = 1000
+    c := with_defaults(Config{grant_type: "authorization_code", authorization_url: "https://issuer.test/auth", token_url: "https://issuer.test/token", client_id: "client", client_secret: "", scope: "", redirect_uri: "", client_auth: ""})
+    [key, ke] = manager_key(c, ident())
+    testing.expect(ke == nil, "key")
+    old := Token{access_token: "old", token_type: "Bearer", refresh_token: "refresh-one", expiry_unix: 1005, has_expiry: true}
+    manager_put(m, key, old)
+
+    tr := SeqTransport{hits: mkshared(0), status: 200, ctype: "application/json", body1: json_token("new", "", 60), body2: json_token("newer", "refresh-two", 60), fail2: "", expect_refresh: "refresh-one"}
+    res := manager_resource()
+    browser := FakeBrowser{token: "browser", calls: mkshared(0)}
+    out := authorize(m, c, ident(), res, false, browser, tr)
+    testing.expect_streq(out.bearer, "new", "refresh grant used")
+    lu := manager_get(m, key)
+    testing.expect(lu.found, "entry stored")
+    stored := lu.token
+    testing.expect_streq(stored.refresh_token, "refresh-one", "omitted refresh token retains prior")
+
+    // Force the rotated entry invalid; the next refresh must use the retained
+    // latest refresh token, not the original access token era.
+    stored.expiry_unix = 1005
+    manager_put(m, key, stored)
+    tr.expect_refresh = "refresh-one" // retained token remains latest in first leg
+    tr2 := SeqTransport{hits: mkshared(0), status: 200, ctype: "application/json", body1: json_token("newer", "refresh-two", 60), body2: "{}", fail2: "", expect_refresh: "refresh-one"}
+    out2 := authorize(m, c, ident(), res, false, browser, tr2)
+    testing.expect_streq(out2.bearer, "newer", "second refresh succeeds")
+    lu2 := manager_get(m, key)
+    testing.expect(lu2.found, "entry still stored")
+    stored2 := lu2.token
+    testing.expect_streq(stored2.refresh_token, "refresh-two", "present refresh token rotates")
+    testing.expect_eq(sget(browser.calls), 0, "no browser on refresh success")
+}
+
+
+fn test_invalid_grant_interactive_browser_fallback() {
+    m := new(Manager)
+    m.now_unix = 1000
+    c := with_defaults(Config{grant_type: "authorization_code", authorization_url: "https://issuer.test/auth", token_url: "https://issuer.test/token", client_id: "client", client_secret: "", scope: "", redirect_uri: "", client_auth: ""})
+    [key, ke] = manager_key(c, ident())
+    testing.expect(ke == nil, "key")
+    manager_put(m, key, Token{access_token: "old", token_type: "Bearer", refresh_token: "dead-refresh", expiry_unix: 1005, has_expiry: true})
+    tr := SeqTransport{hits: mkshared(0), status: 400, ctype: "application/json", body1: "{\"error\":\"invalid_grant\",\"error_description\":\"raw provider secret detail\"}", body2: "{}", fail2: "", expect_refresh: "dead-refresh"}
+    browser := FakeBrowser{token: "fresh-browser-token", calls: mkshared(0)}
+    out := authorize(m, c, ident(), manager_resource(), true, browser, tr)
+    testing.expect_streq(out.err, "", "invalid_grant falls back interactively")
+    testing.expect_streq(out.bearer, "fresh-browser-token", "browser bearer used")
+    testing.expect_eq(sget(browser.calls), 1, "browser fallback invoked")
+    lu := manager_get(m, key)
+    testing.expect(lu.found, "browser token stored under same key")
+    testing.expect_streq(lu.token.access_token, "fresh-browser-token", "stored browser token")
+}
+
+fn test_noninteractive_code_refusal_and_forget() {
+    m := new(Manager)
+    m.now_unix = 1000
+    c := with_defaults(Config{grant_type: "authorization_code", authorization_url: "https://issuer.test/auth", token_url: "https://issuer.test/token", client_id: "client", client_secret: "", scope: "", redirect_uri: "", client_auth: ""})
+    res := manager_resource()
+    browser := FakeBrowser{token: "browser", calls: mkshared(0)}
+    tr := SeqTransport{hits: mkshared(0), status: 200, ctype: "application/json", body1: "{}", body2: "{}", fail2: "", expect_refresh: ""}
+    out := authorize(m, c, ident(), res, false, browser, tr)
+    testing.expect_streq(out.err, NonInteractiveRefusal, "browser-required refusal exact")
+    testing.expect_eq(sget(browser.calls), 0, "noninteractive never invokes browser")
+    testing.expect_eq(sget(tr.hits), 0, "refusal does not hit token endpoint")
+
+    [key, _ke] = manager_key(c, ident())
+    manager_put(m, key, Token{access_token: "a", token_type: "Bearer", refresh_token: "", expiry_unix: 0, has_expiry: false})
+    fe := forget(m, c, ident())
+    testing.expect(fe == nil, "forget succeeds")
+    gone := manager_get(m, key)
+    testing.expect(!gone.found, "exact key forgotten")
+}
+
+fn test_cache_isolation_scope_and_interactive_browser_store() {
+    m := new(Manager)
+    m.now_unix = 1000
+    c := with_defaults(Config{grant_type: "authorization_code", authorization_url: "https://issuer.test/auth", token_url: "https://issuer.test/token", client_id: "client", client_secret: "", scope: "one", redirect_uri: "", client_auth: ""})
+    res := manager_resource()
+    browser := FakeBrowser{token: "browser-token", calls: mkshared(0)}
+    tr := SeqTransport{hits: mkshared(0), status: 200, ctype: "application/json", body1: "{}", body2: "{}", fail2: "", expect_refresh: ""}
+    out := authorize(m, c, ident(), res, true, browser, tr)
+    testing.expect_streq(out.bearer, "browser-token", "interactive browser flow returns bearer")
+    testing.expect_eq(sget(browser.calls), 1, "browser invoked interactively")
+
+    c2 := c
+    c2.scope = "two"
+    out2 := authorize(m, c2, ident(), res, true, browser, tr)
+    testing.expect_streq(out2.bearer, "browser-token", "different scope acquires separately")
+    testing.expect_eq(sget(browser.calls), 2, "scope change does not reuse")
+}

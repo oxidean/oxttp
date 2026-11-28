@@ -1,0 +1,162 @@
+package oauth
+
+// WI-0022 S1 — OAuth foundations: validation matrix, canonical cache-key
+// partitioning, deterministic form encoding, fixed-loop state comparison,
+// and CSPRNG/PKCE wrapper shape. No sockets or browser here.
+import "std/testing"
+import "std/errors"
+
+fn basecfg() -> Config {
+    return Config{grant_type: "client_credentials", authorization_url: "", token_url: "https://issuer.test/token", client_id: "client", client_secret: "secret", scope: "read write", redirect_uri: "", client_auth: "client_secret_post"}
+}
+
+fn expect_err(e: err, want: str, label: str) {
+    testing.expect(e != nil, label + " produced an error")
+    if e != nil {
+        testing.expect_streq(errors.msg(e), want, label)
+    }
+}
+
+fn test_defaults_and_scope() {
+    c := with_defaults(Config{grant_type: "", authorization_url: "", token_url: "https://issuer.test/token", client_id: " id ", client_secret: "", scope: "  read\twrite\n read  other ", redirect_uri: "", client_auth: ""})
+    testing.expect_streq(c.grant_type, "authorization_code", "grant default")
+    testing.expect_streq(c.client_auth, "client_secret_post", "client auth default")
+    testing.expect_streq(c.redirect_uri, "http://127.0.0.1:8765/oauth/callback", "redirect default")
+    testing.expect_streq(normalize_scope(c.scope), "read write other", "scope whitespace normalized deduplicated")
+}
+
+fn test_validation_matrix() {
+    c := basecfg()
+    testing.expect(validate_config(c, "https://api.example.test/resource") == nil, "valid client credentials config")
+
+    badgrant := basecfg()
+    badgrant.grant_type = "device_code"
+    expect_err(validate_config(badgrant, "https://api.example.test/"), "OAuth grant must be authorization_code or client_credentials", "unsupported grant")
+
+    blankid := basecfg()
+    blankid.client_id = " \t"
+    expect_err(validate_config(blankid, "https://api.example.test/"), "OAuth client ID is required", "blank client id")
+
+    insecuretoken := basecfg()
+    insecuretoken.token_url = "http://issuer.test/token"
+    expect_err(validate_config(insecuretoken, "https://api.example.test/"), "OAuth token URL must use HTTPS (HTTP is allowed only on loopback)", "insecure token URL")
+
+    badauth := basecfg()
+    badauth.client_auth = "client_secret_header"
+    expect_err(validate_config(badauth, "https://api.example.test/"), "OAuth client authentication must be client_secret_basic or client_secret_post", "invalid client auth")
+
+    nosecret := basecfg()
+    nosecret.client_secret = ""
+    expect_err(validate_config(nosecret, "https://api.example.test/"), "OAuth client secret is required for client credentials", "client credentials secret required")
+
+    code := with_defaults(Config{grant_type: "authorization_code", authorization_url: "https://issuer.test/authorize", token_url: "https://issuer.test/token", client_id: "client", client_secret: "", scope: "", redirect_uri: "http://127.0.0.1:8765/oauth/callback", client_auth: "client_secret_post"})
+    testing.expect(validate_config(code, "https://api.example.test/") == nil, "valid authorization code config")
+
+    insecureauth := code
+    insecureauth.authorization_url = "http://issuer.test/authorize"
+    expect_err(validate_config(insecureauth, "https://api.example.test/"), "OAuth authorization URL must use HTTPS (HTTP is allowed only on loopback)", "insecure authorization URL")
+
+    badredirect := code
+    badredirect.redirect_uri = "http://localhost:8765/oauth/callback"
+    expect_err(validate_config(badredirect, "https://api.example.test/"), "OAuth redirect URI must be an HTTP loopback IP with a port and path, e.g. http://127.0.0.1:8765/oauth/callback", "localhost redirect rejected")
+
+    insecure_resource := basecfg()
+    expect_err(validate_config(insecure_resource, "http://api.example.test/"), "OAuth requests require HTTPS (HTTP is allowed only on loopback)", "insecure resource URL")
+    testing.expect(validate_config(insecure_resource, "http://127.0.0.1:8000/") == nil, "loopback resource HTTP accepted")
+}
+
+fn test_redirect_matrix() {
+    testing.expect(validate_redirect("http://127.0.0.1:0/cb") == nil, "port zero redirect valid")
+    testing.expect(validate_redirect("http://[::1]:8765/cb") == nil, "IPv6 syntax accepted semantically")
+    msg := "OAuth redirect URI must be an HTTP loopback IP with a port and path, e.g. http://127.0.0.1:8765/oauth/callback"
+    expect_err(validate_redirect("https://127.0.0.1:8765/cb"), msg, "redirect scheme")
+    expect_err(validate_redirect("http://127.0.0.1/cb"), msg, "redirect missing port")
+    expect_err(validate_redirect("http://127.0.0.1:8765"), msg, "redirect missing path")
+    expect_err(validate_redirect("http://127.0.0.1:8765/cb?x=1"), msg, "redirect query")
+    expect_err(validate_redirect("http://user@127.0.0.1:8765/cb"), msg, "redirect userinfo")
+    expect_err(validate_redirect("http://10.0.0.8:8765/cb"), msg, "redirect non-loopback")
+
+    cap := listener_capability()
+    testing.expect(!cap.ipv6_loopback, "oxl 0.26 exposes no IPv6 loopback listener")
+    e := ipv6_redirect_execution_error()
+    testing.expect(e != nil, "IPv6 execution error present")
+    testing.expect(find(errors.msg(e), "unsupported") >= 0, "IPv6 execution error is explicit")
+}
+
+fn test_cache_key_partitioning() {
+    c := with_defaults(basecfg())
+    [k0, e0] = cache_key("/coll", "https://api.example.test/x", c, true, "")
+    testing.expect(e0 == nil, "cache key computes")
+    testing.expect_eq(len(k0), 64, "sha256 hex length")
+
+    c2 := c
+    c2.scope = "read other"
+    [kscope, _e1] = cache_key("/coll", "https://api.example.test/x", c2, true, "")
+    testing.expect(kscope != k0, "scope partitions cache")
+
+    [kcoll, _e2] = cache_key("/other", "https://api.example.test/x", c, true, "")
+    testing.expect(kcoll != k0, "collection root partitions cache")
+    [kverify, _e3] = cache_key("/coll", "https://api.example.test/x", c, false, "")
+    testing.expect(kverify != k0, "verify flag partitions cache")
+    [kproxy, _e4] = cache_key("/coll", "https://api.example.test/x", c, true, "http://proxy.test:8080")
+    testing.expect(kproxy != k0, "proxy partitions cache")
+    [korigin, _e5] = cache_key("/coll", "https://other.example.test/x", c, true, "")
+    testing.expect(korigin != k0, "origin partitions cache")
+    [ksame, _e6] = cache_key("/coll", "https://api.example.test/other/path?q=1", c, true, "")
+    testing.expect_streq(ksame, k0, "same origin reuses despite path/query")
+
+    cg := c
+    cg.grant_type = "authorization_code"
+    [kg, _eg] = cache_key("/coll", "https://api.example.test/x", cg, true, "")
+    testing.expect(kg != k0, "grant partitions cache")
+    ca := c
+    ca.authorization_url = "https://issuer.test/other-auth"
+    [ka, _ea] = cache_key("/coll", "https://api.example.test/x", ca, true, "")
+    testing.expect(ka != k0, "authorization URL partitions cache")
+    ct := c
+    ct.token_url = "https://issuer.test/other-token"
+    [kt, _et] = cache_key("/coll", "https://api.example.test/x", ct, true, "")
+    testing.expect(kt != k0, "token URL partitions cache")
+    ci := c
+    ci.client_id = "other-client"
+    [ki, _ei] = cache_key("/coll", "https://api.example.test/x", ci, true, "")
+    testing.expect(ki != k0, "client id partitions cache")
+    cs := c
+    cs.client_secret = "other-secret"
+    [ks, _es] = cache_key("/coll", "https://api.example.test/x", cs, true, "")
+    testing.expect(ks != k0, "client secret partitions cache")
+    cr := c
+    cr.redirect_uri = "http://127.0.0.1:9999/other"
+    [kr, _er] = cache_key("/coll", "https://api.example.test/x", cr, true, "")
+    testing.expect(kr != k0, "redirect URI partitions cache")
+    cb := c
+    cb.client_auth = "client_secret_basic"
+    [kb, _eb] = cache_key("/coll", "https://api.example.test/x", cb, true, "")
+    testing.expect(kb != k0, "client auth partitions cache")
+}
+
+fn test_encoding_state_and_pkce() {
+    let fields: []FormField = nil
+    fields = push(fields, FormField{name: "z key", value: "last"})
+    fields = push(fields, FormField{name: "a", value: "one two"})
+    fields = push(fields, FormField{name: "a", value: "zero"})
+    testing.expect_streq(form_encode(fields), "a=one+two&a=zero&z+key=last", "sorted deterministic form encoding")
+    testing.expect_streq(query_escape("a b&="), "a+b%26%3D", "query escape helper")
+
+    testing.expect(state_equal("abc", "abc"), "state equal")
+    testing.expect(!state_equal("abc", "abd"), "state mismatch")
+    testing.expect(!state_equal("abc", "abcd"), "state length mismatch")
+
+    rb := mkslice(byte, 3)
+    rb[0] = 251
+    rb[1] = 255
+    rb[2] = 254
+    testing.expect_streq(raw_url_base64(rb), "-__-", "raw URL base64")
+    [st, se] = new_state()
+    testing.expect(se == nil, "state CSPRNG succeeds")
+    testing.expect_eq(len(st), 43, "state length")
+    [ver, ve] = new_pkce_verifier()
+    testing.expect(ve == nil, "verifier CSPRNG succeeds")
+    testing.expect_eq(len(ver), 43, "verifier length")
+    testing.expect_eq(len(pkce_challenge(ver)), 43, "S256 challenge length")
+}

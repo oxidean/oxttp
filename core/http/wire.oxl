@@ -404,6 +404,16 @@ fn content_length(hs: []model.Header) -> [int, err] {
     return v, nil
 }
 
+// body_cap_error is deliberately non-secret and byte-exact for callers
+// (notably OAuth) that need a safe transport failure category.
+fn body_cap_error(limit: int) -> err {
+    return errors.new("http: response body exceeds " + itoa(limit) + " byte limit")
+}
+
+fn body_cap_hit(got: int, limit: int) -> bool {
+    return limit > 0 && got > limit
+}
+
 // read_exact reads exactly n bytes or fails (short read = truncation).
 fn read_exact(r: mut bufio.Reader, n: int) -> [[]byte, err] {
     out := mkslice(byte, n)
@@ -426,12 +436,21 @@ fn read_exact(r: mut bufio.Reader, n: int) -> [[]byte, err] {
 // read_eof drains the reader until io.eof() — the HTTP/1.0 and
 // connection-close body framing.
 fn read_eof(r: mut bufio.Reader) -> [[]byte, err] {
+    return read_eof_cap(r, 0)
+}
+
+// read_eof_cap is read_eof with an opt-in accumulated-byte cap. The cap is
+// enforced while streaming, before the peer can grow memory without bound.
+fn read_eof_cap(r: mut bufio.Reader, limit: int) -> [[]byte, err] {
     out := mkslice(byte, 0)
     scratch := mkslice(byte, 8192)
     dry := 0
     for true {
         [n, e] = r.read(scratch)
         if n > 0 {
+            if body_cap_hit(len(out) + n, limit) {
+                return nil, body_cap_error(limit)
+            }
             i := 0
             for i < n {
                 out = push(out, scratch[i])
@@ -458,6 +477,11 @@ fn read_eof(r: mut bufio.Reader) -> [[]byte, err] {
 // fields in wire order. Chunk extensions are ignored; a missing
 // CRLF or truncated stream is a hard error.
 fn read_chunked(r: mut bufio.Reader) -> [ChunkedBody, err] {
+    return read_chunked_cap(r, 0)
+}
+
+// read_chunked_cap is read_chunked with an opt-in accumulated payload cap.
+fn read_chunked_cap(r: mut bufio.Reader, limit: int) -> [ChunkedBody, err] {
     cb := ChunkedBody{data: mkslice(byte, 0), trailers: nil}
     for true {
         [line, e] = r.readline()
@@ -493,6 +517,9 @@ fn read_chunked(r: mut bufio.Reader) -> [ChunkedBody, err] {
                 }
                 cb.trailers = push(cb.trailers, model.Header{name: substr(t, 0, c), value: trim_ows(substr(t, c + 1, len(t)))})
             }
+        }
+        if body_cap_hit(len(cb.data) + sz, limit) {
+            return cb, body_cap_error(limit)
         }
         [d, de] = read_exact(r, sz)
         if de != nil {

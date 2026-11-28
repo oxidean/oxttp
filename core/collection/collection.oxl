@@ -7,6 +7,7 @@ package collection
 
 import "std/encoding/json"
 import "github.com/oxidean/oxttp/core/model"
+import "github.com/oxidean/oxttp/core/oauth"
 
 // PBody: exactly one of content / form_data / multipart / file
 // (corpus: >1 = parse error; part needs exactly one of value|file).
@@ -146,6 +147,10 @@ struct CollScan {
 
 struct SendPlan {
     req: own model.Req,
+    // oauth is present for auth.type=oauth2 after active-field substitution
+    // and validation. Planning is pure: no token endpoint, socket, or browser
+    // work happens here.
+    oauth: own oauth.Plan,
     warns: []str,
     err: str,
 }
@@ -1995,11 +2000,77 @@ fn collect_proxy_env() -> []str {
     return out
 }
 
+// subst_oauth_active substitutes one active OAuth field. Unlike ordinary
+// headers/body values, unresolved OAuth variables are send-time errors (the
+// token endpoint must never see a literal "$NAME" credential), hence in_url
+// is true even though these are not URL text.
+fn subst_oauth_active(v: str, es: ref env.EnvSet) -> [str, err] {
+    return env.substitute(v, es, true)
+}
+
+// plan_oauth builds the pure OAuth execution plan for a request. Fields are
+// substituted before defaults/validation exactly per spec §2; code-only
+// fields stay inactive (and may contain unresolved variables) for
+// client-credentials.
+fn plan_oauth(o: ref POAuth2, es: ref env.EnvSet, resource_url: str, coll_dir: str, verify_ssl: bool, proxy_url: str) -> [own oauth.Plan, err] {
+    c := oauth.Config{grant_type: o.grant_type, authorization_url: "", token_url: "", client_id: "", client_secret: "", scope: "", redirect_uri: "", client_auth: o.client_auth}
+    [tu, te] = subst_oauth_active(o.token_url, es)
+    if te != nil {
+        return nil, te
+    }
+    c.token_url = tu
+    [cid, ce] = subst_oauth_active(o.client_id, es)
+    if ce != nil {
+        return nil, ce
+    }
+    c.client_id = cid
+    [cs, cse] = subst_oauth_active(o.client_secret, es)
+    if cse != nil {
+        return nil, cse
+    }
+    c.client_secret = cs
+    [sc, sce] = subst_oauth_active(o.scope, es)
+    if sce != nil {
+        return nil, sce
+    }
+    c.scope = sc
+    effective_grant := o.grant_type
+    if len(effective_grant) == 0 {
+        effective_grant = "authorization_code"
+    }
+    if effective_grant == "authorization_code" {
+        [au, ae] = subst_oauth_active(o.authorization_url, es)
+        if ae != nil {
+            return nil, ae
+        }
+        c.authorization_url = au
+        [ru, re] = subst_oauth_active(o.redirect_uri, es)
+        if re != nil {
+            return nil, re
+        }
+        c.redirect_uri = ru
+    } else {
+        c.authorization_url = o.authorization_url
+        c.redirect_uri = o.redirect_uri
+    }
+    c = oauth.with_defaults(c)
+    ve := oauth.validate_config(c, resource_url)
+    if ve != nil {
+        return nil, ve
+    }
+    root := coll_dir
+    if len(root) > 0 {
+        root = os.fullpath(root)
+    }
+    id := oauth.CacheIdentity{collection_root: root, resource_url: resource_url, verify_ssl: verify_ssl, proxy_url: proxy_url}
+    return new(oauth.Plan{cfg: c, identity: id}), nil
+}
+
 // plan_req maps a decoded request + environment + cookie jar into a
 // wire model.Req — corpus §7.1. err set → caller toasts; warns → info
 // toasts (env-layer warnings etc.).
 fn plan_req(r: ref PRequest, envset: ref env.EnvSet, jar: []str, coll_dir: str) -> SendPlan {
-    sp := SendPlan{req: nil, warns: nil, err: ""}
+    sp := SendPlan{req: nil, oauth: nil, warns: nil, err: ""}
     if len(r.kind) > 0 {
         sp.err = "kind " + r.kind + " sends land M4 — unsupported in this build"
         return sp
@@ -2202,8 +2273,20 @@ fn plan_req(r: ref PRequest, envset: ref env.EnvSet, jar: []str, coll_dir: str) 
             b = model.Body.FileBody{path: fp, ctype: ct2, filename: ""}
         }
     }
-    // auth — an explicit enabled Authorization row wins over the block
-    if r.auth != nil && len(r.auth.type) > 0 && !hdr_named(hdrs, "Authorization") {
+    // OAuth planning is independent of explicit Authorization rows: OAuth
+    // execution later replaces those rows on the wire without mutating the
+    // saved request. Non-OAuth explicit-header precedence is unchanged.
+    if r.auth != nil && r.auth.type == "oauth2" && r.auth.oauth2 != nil {
+        [op, oe] = plan_oauth(r.auth.oauth2, es, u, coll_dir, verify, proxy)
+        if oe != nil {
+            sp.err = errors.msg(oe)
+            return sp
+        }
+        sp.oauth = op
+    }
+    // auth — an explicit enabled Authorization row wins over the non-OAuth
+    // block (OAuth is carried on SendPlan and authorized later).
+    if r.auth != nil && len(r.auth.type) > 0 && r.auth.type != "oauth2" && !hdr_named(hdrs, "Authorization") {
         if r.auth.type == "basic" && r.auth.basic != nil {
             [usr, uer] = env.substitute(r.auth.basic.username, es, false)
             if uer != nil {
@@ -2226,9 +2309,6 @@ fn plan_req(r: ref PRequest, envset: ref env.EnvSet, jar: []str, coll_dir: str) 
             hdrs = push(hdrs, model.Header{name: "Authorization", value: "Bearer " + tk})
         } else if r.auth.type == "digest" {
             sp.err = "digest auth needs challenge retry — unsupported in this build"
-            return sp
-        } else if r.auth.type == "oauth2" {
-            sp.err = "oauth2 auth lands M4 — unsupported in this build"
             return sp
         }
     }

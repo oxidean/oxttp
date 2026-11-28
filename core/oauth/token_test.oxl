@@ -1,0 +1,194 @@
+package oauth
+
+// WI-0022 S3 tests — token request construction, auth-secret placement,
+// transport policy fields, parser matrix, and sanitization.
+import "std/errors"
+import "std/testing"
+import "github.com/oxidean/oxttp/core/model"
+
+struct InspectTransport {
+    status: int,
+    ctype: str,
+    body: str,
+    fail: str,
+    expect_basic: str,
+    expect_form_part: str,
+}
+
+fn (f InspectTransport) send(req: ref model.Req) -> [model.Resp, err] {
+    testing.expect_streq(req.method, "POST", "token request method")
+    testing.expect_eq(req.timeout_ms, 30000, "token timeout")
+    testing.expect(!req.follow, "token redirects disabled")
+    testing.expect_eq(req.max_redirects, 0, "token redirect count")
+    testing.expect_eq(req.max_body_bytes, 1048576, "token body cap")
+    testing.expect(req.body.kind() == 1, "raw form body")
+    if req.body.kind() == 1 {
+        rb := req.body as model.Body.Raw
+        testing.expect_streq(rb.ctype, "application/x-www-form-urlencoded", "form content type")
+        if len(f.expect_form_part) > 0 {
+            testing.expect(find(rb.text, f.expect_form_part) >= 0, "expected form part " + f.expect_form_part + " in " + rb.text)
+        }
+    }
+    if len(f.expect_basic) > 0 {
+        testing.expect_streq(hdr_value(req.headers, "authorization"), f.expect_basic, "basic authorization")
+    }
+    if len(f.fail) > 0 {
+        return model.Resp{status: 0, reason: "", headers: nil, body: nil, elapsed_ms: 0.0, remote: "", version: "", req_head: "", hops: nil, trace: nil, tls_ver: 0}, errors.new(f.fail)
+    }
+    let hs: []model.Header = nil
+    if len(f.ctype) > 0 {
+        hs = push(hs, model.Header{name: "Content-Type", value: f.ctype})
+    }
+    return model.Resp{status: f.status, reason: "", headers: hs, body: f.body as []byte, elapsed_ms: 0.0, remote: "", version: "", req_head: "", hops: nil, trace: nil, tls_ver: 0}, nil
+}
+
+fn resource_req() -> own model.Req {
+    r := new(model.Req)
+    r.verify = "no"
+    r.cert_pem = "CERT"
+    r.key_pem = "KEY"
+    r.proxies = push(r.proxies, "all:http://proxy.test:8080")
+    r.no_proxy = "localhost"
+    r.proxy_go = true
+    return r
+}
+
+fn test_client_credentials_post_request() {
+    c := with_defaults(basecfg())
+    c.client_auth = "client_secret_post"
+    c.scope = "read write"
+    res := resource_req()
+    rq := client_credentials_request(c, res)
+    testing.expect_streq(rq.url, c.token_url, "token url")
+    testing.expect_streq(rq.verify, "no", "verify copied")
+    testing.expect_streq(rq.cert_pem, "CERT", "cert copied")
+    testing.expect_streq(rq.key_pem, "KEY", "key copied")
+    testing.expect_eq(len(rq.proxies), 1, "proxy copied")
+    testing.expect_streq(rq.no_proxy, "localhost", "no_proxy copied")
+    testing.expect(rq.proxy_go, "proxy semantics copied")
+    testing.expect_eq(len(rq.headers), 0, "post auth has no authorization header")
+    rb := rq.body as model.Body.Raw
+    testing.expect_streq(rb.text, "client_id=client&client_secret=secret&grant_type=client_credentials&scope=read+write", "client credentials post form")
+}
+
+fn test_client_credentials_basic_request() {
+    c := with_defaults(basecfg())
+    c.client_auth = "client_secret_basic"
+    c.client_id = "id space"
+    c.client_secret = "sec&ret"
+    res := resource_req()
+    rq := client_credentials_request(c, res)
+    rb := rq.body as model.Body.Raw
+    testing.expect(find(rb.text, "client_secret") < 0, "basic secret not duplicated in form")
+    testing.expect(find(rb.text, "client_id=") < 0, "basic id is not duplicated in form")
+    // queryescape each half before joining and std-base64 encoding:
+    // "id+space:sec%26ret"
+    testing.expect_streq(hdr_value(rq.headers, "authorization"), "Basic aWQrc3BhY2U6c2VjJTI2cmV0", "basic uses query-escaped halves")
+}
+
+fn test_refresh_and_code_request_forms() {
+    c := with_defaults(basecfg())
+    res := resource_req()
+    rr := refresh_request(c, res, "refresh one")
+    rb := rr.body as model.Body.Raw
+    testing.expect(find(rb.text, "grant_type=refresh_token") >= 0, "refresh grant")
+    testing.expect(find(rb.text, "refresh_token=refresh+one") >= 0, "refresh token encoded")
+    cr := code_exchange_request(c, res, "code&one", "http://127.0.0.1:9999/cb", "verifier one")
+    cb := cr.body as model.Body.Raw
+    testing.expect(find(cb.text, "grant_type=authorization_code") >= 0, "code grant")
+    testing.expect(find(cb.text, "code=code%26one") >= 0, "code encoded")
+    testing.expect(find(cb.text, "redirect_uri=http%3A%2F%2F127.0.0.1%3A9999%2Fcb") >= 0, "actual redirect encoded")
+    testing.expect(find(cb.text, "code_verifier=verifier+one") >= 0, "verifier encoded")
+}
+
+fn expect_invalid_body(body: str, ctype: str, label: str) {
+    tr := InspectTransport{status: 200, ctype: ctype, body: body, fail: "", expect_basic: "", expect_form_part: ""}
+    c := with_defaults(basecfg())
+    res := resource_req()
+    rq := client_credentials_request(c, res)
+    out := send_token_at(tr, rq, 1000)
+    testing.expect_streq(out.classification, "invalid_response", label + " classification")
+    testing.expect_streq(out.err, "OAuth token endpoint returned an invalid response", label + " safe error")
+}
+
+fn test_json_parser_success_matrix() {
+    tr := InspectTransport{status: 200, ctype: "application/json", body: "{\"access_token\":\"tok\",\"token_type\":\"bearer\",\"refresh_token\":\"ref\",\"expires_in\":60}", fail: "", expect_basic: "", expect_form_part: ""}
+    c := with_defaults(basecfg())
+    res := resource_req()
+    rq := client_credentials_request(c, res)
+    out := send_token_at(tr, rq, 1000)
+    testing.expect_streq(out.classification, "success", "json success")
+    testing.expect_streq(out.token.access_token, "tok", "access token")
+    testing.expect_streq(out.token.refresh_token, "ref", "refresh token")
+    testing.expect_eq(out.token.expiry_unix, 1060, "expiry conversion")
+
+    tr2 := InspectTransport{status: 200, ctype: "application/json", body: "{\"access_token\":\"tok\",\"expires_in\":\"60\"}", fail: "", expect_basic: "", expect_form_part: ""}
+    out2 := send_token_at(tr2, rq, 1000)
+    testing.expect_eq(out2.token.expiry_unix, 1060, "integer-string expires_in")
+    tr2pad := InspectTransport{status: 200, ctype: "application/json", body: "{\"access_token\":\"tok\",\"expires_in\":\"060\"}", fail: "", expect_basic: "", expect_form_part: ""}
+    out2pad := send_token_at(tr2pad, rq, 1000)
+    testing.expect_eq(out2pad.token.expiry_unix, 1060, "zero-padded integer-string matches upstream")
+    trbig := InspectTransport{status: 200, ctype: "application/json", body: "{\"access_token\":\"tok\",\"expires_in\":2147483648}", fail: "", expect_basic: "", expect_form_part: ""}
+    outbig := send_token_at(trbig, rq, 1000)
+    testing.expect_eq(outbig.token.expiry_unix, 2147484647, "large positive expiry saturates at upstream int32 max")
+    tr3 := InspectTransport{status: 200, ctype: "application/json", body: "{\"access_token\":\"tok\",\"expires_in\":null}", fail: "", expect_basic: "", expect_form_part: ""}
+    out3 := send_token_at(tr3, rq, 1000)
+    testing.expect(!out3.token.has_expiry, "null expires_in means no expiry")
+}
+
+fn expect_unusable_body(body: str, label: str) {
+    tr := InspectTransport{status: 200, ctype: "application/json", body: body, fail: "", expect_basic: "", expect_form_part: ""}
+    c := with_defaults(basecfg())
+    res := resource_req()
+    rq := client_credentials_request(c, res)
+    out := send_token_at(tr, rq, 1000)
+    testing.expect_streq(out.classification, "invalid_response", label + " classification")
+    testing.expect_streq(out.err, "OAuth endpoint did not return a usable Bearer token", label + " exact error")
+}
+
+fn test_json_parser_invalid_matrix() {
+    expect_invalid_body("not json", "application/json", "malformed json")
+    expect_invalid_body("{\"access_token\":\"tok\",\"expires_in\":1.5}", "application/json", "float expires")
+    expect_invalid_body("{\"access_token\":\"tok\",\"expires_in\":true}", "application/json", "bool expires")
+    expect_unusable_body("{\"access_token\":\"\"}", "empty access token")
+    expect_unusable_body("{\"access_token\":\"tok\",\"token_type\":\"mac\"}", "non-bearer type")
+    expect_unusable_body("{\"access_token\":\"tok\\n\"}", "CRLF token rejected")
+}
+
+fn test_form_parser_and_endpoint_errors() {
+    tr := InspectTransport{status: 200, ctype: "application/x-www-form-urlencoded", body: "access_token=tok&token_type=Bearer&refresh_token=ref&expires_in=30", fail: "", expect_basic: "", expect_form_part: ""}
+    c := with_defaults(basecfg())
+    res := resource_req()
+    rq := client_credentials_request(c, res)
+    out := send_token_at(tr, rq, 1000)
+    testing.expect_streq(out.classification, "success", "form success")
+    testing.expect_eq(out.token.expiry_unix, 1030, "form expiry")
+
+    trbad := InspectTransport{status: 200, ctype: "text/plain", body: "access_token=tok&expires_in=nope", fail: "", expect_basic: "", expect_form_part: ""}
+    outbad := send_token_at(trbad, rq, 1000)
+    testing.expect_streq(outbad.classification, "success", "unparseable form expiry is no-expiry upstream behavior")
+    testing.expect(!outbad.token.has_expiry, "form invalid expiry omitted")
+
+    trerr := InspectTransport{status: 200, ctype: "application/json", body: "{\"error\":\"invalid_grant\",\"error_description\":\"refresh secret raw detail\"}", fail: "", expect_basic: "", expect_form_part: ""}
+    outerr := send_token_at(trerr, rq, 1000)
+    testing.expect_streq(outerr.classification, "endpoint", "error-in-200 endpoint rejection")
+    testing.expect_streq(outerr.endpoint_code, "invalid_grant", "safe internal code retained")
+    testing.expect_streq(outerr.err, "OAuth grant expired or was revoked; use Forget OAuth token and sign in again", "invalid_grant exact safe error")
+    testing.expect(find(outerr.err, "raw detail") < 0, "raw endpoint description not leaked")
+
+    tr400 := InspectTransport{status: 400, ctype: "application/json", body: "{\"error\":\"invalid_client\",\"error_description\":\"client secret was wrong\"}", fail: "", expect_basic: "", expect_form_part: ""}
+    out400 := send_token_at(tr400, rq, 1000)
+    testing.expect_streq(out400.err, "OAuth token endpoint rejected the request (HTTP 400); check the client credentials, scope and client authentication method", "endpoint rejection exact safe error")
+    testing.expect(find(out400.err, "secret") < 0 || find(out400.err, "client credentials") >= 0, "only fixed safe text")
+}
+
+fn test_transport_error_sanitized() {
+    tr := InspectTransport{status: 0, ctype: "", body: "", fail: "dial secret-user:secret-pass@example failed", expect_basic: "", expect_form_part: ""}
+    c := with_defaults(basecfg())
+    res := resource_req()
+    rq := client_credentials_request(c, res)
+    out := send_token_at(tr, rq, 1000)
+    testing.expect_streq(out.classification, "network", "network classification")
+    testing.expect_streq(out.err, "OAuth token endpoint could not be reached; check its URL, proxy and TLS settings", "network safe error")
+    testing.expect(find(out.err, "secret-pass") < 0, "transport secret not leaked")
+}

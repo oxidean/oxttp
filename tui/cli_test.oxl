@@ -371,3 +371,82 @@ fn test_run_ssl_password_and_tls12_warn() {
     testing.expect(find(rep.stderr, "encrypted private keys") < 0, "no cert → no password warning")
     os.remove_all(dir)
 }
+
+// WI-0022 S10 — posting run OAuth: one process-local memory manager,
+// non-interactive client-credentials acquisition/reuse, exact code-grant
+// refusal, and no token endpoint report rows.
+struct RunOAuthTransport {
+    token_hits: shared,
+    resource_hits: shared,
+}
+
+fn run_oauth_resp(body: str) -> model.Resp {
+    hs := mkslice(model.Header, 0)
+    hs = push(hs, model.Header{name: "Content-Type", value: "application/json"})
+    return model.Resp{status: 200, reason: "OK", headers: hs,
+        body: body as []byte, elapsed_ms: 1.0, remote: "", version: "1.1",
+        req_head: "", hops: nil, trace: nil, tls_ver: 0}
+}
+
+fn (f RunOAuthTransport) send(req: ref model.Req) -> [model.Resp, err] {
+    if find(req.url, "/token") >= 0 {
+        sadd(f.token_hits, 1)
+        return run_oauth_resp("{\"access_token\":\"run-oauth-token\",\"token_type\":\"Bearer\",\"expires_in\":3600}"), nil
+    }
+    sadd(f.resource_hits, 1)
+    auths := 0
+    i := 0
+    for i < len(req.headers) {
+        if ascii_eq(req.headers[i].name, "Authorization") {
+            auths = auths + 1
+            testing.expect_streq(req.headers[i].value, "Bearer run-oauth-token", "run bearer header")
+        }
+        i = i + 1
+    }
+    testing.expect_eq(auths, 1, "run exactly one bearer")
+    return fake_resp(200, "text/plain", "ok", nil), nil
+}
+
+fn test_run_oauth_client_credentials_reuse_and_code_refusal() {
+    dir := "/tmp/oxttp-run-oauth"
+    os.remove_all(dir)
+    os.mkdir_all(dir)
+    os.writefile_(dir + "/cc.posting.yaml", "name: cc\nmethod: GET\nurl: https://api.example.test/a\nauth:\n  type: oauth2\n  oauth2:\n    grant_type: client_credentials\n    token_url: https://issuer.example.test/token\n    client_id: cid\n    client_secret: sec\n")
+    os.writefile_(dir + "/cc2.posting.yaml", "name: cc2\nmethod: GET\nurl: https://api.example.test/b\nauth:\n  type: oauth2\n  oauth2:\n    grant_type: client_credentials\n    token_url: https://issuer.example.test/token\n    client_id: cid\n    client_secret: sec\n")
+    os.writefile_(dir + "/cc3.posting.yaml", "name: cc3\nmethod: GET\nurl: https://api.example.test/c\nauth:\n  type: oauth2\n  oauth2:\n    grant_type: client_credentials\n    token_url: https://issuer.example.test/token\n    client_id: cid\n    client_secret: sec\n    scope: changed\n")
+    o := new(RunOpts)
+    o.coll = dir
+    o.target = dir
+    tr := RunOAuthTransport{token_hits: mkshared(0), resource_hits: mkshared(0)}
+    rep := run_exec(o, tr)
+    testing.expect(len(rep.err) == 0, "run err: " + rep.err)
+    testing.expect(rep.code == 0, "client credentials run passes: " + rep.err)
+    testing.expect_eq(sget(tr.token_hits), 2, "equivalent request reuses; changed scope acquires separately")
+    testing.expect_eq(sget(tr.resource_hits), 3, "three resource sends only")
+    testing.expect_eq(len(rep.lines), 4, "token traffic has no report row")
+
+    os.remove(dir + "/cc.posting.yaml")
+    os.remove(dir + "/cc2.posting.yaml")
+    os.remove(dir + "/cc3.posting.yaml")
+    os.writefile_(dir + "/code.posting.yaml", "name: code\nmethod: GET\nurl: https://api.example.test/c\nauth:\n  type: oauth2\n  oauth2:\n    grant_type: authorization_code\n    authorization_url: https://issuer.example.test/auth\n    token_url: https://issuer.example.test/token\n    client_id: cid\n    redirect_uri: http://127.0.0.1:0/cb\n")
+    tr2 := RunOAuthTransport{token_hits: mkshared(0), resource_hits: mkshared(0)}
+    rep2 := run_exec(o, tr2)
+    testing.expect_eq(rep2.code, 1, "fresh code grant fails non-interactively")
+    testing.expect(find(rep2.lines[0], "send the request to authorize OAuth in your browser first") >= 0, "exact refusal in output")
+    testing.expect_eq(sget(tr2.token_hits), 0, "no token endpoint hit")
+    testing.expect_eq(sget(tr2.resource_hits), 0, "no resource sent")
+
+    ojson := new(RunOpts)
+    ojson.coll = dir
+    ojson.target = dir
+    ojson.json = true
+    ojson.fail_fast = true
+    tr3 := RunOAuthTransport{token_hits: mkshared(0), resource_hits: mkshared(0)}
+    repj := run_exec(ojson, tr3)
+    testing.expect_eq(repj.code, 1, "json oauth failure exit")
+    testing.expect_eq(len(repj.lines), 1, "json report is one document")
+    testing.expect(find(repj.lines[0], "\"outcome\":\"failed\"") >= 0, "json failure outcome")
+    testing.expect(find(repj.lines[0], "send the request to authorize OAuth in your browser first") >= 0, "json exact safe refusal")
+    testing.expect(find(repj.lines[0], "run-oauth-token") < 0, "runtime token never enters json stdout")
+    os.remove_all(dir)
+}

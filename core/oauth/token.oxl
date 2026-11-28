@@ -1,0 +1,363 @@
+package oauth
+
+// WI-0022 S3 — OAuth token endpoint client and response parser.
+// The transport is injected; production passes core/http.H1 while tests use
+// fixtures. Returned user-facing errors are sanitized in this package —
+// endpoint bodies, codes, secrets and transport details never propagate.
+import "std/encoding/base64"
+import "std/encoding/json"
+import "std/net/url"
+import "std/strconv"
+import "github.com/oxidean/oxttp/core/http"
+import "github.com/oxidean/oxttp/core/model"
+
+let TokenBodyCap = 1048576
+let TokenTimeoutMs = 30000
+
+// EndpointToken is the wire-level token response before expires_in is
+// converted to the session clock.
+struct EndpointToken {
+    access_token: str,
+    token_type: str,
+    refresh_token: str,
+    expires_in: int,
+    has_expires_in: bool,
+    error_code: str,
+    endpoint_error: bool,
+    invalid: bool,
+}
+
+// TokenReply is parse_endpoint_response's classified result.
+struct TokenReply {
+    token: EndpointToken,
+    invalid_response: bool,
+}
+
+fn hdr_value(hs: []model.Header, name: str) -> str {
+    ln := lwr(name)
+    i := 0
+    for i < len(hs) {
+        if lwr(hs[i].name) == ln {
+            return hs[i].value
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn form_ct(ctype: str) -> bool {
+    c := lwr(ctype)
+    semi := find(c, ";")
+    if semi >= 0 {
+        c = substr(c, 0, semi)
+    }
+    // trim optional whitespace around the media type
+    for len(c) > 0 && (byteat(c, 0) == 32 || byteat(c, 0) == 9) {
+        c = substr(c, 1, len(c))
+    }
+    for len(c) > 0 && (byteat(c, len(c) - 1) == 32 || byteat(c, len(c) - 1) == 9) {
+        c = substr(c, 0, len(c) - 1)
+    }
+    return c == "application/x-www-form-urlencoded" || c == "text/plain"
+}
+
+fn add_field(fs: []FormField, name: str, value: str) -> []FormField {
+    return push(fs, FormField{name: name, value: value})
+}
+
+// copy_token_security copies the resource request's TLS/proxy security
+// context into a token endpoint request. Timeout/redirect/body cap are OAuth
+// fixed policy, independent of resource settings.
+fn copy_token_security(dst: mut model.Req, src: ref model.Req) {
+    dst.verify = src.verify
+    dst.ssl_min = src.ssl_min
+    dst.ssl_max = src.ssl_max
+    dst.cert_pem = src.cert_pem
+    dst.key_pem = src.key_pem
+    dst.proxies = src.proxies
+    dst.proxy_env = src.proxy_env
+    dst.no_proxy = src.no_proxy
+    dst.proxy_go = src.proxy_go
+    dst.cgi = src.cgi
+}
+
+fn finish_token_request(cfg: Config, resource: ref model.Req, fields: []FormField) -> own model.Req {
+    c := with_defaults(cfg)
+    // client_secret_post carries client_id always and client_secret only
+    // when non-empty. client_secret_basic never duplicates the secret in
+    // the form; its id/secret are URL-query-escaped before Basic base64.
+    if c.client_auth == "client_secret_post" {
+        fields = add_field(fields, "client_id", c.client_id)
+        if len(c.client_secret) > 0 {
+            fields = add_field(fields, "client_secret", c.client_secret)
+        }
+    }
+    rq := new(model.Req)
+    rq.method = "POST"
+    rq.url = c.token_url
+    rq.body = model.Body.Raw{ctype: "application/x-www-form-urlencoded", text: form_encode(fields)}
+    rq.timeout_ms = TokenTimeoutMs
+    rq.follow = false
+    rq.max_redirects = 0
+    rq.max_body_bytes = TokenBodyCap
+    rq.jar_off = true
+    copy_token_security(rq, resource)
+    if c.client_auth == "client_secret_basic" {
+        basic := url.queryescape(c.client_id) + ":" + url.queryescape(c.client_secret)
+        rq.headers = push(rq.headers, model.Header{name: "Authorization", value: "Basic " + base64.encode(basic as []byte)})
+    }
+    return rq
+}
+
+// client_credentials_request builds the exact POST form request.
+fn client_credentials_request(cfg: Config, resource: ref model.Req) -> own model.Req {
+    c := with_defaults(cfg)
+    let fields: []FormField = nil
+    fields = add_field(fields, "grant_type", "client_credentials")
+    if len(c.scope) > 0 {
+        fields = add_field(fields, "scope", c.scope)
+    }
+    return finish_token_request(c, resource, fields)
+}
+
+// refresh_request builds a refresh grant using the latest refresh token.
+fn refresh_request(cfg: Config, resource: ref model.Req, refresh_token: str) -> own model.Req {
+    let fields: []FormField = nil
+    fields = add_field(fields, "grant_type", "refresh_token")
+    fields = add_field(fields, "refresh_token", refresh_token)
+    return finish_token_request(cfg, resource, fields)
+}
+
+// code_exchange_request builds the authorization-code exchange form. The
+// redirect URI must already have port-zero expansion applied by the flow.
+fn code_exchange_request(cfg: Config, resource: ref model.Req, code: str, actual_redirect_uri: str, verifier: str) -> own model.Req {
+    let fields: []FormField = nil
+    fields = add_field(fields, "grant_type", "authorization_code")
+    fields = add_field(fields, "code", code)
+    fields = add_field(fields, "redirect_uri", actual_redirect_uri)
+    fields = add_field(fields, "code_verifier", verifier)
+    return finish_token_request(cfg, resource, fields)
+}
+
+fn json_member_present(obj: ref json.Json, key: str) -> bool {
+    m := obj.child
+    for m != nil {
+        if m.key == key {
+            return true
+        }
+        m = m.next
+    }
+    return false
+}
+
+struct JStrParse { value: str, bad: bool }
+
+fn json_str_member(obj: ref json.Json, key: str) -> JStrParse {
+    if !json_member_present(obj, key) {
+        return JStrParse{value: "", bad: false}
+    }
+    v := json.jget(obj, key)
+    if v == nil {
+        return JStrParse{value: "", bad: false}
+    }
+    if v.kind == 0 {
+        return JStrParse{value: "", bad: false}
+    }
+    if v.kind != 3 {
+        return JStrParse{value: "", bad: true}
+    }
+    return JStrParse{value: v.s, bad: false}
+}
+
+struct IntParse { value: int, ok: bool }
+struct ExpiresParse { value: int, present: bool, bad: bool }
+
+fn strict_int_string(s: str) -> IntParse {
+    if len(s) == 0 {
+        return IntParse{value: 0, ok: false}
+    }
+    [n, e] = strconv.atoi(s)
+    if e != nil {
+        return IntParse{value: 0, ok: false}
+    }
+    // strconv accepts the integer-string forms upstream json.Number.Int64
+    // accepts (including signs and zero padding) and rejects whitespace,
+    // decimals, and non-numbers.
+    return IntParse{value: n, ok: true}
+}
+
+fn clamp_expires_in(n: int) -> int {
+    // x/oauth2 expirationTime is int32 and saturates positive overflow at
+    // MaxInt32 before converting to a time.Duration.
+    if n > 2147483647 {
+        return 2147483647
+    }
+    return n
+}
+
+fn parse_json_expires(obj: ref json.Json) -> ExpiresParse {
+    if !json_member_present(obj, "expires_in") {
+        return ExpiresParse{value: 0, present: false, bad: false}
+    }
+    v := json.jget(obj, "expires_in")
+    if v == nil || v.kind == 0 {
+        return ExpiresParse{value: 0, present: false, bad: false}
+    }
+    if v.kind == 2 {
+        return ExpiresParse{value: clamp_expires_in(v.i), present: true, bad: false}
+    }
+    if v.kind == 3 {
+        ip := strict_int_string(v.s)
+        if ip.ok {
+            return ExpiresParse{value: clamp_expires_in(ip.value), present: true, bad: false}
+        }
+    }
+    return ExpiresParse{value: 0, present: false, bad: true}
+}
+
+fn parse_json_token(body: str) -> EndpointToken {
+    t := EndpointToken{access_token: "", token_type: "", refresh_token: "", expires_in: 0, has_expires_in: false, error_code: "", endpoint_error: false, invalid: false}
+    j := json.jparse(body)
+    if j == nil || j.kind != 4 {
+        t.invalid = true
+        return t
+    }
+    bad := false
+    ja := json_str_member(j, "access_token")
+    jt := json_str_member(j, "token_type")
+    jr := json_str_member(j, "refresh_token")
+    je := json_str_member(j, "error")
+    jd := json_str_member(j, "error_description")
+    ju := json_str_member(j, "error_uri")
+    bad = ja.bad || jt.bad || jr.bad || je.bad || jd.bad || ju.bad
+    t.access_token = ja.value
+    t.token_type = jt.value
+    t.refresh_token = jr.value
+    t.error_code = je.value
+    ep := parse_json_expires(j)
+    bad = bad || ep.bad
+    t.expires_in = ep.value
+    t.has_expires_in = ep.present
+    t.endpoint_error = len(t.error_code) > 0
+    t.invalid = bad
+    return t
+}
+
+fn first_value(vs: ref url.Values, key: str) -> str {
+    return url.vget(vs, key)
+}
+
+fn parse_form_token(body: str) -> EndpointToken {
+    t := EndpointToken{access_token: "", token_type: "", refresh_token: "", expires_in: 0, has_expires_in: false, error_code: "", endpoint_error: false, invalid: false}
+    [vs, e] = url.parsequery(body)
+    if e != nil {
+        t.invalid = true
+        return t
+    }
+    t.access_token = first_value(vs, "access_token")
+    t.token_type = first_value(vs, "token_type")
+    t.refresh_token = first_value(vs, "refresh_token")
+    t.error_code = first_value(vs, "error")
+    t.endpoint_error = len(t.error_code) > 0
+    exs := first_value(vs, "expires_in")
+    if len(exs) > 0 {
+        [n, ne] = strconv.atoi(exs)
+        // Upstream form behavior: absent/zero/unparseable means no expiry.
+        if ne == nil && n != 0 {
+            t.expires_in = n
+            t.has_expires_in = true
+        }
+    }
+    return t
+}
+
+// parse_endpoint_response mirrors x/oauth2's JSON/form split. Non-2xx or an
+// error member is endpoint rejection; success validation happens separately.
+fn parse_endpoint_response(resp: model.Resp) -> TokenReply {
+    body := resp.body as str
+    t := EndpointToken{access_token: "", token_type: "", refresh_token: "", expires_in: 0, has_expires_in: false, error_code: "", endpoint_error: false, invalid: false}
+    if form_ct(hdr_value(resp.headers, "content-type")) {
+        t = parse_form_token(body)
+    } else {
+        t = parse_json_token(body)
+    }
+    if len(t.error_code) > 0 {
+        t.endpoint_error = true
+    }
+    out := TokenReply{token: t, invalid_response: false}
+    if resp.status < 200 || resp.status >= 300 {
+        // A non-2xx is an endpoint rejection even when its error document is
+        // malformed; status is the only metadata surfaced.
+        t.endpoint_error = true
+        out.token = t
+        return out
+    }
+    if t.invalid {
+        out.invalid_response = true
+    }
+    out.token = t
+    return out
+}
+
+fn bearer_usable(t: EndpointToken) -> bool {
+    if len(t.access_token) == 0 {
+        return false
+    }
+    if len(t.token_type) > 0 && lwr(t.token_type) != "bearer" {
+        return false
+    }
+    return find(t.access_token, "\r") < 0 && find(t.access_token, "\n") < 0
+}
+
+fn endpoint_rejection_error(status: int, code: str) -> str {
+    if code == "invalid_grant" {
+        return "OAuth grant expired or was revoked; use Forget OAuth token and sign in again"
+    }
+    return "OAuth token endpoint rejected the request (HTTP " + itoa(status) + "); check the client credentials, scope and client authentication method"
+}
+
+fn token_error_result(msg: str, class: str, status: int, code: str) -> TokenResult {
+    z := Token{access_token: "", token_type: "", refresh_token: "", expiry_unix: 0, has_expiry: false}
+    return TokenResult{token: z, err: msg, classification: class, status: status, endpoint_code: code}
+}
+
+fn token_success_result(t: Token) -> TokenResult {
+    return TokenResult{token: t, err: "", classification: "success", status: 0, endpoint_code: ""}
+}
+
+// send_token_at performs one prepared exchange through the injected
+// transport. now_unix is a test seam for deterministic expiry conversion.
+fn send_token_at(tr: http.Transport, req: ref model.Req, now_unix: int) -> TokenResult {
+    [resp, e] = tr.send(req)
+    if e != nil {
+        return token_error_result("OAuth token endpoint could not be reached; check its URL, proxy and TLS settings", "network", 0, "")
+    }
+    pr := parse_endpoint_response(resp)
+    if pr.token.endpoint_error {
+        return token_error_result(endpoint_rejection_error(resp.status, pr.token.error_code), "endpoint", resp.status, pr.token.error_code)
+    }
+    if pr.invalid_response {
+        return token_error_result("OAuth token endpoint returned an invalid response", "invalid_response", resp.status, "")
+    }
+    if !bearer_usable(pr.token) {
+        return token_error_result("OAuth endpoint did not return a usable Bearer token", "invalid_response", resp.status, "")
+    }
+    tok := Token{access_token: pr.token.access_token, token_type: pr.token.token_type, refresh_token: pr.token.refresh_token, expiry_unix: 0, has_expiry: false}
+    if len(tok.token_type) == 0 {
+        tok.token_type = "Bearer"
+    }
+    if pr.token.has_expires_in {
+        tok.has_expiry = true
+        // Positive values saturate instead of overflowing int64.
+        if pr.token.expires_in > 9223372036854775807 - now_unix {
+            tok.expiry_unix = 9223372036854775807
+        } else {
+            tok.expiry_unix = now_unix + pr.token.expires_in
+        }
+    }
+    return token_success_result(tok)
+}
+
+fn send_token(tr: http.Transport, req: ref model.Req) -> TokenResult {
+    return send_token_at(tr, req, now())
+}

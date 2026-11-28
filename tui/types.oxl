@@ -9,6 +9,7 @@ import "github.com/oxidean/oxttp/core/collection"
 import "github.com/oxidean/oxttp/core/config"
 import "github.com/oxidean/oxttp/core/env"
 import "github.com/oxidean/oxttp/core/model"
+import "github.com/oxidean/oxttp/core/oauth"
 
 struct LineEdit {
     text: str,
@@ -97,6 +98,16 @@ struct RDraft {
     resp_tab: int,
     body_ct: int,
     headers: KVTable,
+    oauth_kv: KVTable,
+    oauth_h_type: str,
+    oauth_h_grant: str,
+    oauth_h_auth_url: str,
+    oauth_h_token_url: str,
+    oauth_h_client_id: str,
+    oauth_h_client_secret: str,
+    oauth_h_scope: str,
+    oauth_h_redirect: str,
+    oauth_h_client_auth: str,
     query_kv: KVTable,
     path_kv: KVTable,
     body: TextView,
@@ -110,6 +121,7 @@ struct RDraft {
     resp_class: int, // status_class for title color; -1 = no response
     path: str,       // backing .posting.yaml — "" = unsaved
     auth_text: str,  // read-only Auth pane render
+    oauth_status: str, // safe session authorization status/notes
     opts_text: str,  // read-only Options pane render
     info_text: str,  // Info pane render (description et al.)
     preq: own collection.PRequest,
@@ -246,6 +258,8 @@ struct App {
     history: []HistEnt,
     pending: own model.Req,
     pending_preq: own collection.PRequest,
+    pending_oauth: own oauth.Plan,
+    oauth_mgr: own oauth.Manager,
     pending_name: str,
     sending: bool,
     var_rows: []str,
@@ -256,6 +270,16 @@ struct App {
     hist: ListCur,
 
     headers: KVTable,
+    oauth_kv: KVTable,
+    oauth_h_type: str,
+    oauth_h_grant: str,
+    oauth_h_auth_url: str,
+    oauth_h_token_url: str,
+    oauth_h_client_id: str,
+    oauth_h_client_secret: str,
+    oauth_h_scope: str,
+    oauth_h_redirect: str,
+    oauth_h_client_auth: str,
     query_kv: KVTable,
     path_kv: KVTable,
     body: TextView,      // editable-ish area is simplified to view+append
@@ -271,6 +295,7 @@ struct App {
     resp_class: int,
     path: str,           // live draft backing file (mirrors RDraft.path)
     auth_text: str,
+    oauth_status: str,
     opts_text: str,
     info_text: str,
     preq: own collection.PRequest,

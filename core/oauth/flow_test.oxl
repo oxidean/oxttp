@@ -1,0 +1,156 @@
+package oauth
+
+// WI-0022 S6 deterministic browser-flow tests. The fake opener writes the
+// loopback callback into the listener backlog and never launches a process;
+// the token endpoint is an injected transport fixture.
+import "std/errors"
+import "std/net"
+import "std/net/url"
+import "std/testing"
+import "github.com/oxidean/oxttp/core/model"
+
+// Non-suspending loopback dial for the BrowserOpener interface fixture.
+// Interface methods cannot suspend; the callback target is always dotted
+// IPv4 in this test, so the raw runtime socket twin is sufficient.
+extern fn rt_sock_open(domain: int, ty: int, proto: int) -> int
+extern fn rt_sock_connect_ipv4(fd: int, ip_h32: int, port: int, tmo_ms: int) -> int
+extern fn rt_sock_close(fd: int) -> int
+extern fn rt_errstr(code: int) -> str
+
+fn dial_loopback_nosusp(port: int) -> [net.Conn, err] {
+    [ip, pe] = net.parse_ipv4("127.0.0.1")
+    if pe != nil {
+        return net.Conn{fd: -1, st: nil, g: 0}, pe
+    }
+    fd := rt_sock_open(2, 1, 0)
+    if fd < 0 {
+        return net.Conn{fd: -1, st: nil, g: 0}, errors.new("loopback socket failed")
+    }
+    rc := rt_sock_connect_ipv4(fd, ip, port, 1000)
+    if rc != 0 {
+        rt_sock_close(fd)
+        return net.Conn{fd: -1, st: nil, g: 0}, errors.new("loopback connect failed: " + rt_errstr(0 - rc))
+    }
+    return net.mkconn(fd), nil
+}
+
+struct LoopbackOpener {
+    opened: shared,
+    fail: bool,
+    deny: bool,
+}
+
+fn (o LoopbackOpener) open(auth_url: str) -> err {
+    sadd(o.opened, 1)
+    if o.fail {
+        return errors.new("staged opener failure")
+    }
+    [au, ae] = url.parse(auth_url)
+    if ae != nil {
+        return ae
+    }
+    [qv, qe] = url.parsequery(au.rawquery)
+    if qe != nil {
+        return qe
+    }
+    redir := url.vget(qv, "redirect_uri")
+    state := url.vget(qv, "state")
+    [ru, re] = url.parse(redir)
+    if re != nil {
+        return re
+    }
+    [c, de] = dial_loopback_nosusp(atoi(ru.port()))
+    if de != nil {
+        return de
+    }
+    target := "/cb?code=flow-code&state=" + url.queryescape(state)
+    if o.deny {
+        target = "/cb?error=access_denied&state=" + url.queryescape(state)
+    }
+    cb_write_close(c, "GET " + target + " HTTP/1.1\r\nHost: " + ru.host + "\r\n\r\n")
+    return nil
+}
+
+struct FlowTokenTransport {
+    hits: shared,
+    fail: bool,
+}
+
+fn flow_resp(body: str) -> model.Resp {
+    let hs: []model.Header = nil
+    hs = push(hs, model.Header{name: "Content-Type", value: "application/json"})
+    return model.Resp{status: 200, reason: "OK", headers: hs, body: body as []byte, elapsed_ms: 0.0, remote: "", version: "", req_head: "", hops: nil, trace: nil, tls_ver: 0}
+}
+
+fn (f FlowTokenTransport) send(req: ref model.Req) -> [model.Resp, err] {
+    sadd(f.hits, 1)
+    if f.fail {
+        return flow_resp(""), errors.new("secret transport detail")
+    }
+    testing.expect_streq(req.method, "POST", "exchange method")
+    testing.expect(req.body.kind() == 1, "exchange body raw")
+    if req.body.kind() == 1 {
+        rb := req.body as model.Body.Raw
+        testing.expect(find(rb.text, "grant_type=authorization_code") >= 0, "code grant form")
+        testing.expect(find(rb.text, "code=flow-code") >= 0, "callback code exchanged")
+        testing.expect(find(rb.text, "code_verifier=") >= 0, "PKCE verifier sent")
+        testing.expect(find(rb.text, "redirect_uri=http") >= 0, "actual redirect sent")
+    }
+    return flow_resp("{\"access_token\":\"flow-access\",\"token_type\":\"Bearer\",\"refresh_token\":\"flow-refresh\",\"expires_in\":3600}"), nil
+}
+
+fn flow_resource() -> own model.Req {
+    r := new(model.Req)
+    r.method = "GET"
+    r.url = "https://api.example.test/data"
+    return r
+}
+
+fn flow_cfg() -> Config {
+    return with_defaults(Config{grant_type: "authorization_code", authorization_url: "https://issuer.test/auth", token_url: "https://issuer.test/token", client_id: "cid", client_secret: "", scope: "", redirect_uri: "http://127.0.0.1:0/cb", client_auth: ""})
+}
+
+fn test_browser_code_pkce_end_to_end() {
+    op := LoopbackOpener{opened: mkshared(0), fail: false, deny: false}
+    fl := OAuthBrowserFlow{opener: op}
+    tr := FlowTokenTransport{hits: mkshared(0), fail: false}
+    out := fl.run(flow_cfg(), flow_resource(), tr)
+    testing.expect_streq(out.err, "", "browser flow succeeds")
+    testing.expect_streq(out.token.access_token, "flow-access", "access token")
+    testing.expect_streq(out.token.refresh_token, "flow-refresh", "refresh token")
+    testing.expect_eq(sget(op.opened), 1, "browser opened once")
+    testing.expect_eq(sget(tr.hits), 1, "one token exchange")
+}
+
+fn test_browser_opener_failure_is_sanitized() {
+    op := LoopbackOpener{opened: mkshared(0), fail: true, deny: false}
+    fl := OAuthBrowserFlow{opener: op}
+    tr := FlowTokenTransport{hits: mkshared(0), fail: false}
+    out := fl.run(flow_cfg(), flow_resource(), tr)
+    testing.expect_streq(out.err, BrowserOpenError, "opener failure exact safe text")
+    testing.expect_streq(out.classification, "browser_open", "opener classification")
+    testing.expect_eq(sget(tr.hits), 0, "no token exchange after opener failure")
+}
+
+
+fn test_browser_denial_is_sanitized_and_not_exchanged() {
+    op := LoopbackOpener{opened: mkshared(0), fail: false, deny: true}
+    fl := OAuthBrowserFlow{opener: op}
+    tr := FlowTokenTransport{hits: mkshared(0), fail: false}
+    out := fl.run(flow_cfg(), flow_resource(), tr)
+    testing.expect_streq(out.err, BrowserDenialError, "denial uses upstream safe denial text")
+    testing.expect_streq(out.classification, "browser_denial", "denial classification")
+    testing.expect_eq(sget(tr.hits), 0, "denial never exchanges a code")
+}
+
+fn test_ipv6_loopback_execution_degrades_before_browser() {
+    op := LoopbackOpener{opened: mkshared(0), fail: false, deny: false}
+    fl := OAuthBrowserFlow{opener: op}
+    tr := FlowTokenTransport{hits: mkshared(0), fail: false}
+    c := flow_cfg()
+    c.redirect_uri = "http://[::1]:0/cb"
+    out := fl.run(c, flow_resource(), tr)
+    testing.expect_streq(out.err, IPv6RedirectUnsupported, "IPv6 degradation exact")
+    testing.expect_eq(sget(op.opened), 0, "browser not opened")
+    testing.expect_eq(sget(tr.hits), 0, "endpoint not hit")
+}

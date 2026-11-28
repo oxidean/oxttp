@@ -7,6 +7,7 @@ package main
 import "std/os"
 
 import "github.com/oxidean/oxttp/core/term"
+import "github.com/oxidean/oxttp/core/oauth"
 
 fn new_app() -> own App {
     a := new(App)
@@ -37,6 +38,10 @@ fn new_app() -> own App {
     a.vars_reveal = false
     a.hist = new_list(0)
     a.headers = new_kv()
+    a.oauth_kv = new_oauth_kv()
+    a.oauth_h_type = "none"
+    a.oauth_h_grant = "Code + PKCE"
+    a.oauth_h_client_auth = "Body"
     a.query_kv = new_kv()
     a.path_kv = new_kv()
     a.body = new_text_view("")
@@ -50,6 +55,7 @@ fn new_app() -> own App {
     a.env_name = "(none)"
     a.confirm_arg = ""
     a.sending = false
+    a.oauth_mgr = new(oauth.Manager)
     a.pal_query = new_line_edit("")
     a.pal_sel = 0
     a.tabsearch = new_list(0)
@@ -110,14 +116,18 @@ fn demo_tree() -> Tree {
 fn new_draft() -> RDraft {
     return RDraft{url: new_line_edit(""), method: "GET", kind: KHttp,
         req_tab: 0, resp_tab: 0, body_ct: 0,
-        headers: new_kv(), query_kv: new_kv(), path_kv: new_kv(),
+        headers: new_kv(), oauth_kv: new_oauth_kv(),
+        oauth_h_type: "none", oauth_h_grant: "Code + PKCE", oauth_h_auth_url: "",
+        oauth_h_token_url: "", oauth_h_client_id: "", oauth_h_client_secret: "",
+        oauth_h_scope: "", oauth_h_redirect: "http://127.0.0.1:8765/oauth/callback", oauth_h_client_auth: "Body",
+        query_kv: new_kv(), path_kv: new_kv(),
         body: new_text_view(""),
         resp_view: new_text_view("(no response yet — ctrl+j sends)"),
         resp_rows: new_list(0),
         resp_body: "",
         resp_hdr_rows: nil, resp_ck_rows: nil, resp_tr_rows: nil,
         resp_title: "response", resp_class: -1,
-        path: "", auth_text: "", opts_text: "", info_text: "",
+        path: "", auth_text: "", oauth_status: "", opts_text: "", info_text: "",
         preq: nil, resp_size: 0, elapsed_ms: 0.0}
 }
 
@@ -170,7 +180,13 @@ fn copy_tv(v: TextView) -> TextView {
 fn draft_capture(a: ref App) -> RDraft {
     return RDraft{url: a.url, method: a.method, kind: a.kind,
         req_tab: a.req_tab, resp_tab: a.resp_tab, body_ct: a.body_ct,
-        headers: copy_kv(a.headers), query_kv: copy_kv(a.query_kv),
+        headers: copy_kv(a.headers), oauth_kv: copy_kv(a.oauth_kv),
+        oauth_h_type: a.oauth_h_type, oauth_h_grant: a.oauth_h_grant,
+        oauth_h_auth_url: a.oauth_h_auth_url, oauth_h_token_url: a.oauth_h_token_url,
+        oauth_h_client_id: a.oauth_h_client_id, oauth_h_client_secret: a.oauth_h_client_secret,
+        oauth_h_scope: a.oauth_h_scope, oauth_h_redirect: a.oauth_h_redirect,
+        oauth_h_client_auth: a.oauth_h_client_auth,
+        query_kv: copy_kv(a.query_kv),
         path_kv: copy_kv(a.path_kv), body: copy_tv(a.body),
         resp_view: copy_tv(a.resp_view), resp_rows: a.resp_rows,
         resp_body: a.resp_body,
@@ -178,7 +194,7 @@ fn draft_capture(a: ref App) -> RDraft {
         resp_ck_rows: copy_strs(a.resp_ck_rows),
         resp_tr_rows: copy_strs(a.resp_tr_rows),
         resp_title: a.resp_title, resp_class: a.resp_class,
-        path: a.path, auth_text: a.auth_text, opts_text: a.opts_text,
+        path: a.path, auth_text: a.auth_text, oauth_status: a.oauth_status, opts_text: a.opts_text,
         info_text: a.info_text, preq: a.preq,
         resp_size: a.resp_size, elapsed_ms: a.elapsed_ms}
 }
@@ -193,6 +209,16 @@ fn draft_restore(a: mut App, d: RDraft) {
     a.resp_tab = d.resp_tab
     a.body_ct = d.body_ct
     a.headers = copy_kv(d.headers)
+    a.oauth_kv = copy_kv(d.oauth_kv)
+    a.oauth_h_type = d.oauth_h_type
+    a.oauth_h_grant = d.oauth_h_grant
+    a.oauth_h_auth_url = d.oauth_h_auth_url
+    a.oauth_h_token_url = d.oauth_h_token_url
+    a.oauth_h_client_id = d.oauth_h_client_id
+    a.oauth_h_client_secret = d.oauth_h_client_secret
+    a.oauth_h_scope = d.oauth_h_scope
+    a.oauth_h_redirect = d.oauth_h_redirect
+    a.oauth_h_client_auth = d.oauth_h_client_auth
     a.query_kv = copy_kv(d.query_kv)
     a.path_kv = copy_kv(d.path_kv)
     a.body = copy_tv(d.body)
@@ -206,6 +232,7 @@ fn draft_restore(a: mut App, d: RDraft) {
     a.resp_class = d.resp_class
     a.path = d.path
     a.auth_text = d.auth_text
+    a.oauth_status = d.oauth_status
     a.opts_text = d.opts_text
     a.info_text = d.info_text
     a.preq = d.preq
@@ -474,7 +501,7 @@ fn req_pane_bindings(a: ref App) -> []Binding {
     ts := req_tabs(a.kind)
     name := ts[a.req_tab]
     if a.kind == KHttp || a.kind == KGraphql {
-        if name == "Headers" || name == "Query" || name == "Params" {
+        if name == "Headers" || name == "Query" || name == "Params" || name == "Auth" {
             // KV table bindings (§4.6). While a cell edit is live the
             // letters are TEXT — hjkl must type into the cell, not
             // navigate the table (they re-bind once it commits).
@@ -521,7 +548,7 @@ fn req_pane_bindings(a: ref App) -> []Binding {
             bs = push(bs, bind("backspace", "body-backspace"))
         }
         // Auth/Info/Options: static panes — up/down scrolls
-        if name == "Auth" || name == "Info" || name == "Options" {
+        if name == "Info" || name == "Options" {
             bs = push(bs, bind("up", "tv-up"))
             bs = push(bs, bind("down", "tv-down"))
             bs = push(bs, bind("k", "tv-up"))
@@ -1384,6 +1411,9 @@ fn active_kv(a: ref App) -> int {
     if n == "Path" {
         return 2
     }
+    if n == "Auth" {
+        return 3
+    }
     return -1
 }
 
@@ -1399,8 +1429,10 @@ fn kv_move(a: mut App, d: int) {
         a.headers.move(d)
     } else if w == 1 {
         a.query_kv.move(d)
-    } else {
+    } else if w == 2 {
         a.path_kv.move(d)
+    } else if w == 3 {
+        a.oauth_kv.move(d)
     }
 }
 
@@ -1411,6 +1443,8 @@ fn kv_col(a: mut App, c: int) {
         a.headers.col = c
     } else if w == 1 {
         a.query_kv.col = c
+    } else if w == 3 {
+        a.oauth_kv.col = 1
     }
 }
 
@@ -1449,6 +1483,9 @@ fn kv_begin_edit(a: mut App) {
         }
         a.path_kv.col = 1
         a.path_kv.begin_edit()
+    } else if w == 3 {
+        a.oauth_kv.col = 1
+        a.oauth_kv.begin_edit()
     }
 }
 
@@ -1462,6 +1499,9 @@ fn kv_commit(a: mut App) {
         a.query_kv.commit_edit()
     } else if w == 2 {
         a.path_kv.commit_edit()
+    } else if w == 3 {
+        a.oauth_kv.commit_edit()
+        oauth_rebuild(a)
     }
 }
 
@@ -1475,6 +1515,9 @@ fn kv_editing(a: ref App) -> bool {
     }
     if w == 2 {
         return a.path_kv.editing
+    }
+    if w == 3 {
+        return a.oauth_kv.editing
     }
     return false
 }
@@ -1499,6 +1542,11 @@ fn kv_cell_bs(a: mut App, w: int) {
         a.path_kv.ensure_edit()
         a.path_kv.edit.backspace()
         a.path_kv.apply_edit()
+    } else if w == 3 {
+        a.oauth_kv.col = 1
+        a.oauth_kv.ensure_edit()
+        a.oauth_kv.edit.backspace()
+        a.oauth_kv.apply_edit()
     }
 }
 
@@ -1519,6 +1567,11 @@ fn kv_cell_del(a: mut App, w: int) {
         a.path_kv.ensure_edit()
         a.path_kv.edit.del_right()
         a.path_kv.apply_edit()
+    } else if w == 3 {
+        a.oauth_kv.col = 1
+        a.oauth_kv.ensure_edit()
+        a.oauth_kv.edit.del_right()
+        a.oauth_kv.apply_edit()
     }
 }
 
@@ -1536,6 +1589,9 @@ fn kv_cell_undo(a: mut App) {
     } else if w == 2 {
         a.path_kv.edit.undo()
         a.path_kv.apply_edit()
+    } else if w == 3 {
+        a.oauth_kv.edit.undo()
+        a.oauth_kv.apply_edit()
     }
 }
 
@@ -1550,6 +1606,9 @@ fn kv_cell_redo(a: mut App) {
     } else if w == 2 {
         a.path_kv.edit.redo()
         a.path_kv.apply_edit()
+    } else if w == 3 {
+        a.oauth_kv.edit.redo()
+        a.oauth_kv.apply_edit()
     }
 }
 
@@ -1690,6 +1749,9 @@ fn kv_type_char(a: mut App, ch: str) {
         }
         a.path_kv.col = 1
         a.path_kv.type_char(ch)
+    } else if w == 3 {
+        a.oauth_kv.col = 1
+        a.oauth_kv.type_char(ch)
     }
 }
 
@@ -2246,7 +2308,7 @@ fn palette_items() -> []PItem {
     t = push(t, PItem{name: "Switch environment", action: "env-switch", degrade: ""})
     t = push(t, PItem{name: "Variables", action: "variables", degrade: ""})
     t = push(t, PItem{name: "Reload collection", action: "reload-collection", degrade: ""})
-    t = push(t, PItem{name: "OAuth sign-in", action: "", degrade: "OAuth2 lands M4"})
+    t = push(t, PItem{name: "Forget OAuth token", action: "forget-oauth", degrade: ""})
     t = push(t, PItem{name: "gRPC stream open/end", action: "stream", degrade: "gRPC oxl-blocked (#223)"})
     t = push(t, PItem{name: "WebSocket disconnect", action: "", degrade: "WS oxl-blocked (#220)"})
     t = push(t, PItem{name: "Import curl command…", action: "import-curl", degrade: ""})
@@ -2267,7 +2329,19 @@ fn palette_items() -> []PItem {
 }
 
 fn palette_filtered(a: ref App) -> []PItem {
-    items := palette_items()
+    all := palette_items()
+    // Forget is OAuth-specific chrome, not a generally meaningful command.
+    // The action remains safely guarded in forget_oauth for direct dispatch.
+    atype := lower_ascii(oauth_value(a, "type"))
+    oauth_req := atype == "oauth2" || atype == "oauth 2.0"
+    items := mkslice(PItem, 0)
+    ai := 0
+    for ai < len(all) {
+        if all[ai].action != "forget-oauth" || oauth_req {
+            items = push(items, all[ai])
+        }
+        ai = ai + 1
+    }
     q := a.pal_query.text
     if len(q) == 0 {
         return items
@@ -2365,6 +2439,9 @@ fn run_named_action(a: mut App, act: str) -> int {
             a.layout = 0
         }
         return ENone
+    }
+    if act == "forget-oauth" {
+        return forget_oauth(a)
     }
     if act == "reload-collection" {
         load_collection(a)

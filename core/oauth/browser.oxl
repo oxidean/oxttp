@@ -1,0 +1,53 @@
+package oauth
+
+// WI-0022 S5 — injectable argv-based browser opener. URLs are argv entries,
+// never shell-interpolated. Tests use fake openers; production uses the OS
+// opener chain below.
+import "std/errors"
+import "std/os/exec"
+
+extern fn rt_is_windows() -> int
+
+interface BrowserOpener {
+    open(url: str) -> err
+}
+
+// ArgvBrowserOpener is production behavior: xdg-open then open on
+// non-Windows; rundll32 argv invocation on Windows. No shell is used.
+struct ArgvBrowserOpener { }
+
+fn opener_run(name: str, url: str) -> err {
+    args := mkslice(str, 1)
+    args[0] = url
+    c := exec.cmd(name, args)
+    [st, e] = c.run()
+    if e != nil {
+        return e
+    }
+    if st != 0 {
+        return errors.new("browser opener exited nonzero")
+    }
+    return nil
+}
+
+fn (o ArgvBrowserOpener) open(url: str) -> err {
+    if rt_is_windows() != 0 {
+        args := mkslice(str, 2)
+        args[0] = "url.dll,FileProtocolHandler"
+        args[1] = url
+        c := exec.cmd("rundll32.exe", args)
+        [st, e] = c.run()
+        if e != nil {
+            return e
+        }
+        if st != 0 {
+            return errors.new("browser opener exited nonzero")
+        }
+        return nil
+    }
+    e := opener_run("xdg-open", url)
+    if e == nil {
+        return nil
+    }
+    return opener_run("open", url)
+}
