@@ -152,35 +152,6 @@ fn breadir(ctx: ref BReadCtx, dir: str) -> [own []str, err] {
     return names, nil
 }
 
-// bjson_footprint estimates a JSON DOM's serialized size without
-// materializing a copy (important when the budget itself is what keeps
-// expansion memory bounded). Per-node punctuation/overhead is included;
-// string escapes are approximated by their source length.
-fn bjson_footprint(v: ref json.Json) -> int {
-    if v == nil {
-        return 4
-    }
-    size := 8 + len(v.key)
-    if v.kind == 3 {
-        size = size + len(v.s) + 2
-    } else if v.kind == 2 {
-        size = size + len(itoa(v.i))
-    } else if v.kind == 6 {
-        size = size + len(ftoa(v.f))
-    } else if v.kind == 4 || v.kind == 5 {
-        size = size + 2
-        c := v.child
-        for c != nil {
-            size = size + bjson_footprint(c)
-            c = c.next
-        }
-    } else if v.kind == 1 {
-        size = size + 5
-    } else {
-        size = size + 4
-    }
-    return size
-}
 
 // requestFootprint — scoped values copied into each request need not
 // be bounded by source file bytes.
@@ -195,10 +166,7 @@ fn breq_footprint(r: ref collection.PRequest, file: str) -> int {
         }
     }
     if r.graphql != nil {
-        size = size + len(r.graphql.query)
-        if r.graphql.variables != nil {
-            size = size + bjson_footprint(r.graphql.variables)
-        }
+        size = size + len(r.graphql.query) + len(r.graphql.variables)
     }
     if r.grpc != nil {
         size = size + len(r.grpc.method) + len(r.grpc.message)
