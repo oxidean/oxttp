@@ -71,35 +71,47 @@ fn test_proxy_pick_env_names() {
     testing.expect_eq(len(pk3.env), 0, "ALL_PROXY ignored (Go has none)")
 }
 
-fn test_proxy_pick_env_normalization() {
-    // schemeless env values normalize to http:// (Go parseProxy
-    // host[:port] form); complete URLs pass through verbatim
+fn test_proxy_pick_env_raw_values() {
+    // collection keeps env proxy values raw. The transport owns Go's
+    // parseProxy retry; normalizing here would apply that retry twice.
     let prs: []str = nil
     prs = push(prs, "http_proxy=px.internal:3128")
     prs = push(prs, "https_proxy=socks5://sec:1080")
     pk := proxy_pick("", prs)
     testing.expect_eq(len(pk.env), 2, "both schemes")
     testing.expect_streq(pk.env[0], "https_proxy=socks5://sec:1080", "url verbatim")
-    testing.expect_streq(pk.env[1], "http_proxy=http://px.internal:3128", "schemeless normalized")
-    // whitespace-padded values trim before the scheme check
+    testing.expect_streq(pk.env[1], "http_proxy=px.internal:3128", "schemeless raw")
+    // whitespace is significant in Go getEnvAny/parseProxy — no trim.
     let prs2: []str = nil
     prs2 = push(prs2, "http_proxy=  bare.host  ")
     pk2 := proxy_pick("", prs2)
-    testing.expect_streq(pk2.env[0], "http_proxy=http://bare.host", "trim + normalize")
+    testing.expect_streq(pk2.env[0], "http_proxy=  bare.host  ", "raw whitespace preserved")
 }
 
 fn test_proxy_pick_env_empties_and_malformed() {
     let prs: []str = nil
     prs = push(prs, "HTTP_PROXY=")
-    prs = push(prs, "http_proxy=   ")
-    prs = push(prs, "HTTPS_PROXY=   ")
+    prs = push(prs, "http_proxy=")
+    prs = push(prs, "HTTPS_PROXY=")
     prs = push(prs, "NOEQUALS")
     prs = push(prs, "=noname")
     prs = push(prs, "")
-    prs = push(prs, "no_proxy=  ")
+    prs = push(prs, "no_proxy=")
     pk := proxy_pick("", prs)
     testing.expect_eq(len(pk.env), 0, "empty values all unset")
-    testing.expect_eq(len(pk.no_proxy), 0, "whitespace no_proxy unset")
+    testing.expect_eq(len(pk.no_proxy), 0, "empty no_proxy unset")
+    // whitespace-only values are raw non-empty in Go. The uppercase
+    // slot wins and is preserved; parseProxy drops it later rather
+    // than falling through to lowercase.
+    let prsw: []str = nil
+    prsw = push(prsw, "HTTP_PROXY=   ")
+    prsw = push(prsw, "http_proxy=http://lower:1")
+    prsw = push(prsw, "NO_PROXY=  ")
+    prsw = push(prsw, "no_proxy=lower.example")
+    pkw := proxy_pick("", prsw)
+    testing.expect_eq(len(pkw.env), 1, "whitespace uppercase occupies slot")
+    testing.expect_streq(pkw.env[0], "http_proxy=   ", "whitespace raw preserved")
+    testing.expect_streq(pkw.no_proxy, "  ", "whitespace no_proxy raw preserved")
     // no_proxy falls back to lowercase when uppercase empty
     let prs2: []str = nil
     prs2 = push(prs2, "NO_PROXY=")

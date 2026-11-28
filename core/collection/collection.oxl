@@ -1838,8 +1838,10 @@ fn px_trim(s: str) -> str {
 }
 
 // px_find returns the whole "NAME=value" pair for an exact name match
-// whose value is non-empty after trimming, "" otherwise. Exact case —
-// collect_proxy_env emits canonical names only.
+// whose raw value is non-empty, "" otherwise. Exact case — collect_proxy_env
+// emits canonical names only. Go getEnvAny does not trim: whitespace-only
+// values still occupy the higher-precedence slot and are dropped later by
+// parseProxy if unusable.
 fn px_find(pairs: []str, name: str) -> str {
     i := 0
     for i < len(pairs) {
@@ -1850,7 +1852,7 @@ fn px_find(pairs: []str, name: str) -> str {
             continue
         }
         if substr(p, 0, eq) == name {
-            if len(px_trim(substr(p, eq + 1, len(p)))) > 0 {
+            if len(substr(p, eq + 1, len(p))) > 0 {
                 return p
             }
         }
@@ -1879,10 +1881,12 @@ fn px_pair_named(pairs: []str, name: str) -> str {
     return ""
 }
 
-// px_pair_val returns the trimmed value of a "NAME=value" pair.
+// px_pair_val returns the raw value of a "NAME=value" pair. Env proxy
+// values deliberately stay raw until the transport's parseProxy port;
+// trimming or scheme-normalizing here would not be Go-compatible.
 fn px_pair_val(p: str) -> str {
     eq := find(p, "=")
-    return px_trim(substr(p, eq + 1, len(p)))
+    return substr(p, eq + 1, len(p))
 }
 
 // px_find_any is getEnvAny: uppercase name wins when both cases are
@@ -1894,21 +1898,6 @@ fn px_find_any(pairs: []str, lc: str, uc: str) -> str {
         return p
     }
     return px_find(pairs, lc)
-}
-
-// px_proxy_url normalizes an env proxy value for the Go path: Go's
-// parseProxy accepts "host[:port]" (http scheme assumed) or a
-// complete URL; schemeless values get "http://" prepended here so
-// the transport always sees a scheme-full URL.
-fn px_proxy_url(v: str) -> str {
-    t := px_trim(v)
-    if len(t) == 0 {
-        return ""
-    }
-    if find(t, "://") < 0 {
-        return "http://" + t
-    }
-    return t
 }
 
 // px_val_any applies getEnvAny uppercase-first precedence.
@@ -1928,8 +1917,9 @@ fn px_val_any(pairs: []str, lc: str, uc: str) -> str {
 // consulted (corpus "else"). Otherwise env vars supply
 // proxy_env/no_proxy with getEnvAny uppercase-first precedence:
 // https_proxy/HTTPS_PROXY and http_proxy/HTTP_PROXY only — Go has
-// NO ALL_PROXY. Values are normalized schemeless→http://. The CGI
-// flag records a raw non-empty REQUEST_METHOD; the transport turns
+// NO ALL_PROXY. Values stay raw; the transport performs Go's one
+// schemeless→http:// parseProxy retry. The CGI flag records a raw
+// non-empty REQUEST_METHOD; the transport turns
 // a usable http_proxy into a send-time error on http:// hops
 // (Go proxyForURL), NOT a silent skip. NO_PROXY/no_proxy is
 // uppercase-first, first non-empty.
@@ -1949,11 +1939,11 @@ fn proxy_pick(proxy_url: str, pairs: []str) -> ProxyPick {
     }
     e := px_find_any(pairs, "https_proxy", "HTTPS_PROXY")
     if len(e) > 0 {
-        pk.env = push(pk.env, "https_proxy=" + px_proxy_url(px_pair_val(e)))
+        pk.env = push(pk.env, "https_proxy=" + px_pair_val(e))
     }
     e = px_find_any(pairs, "http_proxy", "HTTP_PROXY")
     if len(e) > 0 {
-        pk.env = push(pk.env, "http_proxy=" + px_proxy_url(px_pair_val(e)))
+        pk.env = push(pk.env, "http_proxy=" + px_pair_val(e))
     }
     pk.no_proxy = px_val_any(pairs, "no_proxy", "NO_PROXY")
     return pk
