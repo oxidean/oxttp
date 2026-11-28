@@ -273,9 +273,7 @@ fn pexpand(p: ref PParser, s: str, values: []model.KV, stack: []str, where: str,
 fn ptemplate(p: ref PParser, s: str, local: []model.KV, where: str) -> str {
     budget := mkslice(int, 1)
     budget[0] = 1024
-    if local != nil {
-        s = pexpand(p, s, local, mkslice(str, 0), where, budget)
-    }
+    s = pexpand(p, s, local, mkslice(str, 0), where, budget)
     s = dollar_escape(s)
     spans := pref_spans(s)
     out := ""

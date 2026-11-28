@@ -122,27 +122,68 @@ fn test_cli_import() {
     a = push(a, "postman")
     a = push(a, "file.json")
     r := cli_import_args(a)
-    testing.expect(r.code == 1, "degrade code")
-    testing.expect(find(r.stderr, "postman import lands M4") >= 0, "text")
+    testing.expect(r.code == 1, "missing source errors")
+    testing.expect(find(r.stderr, "no such file") >= 0, "missing source text")
     a[2] = "bogus"
     r = cli_import_args(a)
     testing.expect(r.code == 2, "bad type")
-    // zero sources → usage 2, not the M4 degrade
+    // zero sources → usage 2
     a = nil
     a = push(a, "import")
     a = push(a, "-t")
     a = push(a, "postman")
     r = cli_import_args(a)
     testing.expect(r.code == 2, "no sources usage")
-    // --type=x / --output=x forms parse
+    // --type=x / --output=x forms parse and wire the real engine.
+    src := "/tmp/oxttp-cli-import.postman.json"
+    outdir := "/tmp/oxttp-cli-import-out"
+    os.remove_all(outdir)
+    os.remove_all(outdir + "-detect")
+    os.remove_all(outdir + "-single")
+    os.remove_all(outdir + "-env")
+    os.writefile_(src, "{\"info\":{\"name\":\"CLI Import\",\"schema\":\"https://schema.getpostman.com/json/collection/v2.1.0/collection.json\"},\"item\":[{\"name\":\"Get\",\"request\":{\"method\":\"GET\",\"url\":\"https://example.test\"}}]}")
     a = nil
     a = push(a, "import")
     a = push(a, "--type=postman")
-    a = push(a, "--output=/tmp/out")
-    a = push(a, "coll.json")
+    a = push(a, "--output=" + outdir)
+    a = push(a, src)
     r = cli_import_args(a)
-    testing.expect(r.code == 1, "eq forms degrade")
-    testing.expect(find(r.stderr, "postman import lands M4") >= 0, "type applied")
+    testing.expect(r.code == 0, "import success")
+    testing.expect(find(r.stdout, "Imported 1 postman request(s)") >= 0, "success text")
+    testing.expect(find(r.stdout, outdir) >= 0, "output path text")
+    // No --type: detect the Postman envelope from info+item.
+    a = nil
+    a = push(a, "import")
+    a = push(a, "--output=" + outdir + "-detect")
+    a = push(a, src)
+    r = cli_import_args(a)
+    testing.expect(r.code == 0, "detect import success")
+    testing.expect(find(r.stdout, "Imported 1 postman request(s)") >= 0, "detect success text")
+    // Single-dash long forms parse, and type matching is case-insensitive.
+    a = nil
+    a = push(a, "import")
+    a = push(a, "-type=POSTMAN")
+    a = push(a, "-output=" + outdir + "-single")
+    a = push(a, src)
+    r = cli_import_args(a)
+    testing.expect(r.code == 0, "single-dash import success")
+    // Postman environment exports may accompany a collection, but an
+    // env-only import must name the output collection explicitly.
+    envsrc := "/tmp/oxttp-cli-import.postman_environment.json"
+    os.writefile_(envsrc, "{\"name\":\"dev\",\"values\":[{\"key\":\"TOKEN\",\"value\":\"abc\",\"enabled\":true}]}")
+    a = nil
+    a = push(a, "import")
+    a = push(a, envsrc)
+    r = cli_import_args(a)
+    testing.expect(r.code == 2, "env-only without output")
+    testing.expect(find(r.stderr, "importing only environments requires --output DIR") >= 0, "env-only error text")
+    a = nil
+    a = push(a, "import")
+    a = push(a, "--output=" + outdir + "-env")
+    a = push(a, envsrc)
+    r = cli_import_args(a)
+    testing.expect(r.code == 0, "env-only with output")
+    testing.expect(find(r.stdout, "Imported 1 environment(s)") >= 0, "env-only success text")
 }
 
 fn test_run_parse() {

@@ -16,6 +16,8 @@ import "github.com/oxidean/oxttp/core/config"
 import "github.com/oxidean/oxttp/core/env"
 import "github.com/oxidean/oxttp/core/http"
 import "github.com/oxidean/oxttp/core/model"
+import "github.com/oxidean/oxttp/core/importing"
+import "github.com/oxidean/oxttp/core/yaml"
 import "github.com/oxidean/oxttp/shared/version"
 
 struct Out { code: int, stdout: str, stderr: str }
@@ -309,54 +311,428 @@ fn cli_import() -> Out {
     return cli_import_args(cli_args())
 }
 
+fn cli_lower_ascii(s: str) -> str {
+    b := mkslice(byte, len(s))
+    i := 0
+    for i < len(s) {
+        c := byteat(s, i)
+        if c >= 65 && c <= 90 {
+            c = c + 32
+        }
+        b[i] = c
+        i = i + 1
+    }
+    return b as str
+}
+
 fn cli_import_args(args: []str) -> Out {
     i := 1
-    typ := "openapi"
+    typ := ""
+    flags := true
     let srcs: []str = nil
     for i < len(args) {
         a := args[i]
         i = i + 1
-        // --type=x / --output=x forms (upstream flag splitter).
-        if len(a) >= 7 && substr(a, 0, 7) == "--type=" {
+        if flags && a == "--" {
+            flags = false
+            continue
+        }
+        // --type=x / -type=x / -t=x forms (upstream flag splitter).
+        if flags && len(a) >= 7 && substr(a, 0, 7) == "--type=" {
             typ = substr(a, 7, len(a))
             continue
         }
-        if len(a) >= 9 && substr(a, 0, 9) == "--output=" {
+        if flags && len(a) >= 6 && substr(a, 0, 6) == "-type=" {
+            typ = substr(a, 6, len(a))
             continue
         }
-        if len(a) >= 3 && substr(a, 0, 3) == "-t=" {
+        if flags && len(a) >= 3 && substr(a, 0, 3) == "-t=" {
             typ = substr(a, 3, len(a))
             continue
         }
-        if len(a) >= 3 && substr(a, 0, 3) == "-o=" {
+        // Output forms are consumed here and recovered from args in
+        // import_run, which owns the env-only output requirement.
+        if flags && len(a) >= 9 && substr(a, 0, 9) == "--output=" {
             continue
         }
-        if a == "-t" || a == "--type" {
+        if flags && len(a) >= 8 && substr(a, 0, 8) == "-output=" {
+            continue
+        }
+        if flags && len(a) >= 3 && substr(a, 0, 3) == "-o=" {
+            continue
+        }
+        if flags && (a == "-t" || a == "--type" || a == "-type") {
             if i >= len(args) {
                 return Out{code: 2, stdout: "", stderr: "posting import: --type needs a value\n"}
             }
             typ = args[i]
             i = i + 1
-        } else if a == "-o" || a == "--output" {
+        } else if flags && (a == "-o" || a == "--output" || a == "-output") {
             if i >= len(args) {
                 return Out{code: 2, stdout: "", stderr: "posting import: --output needs a value\n"}
             }
             i = i + 1
-        } else if a == "-h" || a == "--help" {
+        } else if flags && (a == "-h" || a == "--help") {
             return Out{code: 0, stdout: "usage: posting import [-t openapi|postman|bruno] [-o DIR] SOURCE...\n", stderr: ""}
-        } else if len(a) > 0 && byteat(a, 0) == 45 {
+        } else if flags && len(a) > 0 && byteat(a, 0) == 45 {
             return Out{code: 2, stdout: "", stderr: "posting import: unknown flag " + a + "\n"}
         } else {
             srcs = push(srcs, a)
         }
     }
-    if typ != "openapi" && typ != "postman" && typ != "bruno" {
+    typ = cli_lower_ascii(typ)
+    if typ != "openapi" && typ != "postman" && typ != "bruno" && typ != "" {
         return Out{code: 2, stdout: "", stderr: "posting import: unknown type " + typ + "\n"}
     }
     if len(srcs) == 0 {
         return Out{code: 2, stdout: "", stderr: "posting import: no input files\n"}
     }
-    return Out{code: 1, stdout: "", stderr: "posting import: " + typ + " import lands M4 in this build\n"}
+    return import_run(srcs, typ, args)
+}
+
+// ---------- import engine ----------
+
+// imp_diag — upstream importDiagnostic: strconv.Quote minus the
+// surrounding quotes (escapes control chars for terminal safety).
+fn imp_diag(msg: str) -> str {
+    j := json.jstr(msg)
+    if j == nil {
+        return msg
+    }
+    q := json.tojson(j)
+    if len(q) >= 2 {
+        return substr(q, 1, len(q) - 1)
+    }
+    return msg
+}
+
+fn imp_warns(warns: []str) -> str {
+    out := ""
+    i := 0
+    for i < len(warns) {
+        out = out + "warning: " + imp_diag(warns[i]) + "\n"
+        i = i + 1
+    }
+    return out
+}
+
+// imp_is_postman_env — values array present, item array absent.
+fn imp_is_postman_env(data: str) -> bool {
+    doc := json.jparse(data)
+    if doc == nil || doc.kind != 4 {
+        return false
+    }
+    v := json.jget(doc, "values")
+    it := json.jget(doc, "item")
+    return v != nil && v.kind == 5 && (it == nil || it.kind != 5)
+}
+
+// imp_detect — parseCollection format sniff: .bru → bruno; else JSON
+// keys openapi|swagger → openapi, info+item → postman; YAML fallback.
+fn imp_detect(src: str, data: str) -> str {
+    // cheap suffix check first
+    if len(src) >= 4 && substr(src, len(src) - 4, len(src)) == ".bru" {
+        return "bruno"
+    }
+    doc := json.jparse(data)
+    if doc != nil && doc.kind == 4 {
+        if json.jget(doc, "openapi") != nil || json.jget(doc, "swagger") != nil {
+            return "openapi"
+        }
+        if json.jget(doc, "info") != nil && json.jget(doc, "item") != nil {
+            return "postman"
+        }
+        return ""
+    }
+    // YAML fallback — top-level map keys only.
+    [yn, ye] = yaml.parse(data)
+    if ye != nil || yn == nil || yn.kind != 1 {
+        return ""
+    }
+    has_oas := false
+    has_info := false
+    has_item := false
+    i := 0
+    for i < len(yn.pairs) {
+        k := yn.pairs[i].key
+        if k == "openapi" || k == "swagger" {
+            has_oas = true
+        }
+        if k == "info" {
+            has_info = true
+        }
+        if k == "item" {
+            has_item = true
+        }
+        i = i + 1
+    }
+    if has_oas {
+        return "openapi"
+    }
+    if has_info && has_item {
+        return "postman"
+    }
+    return ""
+}
+
+struct ImpParseOut { res: own importing.Result, format: str, errmsg: str }
+
+fn imp_parse(src: str, data: str, format: str) -> own ImpParseOut {
+    o := new(ImpParseOut)
+    fmt := format
+    if fmt == "" {
+        fmt = imp_detect(src, data)
+    }
+    if fmt == "" {
+        o.errmsg = "cannot detect import format; use --type openapi, postman, or bruno"
+        return o
+    }
+    o.format = fmt
+    if fmt == "openapi" {
+        [r, e] = importing.oparse(data)
+        if e != nil {
+            o.errmsg = errors.msg(e)
+            return o
+        }
+        o.res = r
+        return o
+    }
+    if fmt == "postman" {
+        [r2, e2] = importing.pparse(data)
+        if e2 != nil {
+            o.errmsg = errors.msg(e2)
+            return o
+        }
+        o.res = r2
+        return o
+    }
+    [r3, e3] = importing.bparse(data)
+    if e3 != nil {
+        o.errmsg = errors.msg(e3)
+        return o
+    }
+    o.res = r3
+    return o
+}
+
+// imp_base — filepath.Base approximation for env naming.
+fn imp_base(path: str) -> str {
+    i := len(path) - 1
+    for i >= 0 {
+        if byteat(path, i) == 47 {
+            return substr(path, i + 1, len(path))
+        }
+        i = i - 1
+    }
+    return path
+}
+
+fn imp_trim_suffix(s: str, suf: str) -> str {
+    if len(s) >= len(suf) && substr(s, len(s) - len(suf), len(s)) == suf {
+        return substr(s, 0, len(s) - len(suf))
+    }
+    return s
+}
+
+// readImports — at most one collection + Postman env exports.
+// imp_abspath — filepath.Abs approximation: lexical, no existence
+// requirement. os.fullpath is realpath(3)-backed and returns "" for
+// paths that do not exist yet — which is exactly the import output
+// case, since write creates it. Relative paths join onto cwd.
+fn imp_abspath(p: str) -> str {
+    if len(p) > 0 && byteat(p, 0) == 47 {
+        return p
+    }
+    cwd := os.fullpath(".")
+    if len(cwd) == 0 {
+        return p
+    }
+    return cwd + "/" + p
+}
+
+fn import_run(sources: []str, format: str, args: []str) -> Out {
+    coll := new(importing.Result)
+    coll.requests = mkslice(importing.ImpRequest, 0)
+    coll.variables = mkslice(model.KV, 0)
+    coll.envs = mkslice(importing.Env, 0)
+    coll.warns = mkslice(str, 0)
+    have_coll := false
+    coll_src := ""
+    coll_fmt := ""
+    all_warns := mkslice(str, 0)
+    si := 0
+    for si < len(sources) {
+        src := sources[si]
+        si = si + 1
+        if os.isdir(src) {
+            if format != "" && format != "bruno" {
+                return Out{code: 2, stdout: "", stderr: "posting import: " + format + " import requires a file\n"}
+            }
+            if have_coll {
+                return Out{code: 1, stdout: "", stderr: "posting import: expected one collection, but " + coll_src + " and " + src + " are both collections\n"}
+            }
+            have_coll = true
+            coll_src = src
+            [cres, cerr] = importing.bl_load(src)
+            if cerr != nil {
+                return Out{code: 1, stdout: "", stderr: "posting import: " + imp_diag(errors.msg(cerr)) + "\n"}
+            }
+            coll = cres
+            coll_fmt = "bruno"
+            continue
+        }
+        if !os.exists(src) {
+            return Out{code: 1, stdout: "", stderr: "posting import: " + imp_diag(src) + ": no such file\n"}
+        }
+        data := os.readfile_(src)
+        if len(data) > 33554432 {
+            return Out{code: 1, stdout: "", stderr: "posting import: " + imp_diag(src) + ": source exceeds the 32 MiB import limit\n"}
+        }
+        if imp_is_postman_env(data) {
+            eo := importing.pparse_env(data)
+            if len(eo.err) > 0 {
+                return Out{code: 1, stdout: "", stderr: "posting import: " + src + ": " + imp_diag(eo.err) + "\n"}
+            }
+            if len(eo.err) == 0 && eo.env != nil {
+                ev := importing.Env{name: eo.env.name, variables: eo.env.variables}
+                if ev.name == "" {
+                    ev.name = imp_trim_suffix(imp_trim_suffix(imp_base(src), ".json"), ".postman_environment")
+                }
+                coll.envs = push(coll.envs, ev)
+            }
+            all_warns = append_kv_warns(all_warns, eo.warns)
+            continue
+        }
+        if have_coll {
+            return Out{code: 1, stdout: "", stderr: "posting import: expected one collection, but " + coll_src + " and " + src + " are both collections; other arguments must be Postman environment exports\n"}
+        }
+        have_coll = true
+        coll_src = src
+        po := imp_parse(src, data, format)
+        if len(po.errmsg) > 0 {
+            return Out{code: 1, stdout: "", stderr: "posting import: " + imp_diag(po.errmsg) + "\n"}
+        }
+        coll = po.res
+        coll_fmt = po.format
+    }
+    // merge env-export warnings into result warnings
+    i := 0
+    for i < len(all_warns) {
+        coll.warns = push(coll.warns, all_warns[i])
+        i = i + 1
+    }
+    output := ""
+    // -o/--output value was consumed by the flag parser; recover it
+    // from the raw args (last occurrence wins).
+    ai := 1
+    for ai < len(args) {
+        a := args[ai]
+        ai = ai + 1
+        if a == "-o" || a == "--output" || a == "-output" {
+            if ai < len(args) {
+                output = args[ai]
+                ai = ai + 1
+            }
+        } else if len(a) >= 3 && substr(a, 0, 3) == "-o=" {
+            output = substr(a, 3, len(a))
+        } else if len(a) >= 8 && substr(a, 0, 8) == "-output=" {
+            output = substr(a, 8, len(a))
+        } else if len(a) >= 9 && substr(a, 0, 9) == "--output=" {
+            output = substr(a, 9, len(a))
+        }
+    }
+    if coll_fmt == "" && len(sources) > 0 && output == "" {
+        return Out{code: 2, stdout: "", stderr: "posting import: importing only environments requires --output DIR, the collection to add them to\n"}
+    }
+    if coll_fmt != "" && len(coll.requests) == 0 {
+        return Out{code: 1, stdout: "", stderr: "posting import: source contains no importable HTTP requests\n" + imp_warns(append_kv_warns(coll.warns, mkslice(str, 0)))}
+    }
+    if output == "" {
+        output = config.default_coll_dir() + "/" + importing.directory_name(coll.name)
+    }
+    output = imp_abspath(output)
+    [written, werr] = importing.write(coll, output)
+    if werr != nil {
+        return Out{code: 1, stdout: "", stderr: "posting import: " + imp_diag(errors.msg(werr)) + "\n"}
+    }
+    warns := append_kv_warns(coll.warns, written.warns)
+    wtext := imp_warns(warns)
+    if coll_fmt == "" {
+        out := "Imported " + itoa(len(coll.envs)) + " environment(s) into \"" + output + "\".\n"
+        return Out{code: 0, stdout: out + imp_envs_line(output, written.envs), stderr: wtext}
+    }
+    out := "Imported " + itoa(len(written.files)) + " " + coll_fmt + " request(s) into \"" + output + "\".\n"
+    return Out{code: 0, stdout: out + imp_envs_line(output, written.envs), stderr: wtext}
+}
+
+fn append_kv_warns(a: []str, b: []str) -> []str {
+    i := 0
+    for i < len(b) {
+        a = push(a, b[i])
+        i = i + 1
+    }
+    return a
+}
+
+// imp_envs_line — printImportedEnvironments: env files + Open with hint.
+fn imp_envs_line(output: str, envs: []importing.WEnv) -> str {
+    if len(envs) == 0 {
+        return "Open with: posting -c " + imp_quote(output) + "\n"
+    }
+    files := ""
+    selected := ""
+    i := 0
+    for i < len(envs) {
+        f := imp_diag(envs[i].file)
+        if envs[i].base {
+            f = f + " (base)"
+        } else if selected == "" {
+            selected = envs[i].name
+        }
+        if i > 0 {
+            files = files + ", "
+        }
+        files = files + f
+        i = i + 1
+    }
+    if selected == "" {
+        selected = envs[0].name
+    }
+    return "Environments: " + files + "\nOpen with: posting -c " + imp_quote(output) + " --env " + imp_quote(selected) + "\n"
+}
+
+fn imp_rep(s: str, old: str, repl: str) -> str {
+    out := ""
+    pos := 0
+    done := false
+    for !done {
+        i := find(substr(s, pos, len(s)), old)
+        if i < 0 {
+            done = true
+        } else {
+            gi := pos + i
+            out = out + substr(s, pos, gi) + repl
+            pos = gi + len(old)
+        }
+    }
+    return out + substr(s, pos, len(s))
+}
+
+// imp_quote — curl.Quote approximation: single-quote when needed.
+fn imp_quote(s: str) -> str {
+    need := false
+    i := 0
+    for i < len(s) {
+        c := byteat(s, i)
+        if c <= 32 || c == 39 || c == 34 || c == 92 {
+            need = true
+        }
+        i = i + 1
+    }
+    if !need {
+        return s
+    }
+    return "'" + imp_rep(s, "'", "'\''") + "'"
 }
 
 // ---------- run ----------
