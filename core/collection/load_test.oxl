@@ -120,7 +120,8 @@ fn test_decode_options_setmask() {
 
 fn test_encode_omitempty() {
     r := new(PRequest{name: "N", description: "", kind: "", method: "GET", url: "http://x", headers: nil, params: nil, path_params: nil, body: nil, graphql: nil, grpc: nil, websocket: nil, auth: nil, scripts: nil, options: nil, captures: nil, variable_scope: nil})
-    out := marshal(r)
+    [out, me] = marshal(r)
+    testing.expect(me == nil, "marshal valid")
     testing.expect(find(out, "name: N") >= 0, "name emitted")
     testing.expect(find(out, "method: GET") >= 0, "method emitted")
     testing.expect(find(out, "description") < 0, "empty desc omitted")
@@ -132,7 +133,8 @@ fn test_encode_key_order_and_safety() {
     r := new(PRequest{name: "true", description: "d", kind: "", method: "POST", url: "u", headers: nil, params: nil, path_params: nil, body: nil, graphql: nil, grpc: nil, websocket: nil, auth: nil, scripts: nil, options: nil, captures: nil, variable_scope: nil})
     hs := push(r.headers, model.KV{name: "X", value: "42", enabled: false})
     r.headers = hs
-    out := marshal(r)
+    [out, me2] = marshal(r)
+    testing.expect(me2 == nil, "marshal valid")
     in := find(out, "name:")
     id := find(out, "method:")
     testing.expect(in >= 0 && id > in, "name before method")
@@ -149,7 +151,8 @@ fn test_marshal_roundtrip() {
     src := "name: Round\nmethod: POST\nurl: http://x\nbody:\n  content: |\n    line\n  content_type: text/plain\noptions:\n  follow_redirects: false\n  timeout: 3.5\nauth:\n  type: basic\n  basic:\n    username: u\n    password: p\n"
     [r, e] = decode_src(src)
     testing.expect(e == nil, "decode")
-    out := marshal(r)
+    [out, me3] = marshal(r)
+    testing.expect(me3 == nil, "marshal valid")
     [r2, e2] = decode_src(out)
     testing.expect(e2 == nil, "re-decode")
     testing.expect_streq(r2.body.content, "line\n", "block scalar rt")
@@ -287,7 +290,11 @@ fn test_plan_req_options() {
     testing.expect_eq(sp.req.max_redirects, 0, "no redirects")
     testing.expect_streq(sp.req.verify, "no", "verify no")
     testing.expect_eq(sp.req.timeout_ms, 2500, "timeout ms")
-    testing.expect_eq(len(sp.warns), 1, "proxy warn")
+    // WI-0017: proxy_url now wires into req.proxies ("all:"-scoped)
+    // instead of warning-and-directing (ADR-0044).
+    testing.expect_eq(len(sp.warns), 0, "no proxy warn")
+    testing.expect_eq(len(sp.req.proxies), 1, "proxy wired")
+    testing.expect_streq(sp.req.proxies[0], "all:http://p", "all-wrapped")
     [r2, e2] = decode_src("url: x.com\n")
     sp2 := plan_req(r2, es, nil, "d")
     testing.expect(sp2.req.follow, "follow default")
@@ -349,7 +356,8 @@ fn test_graphql_variables_scalar() {
     testing.expect(e == nil, "decode")
     testing.expect_streq(r.graphql.variables, "{\"code\": \"001\", \"num\": 7}", "vars verbatim")
     testing.expect_streq(r.graphql.operation_name, "Op", "op name")
-    out := marshal(r)
+    [out, me4] = marshal(r)
+    testing.expect(me4 == nil, "marshal valid")
     testing.expect(find(out, "variables:") >= 0, "vars emitted")
     [r2, e2] = decode_src(out)
     testing.expect(e2 == nil, "re-decode")
@@ -491,4 +499,30 @@ fn test_plan_req_substituted_header_guards() {
         i = i + 1
     }
     testing.expect_eq(cookies, 1, "jar suppressed by substituted row")
+}
+
+// captures validate at decode (upstream ParseRequest →
+// ValidateCaptures): bad variable names and bad JSONPath reject the
+// file; a valid map round-trips through encode.
+fn test_captures_decode_validate() {
+    [r, e] = decode_src("url: x.com\ncaptures:\n  ID: $.data.id\n")
+    testing.expect(e == nil, "valid captures decode")
+    testing.expect_eq(len(r.captures), 1, "one capture")
+    testing.expect_streq(r.captures[0].name, "ID", "name")
+    testing.expect_streq(r.captures[0].value, "$.data.id", "path")
+    [_, e2] = decode_src("url: x.com\ncaptures:\n  1BAD: $.x\n")
+    testing.expect(e2 != nil, "digit-leading name rejected")
+    [_, e3] = decode_src("url: x.com\ncaptures:\n  OK: $.[\n")
+    testing.expect(e3 != nil, "bad jsonpath rejected")
+    [_, e4] = decode_src("url: x.com\ncaptures:\n  OK: data..*\n")
+    testing.expect(e4 == nil, "descendant wildcard is valid")
+}
+
+fn test_encode_validate_captures() {
+    r := new(PRequest{name: "N", description: "", kind: "", method: "GET", url: "http://x", headers: nil, params: nil, path_params: nil, body: nil, graphql: nil, grpc: nil, websocket: nil, auth: nil, scripts: nil, options: nil, captures: nil, variable_scope: nil})
+    r.captures = push(r.captures, model.KV{name: "1BAD", value: "$.x", enabled: true})
+    [_, ee] = encode(r)
+    testing.expect(ee != nil, "encode rejects invalid capture")
+    [_, me] = marshal(r)
+    testing.expect(me != nil, "marshal rejects invalid capture")
 }

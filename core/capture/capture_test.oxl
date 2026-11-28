@@ -1,0 +1,513 @@
+package capture
+import "std/testing"
+import "std/errors"
+import "github.com/oxidean/oxttp/core/model"
+
+fn cap1(name: str, path: str) -> model.KV {
+    return model.KV{name: name, value: path, enabled: true}
+}
+
+fn mkcaps() -> []model.KV {
+    return mkslice(model.KV, 0)
+}
+
+fn one(body: str, path: str) -> [str, err] {
+    caps := mkcaps()
+    caps = push(caps, cap1("V", path))
+    [out, e] = capture_values(caps, body as []byte)
+    if e != nil {
+        return "", e
+    }
+    return out[0].value, nil
+}
+
+fn expect_val(body: str, path: str, want: str) {
+    [v, e] = one(body, path)
+    testing.expect(e == nil, "path " + path)
+    testing.expect_streq(v, want, "path " + path)
+}
+
+fn expect_err(body: str, path: str) {
+    [_, e] = one(body, path)
+    testing.expect(e != nil, "path " + path + " must fail")
+}
+
+fn test_capture_values_basic() {
+    body := ("{\"data\":{\"id\":\"abc\",\"n\":42,\"ok\":true,\"nil\":null}}") as []byte
+    caps := mkcaps()
+    caps = push(caps, cap1("S", "data.id"))
+    caps = push(caps, cap1("N", "$.data.n"))
+    caps = push(caps, cap1("B", "$.data.ok"))
+    caps = push(caps, cap1("Z", "$.data.nil"))
+    [out, e] = capture_values(caps, body)
+    testing.expect(e == nil, "capture_values err")
+    testing.expect_eq(len(out), 4, "count")
+    // sorted by name: B,N,S,Z
+    testing.expect_streq(out[0].value, "true", "bool")
+    testing.expect_streq(out[1].value, "42", "num lexeme")
+    testing.expect_streq(out[2].value, "abc", "str unquoted")
+    testing.expect_streq(out[3].value, "null", "null")
+}
+
+fn test_capture_number_lexeme() {
+    expect_val("{\"x\":1.50e2}", "$.x", "1.50e2")
+    expect_val("{\"x\":-0.25}", "$.x", "-0.25")
+}
+
+fn test_capture_compact_json() {
+    expect_val("{\"o\":{\"a\":1,\"b\":[true,null]},\"arr\":[1,  \"x\"]}", "$.o", "{\"a\":1,\"b\":[true,null]}")
+    expect_val("{\"o\":{\"a\":1},\"arr\":[1,  \"x\"]}", "$.arr", "[1,\"x\"]")
+}
+
+fn test_capture_exactly_one() {
+    expect_err("{\"items\":[{\"id\":1},{\"id\":2}]}", "$.items[*].id")
+    expect_err("{\"a\":1}", "$.missing")
+}
+
+fn test_capture_all_or_nothing() {
+    body := ("{\"a\":1}") as []byte
+    caps := mkcaps()
+    caps = push(caps, cap1("OK", "$.a"))
+    caps = push(caps, cap1("BAD", "$.nope"))
+    [out, e] = capture_values(caps, body)
+    testing.expect(e != nil, "err")
+    testing.expect_eq(len(out), 0, "no partial values")
+}
+
+fn test_capture_bad_json() {
+    caps := mkcaps()
+    caps = push(caps, cap1("X", "$.a"))
+    [_, e] = capture_values(caps, "not json" as []byte)
+    testing.expect(e != nil, "bad body")
+}
+
+fn test_capture_empty() {
+    [out, e] = capture_values(nil, "{}" as []byte)
+    testing.expect(e == nil, "empty ok")
+    testing.expect_eq(len(out), 0, "empty")
+}
+
+fn test_validate_names() {
+    bad := mkcaps()
+    bad = push(bad, cap1("1BAD", "$.a"))
+    bad = push(bad, cap1("ok", "$.a"))
+    testing.expect(validate(bad) != nil, "digit-leading name")
+    good := mkcaps()
+    good = push(good, cap1("_ok", "$.a"))
+    good = push(good, cap1("A1", "$.a"))
+    testing.expect(validate(good) == nil, "valid names")
+}
+
+fn test_validate_paths() {
+    b1 := mkcaps()
+    b1 = push(b1, cap1("X", "$.a["))
+    testing.expect(validate(b1) != nil, "unclosed bracket")
+    b2 := mkcaps()
+    b2 = push(b2, cap1("X", ""))
+    testing.expect(validate(b2) != nil, "empty path")
+}
+
+// ---------- selector coverage ----------
+
+fn test_shorthand() {
+    expect_val("{\"a\":{\"b\":7}}", "a.b", "7")
+    expect_val("{\"a\":[9,8]}", "a[0]", "9")
+    expect_err("{\"a\":[9,8]}", "$[0]") // root is object -> no match
+}
+
+fn test_index_neg_slice() {
+    expect_val("[10,20,30]", "$[-1]", "30")
+    expect_val("[10,20,30,40]", "$[1:2]", "20")
+    expect_val("[10,20,30,40]", "$[-1:]", "40")
+    expect_err("[10,20,30,40]", "$[1:3]")
+    expect_err("[10,20,30,40]", "$[::-1]")
+    expect_err("[10,20,30,40]", "$[::2]")
+    expect_val("{\"a\":[1,2,3]}", "$.a[0:1]", "1")
+}
+
+fn test_wildcard() {
+    expect_err("{\"a\":{\"x\":1},\"b\":{\"x\":2}}", "$.*.x")
+    expect_val("{\"only\":{\"x\":9}}", "$.*.x", "9")
+    expect_err("{\"a\":[1,2]}", "$.a[*]")
+}
+
+fn test_union() {
+    expect_val("{\"a\":{\"x\":1}}", "$['a'].x", "1")
+    expect_err("{\"a\":1,\"b\":2,\"c\":3}", "$['a','c']")
+}
+
+fn test_descendant() {
+    expect_val("{\"x\":{\"y\":{\"id\":5}}}", "$..id", "5")
+    expect_err("{\"a\":[{\"id\":1},{\"id\":2}]}", "$..id")
+}
+
+fn test_filters() {
+    body := "{\"items\":[{\"id\":1,\"price\":5},{\"id\":2,\"price\":15},{\"id\":3,\"price\":25}]}"
+    expect_val(body, "$.items[?(@.price<10)].id", "1")
+    expect_val(body, "$.items[?(@.id==2)].price", "15")
+    expect_val(body, "$.items[?(@.id!=2 && @.price>10)].id", "3")
+    expect_err(body, "$.items[?(@.price>10 || @.id==1)].id")
+    caps := mkcaps()
+    caps = push(caps, cap1("V", "$.items[?(!(@.price<20))].id"))
+    [o3, e3] = capture_values(caps, body as []byte)
+    testing.expect(e3 == nil, "not")
+    testing.expect_streq(o3[0].value, "3", "not result")
+    expect_val("{\"a\":[{\"b\":1}]}", "$.a[?(!@.c)]", "{\"b\":1}")
+    expect_val("{\"items\":[{\"s\":\"abc\"}]}", "$.items[?('abc' == @.s)].s", "abc")
+    expect_val("{\"items\":[{\"p\":1.5}]}", "$.items[?(@.p<2)].p", "1.5")
+}
+
+fn test_functions() {
+    body := "{\"items\":[{\"n\":\"abc\",\"t\":[1,2]},{\"n\":\"xyz\",\"t\":[1]}]}"
+    expect_val(body, "$.items[?(length(@.t)>1)].n", "abc")
+    expect_val(body, "$.items[?(match(@.n, \"a.*\"))].n", "abc")
+    expect_val(body, "$.items[?(search(@.n, \"b\"))].n", "abc")
+    expect_val(body, "$.items[?(match(@.n, \"x.*\"))].n", "xyz")
+    expect_val("{\"items\":[{\"id\":1,\"tags\":[\"a\",\"b\"]},{\"id\":2,\"tags\":[\"c\"]}]}", "$.items[?(count(@.tags[*])==2)].id", "1")
+    expect_val("{\"items\":[{\"id\":1,\"t\":[\"x\"]},{\"id\":2,\"t\":[\"y\",\"z\"]}]}", "$.items[?('x' == value(@.t[*]))].id", "1")
+}
+
+fn test_capture_all_or_nothing_failure_after_success() {
+    body := ("{\"a\":1}") as []byte
+    caps := mkcaps()
+    caps = push(caps, cap1("OK", "$.a"))
+    caps = push(caps, cap1("ZZBAD", "$.nope"))
+    [out, e] = capture_values(caps, body)
+    testing.expect(e != nil, "late failure errors")
+    testing.expect_eq(len(out), 0, "late failure publishes nothing")
+}
+
+fn test_jsonpath_surrogate_pair_member_name() {
+    expect_val("{\"😀\":7}", "$[\"\\uD83D\\uDE00\"]", "7")
+}
+
+fn test_jsonpath_rejects_malformed_slice_repeated_int() {
+    expect_err("[1,2,3]", "$[0:1 2]")
+    expect_err("[1,2,3]", "$[0:1:2 3]")
+}
+
+fn test_jsonpath_function_argument_validation() {
+    body := "{\"items\":[{\"id\":1,\"tags\":[\"a\"]}]}"
+    expect_err(body, "$.items[?(count(@.tags[*],)==1)].id")
+    expect_err(body, "$.items[?(count(1)==1)].id")
+    expect_err(body, "$.items[?(value(1)=='a')].id")
+    expect_val(body, "$.items[?(count(@.id)==1)].id", "1")
+    expect_err(body, "$.items[?(match(@.id))].id")
+}
+
+fn test_jsonpath_rejects_value_function_in_negated_test() {
+    expect_err("{\"items\":[{\"id\":1}]}", "$.items[?(!length(@.id))].id")
+}
+
+fn test_jsonpath_match_alternation_stays_anchored() {
+    expect_err("{\"items\":[{\"n\":\"ab\"}]}", "$.items[?(match(@.n, \"a|b\"))].n")
+    expect_val("{\"items\":[{\"n\":\"a\"}]}", "$.items[?(match(@.n, \"a|b\"))].n", "a")
+}
+
+fn test_capture_path_trims_unicode_whitespace() {
+    expect_val("{\"a\":3}", " $.a ", "3")
+}
+
+fn test_json_escape_u2028_u2029() {
+    body := "{\"o\":{\"x\":\"a b c\"}}"
+    expect_val(body, "$.o", "{\"x\":\"a\\u2028b\\u2029c\"}")
+}
+
+fn test_jsonpath_rejects_isolated_surrogates() {
+    expect_err("{\"😀\":7}", "$[\"\\uD83D\"]")
+    expect_err("{\"x\":7}", "$[\"\\uDE00\"]")
+}
+
+fn test_jsonpath_singular_query_segment_whitespace() {
+    expect_val("{\"a\":[9]}", "$.a [0]", "9")
+}
+
+fn test_json_emit_preserves_kannada() {
+    expect_val("{\"o\":{\"x\":\"ಜಝ\"}}", "$.o", "{\"x\":\"ಜಝ\"}")
+}
+
+
+fn test_jsonpath_explicit_step_slices() {
+    expect_val("[10,20]", "$[0:3:2]", "10")
+    expect_val("[10]", "$[::2]", "10")
+    expect_val("[10]", "$[::-1]", "10")
+    expect_val("[10,20,30]", "$[2:0:-2]", "30")
+    [_, e] = capture_path("$[1:::]")
+    testing.expect(e != nil, "repeated colon rejected")
+}
+
+fn test_capture_big_numbers_and_roots() {
+    expect_val("{\"x\":9007199254740993}", "$.x", "9007199254740993")
+    expect_val("[12345678901234567890,1.234567890123456789,1e400]", "$", "[12345678901234567890,1.234567890123456789,1e400]")
+    expect_val("[1,2]", "$[1]", "2")
+    expect_val("\"root\"", "$", "root")
+}
+
+fn test_capture_quoted_empty_key_and_mixed_union() {
+    expect_val("{\"unusual.key\":{\"\":4}}", "$['unusual.key']['']", "4")
+    expect_val("[7]", "$[0,'a']", "7")
+    expect_val("{\"a\":8}", "$[0,'a']", "8")
+}
+
+fn test_capture_missing_value_comparison() {
+    body := "{\"items\":[{\"id\":1},{\"id\":2,\"x\":1}]}"
+    expect_val(body, "$.items[?(@.x != 1)].id", "1")
+    // RFC 9535: equality implies <= and >=, even when both operands
+    // are missing; strict ordering never appears for non-orderable types.
+    expect_val("[{\"id\":1}]", "$[?(@.missing <= @.also_missing)].id", "1")
+    expect_val("[{\"id\":1}]", "$[?(@.missing >= @.also_missing)].id", "1")
+    expect_val("[{\"id\":1,\"a\":[1],\"b\":[1]}]", "$[?(@.a <= @.b)].id", "1")
+    expect_val("[{\"id\":1,\"a\":2,\"b\":1}]", "$[?(@.a > @.b)].id", "1")
+    expect_err("[{\"id\":1,\"a\":true,\"b\":false}]", "$[?@.a > @.b].id")
+    expect_err("[{\"id\":1,\"a\":[1],\"b\":[1]}]", "$[?@.a > @.b].id")
+}
+
+fn test_capture_object_emit_sorts_keys() {
+    expect_val("{\"o\":{\"z\":1,\"a\":{\"z\":2,\"b\":3}}}", "$.o", "{\"a\":{\"b\":3,\"z\":2},\"z\":1}")
+    expect_val("{\"o\":{\"b\":1,\"a\":1,\"a\":2}}", "$.o", "{\"a\":2,\"b\":1}")
+}
+
+fn test_regex_dot_rewrite_posix_class() {
+    testing.expect_streq(regex_dot_rewrite("[[:alpha:].]"), "[[:alpha:].]", "posix class preserved")
+    testing.expect_streq(regex_dot_rewrite("a.b"), "a[^\\n\\r]b", "bare dot rewritten")
+    body := "{\"items\":[{\"n\":\"a\"},{\"n\":\"1\"}]}"
+    expect_val(body, "$.items[?(match(@.n, \"[[:alpha:].]\"))].n", "a")
+}
+
+fn test_wide_object_capture_completes() {
+    bs := mkslice(byte, 0)
+    bs = push(bs, 123)
+    i := 0
+    for i < 3000 {
+        if i > 0 {
+            bs = push(bs, 44)
+        }
+        pad := itoa(i)
+        for len(pad) < 4 {
+            pad = "0" + pad
+        }
+        bs = bpush(bs, "\"k" + pad + "\":1")
+        i = i + 1
+    }
+    bs = bpush(bs, ",\"k0000\":2}")
+    caps := mkcaps()
+    caps = push(caps, cap1("W", "$"))
+    [out, e] = capture_values(caps, bs)
+    testing.expect(e == nil, "wide object captures")
+    testing.expect_eq(len(out), 1, "wide object count")
+    // root array emission likewise resolves once and streams children
+    // in order — regression coverage for the quadratic child-path scans.
+    ab := mkslice(byte, 0)
+    ab = push(ab, 91)
+    i = 0
+    for i < 3000 {
+        if i > 0 {
+            ab = push(ab, 44)
+        }
+        ab = bpush(ab, itoa(i))
+        i = i + 1
+    }
+    ab = push(ab, 93)
+    [out2, e2] = capture_values(caps, ab)
+    testing.expect(e2 == nil, "wide array captures")
+    testing.expect_eq(len(out2), 1, "wide array count")
+}
+
+
+fn test_capture_values_upstream_map() {
+    body := ("{\"data\":{\"id\":9007199254740993,\"items\":[{\"id\":\"first\"},{\"id\":\"${literal}$cash\"}],\"empty\":\"\",\"enabled\":false,\"nothing\":null,\"a.b\":{\"quote\\\"key\":[7,8]}}}") as []byte
+    caps := mkcaps()
+    caps = push(caps, cap1("ID", "data.id"))
+    caps = push(caps, cap1("ITEM", "$.data.items[1].id"))
+    caps = push(caps, cap1("EMPTY", "data.empty"))
+    caps = push(caps, cap1("BOOL", "data.enabled"))
+    caps = push(caps, cap1("NULL", "data.nothing"))
+    caps = push(caps, cap1("ARRAY", "data[\"a.b\"][\"quote\\\"key\"]"))
+    caps = push(caps, cap1("OBJECT", "data.items[0]"))
+    [out, e] = capture_values(caps, body)
+    testing.expect(e == nil, "upstream capture map")
+    testing.expect_eq(len(out), 7, "upstream capture count")
+    i := 0
+    for i < len(out) {
+        if out[i].name == "ID" { testing.expect_streq(out[i].value, "9007199254740993", "ID") }
+        if out[i].name == "ITEM" { testing.expect_streq(out[i].value, "${literal}$cash", "ITEM") }
+        if out[i].name == "EMPTY" { testing.expect_streq(out[i].value, "", "EMPTY") }
+        if out[i].name == "BOOL" { testing.expect_streq(out[i].value, "false", "BOOL") }
+        if out[i].name == "NULL" { testing.expect_streq(out[i].value, "null", "NULL") }
+        if out[i].name == "ARRAY" { testing.expect_streq(out[i].value, "[7,8]", "ARRAY") }
+        if out[i].name == "OBJECT" { testing.expect_streq(out[i].value, "{\"id\":\"first\"}", "OBJECT") }
+        i = i + 1
+    }
+    expect_val("[{\"id\":1},{\"id\":2}]", "[1].id", "2")
+    expect_val("[{\"id\":1},{\"id\":2}]", "$[1].id", "2")
+    expect_val("\"root\"", "$", "root")
+}
+
+fn test_capture_jsonpath_upstream_table() {
+    body := "{\"data\":{\"users\":[{\"id\":12,\"role\":\"member\",\"active\":false},{\"id\":9007199254740993,\"role\":\"admin\",\"active\":true},{\"id\":27}]},\"nested\":{\"session\":{\"token\":\"secret\"}},\"one\":{\"item\":[7,8]},\"unusual.key\":{\"\":\"empty key\"},\"日本語\":{\"id\":\"unicode\"},\"numbers\":[12345678901234567890,1.234567890123456789,1e400]}"
+    expect_val(body, "data.users[?(@.role == \"admin\")].id", "9007199254740993")
+    expect_val(body, "$.data.users[?(@.active == true && @.id > 20)].id", "9007199254740993")
+    expect_val(body, "data.users[?(match(@.role, \"admin\"))].id", "9007199254740993")
+    expect_val(body, "data.users[?(@.id == 12)].id", "12")
+    expect_val(body, "data.users[-1].id", "27")
+    expect_val(body, "data.users[1:2].id", "9007199254740993")
+    expect_val(body, "$..token", "secret")
+    expect_val(body, "nested..token", "secret")
+    expect_val(body, "one.*", "[7,8]")
+    expect_val(body, "[\"unusual.key\"]['']", "empty key")
+    expect_val(body, "日本語.id", "unicode")
+    expect_val(body, "  $.日本語.id  ", "unicode")
+    expect_val(body, "numbers", "[12345678901234567890,1.234567890123456789,1e400]")
+}
+
+fn capture_pair_fails(body: str, path: str) {
+    caps := mkcaps()
+    caps = push(caps, cap1("A_FIRST", "data.id"))
+    caps = push(caps, cap1("Z_LAST", path))
+    [out, e] = capture_values(caps, body as []byte)
+    testing.expect(e != nil, "path must fail: " + path)
+    testing.expect_eq(len(out), 0, "no partial values: " + path)
+}
+
+fn test_capture_failure_upstream_table() {
+    capture_pair_fails("{\"data\":{\"id\":1}}", "data.missing")
+    capture_pair_fails("{\"data\":{\"id\":1}}", "data.id.nested")
+    capture_pair_fails("{\"data\":{\"id\":1},\"items\":[0,1]}", "items[2]")
+    capture_pair_fails("{\"data\":{\"id\":1},\"items\":{}}", "items[0]")
+    capture_pair_fails("{\"data\":{\"id\":1},\"items\":[{\"id\":2},{\"id\":3}]}", "items[*].id")
+    capture_pair_fails("{\"data\":{\"id\":1},\"items\":[{\"id\":2},{\"id\":3}]}", "items[?(@.id > 3)].id")
+    capture_pair_fails("{\"data\":{\"id\":1}}", "data['id','id']")
+    capture_pair_fails("{\"data\":{\"id\":1}} {}", "data.id")
+    capture_pair_fails("<html>not JSON</html>", "data.id")
+    capture_pair_fails("", "data.id")
+    [out2, e2] = capture_values(nil, "not JSON" as []byte)
+    testing.expect(e2 == nil, "nil captures accept non-JSON")
+    testing.expect_eq(len(out2), 0, "nil captures empty")
+}
+
+fn validate_bad_path(path: str) {
+    caps := mkcaps()
+    caps = push(caps, cap1("ID", path))
+    testing.expect(validate(caps) != nil, "bad path accepted: " + path)
+}
+
+fn test_capture_validation_upstream_table() {
+    validate_bad_path("")
+    validate_bad_path(" ")
+    validate_bad_path("data.")
+    validate_bad_path("data.[0]")
+    validate_bad_path("data[0]id")
+    validate_bad_path("$data")
+    validate_bad_path("$.data[")
+    validate_bad_path("data[01]")
+    validate_bad_path("data[?(@.id ==)]")
+    validate_bad_path(".data")
+    validate_bad_path("..id")
+    validate_bad_path("@.id")
+    validate_bad_path("*")
+    validate_bad_path("1id")
+    validate_bad_path("data[\"bad\\x\"]")
+    validate_bad_path("data[99999999999999999999999999]")
+    bad1 := mkcaps()
+    bad1 = push(bad1, cap1("", "data.id"))
+    testing.expect(validate(bad1) != nil, "empty name")
+    bad2 := mkcaps()
+    bad2 = push(bad2, cap1("1ID", "data.id"))
+    testing.expect(validate(bad2) != nil, "digit name")
+    bad3 := mkcaps()
+    bad3 = push(bad3, cap1("bad-name", "data.id"))
+    testing.expect(validate(bad3) != nil, "hyphen name")
+    bad4 := mkcaps()
+    bad4 = push(bad4, cap1("$uuid", "data.id"))
+    testing.expect(validate(bad4) != nil, "dollar name")
+}
+
+fn test_capture_extra_upstream_edges() {
+    expect_val("[10,20]", "$[2:0:-1]", "20")
+    expect_val("[10]", "$[::-1]", "10")
+    expect_val("{\"items\":[{\"id\":1,\"x\":2}]}", "$.items[?(@.x)].id", "1")
+    expect_val("{\"items\":[{\"id\":1,\"s\":\"abc\"}]}", "$.items[?(@.s < \"b\")].id", "1")
+}
+
+fn test_capture_review_range_and_regex_edges() {
+    // Float range failures are non-numeric for ordering; equal lexemes
+    // still compare equal through the raw-text fallback.
+    expect_err("[{\"id\":1,\"n\":1e400}]", "$[?@.n > 5].id")
+    expect_err("[{\"id\":1,\"n\":-1e400}]", "$[?@.n < 5].id")
+    expect_err("[{\"id\":1,\"n\":1e400}]", "$[?@.n == 1e400].id")
+    expect_err("[{\"id\":1,\"n\":1e400}]", "$[?@.n == 1e999].id")
+    expect_err("[{\"id\":1,\"n\":5}]", "$[?@.n == 9223372036854775808].id")
+    expect_err("[{\"id\":1,\"n\":5}]", "$[?@.n == -9223372036854775809].id")
+    expect_val("[{\"id\":1,\"n\":1e-999}]", "$[?@.n == 0].id", "1")
+    testing.expect_streq(regex_dot_rewrite("\\Q.\\E"), "\\Q.\\E", "quoted literal dot preserved")
+    expect_val("{\"items\":[{\"n\":\".\"},{\"n\":\"a\"}]}", "$.items[?(match(@.n, \"\\\\Q.\\\\E\"))].n", ".")
+    expect_err("[{\"a\":[9],\"id\":1}]", "$[?@[ 0] == 9].id")
+    expect_err("[{\"a\":[9],\"id\":1}]", "$[?@[0 ] == 9].id")
+    // Upstream-limited deviation: std/regexp does not yet support RFC 9485
+    // Unicode category escapes (oxidean/oxl#233), so compilation fails closed.
+    expect_err("[{\"id\":1,\"n\":\"abc\"}]", "$[?match(@.n, \"\\\\p{L}+\")].id")
+}
+
+fn test_jsonpath_integer_range_no_wraparound() {
+    [_, e] = capture_path("$[18446744073709551616]")
+    testing.expect(e != nil, "2^64 index rejected")
+    [_, e2] = capture_path("$[18446744073709551617]")
+    testing.expect(e2 != nil, "2^64+1 index rejected")
+    [_, e3] = capture_path("$[-9007199254740992]")
+    testing.expect(e3 != nil, "negative range rejected")
+    expect_val("[7,8]", "$[-2]", "7")
+}
+
+fn test_json_invalid_utf8_replaced() {
+    body := mkslice(byte, 0)
+    body = bpush(body, "{\"x\":\"a")
+    body = push(body, 255)
+    body = bpush(body, "b\"}")
+    caps := mkcaps()
+    caps = push(caps, cap1("X", "$.x"))
+    [out, e] = capture_values(caps, body)
+    testing.expect(e == nil, "invalid utf8 decodes like upstream")
+    testing.expect_streq(out[0].value, "a�b", "malformed byte replaced")
+}
+
+fn test_wide_array_filter_and_descendant_complete() {
+    ib := mkslice(byte, 0)
+    ib = bpush(ib, "{\"items\":[")
+    i := 0
+    for i < 3000 {
+        if i > 0 {
+            ib = push(ib, 44)
+        }
+        ib = bpush(ib, "{\"id\":" + itoa(i) + "}")
+        i = i + 1
+    }
+    ib = bpush(ib, "]}")
+    caps := mkcaps()
+    caps = push(caps, cap1("W", "$.items[?(@.id >= 0)].id"))
+    [_, e] = capture_values(caps, ib)
+    testing.expect(e != nil, "multi-match filter completes")
+    caps[0].value = "$..id"
+    [_, e2] = capture_values(caps, ib)
+    testing.expect(e2 != nil, "multi-match descendant completes")
+}
+
+fn test_jsonpath_filter_depth_budget() {
+    expr := "$[?(@.id == 1)].id"
+    deep := "$[?"
+    i := 0
+    for i < 300 {
+        deep = deep + "("
+        i = i + 1
+    }
+    deep = deep + "@.id == 1"
+    i = 0
+    for i < 300 {
+        deep = deep + ")"
+        i = i + 1
+    }
+    deep = deep + "].id"
+    [_, e] = capture_path(deep)
+    testing.expect(e != nil, "deeply nested filter rejected")
+    testing.expect(find(errors.msg(e), "exceeds 256 levels") >= 0, "depth error text")
+    expect_val("[{\"id\":1}]", expr, "1")
+}
