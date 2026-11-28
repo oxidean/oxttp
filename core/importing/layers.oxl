@@ -1,0 +1,301 @@
+package importing
+
+// layers.oxl — port of internal/importing/layers.go: variable
+// write-order so each env file's eager ${NAME} expansion matches
+// lazy request-time resolution.
+import "github.com/oxidean/oxttp/core/model"
+
+// VList wraps one env file's variable layer (oxl has no [][]T).
+struct VList { vars: []model.KV }
+
+// IVec wraps an int list (no [][]int either).
+struct IVec { items: []int }
+
+struct LayersOut { files: []VList, warns: []str }
+struct OrdOut { vars: []model.KV, cycle: []str }
+
+// layers returns the per-file variable lists in write order (base
+// first) plus warnings. names-in-cycle warning text verbatim.
+fn layers(base: []model.KV, envs: []Env) -> own LayersOut {
+    o := new(LayersOut)
+    o.files = mkslice(VList, 0)
+    o.warns = mkslice(str, 0)
+    r0 := ordered_vars(base)
+    o.files = push(o.files, VList{vars: r0.vars})
+    if len(r0.cycle) > 0 {
+        o.warns = push(o.warns, "base environment: variables " + str_join(r0.cycle, ", ") + " reference each other in a cycle; they are written in source order")
+    }
+    ei := 0
+    for ei < len(envs) {
+        e := envs[ei]
+        // names the environment defines (linear-scan list)
+        dnames := mkslice(str, 0)
+        vi := 0
+        for vi < len(e.variables) {
+            dnames = push(dnames, e.variables[vi].name)
+            vi = vi + 1
+        }
+        // repeat[i]: base var i must be re-emitted in this env file
+        // because it (transitively) references a name the env defines
+        repeat := mkslice(bool, len(base))
+        changed := true
+        for changed == true {
+            changed = false
+            bi := 0
+            for bi < len(base) {
+                if repeat[bi] {
+                    bi = bi + 1
+                    continue
+                }
+                // skip base vars the env itself redefines
+                isdef := false
+                di := 0
+                for di < len(dnames) {
+                    if dnames[di] == base[bi].name {
+                        isdef = true
+                    }
+                    di = di + 1
+                }
+                if isdef {
+                    bi = bi + 1
+                    continue
+                }
+                refs := model.find_variables(base[bi].value)
+                ri := 0
+                for ri < len(refs) {
+                    di = 0
+                    for di < len(dnames) {
+                        if dnames[di] == refs[ri].name {
+                            repeat[bi] = true
+                            changed = true
+                        }
+                        di = di + 1
+                    }
+                    ri = ri + 1
+                }
+                bi = bi + 1
+            }
+            // newly repeated base vars count as defined for the next
+            // pass (upstream adds their names to `defined`)
+            bi = 0
+            for bi < len(base) {
+                if repeat[bi] {
+                    nm := base[bi].name
+                    already := false
+                    di := 0
+                    for di < len(dnames) {
+                        if dnames[di] == nm {
+                            already = true
+                        }
+                        di = di + 1
+                    }
+                    if !already {
+                        dnames = push(dnames, nm)
+                    }
+                }
+                bi = bi + 1
+            }
+        }
+        vars := mkslice(model.KV, 0)
+        vi = 0
+        for vi < len(e.variables) {
+            vars = push(vars, e.variables[vi])
+            vi = vi + 1
+        }
+        bi := 0
+        for bi < len(base) {
+            if repeat[bi] {
+                vars = push(vars, base[bi])
+            }
+            bi = bi + 1
+        }
+        r1 := ordered_vars(vars)
+        o.files = push(o.files, VList{vars: r1.vars})
+        if len(r1.cycle) > 0 {
+            o.warns = push(o.warns, "environment " + e.name + ": variables " + str_join(r1.cycle, ", ") + " reference each other in a cycle; they are written in source order")
+        }
+        ei = ei + 1
+    }
+    return o
+}
+
+// ordered_vars — topological write order (deps first), source order
+// preserved where possible; cycles broken at earliest member and
+// their names returned in source order.
+fn ordered_vars(vars: []model.KV) -> own OrdOut {
+    n := len(vars)
+    // byName: name → indexes (dupes allowed; deps point at all but self)
+    deps := mkslice(IVec, n)
+    dependents := mkslice(IVec, n)
+    pending := mkslice(int, n)
+    i := 0
+    for i < n {
+        deps[i] = IVec{items: mkslice(int, 0)}
+        dependents[i] = IVec{items: mkslice(int, 0)}
+        pending[i] = 0
+        i = i + 1
+    }
+    i = 0
+    for i < n {
+        // collect this var's refs
+        refs := model.find_variables(vars[i].value)
+        seen := mkslice(int, 0)
+        ri := 0
+        for ri < len(refs) {
+            j := 0
+            for j < n {
+                if j != i && vars[j].name == refs[ri].name {
+                    dup := false
+                    si := 0
+                    for si < len(seen) {
+                        if seen[si] == j {
+                            dup = true
+                        }
+                        si = si + 1
+                    }
+                    if !dup {
+                        seen = push(seen, j)
+                        deps[i].items = push(deps[i].items, j)
+                        dependents[j].items = push(dependents[j].items, i)
+                        pending[i] = pending[i] + 1
+                    }
+                }
+                j = j + 1
+            }
+            ri = ri + 1
+        }
+        i = i + 1
+    }
+    done := mkslice(bool, n)
+    in_cycle := mkslice(bool, n)
+    // ready = sorted list of pending==0 indexes (indexHeap equiv)
+    ready := mkslice(int, 0)
+    i = 0
+    for i < n {
+        if pending[i] == 0 {
+            ready = ins_sorted(ready, i)
+        }
+        i = i + 1
+    }
+    out := mkslice(model.KV, 0)
+    first := 0
+    for len(out) < n {
+        next := -1
+        if len(ready) > 0 {
+            next = ready[0]
+            ready = ready[1:]
+        } else {
+            // cycle: pick earliest undone, mark its loop
+            for first < n && done[first] {
+                first = first + 1
+            }
+            if first >= n {
+                break
+            }
+            members := cycle_from(first, deps, done)
+            next = members[0]
+            mi := 0
+            for mi < len(members) {
+                in_cycle[members[mi]] = true
+                if members[mi] < next {
+                    next = members[mi]
+                }
+                mi = mi + 1
+            }
+        }
+        if next < 0 || done[next] {
+            continue
+        }
+        done[next] = true
+        out = push(out, vars[next])
+        di := 0
+        for di < len(dependents[next].items) {
+            d := dependents[next].items[di]
+            pending[d] = pending[d] - 1
+            if pending[d] == 0 && !done[d] {
+                ready = ins_sorted(ready, d)
+            }
+            di = di + 1
+        }
+    }
+    oo := new(OrdOut)
+    oo.vars = out
+    oo.cycle = mkslice(str, 0)
+    i = 0
+    for i < n {
+        if in_cycle[i] {
+            oo.cycle = push(oo.cycle, vars[i].name)
+        }
+        i = i + 1
+    }
+    return oo
+}
+
+fn ins_sorted(xs: []int, v: int) -> []int {
+    i := len(xs)
+    for i > 0 && xs[i - 1] > v {
+        i = i - 1
+    }
+    out := mkslice(int, len(xs) + 1)
+    j := 0
+    for j < i {
+        out[j] = xs[j]
+        j = j + 1
+    }
+    out[i] = v
+    j = i + 1
+    for j <= len(xs) {
+        out[j] = xs[j - 1]
+        j = j + 1
+    }
+    return out
+}
+
+// cycle_from — follow unwritten deps until a node repeats; return
+// the loop members (upstream cycleFrom).
+fn cycle_from(start: int, deps: []IVec, done: []bool) -> []int {
+    path := mkslice(int, 0)
+    i := start
+    for true {
+        // find i in path
+        pi := -1
+        k := 0
+        for k < len(path) {
+            if path[k] == i {
+                pi = k
+            }
+            k = k + 1
+        }
+        if pi >= 0 {
+            return path[pi:]
+        }
+        path = push(path, i)
+        // first undone dep
+        nxt := -1
+        di := 0
+        for di < len(deps[i].items) {
+            if !done[deps[i].items[di]] {
+                nxt = deps[i].items[di]
+                break
+            }
+            di = di + 1
+        }
+        if nxt < 0 {
+            return mkslice(int, 0)
+        }
+        i = nxt
+    }
+}
+
+fn str_join(xs: []str, sep: str) -> str {
+    out := ""
+    i := 0
+    for i < len(xs) {
+        if i > 0 {
+            out = out + sep
+        }
+        out = out + xs[i]
+        i = i + 1
+    }
+    return out
+}

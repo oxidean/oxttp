@@ -269,6 +269,18 @@ fn env_file_list(dirs: []str, specs: []str) -> own EnvFiles {
 // file sharing the name must not shadow the env stack (corpus §6.1
 // resolves --env file-or-name; the switcher is name-typed).
 fn env_file_list_mode(dirs: []str, specs: []str, files_ok: bool) -> own EnvFiles {
+    probe := ""
+    if files_ok && len(dirs) > 0 {
+        probe = dirs[0]
+    }
+    return env_file_list_probe(probe, dirs, specs, files_ok)
+}
+
+// env_file_list_probe — env_file_list_mode with the file-spec probe
+// dir decoupled from the named-env search dirs: `posting run` probes
+// file specs against the CWD but resolves names in the collection
+// root only (upstream environmentFiles(specs, []string{root})).
+fn env_file_list_probe(probe: str, dirs: []str, specs: []str, files_ok: bool) -> own EnvFiles {
     r := new(EnvFiles)
     r.files = mkslice(str, 0)
     if len(specs) == 0 {
@@ -284,12 +296,12 @@ fn env_file_list_mode(dirs: []str, specs: []str, files_ok: bool) -> own EnvFiles
         if len(e) == 0 {
             continue
         }
-        // file specs resolve against dirs[0] (the app cwd) so the
-        // probe is honest off-process-cwd too — absolute paths pass
-        // through untouched.
+        // file specs resolve against the probe dir (app cwd / run
+        // cwd) so the probe is honest off-process-cwd too — absolute
+        // paths pass through untouched.
         fp := e
-        if files_ok && len(dirs) > 0 && find(e, "/") != 0 {
-            fp = dirs[0] + "/" + e
+        if files_ok && len(probe) > 0 && find(e, "/") != 0 {
+            fp = probe + "/" + e
         }
         if files_ok && os.exists(fp) && !os.isdir(fp) {
             r.files = push(r.files, os.fullpath(fp))
