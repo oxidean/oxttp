@@ -63,6 +63,7 @@ jobs:
           - core/config
           - core/env
           - core/http
+          - core/importing
           - core/item
           - core/model
           - core/session
