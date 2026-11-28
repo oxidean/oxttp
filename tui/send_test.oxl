@@ -8,6 +8,7 @@ package main
 
 import "std/errors"
 import "std/os"
+import "std/net/tls"
 import "std/testing"
 import "github.com/oxidean/oxttp/core/collection"
 import "github.com/oxidean/oxttp/core/model"
@@ -114,7 +115,10 @@ fn test_begin_send_url_substitution() {
     testing.expect(str_contains(a2.toasts[len(a2.toasts)-1].msg, "MISSING"), "names the var")
 }
 
-fn test_begin_send_warns() {
+fn test_begin_send_proxy_wiring() {
+    // WI-0017 (ADR-0044): options.proxy_url wires into req.proxies
+    // ("all:"-scoped) instead of warning-and-directing; env proxy
+    // capture may add proxy_env entries but never warns.
     a := new_app()
     pr := new(collection.PRequest)
     pr.url = "http://x"
@@ -124,16 +128,14 @@ fn test_begin_send_warns() {
     a.pending_preq = pr
     a.url.text = "http://x"
     fx := begin_send_preq(a)
-    testing.expect_eq(fx, ESend, "warns do not block the send")
-    found := false
+    testing.expect_eq(fx, ESend, "proxy send still plans")
+    testing.expect_eq(len(a.pending.proxies), 1, "one proxies entry")
+    testing.expect_streq(a.pending.proxies[0], "all:http://proxy:8888", "all-wrapped")
     i := 0
     for i < len(a.toasts) {
-        if a.toasts[i].level == 0 && str_contains(a.toasts[i].msg, "proxy") {
-            found = true
-        }
+        testing.expect(!str_contains(a.toasts[i].msg, "proxy unsupported"), "no proxy-unsupported warn")
         i = i + 1
     }
-    testing.expect(found, "proxy warn raised at info level")
 }
 
 fn test_exec_send_installs_response() {
@@ -367,6 +369,102 @@ fn test_begin_send_missing_client_cert() {
     testing.expect_eq(fx3, ESend, "valid identity still sends")
     testing.expect_streq(a2.pending.cert_pem, "pem", "cert pem loaded")
     testing.expect_streq(a2.pending.key_pem, "key", "key pem loaded")
+    // an existing-but-empty cert or key aborts too — pairing empty
+    // PEM text errors in the transport and the send must fail fast.
+    os.writefile_(cert, "")
+    a3 := new_app()
+    a3.url.text = "https://x"
+    a3.ssl_cert = cert
+    a3.ssl_key = key
+    fx4 := begin_send(a3)
+    testing.expect_eq(fx4, ENone, "empty cert aborts the send")
+    testing.expect(a3.pending == nil, "empty cert stages nothing")
+    os.writefile_(cert, "pem")
+    os.writefile_(key, "")
+    fx5 := begin_send(a3)
+    testing.expect_eq(fx5, ENone, "empty key aborts the send")
+    testing.expect(a3.pending == nil, "empty key stages nothing")
+}
+
+fn test_ssl_password_degrade_toast() {
+    // WI-0017 (ADR-0045): ssl.password can't be honored — the toast
+    // names the build limitation, never promises a future WI.
+    scratch_coll()
+    cert := COLL_SCRATCH + "/cert.pem"
+    os.writefile_(cert, "pem")
+    a := new_app()
+    a.url.text = "https://x"
+    a.ssl_cert = cert
+    a.ssl_pass = "hunter2"
+    fx := begin_send(a)
+    testing.expect_eq(fx, ESend, "password degrade does not block")
+    found := false
+    i := 0
+    for i < len(a.toasts) {
+        if str_contains(a.toasts[i].msg, "encrypted private keys unsupported") {
+            found = true
+            testing.expect(!str_contains(a.toasts[i].msg, "lands with"), "no future-WI promise")
+        }
+        i = i + 1
+    }
+    testing.expect(found, "ssl.password degrade toast")
+}
+
+fn test_exec_send_tls12_cert_warn() {
+    // WI-0017 (ADR-0045): a configured client cert meeting a TLS1.2
+    // negotiation sends an empty certificate_list — warn like CLI W2.
+    a := new_app()
+    stage_send(a, "https://x")
+    a.pending.cert_pem = "pem"
+    r := fake_resp(200, "text/plain", "ok", new(mkslice(model.Hop, 0)))
+    r.tls_ver = tls.V12
+    f := FakeSend{resp: r, fail: "", expect_path: ""}
+    exec_send_t(a, f)
+    found := false
+    i := 0
+    for i < len(a.toasts) {
+        if str_contains(a.toasts[i].msg, "empty certificate list") {
+            found = true
+            testing.expect_eq(a.toasts[i].level, 1, "cert warning is info level")
+        }
+        i = i + 1
+    }
+    testing.expect(found, "TLS1.2 cert warning toasted")
+    // TLS1.3 negotiation → silent
+    a2 := new_app()
+    stage_send(a2, "https://x")
+    a2.pending.cert_pem = "pem"
+    r2 := fake_resp(200, "text/plain", "ok", new(mkslice(model.Hop, 0)))
+    r2.tls_ver = tls.V13
+    exec_send_t(a2, FakeSend{resp: r2, fail: "", expect_path: ""})
+    i = 0
+    for i < len(a2.toasts) {
+        testing.expect(!str_contains(a2.toasts[i].msg, "certificate list"), "V13 silent")
+        i = i + 1
+    }
+    // cleartext → silent
+    a3 := new_app()
+    stage_send(a3, "http://x")
+    a3.pending.cert_pem = "pem"
+    r3 := fake_resp(200, "text/plain", "ok", new(mkslice(model.Hop, 0)))
+    r3.tls_ver = 0
+    exec_send_t(a3, FakeSend{resp: r3, fail: "", expect_path: ""})
+    i = 0
+    for i < len(a3.toasts) {
+        testing.expect(!str_contains(a3.toasts[i].msg, "certificate list"), "cleartext silent")
+        i = i + 1
+    }
+    // TLS1.2 without a configured cert → silent
+    a4 := new_app()
+    stage_send(a4, "https://x")
+    r4 := fake_resp(200, "text/plain", "ok", new(mkslice(model.Hop, 0)))
+    r4.tls_ver = tls.V12
+    exec_send_t(a4, FakeSend{resp: r4, fail: "", expect_path: ""})
+    i = 0
+    for i < len(a4.toasts) {
+        testing.expect(!str_contains(a4.toasts[i].msg, "certificate list"), "no-cert silent")
+        i = i + 1
+    }
 }
 
 fn test_exec_send_captures_publish() {

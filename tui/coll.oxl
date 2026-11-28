@@ -7,6 +7,7 @@ package main
 
 import "std/errors"
 import "std/os"
+import "std/net/tls"
 import "std/encoding/json"
 import "github.com/oxidean/oxttp/core/capture"
 import "github.com/oxidean/oxttp/core/collection"
@@ -1037,6 +1038,11 @@ fn begin_send_preq(a: mut App) -> int {
             return ENone
         }
         a.pending.cert_pem = os.readfile_(a.ssl_cert)
+        if len(a.pending.cert_pem) == 0 {
+            a.toast(2, "ssl.certificate_path: file unreadable or empty")
+            a.pending = nil
+            return ENone
+        }
         if len(a.ssl_key) > 0 {
             if !os.exists(a.ssl_key) {
                 a.toast(2, "ssl.key_file: file not found")
@@ -1044,9 +1050,16 @@ fn begin_send_preq(a: mut App) -> int {
                 return ENone
             }
             a.pending.key_pem = os.readfile_(a.ssl_key)
+            if len(a.pending.key_pem) == 0 {
+                a.toast(2, "ssl.key_file: file unreadable or empty")
+                a.pending = nil
+                return ENone
+            }
         }
         if len(a.ssl_pass) > 0 {
-            a.toast(2, "ssl.password unsupported — encrypted keys land with mTLS M4")
+            // WI-0017 (ADR-0045): oxl 0.26.0 can't decrypt PKCS#8 /
+            // legacy-encrypted PEM — explicit degrade, not silent.
+            a.toast(2, "ssl.password: encrypted private keys unsupported in this build")
         }
     }
     if len(a.pending_name) == 0 {
@@ -1069,6 +1082,7 @@ fn exec_send_t(a: mut App, t: http.Transport) {
         return
     }
     send_url := a.pending.url
+    had_cert := len(a.pending.cert_pem) > 0
     [resp, e] = t.send(a.pending)
     a.pending = nil
     if e != nil {
@@ -1076,6 +1090,11 @@ fn exec_send_t(a: mut App, t: http.Transport) {
         return
     }
     install_resp(a, resp, send_url)
+    // WI-0017 (ADR-0045): oxl client certs are TLS1.3-only — a 1.2
+    // negotiation sends an empty certificate_list. CLI W2 parity.
+    if had_cert && resp.tls_ver == tls.V12 {
+        a.toast(1, "client certificate was not presented: TLS 1.2 sends an empty certificate list in this build")
+    }
 }
 
 // send_failed installs the transport error as the response view —

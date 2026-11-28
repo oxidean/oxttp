@@ -281,7 +281,11 @@ fn test_plan_req_options() {
     testing.expect_eq(sp.req.max_redirects, 0, "no redirects")
     testing.expect_streq(sp.req.verify, "no", "verify no")
     testing.expect_eq(sp.req.timeout_ms, 2500, "timeout ms")
-    testing.expect_eq(len(sp.warns), 1, "proxy warn")
+    // WI-0017: proxy_url now wires into req.proxies ("all:"-scoped)
+    // instead of warning-and-directing (ADR-0044).
+    testing.expect_eq(len(sp.warns), 0, "no proxy warn")
+    testing.expect_eq(len(sp.req.proxies), 1, "proxy wired")
+    testing.expect_streq(sp.req.proxies[0], "all:http://p", "all-wrapped")
     [r2, e2] = decode_src("url: x.com\n")
     sp2 := plan_req(r2, es, nil, "d")
     testing.expect(sp2.req.follow, "follow default")

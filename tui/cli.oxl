@@ -7,6 +7,7 @@ package main
 
 import "std/os"
 import "std/errors"
+import "std/net/tls"
 import "std/time"
 import "std/encoding/json"
 import "std/encoding/base64"
@@ -200,6 +201,7 @@ struct RunOpts {
     envs: []str,
     fail_fast: bool,
     json: bool,
+    cfg_file: str, // test seam — "" = default config resolution
 }
 
 struct RunRep {
@@ -414,7 +416,7 @@ fn run_exec(o: ref RunOpts, t: http.Transport) -> own RunRep {
         di = di + 1
     }
     // settings: warnings are fatal unattended (upstream run.go).
-    cr := config.load("", config.posting_env_pairs())
+    cr := config.load(o.cfg_file, config.posting_env_pairs())
     if len(cr.warns) > 0 {
         rep.err = join(cr.warns)
         rep.code = 1
@@ -424,6 +426,11 @@ fn run_exec(o: ref RunOpts, t: http.Transport) -> own RunRep {
     // on stderr like the TUI's toast (spec §run env).
     if cr.s.use_host_environment {
         rep.stderr = rep.stderr + "posting run: warning: use_host_environment is set but host environment variables are not merged in this build\n"
+    }
+    // WI-0017 (ADR-0045): ssl.password can't be honored — oxl 0.26.0
+    // rejects encrypted PEM; warn once per run, not per request.
+    if len(cr.s.ssl_password) > 0 && len(cr.s.ssl_certificate_path) > 0 {
+        rep.stderr = rep.stderr + "posting run: warning: ssl.password is set but encrypted private keys are unsupported in this build\n"
     }
     re := run_env(edirs, o.envs)
     if len(re.err) > 0 {
@@ -567,11 +574,17 @@ fn run_exec(o: ref RunOpts, t: http.Transport) -> own RunRep {
                 cert_err = "ssl.certificate_path: file not found"
             } else {
                 sp.req.cert_pem = os.readfile_(cr.s.ssl_certificate_path)
-                if len(cr.s.ssl_key_file) > 0 {
+                if len(sp.req.cert_pem) == 0 {
+                    cert_err = "ssl.certificate_path: file unreadable or empty"
+                }
+                if len(cert_err) == 0 && len(cr.s.ssl_key_file) > 0 {
                     if !os.exists(cr.s.ssl_key_file) {
                         cert_err = "ssl.key_file: file not found"
                     } else {
                         sp.req.key_pem = os.readfile_(cr.s.ssl_key_file)
+                        if len(sp.req.key_pem) == 0 {
+                            cert_err = "ssl.key_file: file unreadable or empty"
+                        }
                     }
                 }
             }
@@ -597,6 +610,12 @@ fn run_exec(o: ref RunOpts, t: http.Transport) -> own RunRep {
         }
         // carry cookies for this run only (upstream run.go).
         jar = jar_collect(jar, url_origin(sp.req.url), resp)
+        // WI-0017 (ADR-0045): client certs are TLS1.3-only — a 1.2
+        // negotiation presents an empty certificate_list; warn like
+        // the interactive toast (CLI W2 parity).
+        if len(sp.req.cert_pem) > 0 && resp.tls_ver == tls.V12 {
+            rep.stderr = rep.stderr + "posting run: warning: " + n.rel + ": client certificate was not presented (TLS 1.2 sends an empty certificate list in this build)\n"
+        }
         if model.status_class(resp.status) == 2 {
             rep.lines = push(rep.lines, "FAILED " + n.rel + ": " + itoa(resp.status) + " " + resp.reason + "\n")
             failed = failed + 1

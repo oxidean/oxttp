@@ -44,8 +44,8 @@ Updated: 2026-11-26 · pin oxl 0.26.0
 | §4 Screens / panels | `next`/`partial` | S9 shell+panes+modals render; widget depths land S10 |
 | §5 `.posting.yaml` collections | `done` | S10: yaml subset + decode/encode/scan; TUI browse/open/dup/delete/save |
 | §6 Environments / captures | `done`/`partial` | S10: env files+layers+switching+substitution; environments.json S11; captures M4 |
-| §7.1 HTTP(+TLS) send | `done` | S10 TUI send via existing H1+TLS path (HTTPS included); proxy warns |
-| §7.1 client certs | `next` | oxl 0.26.0 `client_cert` → WI-0013 cli + M4 tui; TLS 1.3-only — negotiated 1.2 sends empty cert list |
+| §7.1 HTTP(+TLS) send | `done` | S10 TUI send via existing H1+TLS path (HTTPS included); WI-0017: `options.proxy_url`→`all:`-scoped proxies + env HTTP(S)_PROXY/NO_PROXY capture under Go httpproxy semantics (CGI guard) in plan_req, both interactive and `run`; DevD — only `http` proxy URLs transport-implemented, `https`/`socks5` proxy schemes error unsupported |
+| §7.1 client certs | `done` | WI-0017: `ssl.certificate_path`/`key_file`/`ca_bundle` fold at send time (interactive + run); DevDs — `ssl.password` undecryptable in oxl 0.26.0 (explicit warning), client certs TLS1.3-only (TLS1.2 negotiation warns, empty cert list) |
 | §7.2 GraphQL | `post` | M4 |
 | §7.3 gRPC | `post` | oxl 0.26.0 `net/grpc` shipped → M4 |
 | §7.4 WebSocket | `post` | oxl 0.26.0 `net/websocket` shipped → M4 |
