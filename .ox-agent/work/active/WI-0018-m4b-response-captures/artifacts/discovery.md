@@ -39,10 +39,10 @@ exit codes), §5.2 (`captures` schema row), §6.4 (response captures),
   all existing session values unchanged (atomic). Success → merge
   into `sessionVars` map (session layer = highest precedence); variables
   screen refreshes if open.
-- `run` (cmd/posting/run.go:320-341): captures run only when status
-  class is neither Error (>=300) nor Warning (GraphQL errors / stream
-  error); redirect class (<400) DOES capture. Transport error / bad
-  status → no captures. Failure → result.Error, outcome failed; captures
+- `run` (cmd/posting/run.go:320-341): captures run only when the
+  outcome is neither error-class nor warning-class (GraphQL errors /
+  stream error); redirect outcomes DO capture. Transport error → no
+  captures. Failure → result.Error, outcome failed; captures
   merge as a session-sourced layer for later requests, discarded at end.
 - Decode-time validation: internal/collection/format.go:119 —
   ValidateCaptures runs inside request parse, so a bad name/path makes

@@ -71,6 +71,27 @@ fn jadd(parent: mut JVal, key: str, val: own JVal) {
     m.next = val
 }
 
+// jprepend links val at the head in O(1). Parser containers collect in
+// reverse order and call jreverse_children once at the end, avoiding the
+// quadratic tail scan of repeated jadd calls.
+fn jprepend(parent: mut JVal, key: str, val: own JVal) {
+    val.key = key
+    val.next = parent.child
+    parent.child = val
+}
+
+fn jreverse_children(parent: mut JVal) {
+    let rev: own JVal = nil
+    cur := parent.child
+    for cur != nil {
+        nxt := cur.next
+        cur.next = rev
+        rev = cur
+        cur = nxt
+    }
+    parent.child = rev
+}
+
 // ---------- parse ----------
 
 struct JCur { src: str, pos: int, err: int, depth: int }
@@ -263,6 +284,7 @@ fn jparse_val(p: mut JCur) -> own JVal {
         if p.pos < len(p.src) && byteat(p.src, p.pos) == 125 {
             p.pos = p.pos + 1
             p.depth = p.depth - 1
+            jreverse_children(o)
             return o
         }
         for true {
@@ -289,7 +311,7 @@ fn jparse_val(p: mut JCur) -> own JVal {
                 p.depth = p.depth - 1
                 return jnullv()
             }
-            jadd(o, k, v)
+            jprepend(o, k, v)
             jws(p)
             if p.pos >= len(p.src) {
                 p.err = 1
@@ -304,6 +326,7 @@ fn jparse_val(p: mut JCur) -> own JVal {
             if c2 == 125 {
                 p.pos = p.pos + 1
                 p.depth = p.depth - 1
+                jreverse_children(o)
                 return o
             }
             p.err = 1
@@ -319,6 +342,7 @@ fn jparse_val(p: mut JCur) -> own JVal {
         if p.pos < len(p.src) && byteat(p.src, p.pos) == 93 {
             p.pos = p.pos + 1
             p.depth = p.depth - 1
+            jreverse_children(a)
             return a
         }
         for true {
@@ -327,7 +351,7 @@ fn jparse_val(p: mut JCur) -> own JVal {
                 p.depth = p.depth - 1
                 return jnullv()
             }
-            jadd(a, "", v)
+            jprepend(a, "", v)
             jws(p)
             if p.pos >= len(p.src) {
                 p.err = 1
@@ -342,6 +366,7 @@ fn jparse_val(p: mut JCur) -> own JVal {
             if c2 == 93 {
                 p.pos = p.pos + 1
                 p.depth = p.depth - 1
+                jreverse_children(a)
                 return a
             }
             p.err = 1
@@ -450,9 +475,9 @@ fn jesc_into(b: []byte, s: str) -> []byte {
                 b = push(b, c)
             } else {
                 d := utf8.decode(s, i)
-                if d.r == 3228 || d.r == 3229 {
+                if d.r == 8232 || d.r == 8233 {
                     b = bpush(b, "\\u202")
-                    b = push(b, byteat("89", d.r - 3228))
+                    b = push(b, byteat("89", d.r - 8232))
                 } else {
                     j := 0
                     for j < d.n {

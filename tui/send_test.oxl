@@ -18,11 +18,15 @@ import "github.com/oxidean/oxttp/core/term"
 struct FakeSend {
     resp: model.Resp,
     fail: str,
+    expect_path: str,
 }
 
 fn (f FakeSend) send(req: ref model.Req) -> [model.Resp, err] {
     if len(f.fail) > 0 {
         return f.resp, errors.new(f.fail)
+    }
+    if len(f.expect_path) > 0 && find(req.url, "/use/") >= 0 && find(req.url, f.expect_path) < 0 {
+        return f.resp, errors.new("expected path missing: " + req.url)
     }
     return f.resp, nil
 }
@@ -138,7 +142,7 @@ fn test_exec_send_installs_response() {
     hs := mkslice(model.Hop, 0)
     r := fake_resp(200, "application/json", "{\"a\":1}", new(hs))
     r.headers = push(r.headers, model.Header{name: "Set-Cookie", value: "sid=abc; Path=/"})
-    f := FakeSend{resp: r, fail: ""}
+    f := FakeSend{resp: r, fail: "", expect_path: ""}
     exec_send_t(a, f)
     testing.expect(a.pending == nil, "pending consumed")
     // body: JSON content-type re-indents 2sp
@@ -192,7 +196,7 @@ fn test_install_resp_hops_and_nojson() {
 fn test_exec_send_error_installs() {
     a := new_app()
     stage_send(a, "http://x")
-    f := FakeSend{resp: fake_resp(0, "", "", nil), fail: "dial tcp: refused"}
+    f := FakeSend{resp: fake_resp(0, "", "", nil), fail: "dial tcp: refused", expect_path: ""}
     exec_send_t(a, f)
     testing.expect_eq(len(a.resp_view.lines), 1, "error text installed")
     testing.expect(str_contains(a.resp_view.lines[0], "request failed"), "failed prefix")
@@ -233,12 +237,12 @@ fn test_history_open_and_delete() {
     load_collection(a)
     stage_send(a, "http://x/one")
     r := fake_resp(200, "application/json", "{\"k\":2}", new(mkslice(model.Hop, 0)))
-    f := FakeSend{resp: r, fail: ""}
+    f := FakeSend{resp: r, fail: "", expect_path: ""}
     exec_send_t(a, f)
     stage_send(a, "http://x/two")
     r2 := fake_resp(404, "text/plain", "nope", new(mkslice(model.Hop, 0)))
     r2.reason = "Not Found"
-    f2 := FakeSend{resp: r2, fail: ""}
+    f2 := FakeSend{resp: r2, fail: "", expect_path: ""}
     exec_send_t(a, f2)
     testing.expect_eq(len(a.history), 2, "two entries")
     // MHistory lists newest-first: sel 0 opens the LAST pushed entry
@@ -312,7 +316,7 @@ fn test_jar_origin_scoping() {
     stage_send(a, "http://b.test/y")
     r := fake_resp(200, "", "", nil)
     r.headers = push(r.headers, model.Header{name: "Set-Cookie", value: "sc=3; Path=/"})
-    f := FakeSend{resp: r, fail: ""}
+    f := FakeSend{resp: r, fail: "", expect_path: ""}
     exec_send_t(a, f)
     testing.expect_eq(len(a.jar), 3, "new cookie appended")
     testing.expect_streq(a.jar[2].origin, "http://b.test", "stored under b.test")
@@ -371,7 +375,7 @@ fn test_exec_send_captures_publish() {
     a.pending_preq.captures = push(a.pending_preq.captures,
         model.KV{name: "UID", value: "$.data.id", enabled: true})
     r := fake_resp(200, "application/json", "{\"data\":{\"id\":\"u-42\"}}", nil)
-    f := FakeSend{resp: r, fail: ""}
+    f := FakeSend{resp: r, fail: "", expect_path: ""}
     exec_send_t(a, f)
     lr := a.env.lookup("UID")
     testing.expect(lr.ok, "capture published to env")
@@ -394,7 +398,7 @@ fn test_exec_send_captures_failure() {
     a.pending_preq.captures = push(a.pending_preq.captures,
         model.KV{name: "UID", value: "$.missing", enabled: true})
     r := fake_resp(200, "application/json", "{\"data\":{\"id\":\"u-42\"}}", nil)
-    f := FakeSend{resp: r, fail: ""}
+    f := FakeSend{resp: r, fail: "", expect_path: ""}
     exec_send_t(a, f)
     // warning toast, nothing published — response still installs
     found := false
@@ -418,7 +422,7 @@ fn test_exec_send_captures_all_or_nothing() {
     a.pending_preq.captures = push(a.pending_preq.captures,
         model.KV{name: "BAD", value: "$.nope", enabled: true})
     r := fake_resp(200, "application/json", "{\"data\":{\"id\":\"u-42\"}}", nil)
-    f := FakeSend{resp: r, fail: ""}
+    f := FakeSend{resp: r, fail: "", expect_path: ""}
     exec_send_t(a, f)
     testing.expect_eq(len(a.session_vars), 0, "partial capture not published")
 }

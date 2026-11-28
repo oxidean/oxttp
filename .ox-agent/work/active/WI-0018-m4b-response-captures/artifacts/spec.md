@@ -113,7 +113,7 @@ nil.
   kind); numeric → float64; strings → byte-lexicographic; else false.
   `>` = sameType && !less && !equal; `>=` = sameType && !less.
 - Existence TEST: sub-query selects ≥1 node. NTEST: 0 nodes.
-- Singular query operand missing → nil value (never equal; `!=` true).
+- Singular query operand missing → missing value: two missing operands compare equal; missing vs explicit `null` does not.
 - Filter selector applies to array elements and object member values
   (document order — ADR-0052), collecting matches per element.
 - Descendant `..`: select from node and all descendants recursively

@@ -165,3 +165,62 @@ fn test_functions() {
     expect_val("{\"items\":[{\"id\":1,\"tags\":[\"a\",\"b\"]},{\"id\":2,\"tags\":[\"c\"]}]}", "$.items[?(count(@.tags[*])==2)].id", "1")
     expect_val("{\"items\":[{\"id\":1,\"t\":[\"x\"]},{\"id\":2,\"t\":[\"y\",\"z\"]}]}", "$.items[?('x' == value(@.t[*]))].id", "1")
 }
+
+fn test_capture_all_or_nothing_failure_after_success() {
+    body := ("{\"a\":1}") as []byte
+    caps := mkcaps()
+    caps = push(caps, cap1("OK", "$.a"))
+    caps = push(caps, cap1("ZZBAD", "$.nope"))
+    [out, e] = capture_values(caps, body)
+    testing.expect(e != nil, "late failure errors")
+    testing.expect_eq(len(out), 0, "late failure publishes nothing")
+}
+
+fn test_jsonpath_surrogate_pair_member_name() {
+    expect_val("{\"😀\":7}", "$[\"\\uD83D\\uDE00\"]", "7")
+}
+
+fn test_jsonpath_rejects_malformed_slice_repeated_int() {
+    expect_err("[1,2,3]", "$[0:1 2]")
+    expect_err("[1,2,3]", "$[0:1:2 3]")
+}
+
+fn test_jsonpath_function_argument_validation() {
+    body := "{\"items\":[{\"id\":1,\"tags\":[\"a\"]}]}"
+    expect_err(body, "$.items[?(count(@.tags[*],)==1)].id")
+    expect_err(body, "$.items[?(count(1)==1)].id")
+    expect_err(body, "$.items[?(value(1)=='a')].id")
+    expect_val(body, "$.items[?(count(@.id)==1)].id", "1")
+    expect_err(body, "$.items[?(match(@.id))].id")
+}
+
+fn test_jsonpath_rejects_value_function_in_negated_test() {
+    expect_err("{\"items\":[{\"id\":1}]}", "$.items[?(!length(@.id))].id")
+}
+
+fn test_jsonpath_match_alternation_stays_anchored() {
+    expect_err("{\"items\":[{\"n\":\"ab\"}]}", "$.items[?(match(@.n, \"a|b\"))].n")
+    expect_val("{\"items\":[{\"n\":\"a\"}]}", "$.items[?(match(@.n, \"a|b\"))].n", "a")
+}
+
+fn test_capture_path_trims_unicode_whitespace() {
+    expect_val("{\"a\":3}", " $.a ", "3")
+}
+
+fn test_json_escape_u2028_u2029() {
+    body := "{\"o\":{\"x\":\"a b c\"}}"
+    expect_val(body, "$.o", "{\"x\":\"a\\u2028b\\u2029c\"}")
+}
+
+fn test_jsonpath_rejects_isolated_surrogates() {
+    expect_err("{\"😀\":7}", "$[\"\\uD83D\"]")
+    expect_err("{\"x\":7}", "$[\"\\uDE00\"]")
+}
+
+fn test_jsonpath_singular_query_segment_whitespace() {
+    expect_val("{\"a\":[9]}", "$.a [0]", "9")
+}
+
+fn test_json_emit_preserves_kannada() {
+    expect_val("{\"o\":{\"x\":\"ಜಝ\"}}", "$.o", "{\"x\":\"ಜಝ\"}")
+}

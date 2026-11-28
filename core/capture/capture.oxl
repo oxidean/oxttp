@@ -545,6 +545,24 @@ fn pij_str_escape(p: mut PCur, q: int, out: []byte) -> []byte {
             return out
         }
         p.pos = p.pos + 4
+        if cp >= 55296 && cp <= 56319 {
+            paired := false
+            if p.pos + 1 < len(p.s) && byteat(p.s, p.pos) == 92 && byteat(p.s, p.pos + 1) == 117 {
+                lo := jhex4(p.s, p.pos + 2)
+                if lo >= 56320 && lo <= 57343 {
+                    p.pos = p.pos + 6
+                    cp = 65536 + (cp - 55296) * 1024 + (lo - 56320)
+                    paired = true
+                }
+            }
+            if !paired {
+                pperr(p, "isolated surrogate")
+                return out
+            }
+        } else if cp >= 56320 && cp <= 57343 {
+            pperr(p, "isolated surrogate")
+            return out
+        }
         es := utf8.encode(cp)
         eb := es as []byte
         i := 0
@@ -1005,6 +1023,10 @@ fn pij_parse_slice_rest(p: mut PCur, sel: own JPSel, start_empty: bool) -> [own 
         if c2 == 93 || c2 == 44 {
             return sel, nil
         }
+        if c2 != 58 {
+            pperr(p, "expected slice separator")
+            return nil, errors.new("jsonpath: expected slice separator")
+        }
     }
     return sel, nil
 }
@@ -1066,6 +1088,11 @@ fn pij_parse_func(p: mut PCur, name: str) -> [own FExpr, err] {
         c2 := pij_peek(p, 0)
         if c2 == 44 {
             p.pos = p.pos + 1
+            pij_skip(p)
+            if pij_peek(p, 0) == 41 {
+                pperr(p, "expected function argument")
+                return nil, errors.new("jsonpath: expected function argument")
+            }
             continue
         }
         if c2 == 41 {
@@ -1084,15 +1111,19 @@ fn pij_parse_func(p: mut PCur, name: str) -> [own FExpr, err] {
         }
         rt = RT_VALUE
     } else if fid == FN_COUNT || fid == FN_VALUE {
-        if nargs != 1 || (ah.rtype != RT_VALUE && ah.rtype != RT_NODES) {
+        if nargs != 1 || ah == nil || ah.expr == nil || ah.expr.kind != FE_QRY {
             pperr(p, "bad args")
             return nil, errors.new("jsonpath: bad function arguments")
         }
         rt = RT_VALUE
     } else {
         // match/search: 2 value args, logical result
+        if nargs != 2 || ah == nil {
+            pperr(p, "bad args")
+            return nil, errors.new("jsonpath: bad function arguments")
+        }
         a2 := ah.next
-        if nargs != 2 || ah.rtype != RT_VALUE || a2 == nil || a2.rtype != RT_VALUE {
+        if ah.rtype != RT_VALUE || a2 == nil || a2.rtype != RT_VALUE {
             pperr(p, "bad args")
             return nil, errors.new("jsonpath: bad function arguments")
         }
@@ -1216,6 +1247,7 @@ fn pij_parse_singular_query(p: mut PCur, root: bool) -> [own JPQuery, err] {
     q.root = root
     q.singular = true
     for true {
+        pij_skip(p)
         c := pij_peek(p, 0)
         if c == 91 { // '['
             p.pos = p.pos + 1
@@ -1358,6 +1390,10 @@ fn pij_parse_basic(p: mut PCur) -> [own FExpr, err] {
             [f, fe] = pij_parse_func(p, name)
             if fe != nil {
                 return nil, fe
+            }
+            if f.rtype != RT_LOGICAL {
+                pperr(p, "negated test requires logical function")
+                return nil, errors.new("jsonpath: negated test requires logical function")
             }
             n2 := new(FExpr)
             n2.kind = FE_NOT
@@ -1514,22 +1550,48 @@ fn parse_path(text: str) -> [own JPQuery, err] {
         pperr(p, "trailing characters")
         return nil, errors.new("jsonpath: trailing characters")
     }
+    if p.err != 0 {
+        return nil, errors.new("jsonpath: invalid path")
+    }
     return q, nil
+}
+
+// unicode_space — Go unicode.IsSpace White_Space set used by TrimSpace.
+fn unicode_space(r: int) -> bool {
+    if (r >= 9 && r <= 13) || r == 32 || r == 133 || r == 160 {
+        return true
+    }
+    if r == 5760 || (r >= 8192 && r <= 8202) || r == 8232 || r == 8233 || r == 8239 || r == 8287 || r == 12288 {
+        return true
+    }
+    return false
 }
 
 // capture_path — upstream capturePath(): trim, shorthand prefix,
 // then full RFC 9535 parse.
 fn capture_path(path: str) -> [own JPQuery, err] {
     t := path
-    // TrimSpace (ASCII whitespace — upstream trims unicode too;
-    // JSONPath blanks are ASCII anyway)
     lo := 0
-    for lo < len(t) && pij_is_blank(byteat(t, lo)) {
-        lo = lo + 1
+    for lo < len(t) {
+        d := utf8.decode(t, lo)
+        if !unicode_space(d.r) {
+            break
+        }
+        lo = lo + d.n
     }
     hi := len(t)
-    for hi > lo && pij_is_blank(byteat(t, hi - 1)) {
-        hi = hi - 1
+    for hi > lo {
+        // UTF-8 continuation bytes mark the end of a multi-byte rune;
+        // backing up to its lead byte lets decode tell us its width.
+        lead := hi - 1
+        for lead > lo && byteat(t, lead) >= 128 && byteat(t, lead) < 192 {
+            lead = lead - 1
+        }
+        d := utf8.decode(t, lead)
+        if lead + d.n != hi || !unicode_space(d.r) {
+            break
+        }
+        hi = lead
     }
     t = substr(t, lo, hi)
     if len(t) == 0 {
@@ -1661,7 +1723,59 @@ fn pv_f64(pv: PVal, root: ref JVal) -> F64 {
     return jnum_f64(pv_numlex(pv, root))
 }
 
+// jhas_member — direct last-wins object member existence check. Unlike
+// jchild_paths this does not materialize/dedupe every child, so named-member
+// selection stays linear in object size rather than quadratic.
+fn jhas_member(root: ref JVal, p: JPath, name: str) -> bool {
+    cur := root
+    i := 0
+    for i < len(p.steps) {
+        st := p.steps[i]
+        nxt := new(JVal)
+        found := false
+        if st.is_idx {
+            n := 0
+            m := cur.child
+            for m != nil {
+                if n == st.idx {
+                    nxt = m
+                    found = true
+                    break
+                }
+                n = n + 1
+                m = m.next
+            }
+        } else {
+            m := cur.child
+            for m != nil {
+                if m.key == st.name {
+                    nxt = m
+                    found = true
+                }
+                m = m.next
+            }
+        }
+        if !found {
+            return false
+        }
+        cur = nxt
+        i = i + 1
+    }
+    if cur.kind != 4 {
+        return false
+    }
+    m2 := cur.child
+    for m2 != nil {
+        if m2.key == name {
+            return true
+        }
+        m2 = m2.next
+    }
+    return false
+}
+
 // ---------- query evaluation ----------
+
 
 // jq_eval — evaluate query from `cur` (relative) or doc root ($).
 fn jq_eval(q: ref JPQuery, cur: JPath, root: ref JVal) -> []JPath {
@@ -1709,15 +1823,8 @@ fn jsel_union_eval(sels: ref JPSel, ip: JPath, out: []JPath, root: ref JVal) -> 
 
 fn jsel_apply(sel: ref JPSel, ip: JPath, out: []JPath, root: ref JVal) -> []JPath {
     if sel.kind == SK_NAME {
-        // last-wins member exists?
-        kids := jchild_paths(root, ip)
-        j := 0
-        for j < len(kids) {
-            st := kids[j].steps[len(kids[j].steps) - 1]
-            if !st.is_idx && st.name == sel.name {
-                return push(out, kids[j])
-            }
-            j = j + 1
+        if jhas_member(root, ip, sel.name) {
+            return push(out, jpath_push(ip, JStep{is_idx: false, name: sel.name, idx: 0}))
         }
         return out
     }
@@ -2042,7 +2149,7 @@ fn regex_prepare(pat: str, anchored: bool) -> own regexp.Re {
     rw := regex_dot_rewrite(pat)
     full := rw
     if anchored {
-        full = "\\A" + rw + "\\z"
+        full = "\\A(?:" + rw + ")\\z"
     }
     [re, e] = regexp.compile(full)
     if e != nil {

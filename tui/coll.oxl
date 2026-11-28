@@ -1223,8 +1223,24 @@ fn install_resp(a: mut App, resp: model.Resp, req_url: str) {
         } else {
             ci := 0
             for ci < len(cvals) {
-                session_set(a, cvals[ci].name, cvals[ci].value)
+                hit := false
+                vi := 0
+                for vi < len(a.session_vars) {
+                    if a.session_vars[vi].name == cvals[ci].name {
+                        a.session_vars[vi].value = cvals[ci].value
+                        hit = true
+                        break
+                    }
+                    vi = vi + 1
+                }
+                if !hit {
+                    a.session_vars = push(a.session_vars, model.KV{name: cvals[ci].name, value: cvals[ci].value, enabled: true})
+                }
                 ci = ci + 1
+            }
+            if len(cvals) > 0 {
+                rebuild_env(a)
+                var_rows_build(a)
             }
         }
     }

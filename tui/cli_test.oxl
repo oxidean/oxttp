@@ -191,7 +191,7 @@ fn test_run_exec() {
     o := new(RunOpts)
     o.coll = dir
     o.target = dir
-    fx := FakeSend{resp: fake_resp(200, "text/plain", "hi", nil), fail: ""}
+    fx := FakeSend{resp: fake_resp(200, "text/plain", "hi", nil), fail: "", expect_path: ""}
     rep := run_exec(o, fx)
     // ADR-0038: a scripted request aborts the whole run BEFORE any
     // send — the valid request never reaches the transport.
@@ -239,7 +239,7 @@ fn test_run_exec_orders_by_rel() {
     os.writefile_(dir + "/z/b.posting.yaml", "name: b\nmethod: GET\nurl: http://x.test/b\n")
     o := new(RunOpts)
     o.target = dir
-    fx := FakeSend{resp: fake_resp(200, "text/plain", "hi", nil), fail: ""}
+    fx := FakeSend{resp: fake_resp(200, "text/plain", "hi", nil), fail: "", expect_path: ""}
     rep := run_exec(o, fx)
     testing.expect(len(rep.err) == 0, "err: " + rep.err)
     testing.expect(rep.code == 0, "clean run")
@@ -282,13 +282,13 @@ fn test_run_exec_captures() {
     os.writefile_(dir + "/01.get.posting.yaml",
         "name: get\nmethod: GET\nurl: http://x.test/a\ncaptures:\n  TOKEN: $.token\n")
     os.writefile_(dir + "/02.use.posting.yaml",
-        "name: use\nmethod: GET\nurl: http://x.test/b?token=$TOKEN\n")
+        "name: use\nmethod: GET\nurl: http://x.test/use/$TOKEN\n")
     o := new(RunOpts)
     o.target = dir
-    fx := FakeSend{resp: fake_resp(200, "application/json", "{\"token\":\"sekrit\"}", nil), fail: ""}
+    fx := FakeSend{resp: fake_resp(200, "application/json", "{\"token\":\"sekrit\"}", nil), fail: "", expect_path: "/use/sekrit"}
     rep := run_exec(o, fx)
     testing.expect(len(rep.err) == 0, "err: " + rep.err)
-    testing.expect(rep.code == 0, "clean run")
+    testing.expect(rep.code == 0, "clean run: " + rep.err + " / " + rep.lines[len(rep.lines) - 2])
     testing.expect(len(rep.lines) == 3, "2 req + summary")
     testing.expect(find(rep.lines[1], "PASSED") == 0, "second req passed — $TOKEN resolved")
     // a capture that matches nothing fails the request

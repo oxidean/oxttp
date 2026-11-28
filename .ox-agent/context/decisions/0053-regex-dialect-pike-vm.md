@@ -15,7 +15,7 @@ rewrite `.` to `[^\n\r]` for RFC 9485 semantics. oxl 0.26.0 ships
 ## Decision
 
 Use `std/regexp` for both functions: `match` compiles
-`\A`+pattern+`\z` then `matchstr`; `search` compiles the pattern then
+`\A(?:`+pattern+`)\z` then `matchstr`; `search` compiles the pattern then
 `matchstr` (contains-match — Go `MatchString` semantics incl. empty
 matches). Unescaped `.` outside char classes rewrites to `[^\n\r]`
 before compile (text-level rewrite; equivalent to upstream's AST
