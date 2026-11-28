@@ -7,6 +7,7 @@ package importing
 import "std/os"
 import "std/testing"
 import "std/time"
+import "std/errors"
 import "github.com/oxidean/oxttp/core/collection"
 import "github.com/oxidean/oxttp/core/model"
 import "github.com/oxidean/oxttp/core/yaml"
@@ -318,8 +319,7 @@ fn review_postman_collection() -> str {
         "{\"name\":\"empty\",\"item\":[]}," +
         "{\"name\":\"folder\",\"item\":[{\"name\":\"get\",\"request\":{\"method\":\"GET\",\"url\":\"https://example.test/?a={{term}}&b=2\",\"header\":[{\"key\":\"X-Off\",\"value\":\"v\",\"disabled\":true}]}}]}," +
         "{\"name\":\"body off\",\"request\":{\"method\":\"POST\",\"url\":\"https://example.test\",\"body\":{\"mode\":\"raw\",\"raw\":\"secret\",\"disabled\":true}}}," +
-        "{\"name\":\"key\",\"request\":{\"method\":\"GET\",\"url\":\"https://example.test\",\"auth\":{\"type\":\"apikey\",\"apikey\":[{\"key\":\"key\",\"value\":\"X-Key\"},{\"key\":\"value\",\"value\":\"abc\"},{\"key\":\"in\",\"value\":\"{{PLACEMENT}}\"}]}}}," +
-        "{\"name\":\"trace\",\"request\":{\"method\":\"TRACE\",\"url\":\"https://example.test\"}}" +
+        "{\"name\":\"key\",\"request\":{\"method\":\"GET\",\"url\":\"https://example.test\",\"auth\":{\"type\":\"apikey\",\"apikey\":[{\"key\":\"key\",\"value\":\"X-Key\"},{\"key\":\"value\",\"value\":\"abc\"},{\"key\":\"in\",\"value\":\"{{PLACEMENT}}\"}]}}}" +
         "]}"
 }
 
@@ -329,8 +329,7 @@ fn test_review_postman_regressions() {
     if err != nil {
         return
     }
-    testing.expect_eq(len(res.requests), 3, "trace skipped, others kept")
-    testing.expect(contains(str_join(res.warns, "\n"), "TRACE is not supported"), "trace warning")
+    testing.expect_eq(len(res.requests), 3, "requests kept")
     gi := -1
     bi := -1
     ki := -1
@@ -372,6 +371,36 @@ fn test_review_postman_regressions() {
     }
 }
 
+fn test_postman_trace_is_an_import_error() {
+    src := "{\"info\":{\"name\":\"T\",\"schema\":\"https://schema.getpostman.com/json/collection/v2.1.0/collection.json\"},\"item\":[{\"name\":\"trace\",\"request\":{\"method\":\"TRACE\",\"url\":\"https://example.test\"}}]}"
+    [res, err] = pparse(src)
+    testing.expect(err != nil, "trace import fails")
+    if err != nil {
+        testing.expect(contains(errors.msg(err), "HTTP method \"TRACE\" is not supported by Posting"), "trace error text: " + errors.msg(err))
+    }
+}
+
+fn test_postman_graphql_import_kind_and_roundtrip() {
+    src := "{\"info\":{\"name\":\"G\",\"schema\":\"https://schema.getpostman.com/json/collection/v2.1.0/collection.json\"},\"item\":[{\"name\":\"gql\",\"request\":{\"method\":\"POST\",\"url\":\"https://example.test/graphql\",\"body\":{\"mode\":\"graphql\",\"graphql\":{\"query\":\"query Q { viewer { id } }\",\"variables\":{\"id\":1}}}}}]}"
+    [res, err] = pparse(src)
+    testing.expect(err == nil, "graphql postman parses")
+    if err != nil {
+        return
+    }
+    testing.expect_eq(len(res.requests), 1, "one request")
+    rq := res.requests[0].req
+    testing.expect_streq(rq.kind, "graphql", "kind set")
+    testing.expect_streq(rq.method, "", "method normalized out")
+    testing.expect(rq.body == nil, "http body normalized out")
+    testing.expect(rq.graphql != nil, "graphql payload present")
+    [back, rerr] = roundtrip(rq)
+    testing.expect(rerr == nil, "graphql request roundtrips")
+    if rerr == nil {
+        testing.expect_streq(back.kind, "graphql", "kind survives")
+        testing.expect(back.graphql != nil, "payload survives")
+    }
+}
+
 fn test_review_write_creates_request_parent_dirs() {
     [res, err] = pparse(review_postman_collection())
     testing.expect(err == nil, "postman parses")
@@ -404,6 +433,33 @@ fn test_review_openapi_version_and_base_url() {
     trailing := "{\"openapi\":\"3.1.\",\"info\":{\"title\":\"Bad\",\"version\":\"1\"},\"paths\":{}}"
     [_rt, te] = oparse(trailing)
     testing.expect(te != nil, "malformed OpenAPI version rejected")
+}
+
+fn test_review_openapi_json_duplicate_keys_and_depth() {
+    dup := "{\"openapi\":\"3.0.3\",\"openapi\":\"3.0.3\",\"info\":{\"title\":\"D\",\"version\":\"1\"},\"paths\":{}}"
+    [_rd, de] = oparse(dup)
+    testing.expect(de != nil, "duplicate object keys reject")
+    if de != nil {
+        testing.expect(contains(errors.msg(de), "duplicate object key \"openapi\""), "duplicate error text: " + errors.msg(de))
+        testing.expect(contains(errors.msg(de), "decode OpenAPI JSON:"), "json decode prefix")
+    }
+    deep := ""
+    di := 0
+    for di < 102 {
+        deep = deep + "{\"a\":"
+        di = di + 1
+    }
+    deep = deep + "1"
+    di = 0
+    for di < 102 {
+        deep = deep + "}"
+        di = di + 1
+    }
+    [_rp, pe] = oparse(deep)
+    testing.expect(pe != nil, "deep JSON rejects")
+    if pe != nil {
+        testing.expect(contains(errors.msg(pe), "OpenAPI nesting exceeds 100 levels"), "depth error text: " + errors.msg(pe))
+    }
 }
 
 fn test_review_openapi_local_ref_resolution() {

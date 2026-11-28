@@ -155,6 +155,57 @@ fn ofail(p: ref OParser, msg: str) {
     }
 }
 
+fn oquote(s: str) -> str {
+    return json.tojson(json.jstr(s))
+}
+
+// o_validate_tree enforces the upstream decode guards lost by the generic
+// std DOM parser: duplicate object keys are fatal, and container nesting is
+// capped at 100 levels before any recursive import walk can amplify it.
+fn o_validate_tree(v: ref json.Json, depth: int) -> str {
+    if depth > 100 {
+        return "OpenAPI nesting exceeds 100 levels"
+    }
+    if v == nil {
+        return ""
+    }
+    if v.kind == 4 {
+        ks := mkslice(str, 0)
+        c := v.child
+        for c != nil {
+            ks = push(ks, c.key)
+            c = c.next
+        }
+        sort.sort(ks)
+        ki := 1
+        for ki < len(ks) {
+            if ks[ki] == ks[ki - 1] {
+                return "duplicate object key " + oquote(ks[ki])
+            }
+            ki = ki + 1
+        }
+        c = v.child
+        for c != nil {
+            msg := o_validate_tree(c, depth + 1)
+            if len(msg) > 0 {
+                return msg
+            }
+            c = c.next
+        }
+    }
+    if v.kind == 5 {
+        a := v.child
+        for a != nil {
+            msg := o_validate_tree(a, depth + 1)
+            if len(msg) > 0 {
+                return msg
+            }
+            a = a.next
+        }
+    }
+    return ""
+}
+
 // oparse — Parse(data): one JSON or YAML document → Result.
 fn oparse(data: str) -> [own Result, err] {
     if len(data) > O_MAX_MATERIALIZED {
@@ -166,7 +217,8 @@ fn oparse(data: str) -> [own Result, err] {
         first = substr(trimmed, 0, 1)
     }
     root := json.jnull()
-    if first == "{" || first == "[" {
+    is_json_input := first == "{" || first == "["
+    if is_json_input {
         root = json.jparse(data)
         if root == nil || root.kind == 0 {
             return nil, errors.new("decode OpenAPI JSON: malformed document")
@@ -177,6 +229,13 @@ fn oparse(data: str) -> [own Result, err] {
             return nil, errors.new("decode OpenAPI: " + errors.msg(ye))
         }
         root = yn2j(yn)
+    }
+    vmsg := o_validate_tree(root, 0)
+    if len(vmsg) > 0 {
+        if is_json_input {
+            return nil, errors.new("decode OpenAPI JSON: " + vmsg)
+        }
+        return nil, errors.new(vmsg)
     }
     if !ois_obj(root) {
         return nil, errors.new("OpenAPI document must be an object")

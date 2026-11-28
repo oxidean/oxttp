@@ -445,12 +445,6 @@ fn pwalk(p: ref PParser, arr: own json.Json, dirs: []str, auth: own json.Json, l
             return "postman: " + where + " has neither a request nor a folder item array"
         }
         rmethod := upper_ascii2(jstrv(jgetk(rq, "method")))
-        if rmethod == "TRACE" {
-            pwarn(p, where, "TRACE is not supported by Posting; request skipped")
-            i = i + 1
-            it = it.next
-            continue
-        }
         // scopedAliases: materialize defaults that transitively
         // reference a scoped name (upstream scopedAliases).
         eff := pscoped_aliases(p, scp)
@@ -1114,6 +1108,7 @@ fn pconvert_body(p: ref PParser, req: ref collection.PRequest, b: ref json.Json,
         vt := ptemplate(p, varv, scp, where)
         g.variables = json.jparse(vt)
         req.graphql = g
+        req.kind = "graphql"
         return ""
     }
     pwarn(p, where, "body mode \"" + mode + "\" is unsupported; body omitted (multipart/files require manual conversion)")
@@ -1126,7 +1121,7 @@ fn http_methods() -> []str {
     m := mkslice(str, 0)
     m = push(m, "GET"); m = push(m, "POST"); m = push(m, "PUT")
     m = push(m, "PATCH"); m = push(m, "DELETE"); m = push(m, "HEAD")
-    m = push(m, "OPTIONS"); m = push(m, "TRACE")
+    m = push(m, "OPTIONS")
     return m
 }
 
@@ -1232,6 +1227,10 @@ fn pconvert(p: ref PParser, raw: ref json.Json, inherited: own json.Json, scp: [
     }
     if jpresent(jgetk(node, "certificate")) {
         pwarn(p, where, "client certificate configuration is not imported")
+    }
+    if req.kind == "graphql" {
+        req.method = ""
+        req.body = nil
     }
     return req, nil
 }

@@ -23,6 +23,10 @@ import "github.com/oxidean/oxttp/core/importing"
 import "github.com/oxidean/oxttp/core/yaml"
 import "github.com/oxidean/oxttp/shared/version"
 
+// stat-style regular-file probe (follows symlinks), matching os.Stat's
+// Mode().IsRegular gate in the upstream import command.
+extern fn rt_isfilex(path: str) -> int
+
 struct Out { code: int, stdout: str, stderr: str }
 
 fn cli_is_sub(a0: str) -> bool {
@@ -382,7 +386,7 @@ fn cli_import_args(args: []str) -> Out {
             output = args[i]
             i = i + 1
         } else if flags && (a == "-h" || a == "--help") {
-            return Out{code: 0, stdout: "usage: posting import [-t openapi|postman|bruno] [-o DIR] SOURCE...\n", stderr: ""}
+            return Out{code: 0, stdout: "Usage: posting import [options] SOURCE [ENVIRONMENT...]\n\nImport an OpenAPI 3.x specification, Postman v2 collection, Bruno .bru request,\nor Bruno collection directory, with any number of Postman environment exports.\nThe collection format is detected unless --type is given.\n\nCollection variables are written to posting.env, the base environment. Each\nenvironment is written to its own <name>.env, layered on the base. To add\nenvironments to an existing collection, give only environment files and\n--output.\n\nOptions:\n  -t, --type FORMAT    Collection format: openapi, postman, or bruno\n  -o, --output DIR     Destination (default: a named folder in the default collection)\n  -h, --help           Show this help\n\nOptions may appear before or after the files. Existing files are never\noverwritten. Unsupported source features are reported as warnings.\n", stderr: ""}
         } else if flags && len(a) > 0 && byteat(a, 0) == 45 {
             return Out{code: 2, stdout: "", stderr: "posting import: unknown flag " + a + "\n"}
         } else {
@@ -391,10 +395,10 @@ fn cli_import_args(args: []str) -> Out {
     }
     typ = cli_lower_ascii(typ)
     if typ != "openapi" && typ != "postman" && typ != "bruno" && typ != "" {
-        return Out{code: 2, stdout: "", stderr: "posting import: unknown type " + typ + "\n"}
+        return Out{code: 2, stdout: "", stderr: "posting import: unknown import type \"" + typ + "\" (choose openapi, postman, or bruno)\n"}
     }
     if len(srcs) == 0 {
-        return Out{code: 2, stdout: "", stderr: "posting import: no input files\n"}
+        return Out{code: 2, stdout: "", stderr: "posting import: expected a source file or directory\n"}
     }
     return import_run(srcs, typ, output)
 }
@@ -641,6 +645,9 @@ fn import_run(sources: []str, format: str, output_opt: str) -> Out {
         }
         if !os.exists(src) {
             return Out{code: 1, stdout: "", stderr: "posting import: " + imp_diag(src) + ": no such file\n"}
+        }
+        if rt_isfilex(src) == 0 {
+            return Out{code: 1, stdout: "", stderr: "posting import: source must be a regular file or Bruno directory\n"}
         }
         [data, drerr] = imp_read_bounded(src, 33554432)
         if drerr != nil {
@@ -1276,9 +1283,9 @@ fn run_exec(o: ref RunOpts, t: http.Transport) -> own RunRep {
         if len(sp.err) > 0 {
             rep.lines = push(rep.lines, "FAILED " + nrel + ": " + sp.err + "\n")
             failed = failed + 1
-            if o.fail_fast { stop = true }
             jresults = jappend(jresults, first_j, "{\"file\":" + jesc(nrel) + ",\"name\":" + jesc(n.req.name) + ",\"outcome\":\"failed\",\"error\":" + jesc(sp.err) + "}")
             first_j = false
+            if o.fail_fast { skipped = len(ord) - oi; break }
             continue
         }
         // plan_req leaves verify "" (on) or "no" — never "yes";
@@ -1314,9 +1321,9 @@ fn run_exec(o: ref RunOpts, t: http.Transport) -> own RunRep {
         if len(cert_err) > 0 {
             rep.lines = push(rep.lines, "FAILED " + nrel + ": " + cert_err + "\n")
             failed = failed + 1
-            if o.fail_fast { stop = true }
             jresults = jappend(jresults, first_j, "{\"file\":" + jesc(nrel) + ",\"name\":" + jesc(n.req.name) + ",\"outcome\":\"failed\",\"error\":" + jesc(cert_err) + "}")
             first_j = false
+            if o.fail_fast { skipped = len(ord) - oi; break }
             continue
         }
         [resp, se] = t.send(sp.req)
@@ -1325,9 +1332,9 @@ fn run_exec(o: ref RunOpts, t: http.Transport) -> own RunRep {
             msg := errors.msg(se)
             rep.lines = push(rep.lines, "FAILED " + nrel + ": " + msg + "\n")
             failed = failed + 1
-            if o.fail_fast { stop = true }
             jresults = jappend(jresults, first_j, "{\"file\":" + jesc(nrel) + ",\"name\":" + jesc(n.req.name) + ",\"outcome\":\"failed\",\"error\":" + jesc(msg) + "}")
             first_j = false
+            if o.fail_fast { skipped = len(ord) - oi; break }
             continue
         }
         // carry cookies for this run only (upstream run.go).
@@ -1344,9 +1351,9 @@ fn run_exec(o: ref RunOpts, t: http.Transport) -> own RunRep {
             serr := trim_space(itoa(resp.status) + " " + resp.reason)
             rep.lines = push(rep.lines, "FAILED " + nrel + ": " + serr + "\n")
             failed = failed + 1
-            if o.fail_fast { stop = true }
             jresults = jappend(jresults, first_j, "{\"file\":" + jesc(nrel) + ",\"name\":" + jesc(n.req.name) + ",\"outcome\":\"failed\",\"error\":" + jesc(serr) + ",\"response\":" + resp_json(sp.req, resp, rts) + "}")
             first_j = false
+            if o.fail_fast { skipped = len(ord) - oi; break }
             continue
         }
         // captures run only after a passing status (upstream
@@ -1358,9 +1365,9 @@ fn run_exec(o: ref RunOpts, t: http.Transport) -> own RunRep {
             cmsg := errors.msg(ce)
             rep.lines = push(rep.lines, "FAILED " + nrel + ": " + cmsg + "\n")
             failed = failed + 1
-            if o.fail_fast { stop = true }
             jresults = jappend(jresults, first_j, "{\"file\":" + jesc(nrel) + ",\"name\":" + jesc(n.req.name) + ",\"outcome\":\"failed\",\"error\":" + jesc(cmsg) + ",\"response\":" + resp_json(sp.req, resp, rts) + "}")
             first_j = false
+            if o.fail_fast { skipped = len(ord) - oi; break }
             continue
         }
         ci := 0

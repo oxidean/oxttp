@@ -131,6 +131,22 @@ fn test_cli_import() {
     a[2] = "bogus"
     r = cli_import_args(a)
     testing.expect(r.code == 2, "bad type")
+    testing.expect(find(r.stderr, "unknown import type \"bogus\" (choose openapi, postman, or bruno)") >= 0, "bad type text")
+    // non-regular sources are rejected before opening
+    a = nil
+    a = push(a, "import")
+    a = push(a, "/dev/null")
+    r = cli_import_args(a)
+    testing.expect(r.code == 1, "device source rejected")
+    testing.expect(find(r.stderr, "source must be a regular file or Bruno directory") >= 0, "regular file text")
+    // help is the upstream multi-line usage
+    a = nil
+    a = push(a, "import")
+    a = push(a, "--help")
+    r = cli_import_args(a)
+    testing.expect(r.code == 0, "help exits zero")
+    testing.expect(find(r.stdout, "Usage: posting import [options] SOURCE [ENVIRONMENT...]") == 0, "help usage")
+    testing.expect(find(r.stdout, "Existing files are never") >= 0, "help body")
     // zero sources → usage 2
     a = nil
     a = push(a, "import")
@@ -138,6 +154,7 @@ fn test_cli_import() {
     a = push(a, "postman")
     r = cli_import_args(a)
     testing.expect(r.code == 2, "no sources usage")
+    testing.expect(find(r.stderr, "expected a source file or directory") >= 0, "no sources text")
     // --type=x / --output=x forms parse and wire the real engine.
     src := root + "/import.postman.json"
     outdir := root + "/out"
@@ -412,6 +429,32 @@ fn test_run_exec_orders_by_rel() {
     testing.expect(len(rep.lines) == 3, "2 req + summary")
     testing.expect(find(rep.lines[0], "PASSED a.posting.yaml") == 0, "a first")
     testing.expect(find(rep.lines[1], "PASSED z/b.posting.yaml") == 0, "z/b second")
+    os.remove_all(dir)
+}
+
+fn test_run_exec_fail_fast_shape() {
+    dir := "/tmp/oxttp-run-ff"
+    os.remove_all(dir)
+    os.mkdir_all(dir)
+    os.writefile_(dir + "/01.bad.posting.yaml", "name: bad\nmethod: GET\nurl: http://x.test/a\ncaptures:\n  NOPE: $.missing\n")
+    os.writefile_(dir + "/02.good.posting.yaml", "name: good\nmethod: GET\nurl: http://x.test/b\n")
+    o := new(RunOpts)
+    o.target = dir
+    o.fail_fast = true
+    fx := FakeSend{resp: fake_resp(200, "application/json", "{}", nil), fail: "", expect_path: ""}
+    rep := run_exec(o, fx)
+    testing.expect(rep.code == 1, "failed run")
+    testing.expect_eq(len(rep.lines), 2, "failure plus summary only")
+    testing.expect(find(rep.lines[0], "FAILED 01.bad.posting.yaml") == 0, "failure line")
+    testing.expect(find(rep.lines[1], "0 passed, 1 failed, 1 skipped") >= 0, "numeric skipped summary")
+    joined := str_join(rep.lines, "")
+    testing.expect(find(joined, "SKIPPED") < 0, "no per-request skipped lines")
+    o.json = true
+    rep = run_exec(o, fx)
+    testing.expect_eq(len(rep.lines), 1, "json report line")
+    testing.expect(find(rep.lines[0], "\"outcome\":\"failed\"") >= 0, "failed result present")
+    testing.expect(find(rep.lines[0], "\"outcome\":\"skipped\"") < 0, "no skipped result object")
+    testing.expect(find(rep.lines[0], "\"skipped\":1") >= 0, "json skipped count")
     os.remove_all(dir)
 }
 

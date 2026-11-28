@@ -10,6 +10,41 @@ import "github.com/oxidean/oxttp/core/collection"
 import "github.com/oxidean/oxttp/core/model"
 import "github.com/oxidean/oxttp/core/yaml"
 
+// rt_open_write_mode creates atomically with O_EXCL; imported output must
+// never overwrite an existing path, even when another process wins the race
+// between the pre-check and create.
+extern fn rt_open_write_mode(path: str, mode: int, src: str) -> int
+
+extern fn rt_fd_write(fd: int, b: []byte) -> int
+
+extern fn rt_fd_close(fd: int) -> int
+
+fn write_file_excl(path: str, content: str) -> int {
+    fd := rt_open_write_mode(path, 420, path)
+    if fd < 0 {
+        return -1
+    }
+    b := content as []byte
+    off := 0
+    ok := true
+    for off < len(b) {
+        w := rt_fd_write(fd, b[off:])
+        if w <= 0 {
+            ok = false
+            break
+        }
+        off = off + w
+    }
+    if rt_fd_close(fd) < 0 {
+        ok = false
+    }
+    if !ok {
+        os.remove(path)
+        return -1
+    }
+    return len(b)
+}
+
 fn write(result: ref Result, dir: str) -> [own Written, err] {
     w := new(Written)
     w.files = mkslice(str, 0)
@@ -124,8 +159,8 @@ fn write(result: ref Result, dir: str) -> [own Written, err] {
                 continue
             }
             path := dir + "/" + cand
-            // exists-check + write (O_EXCL equivalent; ADR-0065
-            // records the fs-confinement deviation)
+            // pre-check only picks the display name; the create itself is
+            // atomic O_EXCL so a concurrent writer cannot be overwritten.
             if os.exists(path) {
                 n = n + 1
                 continue
@@ -145,7 +180,11 @@ fn write(result: ref Result, dir: str) -> [own Written, err] {
                     break
                 }
             }
-            if os.writefile_(path, data) < 0 {
+            if write_file_excl(path, data) < 0 {
+                if os.exists(path) {
+                    n = n + 1
+                    continue
+                }
                 ok = false
                 break
             }
