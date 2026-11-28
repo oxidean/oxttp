@@ -139,4 +139,13 @@ fn test_authorization_url_and_ipv6_degrade() {
     testing.expect(find(u, "code_challenge_method=S256") >= 0, "PKCE method")
     testing.expect(find(u, "state=state+x") >= 0 || find(u, "state=state%20x") >= 0, "state query escaped")
     testing.expect(redirect_is_ipv6_loopback("http://[::1]:8765/cb"), "IPv6 loopback detected")
+    c2 := c
+    c2.authorization_url = "https://issuer.test/auth?"
+    u2 := authorization_url(c2, "http://127.0.0.1:991/cb", "state", "verifier")
+    testing.expect(find(u2, "?response_type=code") >= 0, "trailing question mark not doubled")
+    c3 := c
+    c3.authorization_url = "https://issuer.test/auth?prompt=consent&"
+    u3 := authorization_url(c3, "http://127.0.0.1:991/cb", "state", "verifier")
+    testing.expect(find(u3, "&response_type=code") >= 0, "trailing ampersand reused")
+    testing.expect(find(u3, "&&") < 0, "separator not doubled")
 }

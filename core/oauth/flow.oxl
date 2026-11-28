@@ -48,6 +48,12 @@ fn authorization_url(cfg: Config, actual_redirect_uri: str, state: str, verifier
     if find(c.authorization_url, "?") >= 0 {
         sep = "&"
     }
+    if len(c.authorization_url) > 0 {
+        last := byteat(c.authorization_url, len(c.authorization_url) - 1)
+        if last == 63 || last == 38 { // already ends in ? or &
+            sep = ""
+        }
+    }
     return c.authorization_url + sep + q
 }
 

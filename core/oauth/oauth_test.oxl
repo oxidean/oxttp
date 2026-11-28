@@ -68,6 +68,8 @@ fn test_validation_matrix() {
 fn test_redirect_matrix() {
     testing.expect(validate_redirect("http://127.0.0.1:0/cb") == nil, "port zero redirect valid")
     testing.expect(validate_redirect("http://[::1]:8765/cb") == nil, "IPv6 syntax accepted semantically")
+    testing.expect(validate_redirect("http://[0:0:0:0:0:0:0:1]:8765/cb") == nil, "expanded IPv6 loopback accepted")
+    testing.expect(validate_redirect("http://[0::0001]:8765/cb") == nil, "mixed IPv6 loopback spelling accepted")
     msg := "OAuth redirect URI must be an HTTP loopback IP with a port and path, e.g. http://127.0.0.1:8765/oauth/callback"
     expect_err(validate_redirect("https://127.0.0.1:8765/cb"), msg, "redirect scheme")
     expect_err(validate_redirect("http://127.0.0.1/cb"), msg, "redirect missing port")

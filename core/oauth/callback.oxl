@@ -127,9 +127,12 @@ fn split_lines_crlf(head: str) -> []str {
 // handle_callback_conn services one accepted connection. The returned bool
 // reports whether the connection produced an outcome that ends the OAuth
 // wait; invalid state/nonmatching requests only count as extraneous.
-fn handle_callback_conn(c: net.Conn, expected: ref url.URL, state: str) -> [CallbackOutcome, err] {
+fn handle_callback_conn(c: net.Conn, expected: ref url.URL, state: str, wait_deadline_ms: int) -> [CallbackOutcome, err] {
     none := CallbackOutcome{kind: "extraneous", code: "", error_code: "", detail: ""}
     deadline := now_ms() + CallbackConnMs
+    if deadline > wait_deadline_ms {
+        deadline = wait_deadline_ms
+    }
     [head, he] = read_callback_head(c, deadline)
     if he != nil {
         callback_simple(c, 400, "Bad Request", "Bad OAuth callback.", false)
@@ -227,7 +230,7 @@ fn wait_callback(l: net.Listener, actual_redirect_uri: str, state: str, deadline
             // are also bounded by the outer deadline rather than fatal here.
             continue
         }
-        [oc, he] = handle_callback_conn(c, expected, state)
+        [oc, he] = handle_callback_conn(c, expected, state, deadline_ms)
         c.close()
         if he != nil || oc.kind == "extraneous" {
             extraneous = extraneous + 1

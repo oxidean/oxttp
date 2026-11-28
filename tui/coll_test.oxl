@@ -675,6 +675,20 @@ fn has_oauth_row(a: ref App, name: str) -> bool {
     return false
 }
 
+
+fn test_oauth_editor_invalid_enums_stay_verbatim() {
+    a := new_app()
+    pr := oauth_preq()
+    pr.auth.oauth2.grant_type = "client-credentials"
+    pr.auth.oauth2.client_auth = "sometimes-basic"
+    oauth_seed(a, pr)
+    testing.expect_streq(oauth_value(a, "grant_type"), "client-credentials", "invalid grant enum remains raw")
+    testing.expect_streq(oauth_value(a, "client_auth"), "sometimes-basic", "invalid client auth enum remains raw")
+    r := draft_to_request(a)
+    testing.expect_streq(r.auth.oauth2.grant_type, "client-credentials", "invalid grant is not rewritten")
+    testing.expect_streq(r.auth.oauth2.client_auth, "sometimes-basic", "invalid client auth is not rewritten")
+}
+
 fn test_oauth_editor_conditional_roundtrip_and_tabs() {
     a := new_app()
     set_oauth_row(a, "type", "OAuth 2.0")

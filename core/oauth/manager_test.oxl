@@ -139,7 +139,7 @@ fn test_refresh_rotation_and_retention() {
 }
 
 
-fn test_invalid_grant_interactive_browser_fallback() {
+fn test_invalid_grant_requires_explicit_relogin() {
     m := new(Manager)
     m.now_unix = 1000
     c := with_defaults(Config{grant_type: "authorization_code", authorization_url: "https://issuer.test/auth", token_url: "https://issuer.test/token", client_id: "client", client_secret: "", scope: "", redirect_uri: "", client_auth: ""})
@@ -149,12 +149,12 @@ fn test_invalid_grant_interactive_browser_fallback() {
     tr := SeqTransport{hits: mkshared(0), status: 400, ctype: "application/json", body1: "{\"error\":\"invalid_grant\",\"error_description\":\"raw provider secret detail\"}", body2: "{}", fail2: "", expect_refresh: "dead-refresh"}
     browser := FakeBrowser{token: "fresh-browser-token", calls: mkshared(0)}
     out := authorize(m, c, ident(), manager_resource(), true, browser, tr)
-    testing.expect_streq(out.err, "", "invalid_grant falls back interactively")
-    testing.expect_streq(out.bearer, "fresh-browser-token", "browser bearer used")
-    testing.expect_eq(sget(browser.calls), 1, "browser fallback invoked")
+    testing.expect_streq(out.err, "OAuth grant expired or was revoked; use Forget OAuth token and sign in again", "invalid_grant exact re-login error")
+    testing.expect_streq(out.bearer, "", "no bearer after revoked grant")
+    testing.expect_eq(sget(browser.calls), 0, "invalid_grant never auto-launches browser")
     lu := manager_get(m, key)
-    testing.expect(lu.found, "browser token stored under same key")
-    testing.expect_streq(lu.token.access_token, "fresh-browser-token", "stored browser token")
+    testing.expect(lu.found, "old token remains forgettable under same key")
+    testing.expect_streq(lu.token.access_token, "old", "revoked token is not overwritten")
 }
 
 fn test_noninteractive_code_refusal_and_forget() {

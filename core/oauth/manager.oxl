@@ -165,16 +165,9 @@ fn authorize(m: mut Manager, cfg: Config, ident: CacheIdentity, resource: ref mo
             manager_put(m, key, merged)
             return auth_success_result(merged)
         }
-        // invalid_grant means consent/credential material is gone. Interactive
-        // callers may acquire a fresh authorization; non-interactive callers
-        // receive the sanitized endpoint failure rather than a browser wait.
-        if refreshed.endpoint_code == "invalid_grant" && interactive && browser != nil {
-            br := browser.run(c, resource, tr)
-            if len(br.err) == 0 {
-                manager_put(m, key, br.token)
-            }
-            return auth_from_token_result(br)
-        }
+        // invalid_grant means consent/credential material is gone. Surface
+        // the sanitized re-login failure even for interactive callers —
+        // automatically opening a browser would hide the revocation signal.
         return auth_from_token_result(refreshed)
     }
 

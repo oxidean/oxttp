@@ -437,28 +437,44 @@ fn oauth_grant_label(v: str) -> str {
     if v == "client_credentials" {
         return "Client credentials"
     }
-    return "Code + PKCE"
+    if v == "authorization_code" {
+        return "Code + PKCE"
+    }
+    // Unknown file values stay visible verbatim so validation can reject
+    // them; they must not be silently rewritten into a valid default.
+    return v
 }
 
 fn oauth_grant_yaml(v: str) -> str {
-    if str_contains(lower_ascii(v), "client") {
+    if v == "Client credentials" {
         return "client_credentials"
     }
-    return "authorization_code"
+    if v == "Code + PKCE" {
+        return "authorization_code"
+    }
+    // Raw enum values round-trip exactly, including invalid ones. Validation
+    // owns rejection; the editor must not materialize a default over them.
+    return v
 }
 
 fn oauth_clientauth_label(v: str) -> str {
     if v == "client_secret_basic" {
         return "Basic header"
     }
-    return "Body"
+    if v == "client_secret_post" {
+        return "Body"
+    }
+    return v
 }
 
 fn oauth_clientauth_yaml(v: str) -> str {
-    if str_contains(lower_ascii(v), "basic") {
+    if v == "Basic header" {
         return "client_secret_basic"
     }
-    return "client_secret_post"
+    if v == "Body" {
+        return "client_secret_post"
+    }
+    return v
 }
 
 fn oauth_row(rows: []KVRow, name: str, value: str) -> KVRow {
@@ -1385,7 +1401,7 @@ fn forget_oauth(a: mut App) -> int {
     if es == nil {
         es = new(env.EnvSet)
     }
-    sp := collection.plan_req(pr, es, nil, a.coll_dir)
+    sp := collection.plan_req_for_forget(pr, es, nil, a.coll_dir)
     if len(sp.err) > 0 {
         a.toast(2, "forget OAuth token: " + sp.err)
         return ENone

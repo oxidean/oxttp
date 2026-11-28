@@ -613,6 +613,11 @@ fn run_exec(o: ref RunOpts, t: http.Transport) -> own RunRep {
                 first_j = false
                 continue
             }
+            ni := 0
+            for ni < len(ar.notes) {
+                rep.stderr = rep.stderr + "posting run: warning: " + n.rel + ": " + ar.notes[ni] + "\n"
+                ni = ni + 1
+            }
             let ohs: []model.Header = nil
             oi2 := 0
             for oi2 < len(sp.req.headers) {

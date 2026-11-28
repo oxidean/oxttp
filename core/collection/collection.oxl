@@ -2012,7 +2012,7 @@ fn subst_oauth_active(v: str, es: ref env.EnvSet) -> [str, err] {
 // substituted before defaults/validation exactly per spec §2; code-only
 // fields stay inactive (and may contain unresolved variables) for
 // client-credentials.
-fn plan_oauth(o: ref POAuth2, es: ref env.EnvSet, resource_url: str, coll_dir: str, verify_ssl: bool, proxy_url: str) -> [own oauth.Plan, err] {
+fn plan_oauth(o: ref POAuth2, es: ref env.EnvSet, resource_url: str, coll_dir: str, verify_ssl: bool, proxy_url: str, validate: bool) -> [own oauth.Plan, err] {
     c := oauth.Config{grant_type: o.grant_type, authorization_url: "", token_url: "", client_id: "", client_secret: "", scope: "", redirect_uri: "", client_auth: o.client_auth}
     [tu, te] = subst_oauth_active(o.token_url, es)
     if te != nil {
@@ -2054,13 +2054,18 @@ fn plan_oauth(o: ref POAuth2, es: ref env.EnvSet, resource_url: str, coll_dir: s
         c.redirect_uri = o.redirect_uri
     }
     c = oauth.with_defaults(c)
-    ve := oauth.validate_config(c, resource_url)
-    if ve != nil {
-        return nil, ve
+    if validate {
+        ve := oauth.validate_config(c, resource_url)
+        if ve != nil {
+            return nil, ve
+        }
     }
     root := coll_dir
     if len(root) > 0 {
-        root = os.fullpath(root)
+        abs := os.fullpath(root)
+        if len(abs) > 0 {
+            root = abs
+        }
     }
     id := oauth.CacheIdentity{collection_root: root, resource_url: resource_url, verify_ssl: verify_ssl, proxy_url: proxy_url}
     return new(oauth.Plan{cfg: c, identity: id}), nil
@@ -2070,6 +2075,17 @@ fn plan_oauth(o: ref POAuth2, es: ref env.EnvSet, resource_url: str, coll_dir: s
 // wire model.Req — corpus §7.1. err set → caller toasts; warns → info
 // toasts (env-layer warnings etc.).
 fn plan_req(r: ref PRequest, envset: ref env.EnvSet, jar: []str, coll_dir: str) -> SendPlan {
+    return plan_req_mode(r, envset, jar, coll_dir, true)
+}
+
+// plan_req_for_forget resolves the same cache identity as a send but does
+// not validate the OAuth endpoint/configuration. Forget must remain able to
+// clear a token after the file becomes invalid.
+fn plan_req_for_forget(r: ref PRequest, envset: ref env.EnvSet, jar: []str, coll_dir: str) -> SendPlan {
+    return plan_req_mode(r, envset, jar, coll_dir, false)
+}
+
+fn plan_req_mode(r: ref PRequest, envset: ref env.EnvSet, jar: []str, coll_dir: str, validate_oauth: bool) -> SendPlan {
     sp := SendPlan{req: nil, oauth: nil, warns: nil, err: ""}
     if len(r.kind) > 0 {
         sp.err = "kind " + r.kind + " sends land M4 — unsupported in this build"
@@ -2277,7 +2293,7 @@ fn plan_req(r: ref PRequest, envset: ref env.EnvSet, jar: []str, coll_dir: str) 
     // execution later replaces those rows on the wire without mutating the
     // saved request. Non-OAuth explicit-header precedence is unchanged.
     if r.auth != nil && r.auth.type == "oauth2" && r.auth.oauth2 != nil {
-        [op, oe] = plan_oauth(r.auth.oauth2, es, u, coll_dir, verify, proxy)
+        [op, oe] = plan_oauth(r.auth.oauth2, es, u, coll_dir, verify, proxy, validate_oauth)
         if oe != nil {
             sp.err = errors.msg(oe)
             return sp
