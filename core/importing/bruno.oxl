@@ -1192,4 +1192,3 @@ fn bparse(data: str) -> [own Result, err] {
     }
     return res, nil
 }
-
