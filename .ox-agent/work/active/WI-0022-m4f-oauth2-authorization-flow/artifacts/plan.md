@@ -352,7 +352,7 @@ Gate:
    Mitigate by keeping manager data flat/owned inside `core/oauth` and by
    adapting public signatures during S1/S4 before UI integration.
 2. **`std/net.listen` cannot bind exact loopback or IPv6.** Accepted in
-   ADR-0061/0058; do not attempt unsafe workarounds. Tests must pin strict
+   ADR-0061/0063; do not attempt unsafe workarounds. Tests must pin strict
    Host/state/path mitigation and explicit IPv6 failure.
 3. **Synchronous TUI blocking means waiting text may not repaint.** Accepted
    in ADR-0061; implement best-effort text but do not invest in async rewrite.

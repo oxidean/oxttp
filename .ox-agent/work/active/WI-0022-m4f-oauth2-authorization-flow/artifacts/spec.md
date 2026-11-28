@@ -3,7 +3,7 @@
 Upstream: Posting `32c45669032342cf9b95d5758af47a0d93de0ad7`; corpus
 `docs/corpus/corpus-posting.md` §5.2, §7.6, §7.7, §9. Discovery and decision
 record: `artifacts/discovery.md`, `artifacts/brainstorm.md`, ADR-0059 through
-ADR-0062. Pin: oxl 0.26.0.
+ADR-0063. Pin: oxl 0.26.0.
 
 ## 1. Goal and scope
 
