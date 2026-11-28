@@ -197,7 +197,7 @@ New `*_test.oxl` coverage (existing suites must stay green):
 - **D6** No TLS-version config surface exists in posting (corpus
   §2.2/§5.2) — the CLI's `--ssl` pins have no TUI equivalent;
   transport `[V12,V13]` default applies. Documented absence.
-- **D9** Cert PEM parse/key-mismatch errors surface as transport
+- **D7** Cert PEM parse/key-mismatch errors surface as transport
   send failures (toast `send_failed` / run FAILED row), not plan-
   time toasts — corpus "reported at send time" holds; layering kept
   (`core/collection` gains no `net/tls` import).
