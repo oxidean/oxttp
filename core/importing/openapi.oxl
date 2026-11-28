@@ -2,8 +2,8 @@ package importing
 
 // openapi.oxl — port of internal/importing/openapi/* (openapi.go,
 // budget.go, json.go, numbers.go, security.go, values.go) per
-// ADR-0044/0045. DOM is std/encoding/json Json; YAML input goes
-// through core/yaml's subset (ADR-0045 deviation 1) and numbers
+// ADR-0064/0065. DOM is std/encoding/json Json; YAML input goes
+// through core/yaml's subset (ADR-0065 deviation 1) and numbers
 // approximate json.Number lexemes (deviation 2).
 import "std/encoding/json"
 import "std/encoding/hex"
@@ -51,7 +51,7 @@ fn okeys(o: ref json.Json) -> []str {
 }
 
 // onum_text — scalar() number rendering: ints exact, floats
-// shortest round-trip (ADR-0045 deviation 2).
+// shortest round-trip (ADR-0065 deviation 2).
 fn onum_text(v: ref json.Json) -> str {
     if v == nil {
         return ""

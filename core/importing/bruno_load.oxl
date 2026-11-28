@@ -2,7 +2,7 @@ package importing
 
 // bruno_load.oxl — port of internal/importing/bruno/load.go
 // (posting @32c4566): Load of a .bru file or collection directory.
-// Deviations (ADR-0045): os.Root confinement → plain os.* with
+// Deviations (ADR-0065): os.Root confinement → plain os.* with
 // check-then-read plus explicit lstat-style symlink rejection;
 // bruno.json parsed via json.Json DOM.
 import "std/encoding/json"

@@ -1,4 +1,4 @@
-# ADR-0044 — `posting import` engines live in `core/importing`, emit `PRequest`
+# ADR-0064 — `posting import` engines live in `core/importing`, emit `PRequest`
 
 - Status: accepted
 - Date: 2026-11-28
@@ -48,4 +48,4 @@ reach.
   `Substitute`/`MapLookup`, `PathParamNames`, `Normalize`,
   `Variable`) are added to `core/model` as new files, matching
   upstream semantics.
-- Deviations are recorded in ADR-0045 (DOM/YAML capability gaps).
+- Deviations are recorded in ADR-0065 (DOM/YAML capability gaps).

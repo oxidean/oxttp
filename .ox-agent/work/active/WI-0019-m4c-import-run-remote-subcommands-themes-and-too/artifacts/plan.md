@@ -1,7 +1,7 @@
 # WI-0019 plan — M4c import / run / remote / themes / tools
 
-Spec: `artifacts/spec.md`. ADRs: 0044 (layout), 0045 (DOM/fs
-deviations), 0046 (remote degrade+surface), 0047 (run env), 0048
+Spec: `artifacts/spec.md`. ADRs: 0064 (layout), 0065 (DOM/fs
+deviations), 0066 (remote degrade+surface), 0067 (run env), 0068
 (test strategy). Upstream reference clone: `/tmp/posting-src-full`.
 
 ## Stage P1 — model + shared helpers (foundation)
@@ -132,7 +132,7 @@ P3 postman first (simplest DOM consumer, validates jsondom+write).
 P4 openapi (hardest DOM+schema). P5 bruno (self-contained text).
 P6 wiring last so engines are testable headlessly. P7/P8 surgical.
 P9 verify-only. TDD per stage: write ported upstream test cases
-first where feasible (ADR-0048), then implement to green.
+first where feasible (ADR-0068), then implement to green.
 
 ## Risks
 

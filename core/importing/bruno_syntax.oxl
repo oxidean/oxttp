@@ -2,7 +2,7 @@ package importing
 
 // bruno_syntax.oxl — port of internal/importing/bruno/syntax.go
 // (posting @32c4566). .bru text blocks, pairs, lists.
-// Deviations (ADR-0045): utf8.Valid hand-rolled; rune scans via
+// Deviations (ADR-0065): utf8.Valid hand-rolled; rune scans via
 // next_rune instead of Go range.
 import "std/errors"
 import "github.com/oxidean/oxttp/core/model"

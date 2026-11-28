@@ -85,7 +85,7 @@ fn cli_locate_args(args: []str) -> Out {
     return Out{code: 2, stdout: "", stderr: "Unknown thing to locate: \"" + what + "\"\n"}
 }
 
-// ---------- remote (ADR-0046: UDS degrade, upstream surface) ----------
+// ---------- remote (ADR-0066: UDS degrade, upstream surface) ----------
 
 // RParse is upstream remoteOptions + parse outcome. err/help mirror
 // Go's (opts, error) with flagHelp as a distinct help flag.
@@ -298,7 +298,7 @@ fn cli_remote_args(args: []str) -> Out {
         return Out{code: 0, stdout: REMOTE_SKILL_MD, stderr: ""}
     }
     // UDS unsupported: instance discovery always yields zero
-    // instances (ADR-0046).
+    // instances (ADR-0066).
     os.getenv("POSTING_INSTANCE")
     if rp.cmd == "list" {
         if rp.json {
@@ -1109,7 +1109,7 @@ fn run_exec(o: ref RunOpts, t: http.Transport) -> own RunRep {
     if len(cr.s.ssl_password) > 0 && len(cr.s.ssl_certificate_path) > 0 {
         rep.stderr = rep.stderr + "posting run: warning: ssl.password is set but encrypted private keys are unsupported in this build\n"
     }
-    // env stack (ADR-0047): no -e → the ROOT's posting.env+
+    // env stack (ADR-0067): no -e → the ROOT's posting.env+
     // posting.local.env only; any -e suppresses the implicit base and
     // resolves names in the root, file specs against the CWD.
     cwd := os.fullpath(".")

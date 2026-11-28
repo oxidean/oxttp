@@ -2,7 +2,7 @@ package importing
 
 // WI-0019 — port of internal/importing/{result,write,layers}.go +
 // the postman engine (internal/importing/postman/postman.go) per
-// ADR-0044/0045. Requests are collection.PRequest; each carries a
+// ADR-0064/0065. Requests are collection.PRequest; each carries a
 // suggested collection-relative file path (write.go sanitizes).
 import "std/os"
 import "std/errors"

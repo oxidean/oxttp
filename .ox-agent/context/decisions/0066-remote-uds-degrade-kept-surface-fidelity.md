@@ -1,4 +1,4 @@
-# ADR-0046 — `remote` keeps the UDS degrade; surface fidelity is still owed
+# ADR-0066 — `remote` keeps the UDS degrade; surface fidelity is still owed
 
 - Status: accepted
 - Date: 2026-11-28

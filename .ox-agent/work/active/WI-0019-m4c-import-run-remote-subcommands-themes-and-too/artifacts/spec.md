@@ -1,6 +1,6 @@
 # WI-0019 spec — M4c import / run / remote subcommands, themes, tools
 
-Direction locked by `artifacts/brainstorm.md` + ADR-0044/0045/0046/0047.
+Direction locked by `artifacts/brainstorm.md` + ADR-0064/0065/0066/0067.
 Corpus: `docs/corpus/corpus-posting.md` §1 (CLI surface) + §8
 (themes/import/remote/tools). Upstream source of truth re-verified
 first-hand at `darrenburns/posting` @ `32c4566` (clone
@@ -10,7 +10,7 @@ first-hand at `darrenburns/posting` @ `32c4566` (clone
 
 ### S1 — `posting import` real engines (the bulk)
 
-New package `core/importing` (ADR-0044). `tui/cli_import_args`
+New package `core/importing` (ADR-0064). `tui/cli_import_args`
 rewritten to upstream `parseImportOptions`/`readImports`/
 `importCommand` semantics (`cmd/posting/import.go`):
 
@@ -76,7 +76,7 @@ rewritten to upstream `parseImportOptions`/`readImports`/
 
 - JSON path: `std/encoding/json` DOM; depth ≤100; duplicate keys
   rejected (`duplicate object key %q`); numbers via kind-2/6
-  (ADR-0045). YAML path: `core/yaml` subset (ADR-0045 deviation);
+  (ADR-0065). YAML path: `core/yaml` subset (ADR-0065 deviation);
   version regex `^3\.[01]\.[0-9]+$` else `unsupported OpenAPI
   version %q (supported: 3.0.x and 3.1.x; Swagger 2 is not
   supported)`.
@@ -278,7 +278,7 @@ rewritten to upstream `parseImportOptions`/`readImports`/
   unsupported-block warns; scope.vars resets to parent.vars copy
   (folder vars materialize, collection vars defer).
 
-### S2 — `posting run` fidelity fixes (ADR-0047)
+### S2 — `posting run` fidelity fixes (ADR-0067)
 
 - `-c/--collection DIR` without PATH → target `.` (whole collection);
   PATH relative joins -c root; without -c root = target dir or file
@@ -307,7 +307,7 @@ rewritten to upstream `parseImportOptions`/`readImports`/
   empty-url abort texts, captures→FAILED degrade (WI-0018), config
   warnings fatal, use_host_environment stderr warning.
 
-### S3 — `posting remote` surface fidelity (ADR-0046)
+### S3 — `posting remote` surface fidelity (ADR-0066)
 
 - `parseRemoteOptions` port: flags `--json --none --name --curl
   --yaml --instance` (+`-h/--help`), `--x=v`/`--x v`, `--` end;
@@ -339,7 +339,7 @@ rewritten to upstream `parseImportOptions`/`readImports`/
   yaml file BEFORE dialing? remoteRequest runs after Choose; with
   zero instances Choose fails first → degrade before file reads.
   Keep that order).
-- `remote` protocol types ported as dead structs? — NO (ADR-0046
+- `remote` protocol types ported as dead structs? — NO (ADR-0066
   note: only if trivial; skip to keep diff focused).
 
 ### S4 — themes/tools verification
@@ -384,13 +384,13 @@ rewritten to upstream `parseImportOptions`/`readImports`/
 8. `posting remote` rejects `new`/`focus` (exit 2), strict flag
    errors exit 2, `skill` prints 131-line SKILL.md, `list` empty →
    stderr message exit 0, `--help` full usage.
-9. Deviations recorded: this spec + ADR-0045 (yaml subset, number
-   lexemes, fs confinement) + ADR-0046 (UDS degrade message) +
-   ADR-0047 (env scoping is upstream-faithful, not a deviation).
+9. Deviations recorded: this spec + ADR-0065 (yaml subset, number
+   lexemes, fs confinement) + ADR-0066 (UDS degrade message) +
+   ADR-0067 (env scoping is upstream-faithful, not a deviation).
 
 ## Out of scope
 
 - UDS transport itself (oxl lacks AF_UNIX — upstream issue to file).
 - Captures implementation (WI-0018), GraphQL/SSE/gRPC/WS request
   kinds in run (WI-0020/0021), OAuth (WI-0022), TLS/proxy (WI-0017).
-- `remote` protocol client structs (dead code — skipped per ADR-0046).
+- `remote` protocol client structs (dead code — skipped per ADR-0066).

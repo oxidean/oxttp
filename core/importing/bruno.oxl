@@ -2,7 +2,7 @@ package importing
 
 // bruno.oxl — port of internal/importing/bruno/bruno.go
 // (posting @32c4566): scope layering, expansion, convert,
-// environments, diagnostics. Deviations (ADR-0045): vars/auth
+// environments, diagnostics. Deviations (ADR-0065): vars/auth
 // fields are ordered KV lists standing in for Go maps (last wins);
 // graphql.variables must already be JSON for PGraphQL.
 import "std/encoding/json"

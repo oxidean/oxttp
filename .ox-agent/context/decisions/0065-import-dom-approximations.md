@@ -1,4 +1,4 @@
-# ADR-0045 — Import DOM approximations: yaml subset, json lexemes, fs confinement
+# ADR-0065 — Import DOM approximations: yaml subset, json lexemes, fs confinement
 
 - Status: accepted
 - Date: 2026-11-28

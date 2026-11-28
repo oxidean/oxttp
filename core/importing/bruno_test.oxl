@@ -3,7 +3,7 @@ package importing
 // bruno_test.oxl — ports of upstream internal/importing/bruno tests
 // (posting @32c4566): parse/round-trip, bodies, warnings, expansion
 // bounds, GraphQL, collection inheritance. Filesystem cases use
-// os.temp_dir + writefile_ (ADR-0045 approximations).
+// os.temp_dir + writefile_ (ADR-0065 approximations).
 import "std/os"
 import "std/testing"
 import "std/time"

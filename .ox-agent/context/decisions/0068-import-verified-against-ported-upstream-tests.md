@@ -1,4 +1,4 @@
-# ADR-0048 — Import engines verified against ported upstream test vectors
+# ADR-0068 — Import engines verified against ported upstream test vectors
 
 - Status: accepted
 - Date: 2026-11-28
@@ -27,7 +27,7 @@ behavioral evidence, not just compilation.
    exit-code, and stdout/stderr contract (Out fields), including the
    S2/S3 fidelity fixes.
 4. Where an upstream test asserts behavior our recorded deviations
-   (ADR-0045) change — e.g. YAML anchors, number lexemes — the test
+   (ADR-0065) change — e.g. YAML anchors, number lexemes — the test
    asserts the *deviated* behavior with a comment citing the ADR, so
    the gap stays visible.
 

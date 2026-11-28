@@ -2,7 +2,7 @@ package importing
 
 // postman.oxl — port of internal/importing/postman/postman.go
 // (posting @32c4566). Converts Postman v2/v2.1 JSON collections and
-// environment exports. Deviations (ADR-0045): std json.Json keeps
+// environment exports. Deviations (ADR-0065): std json.Json keeps
 // the FIRST duplicate object key (encoding/json keeps last).
 import "std/encoding/json"
 import "std/errors"

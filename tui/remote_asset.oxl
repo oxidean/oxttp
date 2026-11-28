@@ -1,7 +1,7 @@
 package main
 
 // Generated from posting @32c4566 cmd/posting/remote.go
-// (remoteUsage) and skills/using-posting/SKILL.md (WI-0019, ADR-0046).
+// (remoteUsage) and skills/using-posting/SKILL.md (WI-0019, ADR-0066).
 
 let REMOTE_USAGE = "Usage: posting remote COMMAND [REQUEST] [options]\n" +
     "\n" +

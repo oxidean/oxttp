@@ -124,7 +124,7 @@ fn write(result: ref Result, dir: str) -> [own Written, err] {
                 continue
             }
             path := dir + "/" + cand
-            // exists-check + write (O_EXCL equivalent; ADR-0045
+            // exists-check + write (O_EXCL equivalent; ADR-0065
             // records the fs-confinement deviation)
             if os.exists(path) {
                 n = n + 1

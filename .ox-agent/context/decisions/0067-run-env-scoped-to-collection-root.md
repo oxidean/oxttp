@@ -1,4 +1,4 @@
-# ADR-0047 — `run` env scoping pinned to the collection root
+# ADR-0067 — `run` env scoping pinned to the collection root
 
 - Status: accepted
 - Date: 2026-11-28
