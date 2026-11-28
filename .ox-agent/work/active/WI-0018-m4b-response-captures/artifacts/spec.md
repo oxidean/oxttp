@@ -8,12 +8,14 @@ upstream `internal/model/captures.go`, `internal/ui/environments.go`,
 `docs/guide/environments.md#response-captures` @ 32c4566.
 
 **Scope: capture engine + decode-time validation + TUI publish.**
-`posting run` wiring (per-request FAILED on capture error, session-
-layer merge across the run) is WI-0019 — the engine API is shaped so
-that wiring is a thin call. GraphQL/gRPC/WS response kinds land in
-later M4 WIs; captures operate on `resp.body` bytes regardless of kind
-(upstream captures "decoded gRPC JSON" / final retained body — same
-rule applies when those transports arrive).
+The thin headless-run capture wiring already present in `run_exec`
+(per-request FAILED on capture error, run-scoped session-layer merge
+across later requests) is included because it is part of the same
+capture publication contract and is covered here; broader WI-0019
+run/import/remote behavior remains out of scope. GraphQL/gRPC/WS
+response kinds land in later M4 WIs; captures operate on `resp.body`
+bytes regardless of kind (upstream captures "decoded gRPC JSON" /
+final retained body — same rule applies when those transports arrive).
 
 ## New package `core/capture`
 
@@ -94,8 +96,11 @@ Go `MatchString`). `.`→`[^\n\r]` rewrite applies to unescaped dots
 outside char classes (upstream does it AST-level; text rewrite is
 equivalent for our grammar). Regex compile failure → false (upstream
 same). std/regexp is a Pike-VM NFA (linear-time, RE2-class: no
-backreferences/lookaround — same expressiveness class as upstream's
-RE2). `length`: string→rune... — **byte
+backreferences/lookaround) but it does not yet implement RFC 9485
+Unicode category escapes (`\p{L}`, `\P{N}`, …). That is a documented
+upstream-limited deviation, not silent parity: those patterns compile
+upstream but currently fail compilation here and therefore evaluate
+false; full category support belongs in oxl std/regexp. `length`: string→rune... — **byte
 length? NO**: upstream uses `utf8.RuneCountInString` — implement
 rune count; array→len; object→member count; else nil.
 `count(x)`: node-list length. `value(x)`: single node → value, else
@@ -109,9 +114,12 @@ nil.
   lexeme like `1e400` → non-numeric, falls to structural compare on
   raw lexeme); else structural deep-equal (kind + payload; numbers
   compare by float when both parse, else lexeme equality).
-- `<` `<=` `>` `>=`: require sameType (both numeric, or same JSON
-  kind); numeric → float64; strings → byte-lexicographic; else false.
-  `>` = sameType && !less && !equal; `>=` = sameType && !less.
+- `<` `<=` `>` `>=`: RFC 9535 ordering. Strict ordering exists only
+  for numbers (float64) and strings (byte-lexicographic); containers
+  and booleans never order. `>` is operand-swapped `<`; equality
+  implies the inclusive forms, including two missing operands. Mixed
+  or non-orderable types are false except that structurally equal
+  operands still satisfy `<=`/`>=`.
 - Existence TEST: sub-query selects ≥1 node. NTEST: 0 nodes.
 - Singular query operand missing → missing value: two missing operands compare equal; missing vs explicit `null` does not.
 - Filter selector applies to array elements and object member values
@@ -229,7 +237,9 @@ Mirror upstream `captures_test.go` cases:
 - Corpus §6.4 behaviors: exactly-one-match, all-or-nothing, session
   layer highest, literal strings, number precision, status-agnostic
   TUI publish, no publish on transport failure.
-- Deviations documented: object filter order (ADR-0052); filter
-  literal `1e400`-style overflow → our parse error vs upstream
-  NumError text (message text not byte-pinned); run-path gating is
-  WI-0019 scope.
+- Deviations documented: object filter order (ADR-0052); RFC 9485
+  Unicode category escapes are unsupported by oxl std/regexp until the
+  upstream regex gap is closed (oxidean/oxl#233); filter literal `1e400`-style overflow →
+  our parse error vs upstream NumError text (message text not
+  byte-pinned). The narrow run-path capture wiring is in scope here;
+  the rest of run/import/remote remains WI-0019.

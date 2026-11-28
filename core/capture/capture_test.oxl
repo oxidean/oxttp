@@ -1,5 +1,6 @@
 package capture
 import "std/testing"
+import "std/errors"
 import "github.com/oxidean/oxttp/core/model"
 
 fn cap1(name: str, path: str) -> model.KV {
@@ -435,11 +436,14 @@ fn test_capture_review_range_and_regex_edges() {
     expect_err("[{\"id\":1,\"n\":-1e400}]", "$[?@.n < 5].id")
     expect_val("[{\"id\":1,\"n\":1e400}]", "$[?@.n == 1e400].id", "1")
     expect_err("[{\"id\":1,\"n\":1e400}]", "$[?@.n == 1e999].id")
-    expect_err("[{\"id\":1,\"n\":1e-999}]", "$[?@.n == 0].id")
+    expect_val("[{\"id\":1,\"n\":1e-999}]", "$[?@.n == 0].id", "1")
     testing.expect_streq(regex_dot_rewrite("\\Q.\\E"), "\\Q.\\E", "quoted literal dot preserved")
     expect_val("{\"items\":[{\"n\":\".\"},{\"n\":\"a\"}]}", "$.items[?(match(@.n, \"\\\\Q.\\\\E\"))].n", ".")
     expect_err("[{\"a\":[9],\"id\":1}]", "$[?@[ 0] == 9].id")
     expect_err("[{\"a\":[9],\"id\":1}]", "$[?@[0 ] == 9].id")
+    // Upstream-limited deviation: std/regexp does not yet support RFC 9485
+    // Unicode category escapes (oxidean/oxl#233), so compilation fails closed.
+    expect_err("[{\"id\":1,\"n\":\"abc\"}]", "$[?match(@.n, \"\\\\p{L}+\")].id")
 }
 
 fn test_jsonpath_integer_range_no_wraparound() {
@@ -483,4 +487,25 @@ fn test_wide_array_filter_and_descendant_complete() {
     caps[0].value = "$..id"
     [_, e2] = capture_values(caps, ib)
     testing.expect(e2 != nil, "multi-match descendant completes")
+}
+
+fn test_jsonpath_filter_depth_budget() {
+    expr := "$[?(@.id == 1)].id"
+    deep := "$[?"
+    i := 0
+    for i < 300 {
+        deep = deep + "("
+        i = i + 1
+    }
+    deep = deep + "@.id == 1"
+    i = 0
+    for i < 300 {
+        deep = deep + ")"
+        i = i + 1
+    }
+    deep = deep + "].id"
+    [_, e] = capture_path(deep)
+    testing.expect(e != nil, "deeply nested filter rejected")
+    testing.expect(find(errors.msg(e), "exceeds 256 levels") >= 0, "depth error text")
+    expect_val("[{\"id\":1}]", expr, "1")
 }

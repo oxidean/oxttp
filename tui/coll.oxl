@@ -1223,7 +1223,7 @@ fn install_resp(a: mut App, resp: model.Resp, req_url: str) {
     if a.pending_preq != nil && len(a.pending_preq.captures) > 0 {
         [cvals, ce] = capture.capture_values(a.pending_preq.captures, resp.body)
         if ce != nil {
-            a.toast(2, "Couldn't capture response: " + errors.msg(ce))
+            a.toast(0, "Couldn't capture response: " + errors.msg(ce))
         } else {
             ci := 0
             for ci < len(cvals) {

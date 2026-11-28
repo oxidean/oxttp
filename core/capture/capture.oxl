@@ -442,7 +442,7 @@ struct FArg {
 
 // ---------- JSONPath parser ----------
 
-struct PCur { s: str, pos: int, err: int }
+struct PCur { s: str, pos: int, err: int, depth: int }
 
 fn pperr(p: mut PCur, msg: str) {
     if p.err == 0 {
@@ -665,7 +665,21 @@ fn pij_scan_qstring(p: mut PCur) -> str {
 
 // ---------- filter expression parser ----------
 
+// pij_parse_or caps recursive filter nesting. Parenthesized filters and
+// function arguments re-enter this wrapper; without a budget a hostile
+// collection can exhaust the native stack during decode-time validation.
 fn pij_parse_or(p: mut PCur) -> [own FExpr, err] {
+    if p.depth >= 256 {
+        pperr(p, "filter expression exceeds 256 levels")
+        return nil, errors.new("jsonpath: filter expression exceeds 256 levels")
+    }
+    p.depth = p.depth + 1
+    [r, e] = pij_parse_or_inner(p)
+    p.depth = p.depth - 1
+    return r, e
+}
+
+fn pij_parse_or_inner(p: mut PCur) -> [own FExpr, err] {
     [first, e1] = pij_parse_and(p)
     if e1 != nil {
         return nil, e1
@@ -1587,7 +1601,7 @@ fn pij_qry_expr(q: own JPQuery, singular: bool) -> [own FExpr, err] {
 
 // parse_path parses a normalized ($-rooted) JSONPath into JPQuery.
 fn parse_path(text: str) -> [own JPQuery, err] {
-    p := new(PCur{s: text, pos: 0, err: 0})
+    p := new(PCur{s: text, pos: 0, err: 0, depth: 0})
     c := pij_get(p)
     if c != 36 { // '$'
         pperr(p, "path must start with $")
@@ -1766,29 +1780,13 @@ fn jnum_f64(lex: str) -> F64 {
         return F64{v: 0.0, ok: false}
     }
     // strconv.parsefloat is syntax-only in oxl (strtod range errors
-    // are not surfaced). Treat overflow to ±Inf and underflow of a
-    // nonzero mantissa to zero as non-numeric, matching Go's
-    // json.Number.Float64 ErrRange semantics used upstream.
+    // are not surfaced). Treat overflow to ±Inf as non-numeric,
+    // matching Go's json.Number.Float64 ErrRange semantics used
+    // upstream. Go does not report ErrRange for decimal underflow:
+    // a nonzero mantissa that rounds to zero compares as numeric zero.
     [infv, _ife] = strconv.parsefloat("1e999")
     if f >= infv || f <= -infv {
         return F64{v: 0.0, ok: false}
-    }
-    if f == 0.0 {
-        nonzero := false
-        i := 0
-        for i < len(lex) {
-            c := byteat(lex, i)
-            if c == 101 || c == 69 {
-                break
-            }
-            if c >= 49 && c <= 57 {
-                nonzero = true
-            }
-            i = i + 1
-        }
-        if nonzero {
-            return F64{v: 0.0, ok: false}
-        }
     }
     return F64{v: f, ok: true}
 }
@@ -2550,6 +2548,10 @@ fn validate(captures: []model.KV) -> err {
     return nil
 }
 
+fn capture_kv_lt(a: model.KV, b: model.KV) -> bool {
+    return a.name < b.name
+}
+
 // sort_captures — copy sorted by name (upstream iterates sorted map
 // keys for deterministic first-error).
 fn sort_captures(captures: []model.KV) -> []model.KV {
@@ -2559,18 +2561,7 @@ fn sort_captures(captures: []model.KV) -> []model.KV {
         out = push(out, captures[i])
         i = i + 1
     }
-    // insertion sort by name
-    i = 1
-    for i < len(out) {
-        v := out[i]
-        j := i - 1
-        for j >= 0 && out[j].name > v.name {
-            out[j + 1] = out[j]
-            j = j - 1
-        }
-        out[j + 1] = v
-        i = i + 1
-    }
+    sort.sortfn(out, capture_kv_lt)
     return out
 }
 

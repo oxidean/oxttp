@@ -404,7 +404,7 @@ fn test_exec_send_captures_failure() {
     found := false
     i := 0
     for i < len(a.toasts) {
-        if a.toasts[i].level == 2 && str_contains(a.toasts[i].msg, "Couldn't capture response") {
+        if a.toasts[i].level == 0 && str_contains(a.toasts[i].msg, "Couldn't capture response") {
             found = true
         }
         i = i + 1
@@ -452,7 +452,7 @@ fn test_exec_send_captures_non_json_body() {
     found := false
     i := 0
     for i < len(a.toasts) {
-        if a.toasts[i].level == 2 && str_contains(a.toasts[i].msg, "Couldn't capture response") {
+        if a.toasts[i].level == 0 && str_contains(a.toasts[i].msg, "Couldn't capture response") {
             found = true
         }
         i = i + 1
