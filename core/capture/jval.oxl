@@ -1,0 +1,522 @@
+package capture
+
+// JVal — JSON DOM for response captures. Mirrors std/json.Json's
+// linked-list shape but kind=2 numbers keep the RAW LEXEME in `s`
+// (corpus §6.4 / upstream UseNumber: 9007199254740993 and 1e400
+// survive verbatim). kind: 0 null, 1 bool, 2 num, 3 str, 4 obj, 5 arr.
+// Object children carry `key`; document order is preserved and
+// duplicate keys stay (lookup is last-wins, matching Go map decode).
+import "std/errors"
+import "std/unicode/utf8"
+
+struct JVal {
+    kind: int,
+    s: str,        // str payload / num lexeme
+    b: bool,
+    key: str,      // member key (obj children only)
+    child: own JVal,
+    next: own JVal,
+}
+
+fn jnullv() -> own JVal {
+    j := new(JVal)
+    j.kind = 0
+    return j
+}
+
+fn jboolv(v: bool) -> own JVal {
+    j := new(JVal)
+    j.kind = 1
+    j.b = v
+    return j
+}
+
+fn jnumv(lex: str) -> own JVal {
+    j := new(JVal)
+    j.kind = 2
+    j.s = lex
+    return j
+}
+
+fn jstrv(v: str) -> own JVal {
+    j := new(JVal)
+    j.kind = 3
+    j.s = v
+    return j
+}
+
+fn jobjv() -> own JVal {
+    j := new(JVal)
+    j.kind = 4
+    return j
+}
+
+fn jarrv() -> own JVal {
+    j := new(JVal)
+    j.kind = 5
+    return j
+}
+
+// jadd appends val as a member (key) or element of parent.
+fn jadd(parent: mut JVal, key: str, val: own JVal) {
+    val.key = key
+    if parent.child == nil {
+        parent.child = val
+        return
+    }
+    m := parent.child
+    for m.next != nil {
+        m = m.next
+    }
+    m.next = val
+}
+
+// ---------- parse ----------
+
+struct JCur { src: str, pos: int, err: int, depth: int }
+
+let MAX_JDEPTH = 256
+
+fn jws(p: mut JCur) {
+    for p.pos < len(p.src) {
+        c := byteat(p.src, p.pos)
+        if c == 32 || c == 9 || c == 10 || c == 13 {
+            p.pos = p.pos + 1
+        } else {
+            return
+        }
+    }
+}
+
+fn jisdig(c: int) -> bool { return c >= 48 && c <= 57 }
+
+fn jhex4(s: str, i: int) -> int {
+    // 4 hex digits at byte i -> codepoint, -1 on bad
+    v := 0
+    k := 0
+    for k < 4 {
+        if i + k >= len(s) {
+            return -1
+        }
+        c := byteat(s, i + k)
+        d := -1
+        if c >= 48 && c <= 57 {
+            d = c - 48
+        } else if c >= 97 && c <= 102 {
+            d = c - 87
+        } else if c >= 65 && c <= 70 {
+            d = c - 55
+        }
+        if d < 0 {
+            return -1
+        }
+        v = v * 16 + d
+        k = k + 1
+    }
+    return v
+}
+
+// jparse_str parses a "..." JSON string at p.pos (opening quote).
+// Returns decoded text; sets p.err on malformed input.
+fn jparse_str(p: mut JCur) -> str {
+    // p.pos at '"'
+    p.pos = p.pos + 1
+    out := mkslice(byte, 0)
+    for p.pos < len(p.src) {
+        c := byteat(p.src, p.pos)
+        if c == 34 {
+            p.pos = p.pos + 1
+            return out as str
+        }
+        if c == 92 {
+            p.pos = p.pos + 1
+            if p.pos >= len(p.src) {
+                p.err = 1
+                return ""
+            }
+            e := byteat(p.src, p.pos)
+            p.pos = p.pos + 1
+            if e == 34 {
+                out = push(out, 34)
+            } else if e == 92 {
+                out = push(out, 92)
+            } else if e == 47 {
+                out = push(out, 47)
+            } else if e == 98 {
+                out = push(out, 8)
+            } else if e == 102 {
+                out = push(out, 12)
+            } else if e == 110 {
+                out = push(out, 10)
+            } else if e == 114 {
+                out = push(out, 13)
+            } else if e == 116 {
+                out = push(out, 9)
+            } else if e == 117 {
+                cp := jhex4(p.src, p.pos)
+                if cp < 0 {
+                    p.err = 1
+                    return ""
+                }
+                p.pos = p.pos + 4
+                // surrogate pair
+                if cp >= 55296 && cp <= 56319 {
+                    if p.pos + 1 < len(p.src) && byteat(p.src, p.pos) == 92 && byteat(p.src, p.pos + 1) == 117 {
+                        lo := jhex4(p.src, p.pos + 2)
+                        if lo >= 56320 && lo <= 57343 {
+                            p.pos = p.pos + 6
+                            cp = 65536 + (cp - 55296) * 1024 + (lo - 56320)
+                        }
+                    }
+                }
+                es := utf8.encode(cp)
+                eb := es as []byte
+                i := 0
+                for i < len(eb) {
+                    out = push(out, eb[i])
+                    i = i + 1
+                }
+            } else {
+                p.err = 1
+                return ""
+            }
+            continue
+        }
+        if c < 32 {
+            p.err = 1
+            return ""
+        }
+        out = push(out, c)
+        p.pos = p.pos + 1
+    }
+    p.err = 1
+    return ""
+}
+
+fn jparse_num(p: mut JCur) -> own JVal {
+    start := p.pos
+    if byteat(p.src, p.pos) == 45 {
+        p.pos = p.pos + 1
+    }
+    if p.pos >= len(p.src) || !jisdig(byteat(p.src, p.pos)) {
+        p.err = 1
+        return jnullv()
+    }
+    if byteat(p.src, p.pos) == 48 {
+        p.pos = p.pos + 1
+        if p.pos < len(p.src) && jisdig(byteat(p.src, p.pos)) {
+            p.err = 1
+            return jnullv()
+        }
+    } else {
+        for p.pos < len(p.src) && jisdig(byteat(p.src, p.pos)) {
+            p.pos = p.pos + 1
+        }
+    }
+    if p.pos < len(p.src) && byteat(p.src, p.pos) == 46 {
+        p.pos = p.pos + 1
+        d0 := p.pos
+        for p.pos < len(p.src) && jisdig(byteat(p.src, p.pos)) {
+            p.pos = p.pos + 1
+        }
+        if p.pos == d0 {
+            p.err = 1
+            return jnullv()
+        }
+    }
+    if p.pos < len(p.src) && (byteat(p.src, p.pos) == 101 || byteat(p.src, p.pos) == 69) {
+        p.pos = p.pos + 1
+        if p.pos < len(p.src) && (byteat(p.src, p.pos) == 43 || byteat(p.src, p.pos) == 45) {
+            p.pos = p.pos + 1
+        }
+        d0 := p.pos
+        for p.pos < len(p.src) && jisdig(byteat(p.src, p.pos)) {
+            p.pos = p.pos + 1
+        }
+        if p.pos == d0 {
+            p.err = 1
+            return jnullv()
+        }
+    }
+    return jnumv(substr(p.src, start, p.pos))
+}
+
+fn jparse_val(p: mut JCur) -> own JVal {
+    if p.err != 0 {
+        return jnullv()
+    }
+    if p.depth >= MAX_JDEPTH {
+        p.err = 1
+        return jnullv()
+    }
+    jws(p)
+    if p.pos >= len(p.src) {
+        p.err = 1
+        return jnullv()
+    }
+    c := byteat(p.src, p.pos)
+    if c == 123 { // {
+        p.pos = p.pos + 1
+        o := jobjv()
+        p.depth = p.depth + 1
+        jws(p)
+        if p.pos < len(p.src) && byteat(p.src, p.pos) == 125 {
+            p.pos = p.pos + 1
+            p.depth = p.depth - 1
+            return o
+        }
+        for true {
+            jws(p)
+            if p.pos >= len(p.src) || byteat(p.src, p.pos) != 34 {
+                p.err = 1
+                p.depth = p.depth - 1
+                return jnullv()
+            }
+            k := jparse_str(p)
+            if p.err != 0 {
+                p.depth = p.depth - 1
+                return jnullv()
+            }
+            jws(p)
+            if p.pos >= len(p.src) || byteat(p.src, p.pos) != 58 {
+                p.err = 1
+                p.depth = p.depth - 1
+                return jnullv()
+            }
+            p.pos = p.pos + 1
+            v := jparse_val(p)
+            if p.err != 0 {
+                p.depth = p.depth - 1
+                return jnullv()
+            }
+            jadd(o, k, v)
+            jws(p)
+            if p.pos >= len(p.src) {
+                p.err = 1
+                p.depth = p.depth - 1
+                return jnullv()
+            }
+            c2 := byteat(p.src, p.pos)
+            if c2 == 44 {
+                p.pos = p.pos + 1
+                continue
+            }
+            if c2 == 125 {
+                p.pos = p.pos + 1
+                p.depth = p.depth - 1
+                return o
+            }
+            p.err = 1
+            p.depth = p.depth - 1
+            return jnullv()
+        }
+    }
+    if c == 91 { // [
+        p.pos = p.pos + 1
+        a := jarrv()
+        p.depth = p.depth + 1
+        jws(p)
+        if p.pos < len(p.src) && byteat(p.src, p.pos) == 93 {
+            p.pos = p.pos + 1
+            p.depth = p.depth - 1
+            return a
+        }
+        for true {
+            v := jparse_val(p)
+            if p.err != 0 {
+                p.depth = p.depth - 1
+                return jnullv()
+            }
+            jadd(a, "", v)
+            jws(p)
+            if p.pos >= len(p.src) {
+                p.err = 1
+                p.depth = p.depth - 1
+                return jnullv()
+            }
+            c2 := byteat(p.src, p.pos)
+            if c2 == 44 {
+                p.pos = p.pos + 1
+                continue
+            }
+            if c2 == 93 {
+                p.pos = p.pos + 1
+                p.depth = p.depth - 1
+                return a
+            }
+            p.err = 1
+            p.depth = p.depth - 1
+            return jnullv()
+        }
+    }
+    if c == 34 {
+        s := jparse_str(p)
+        if p.err != 0 {
+            return jnullv()
+        }
+        return jstrv(s)
+    }
+    if c == 116 { // true
+        if p.pos + 4 <= len(p.src) && substr(p.src, p.pos, p.pos + 4) == "true" {
+            p.pos = p.pos + 4
+            return jboolv(true)
+        }
+        p.err = 1
+        return jnullv()
+    }
+    if c == 102 { // false
+        if p.pos + 5 <= len(p.src) && substr(p.src, p.pos, p.pos + 5) == "false" {
+            p.pos = p.pos + 5
+            return jboolv(false)
+        }
+        p.err = 1
+        return jnullv()
+    }
+    if c == 110 { // null
+        if p.pos + 4 <= len(p.src) && substr(p.src, p.pos, p.pos + 4) == "null" {
+            p.pos = p.pos + 4
+            return jnullv()
+        }
+        p.err = 1
+        return jnullv()
+    }
+    if c == 45 || jisdig(c) {
+        return jparse_num(p)
+    }
+    p.err = 1
+    return jnullv()
+}
+
+// jparse parses a complete JSON document; trailing content is an error.
+fn jparse(text: str) -> [own JVal, err] {
+    p := new(JCur{src: text, pos: 0, err: 0, depth: 0})
+    jws(p)
+    v := jparse_val(p)
+    if p.err != 0 {
+        return nil, errors.new("invalid JSON")
+    }
+    jws(p)
+    if p.pos != len(p.src) {
+        return nil, errors.new("invalid JSON: trailing content")
+    }
+    return v, nil
+}
+
+// ---------- emit (compact, Go json.Marshal parity) ----------
+
+fn bpush(b: []byte, s: str) -> []byte {
+    i := 0
+    for i < len(s) {
+        b = push(b, byteat(s, i))
+        i = i + 1
+    }
+    return b
+}
+
+// jesc — Go json.Marshal string escaping: control chars short/\uXXXX,
+// '"' '\' escaped, HTML chars <>& and U+2028/2029 as \uXXXX.
+fn jesc_into(b: []byte, s: str) -> []byte {
+    i := 0
+    for i < len(s) {
+        c := byteat(s, i)
+        if c == 34 {
+            b = bpush(b, "\\\"")
+        } else if c == 92 {
+            b = bpush(b, "\\\\")
+        } else if c == 8 {
+            b = bpush(b, "\\b")
+        } else if c == 9 {
+            b = bpush(b, "\\t")
+        } else if c == 10 {
+            b = bpush(b, "\\n")
+        } else if c == 12 {
+            b = bpush(b, "\\f")
+        } else if c == 13 {
+            b = bpush(b, "\\r")
+        } else if c < 32 {
+            b = bpush(b, "\\u00")
+            h := "0123456789abcdef"
+            b = push(b, byteat(h, c / 16))
+            b = push(b, byteat(h, c - (c / 16) * 16))
+        } else if c == 60 {
+            b = bpush(b, "\\u003c")
+        } else if c == 62 {
+            b = bpush(b, "\\u003e")
+        } else if c == 38 {
+            b = bpush(b, "\\u0026")
+        } else {
+            // pass UTF-8 sequences through verbatim; U+2028/2029 check
+            if c < 128 {
+                b = push(b, c)
+            } else {
+                d := utf8.decode(s, i)
+                if d.r == 3228 || d.r == 3229 {
+                    b = bpush(b, "\\u202")
+                    b = push(b, byteat("89", d.r - 3228))
+                } else {
+                    j := 0
+                    for j < d.n {
+                        b = push(b, byteat(s, i + j))
+                        j = j + 1
+                    }
+                }
+                i = i + d.n - 1
+            }
+        }
+        i = i + 1
+    }
+    return b
+}
+
+fn jemit_into(j: ref JVal, b: []byte) -> []byte {
+    if j == nil || j.kind == 0 {
+        return bpush(b, "null")
+    }
+    if j.kind == 1 {
+        if j.b {
+            return bpush(b, "true")
+        }
+        return bpush(b, "false")
+    }
+    if j.kind == 2 {
+        return bpush(b, j.s) // raw lexeme — precision preserved
+    }
+    if j.kind == 3 {
+        b = push(b, 34)
+        b = jesc_into(b, j.s)
+        return push(b, 34)
+    }
+    if j.kind == 4 {
+        b = push(b, 123)
+    } else {
+        b = push(b, 91)
+    }
+    m := j.child
+    first := true
+    for m != nil {
+        if first {
+            first = false
+        } else {
+            b = push(b, 44)
+        }
+        if j.kind == 4 {
+            b = push(b, 34)
+            b = jesc_into(b, m.key)
+            b = push(b, 34)
+            b = push(b, 58)
+        }
+        b = jemit_into(m, b)
+        m = m.next
+    }
+    if j.kind == 4 {
+        return push(b, 125)
+    }
+    return push(b, 93)
+}
+
+// jemit — compact JSON text for a node (Go json.Marshal shape).
+fn jemit(j: ref JVal) -> str {
+    b := mkslice(byte, 0)
+    b = jemit_into(j, b)
+    return b as str
+}

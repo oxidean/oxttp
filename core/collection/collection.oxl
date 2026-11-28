@@ -125,6 +125,7 @@ import "std/os"
 import "std/strconv"
 import "std/strings"
 import "std/net/url"
+import "github.com/oxidean/oxttp/core/capture"
 import "github.com/oxidean/oxttp/core/env"
 import "github.com/oxidean/oxttp/core/yaml"
 import "github.com/oxidean/oxttp/shared/version"
@@ -1064,6 +1065,12 @@ fn decode(n: ref yaml.YNode) -> [own PRequest, err] {
             if re3 != nil {
                 return nil, re3
             }
+            // upstream ParseRequest → ValidateCaptures: bad var
+            // names / JSONPath reject the file at load.
+            ve3 := capture.validate(rows3)
+            if ve3 != nil {
+                return nil, cerr(errors.msg(ve3))
+            }
             r.captures = rows3
         } else if k == "variable_scope" {
             [vs, ve] = varscope_dec(v)
@@ -1504,6 +1511,10 @@ fn path_dir(p: str) -> str {
 
 // save_file marshals r to path, creating parent dirs (§5.2 save).
 fn save_file(path: str, r: ref PRequest) -> err {
+    sv := capture.validate(r.captures)
+    if sv != nil {
+        return cerr(errors.msg(sv))
+    }
     d := path_dir(path)
     if len(d) > 0 {
         me := os.mkdir_all(d)

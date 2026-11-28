@@ -271,3 +271,42 @@ fn test_is_utf8_and_resp_json_binary() {
     testing.expect(find(j, "\"proto\":\"HTTP/1.1\"") >= 0, "proto")
     testing.expect(find(j, "\"receivedAt\":1700000000000") >= 0, "receivedAt")
 }
+
+// captures feed later requests in the same run via the session
+// layer (upstream run.go model.Merge per request); a failed capture
+// fails that request; invalid captures reject the file at load.
+fn test_run_exec_captures() {
+    dir := "/tmp/oxttp-run-cap"
+    os.remove_all(dir)
+    os.mkdir_all(dir)
+    os.writefile_(dir + "/01.get.posting.yaml",
+        "name: get\nmethod: GET\nurl: http://x.test/a\ncaptures:\n  TOKEN: $.token\n")
+    os.writefile_(dir + "/02.use.posting.yaml",
+        "name: use\nmethod: GET\nurl: http://x.test/b?token=$TOKEN\n")
+    o := new(RunOpts)
+    o.target = dir
+    fx := FakeSend{resp: fake_resp(200, "application/json", "{\"token\":\"sekrit\"}", nil), fail: ""}
+    rep := run_exec(o, fx)
+    testing.expect(len(rep.err) == 0, "err: " + rep.err)
+    testing.expect(rep.code == 0, "clean run")
+    testing.expect(len(rep.lines) == 3, "2 req + summary")
+    testing.expect(find(rep.lines[1], "PASSED") == 0, "second req passed — $TOKEN resolved")
+    // a capture that matches nothing fails the request
+    os.remove_all(dir)
+    os.mkdir_all(dir)
+    os.writefile_(dir + "/01.bad.posting.yaml",
+        "name: bad\nmethod: GET\nurl: http://x.test/a\ncaptures:\n  NOPE: $.missing\n")
+    rep = run_exec(o, fx)
+    testing.expect(rep.code == 1, "capture failure exits 1")
+    testing.expect(find(rep.lines[0], "FAILED") == 0, "failed line")
+    testing.expect(find(rep.lines[0], "matched 0 values") >= 0, "err text")
+    // invalid capture (bad var name) rejects the file before any send
+    os.remove_all(dir)
+    os.mkdir_all(dir)
+    os.writefile_(dir + "/01.badname.posting.yaml",
+        "name: bad\nmethod: GET\nurl: http://x.test/a\ncaptures:\n  1BAD: $.x\n")
+    rep = run_exec(o, fx)
+    testing.expect(rep.code == 1, "invalid capture aborts")
+    testing.expect(len(rep.lines) == 0, "nothing ran")
+    os.remove_all(dir)
+}

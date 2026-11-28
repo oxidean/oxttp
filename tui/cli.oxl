@@ -11,6 +11,7 @@ import "std/time"
 import "std/encoding/json"
 import "std/encoding/base64"
 import "std/unicode/utf8"
+import "github.com/oxidean/oxttp/core/capture"
 import "github.com/oxidean/oxttp/core/collection"
 import "github.com/oxidean/oxttp/core/config"
 import "github.com/oxidean/oxttp/core/env"
@@ -512,8 +513,13 @@ fn run_exec(o: ref RunOpts, t: http.Transport) -> own RunRep {
         ord[sj + 1] = v
         si = si + 1
     }
-    // loop
+    // loop — captures accumulate into a run-scoped session layer
+    // (upstream run.go: model.Merge(variables, captureLayer) per
+    // request; last write wins on name collisions).
     let jar: []JarEnt = nil
+    let capvars: []model.KV = nil
+    sess_li := -1
+
     passed := 0
     failed := 0
     skipped := 0
@@ -528,14 +534,6 @@ fn run_exec(o: ref RunOpts, t: http.Transport) -> own RunRep {
             skipped = skipped + 1
             rep.lines = push(rep.lines, "SKIPPED " + n.rel + "\n")
             jresults = jappend(jresults, first_j, "{\"file\":" + jesc(n.rel) + ",\"name\":" + jesc(n.req.name) + ",\"outcome\":\"skipped\"}")
-            first_j = false
-            continue
-        }
-        if len(n.req.captures) > 0 {
-            rep.lines = push(rep.lines, "FAILED " + n.rel + ": captures unsupported in this build — lands M4\n")
-            failed = failed + 1
-            if o.fail_fast { stop = true }
-            jresults = jappend(jresults, first_j, "{\"file\":" + jesc(n.rel) + ",\"name\":" + jesc(n.req.name) + ",\"outcome\":\"failed\",\"error\":\"captures unsupported in this build\"}")
             first_j = false
             continue
         }
@@ -606,6 +604,33 @@ fn run_exec(o: ref RunOpts, t: http.Transport) -> own RunRep {
             jresults = jappend(jresults, first_j, "{\"file\":" + jesc(n.rel) + ",\"name\":" + jesc(n.req.name) + ",\"outcome\":\"failed\",\"response\":" + resp_json(sp.req, resp, rts) + "}")
             first_j = false
             continue
+        }
+        // captures run only after a passing status (upstream
+        // runRequest: Error/Warning class returns before
+        // CaptureValues); failure fails the request, success
+        // feeds later requests via the session layer.
+        [cvals, ce] = capture.capture_values(n.req.captures, resp.body)
+        if ce != nil {
+            cmsg := errors.msg(ce)
+            rep.lines = push(rep.lines, "FAILED " + n.rel + ": " + cmsg + "\n")
+            failed = failed + 1
+            if o.fail_fast { stop = true }
+            jresults = jappend(jresults, first_j, "{\"file\":" + jesc(n.rel) + ",\"name\":" + jesc(n.req.name) + ",\"outcome\":\"failed\",\"error\":" + jesc(cmsg) + ",\"response\":" + resp_json(sp.req, resp, rts) + "}")
+            first_j = false
+            continue
+        }
+        ci := 0
+        for ci < len(cvals) {
+            capvars = capvar_set(capvars, cvals[ci])
+            ci = ci + 1
+        }
+        if len(cvals) > 0 {
+            if sess_li < 0 {
+                es.layers = push(es.layers, env.EnvLayer{name: "session", source: "session", vars: capvars})
+                sess_li = len(es.layers) - 1
+            } else {
+                es.layers[sess_li].vars = capvars
+            }
         }
         rep.lines = push(rep.lines, "PASSED " + n.rel + ": " + itoa(resp.status) + " " + resp.reason + " (" + ftoa(resp.elapsed_ms) + " ms)\n")
         passed = passed + 1
@@ -761,4 +786,19 @@ fn jar_collect(jar: []JarEnt, origin: str, resp: model.Resp) -> []JarEnt {
         }
     }
     return jar
+}
+
+// capvar_set upserts a captured value into the run-scoped session
+// layer — same name replaces (upstream maps.Copy order).
+fn capvar_set(vars: []model.KV, kv: model.KV) -> []model.KV {
+    i := 0
+    for i < len(vars) {
+        if vars[i].name == kv.name {
+            vars[i].value = kv.value
+            vars[i].enabled = true
+            return vars
+        }
+        i = i + 1
+    }
+    return push(vars, kv)
 }

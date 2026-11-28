@@ -450,3 +450,20 @@ fn test_plan_req_substituted_header_guards() {
     }
     testing.expect_eq(cookies, 1, "jar suppressed by substituted row")
 }
+
+// captures validate at decode (upstream ParseRequest →
+// ValidateCaptures): bad variable names and bad JSONPath reject the
+// file; a valid map round-trips through encode.
+fn test_captures_decode_validate() {
+    [r, e] = decode_src("url: x.com\ncaptures:\n  ID: $.data.id\n")
+    testing.expect(e == nil, "valid captures decode")
+    testing.expect_eq(len(r.captures), 1, "one capture")
+    testing.expect_streq(r.captures[0].name, "ID", "name")
+    testing.expect_streq(r.captures[0].value, "$.data.id", "path")
+    [_, e2] = decode_src("url: x.com\ncaptures:\n  1BAD: $.x\n")
+    testing.expect(e2 != nil, "digit-leading name rejected")
+    [_, e3] = decode_src("url: x.com\ncaptures:\n  OK: $.[\n")
+    testing.expect(e3 != nil, "bad jsonpath rejected")
+    [_, e4] = decode_src("url: x.com\ncaptures:\n  OK: data..*\n")
+    testing.expect(e4 == nil, "descendant wildcard is valid")
+}

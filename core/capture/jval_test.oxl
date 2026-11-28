@@ -1,0 +1,11 @@
+package capture
+import "std/testing"
+fn test_smoke() {
+    [j, e] = jparse("{\"a\":{\"b\":[1,2]}}")
+    testing.expect(e == nil, "parse")
+    testing.expect_streq(jemit(j), "{\"a\":{\"b\":[1,2]}}", "emit")
+    p := JPath{steps: nil}
+    p.steps = push(p.steps, JStep{is_idx: false, name: "a", idx: 0})
+    p.steps = push(p.steps, JStep{is_idx: false, name: "b", idx: 0})
+    testing.expect(jwalk(j, p) == 5, "walk to array")
+}

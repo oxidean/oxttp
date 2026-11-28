@@ -364,3 +364,61 @@ fn test_begin_send_missing_client_cert() {
     testing.expect_streq(a2.pending.cert_pem, "pem", "cert pem loaded")
     testing.expect_streq(a2.pending.key_pem, "key", "key pem loaded")
 }
+
+fn test_exec_send_captures_publish() {
+    a := new_app()
+    stage_send(a, "http://x/users")
+    a.pending_preq.captures = push(a.pending_preq.captures,
+        model.KV{name: "UID", value: "$.data.id", enabled: true})
+    r := fake_resp(200, "application/json", "{\"data\":{\"id\":\"u-42\"}}", nil)
+    f := FakeSend{resp: r, fail: ""}
+    exec_send_t(a, f)
+    lr := a.env.lookup("UID")
+    testing.expect(lr.ok, "capture published to env")
+    testing.expect_streq(lr.value, "u-42", "captured value")
+    found := false
+    i := 0
+    for i < len(a.session_vars) {
+        if a.session_vars[i].name == "UID" {
+            found = true
+            testing.expect_streq(a.session_vars[i].value, "u-42", "session var")
+        }
+        i = i + 1
+    }
+    testing.expect(found, "session_vars row")
+}
+
+fn test_exec_send_captures_failure() {
+    a := new_app()
+    stage_send(a, "http://x/users")
+    a.pending_preq.captures = push(a.pending_preq.captures,
+        model.KV{name: "UID", value: "$.missing", enabled: true})
+    r := fake_resp(200, "application/json", "{\"data\":{\"id\":\"u-42\"}}", nil)
+    f := FakeSend{resp: r, fail: ""}
+    exec_send_t(a, f)
+    // warning toast, nothing published — response still installs
+    found := false
+    i := 0
+    for i < len(a.toasts) {
+        if a.toasts[i].level == 1 && str_contains(a.toasts[i].msg, "Couldn't capture response") {
+            found = true
+        }
+        i = i + 1
+    }
+    testing.expect(found, "capture warning toast")
+    testing.expect_eq(len(a.session_vars), 0, "no session vars")
+    testing.expect_eq(a.resp_class, 0, "response still installed")
+}
+
+fn test_exec_send_captures_all_or_nothing() {
+    a := new_app()
+    stage_send(a, "http://x/users")
+    a.pending_preq.captures = push(a.pending_preq.captures,
+        model.KV{name: "GOOD", value: "$.data.id", enabled: true})
+    a.pending_preq.captures = push(a.pending_preq.captures,
+        model.KV{name: "BAD", value: "$.nope", enabled: true})
+    r := fake_resp(200, "application/json", "{\"data\":{\"id\":\"u-42\"}}", nil)
+    f := FakeSend{resp: r, fail: ""}
+    exec_send_t(a, f)
+    testing.expect_eq(len(a.session_vars), 0, "partial capture not published")
+}

@@ -1,0 +1,2431 @@
+package capture
+
+// Response captures — corpus §6.4 / upstream internal/model/captures.go
+// @ 32c4566. captures: {VAR: jsonpath}; each path must select exactly
+// one value; strings store unquoted, everything else compact JSON;
+// numbers keep raw lexemes; all-or-nothing publish.
+//
+// JSONPath is RFC 9535 as implemented by github.com/theory/jsonpath
+// (upstream's engine): name/wildcard/index/slice/union/filter/
+// descendant selectors, filter expressions with &&/||/!/parens,
+// literals, singular+full path operands, and functions
+// length/count/value/match/search. Matches are root-relative PATHS
+// (ADR-0050) — never shared node refs.
+import "std/errors"
+import "std/regexp"
+import "std/strconv"
+import "std/unicode/utf8"
+import "github.com/oxidean/oxttp/core/model"
+
+// ---------- path-encoded matches ----------
+
+struct JStep { is_idx: bool, name: str, idx: int }
+struct JPath { steps: []JStep }
+
+fn jpath_push(p: JPath, st: JStep) -> JPath {
+    // copy steps — push() may write into shared backing, and sibling
+    // paths must not alias each other's last step.
+    ns := mkslice(JStep, 0)
+    i := 0
+    for i < len(p.steps) {
+        ns = push(ns, p.steps[i])
+        i = i + 1
+    }
+    ns = push(ns, st)
+    return JPath{steps: ns}
+}
+
+fn jpath_eq(a: JPath, b: JPath) -> bool {
+    if len(a.steps) != len(b.steps) {
+        return false
+    }
+    i := 0
+    for i < len(a.steps) {
+        sa := a.steps[i]
+        sb := b.steps[i]
+        if sa.is_idx != sb.is_idx || sa.idx != sb.idx || sa.name != sb.name {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// jwalk moves a borrowed cursor along p; returns the node kind or -1.
+fn jwalk(root: ref JVal, p: JPath) -> int {
+    cur := root
+    i := 0
+    for i < len(p.steps) {
+        st := p.steps[i]
+        nxt := new(JVal)
+        found := false
+        if st.is_idx {
+            n := 0
+            m := cur.child
+            for m != nil {
+                if n == st.idx {
+                    nxt = m
+                    found = true
+                    break
+                }
+                n = n + 1
+                m = m.next
+            }
+        } else {
+            m := cur.child
+            for m != nil {
+                if m.key == st.name {
+                    nxt = m
+                    found = true
+                }
+                m = m.next
+            }
+        }
+        if !found {
+            return -1
+        }
+        cur = nxt
+        i = i + 1
+    }
+    return cur.kind
+}
+
+// jchild_paths — direct-child paths of the node at p. Objects yield
+// unique keys, LAST occurrence wins (Go map decode parity, ADR-0052
+// document order); arrays yield index steps.
+fn jchild_paths(root: ref JVal, p: JPath) -> []JPath {
+    let out: []JPath = nil
+    kind := jwalk(root, p)
+    if kind != 4 && kind != 5 {
+        return out
+    }
+    // re-walk to reach the node for child iteration
+    cur := root
+    i := 0
+    for i < len(p.steps) {
+        st := p.steps[i]
+        nxt := new(JVal)
+        if st.is_idx {
+            n := 0
+            m := cur.child
+            for m != nil {
+                if n == st.idx {
+                    nxt = m
+                    break
+                }
+                n = n + 1
+                m = m.next
+            }
+        } else {
+            m := cur.child
+            for m != nil {
+                if m.key == st.name {
+                    nxt = m
+                }
+                m = m.next
+            }
+        }
+        cur = nxt
+        i = i + 1
+    }
+    if kind == 5 {
+        n := 0
+        m := cur.child
+        for m != nil {
+            cp := jpath_push(p, JStep{is_idx: true, name: "", idx: n})
+            out = push(out, cp)
+            n = n + 1
+            m = m.next
+        }
+        return out
+    }
+    // object: enumerate child positions; keep only last occurrence
+    // of each key.
+    pos := 0
+    m := cur.child
+    for m != nil {
+        later := m.next
+        dup := false
+        for later != nil {
+            if later.key == m.key {
+                dup = true
+            }
+            later = later.next
+        }
+        if !dup {
+            cp := jpath_push(p, JStep{is_idx: false, name: m.key, idx: 0})
+            out = push(out, cp)
+        }
+        pos = pos + 1
+        m = m.next
+    }
+    return out
+}
+
+// jdesc_paths — self plus every descendant path (containers recurse;
+// scalar descendants are included harmlessly — selectors on them
+// yield nothing, matching upstream descend()).
+fn jdesc_paths(root: ref JVal, p: JPath) -> []JPath {
+    out := mkslice(JPath, 0)
+    out = push(out, p)
+    kids := jchild_paths(root, p)
+    i := 0
+    for i < len(kids) {
+        sub := jdesc_paths(root, kids[i])
+        j := 0
+        for j < len(sub) {
+            out = push(out, sub[j])
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// scalar accessors — kind-checked reads at a path.
+fn jstr_at(root: ref JVal, p: JPath) -> str {
+    cur := root
+    i := 0
+    for i < len(p.steps) {
+        st := p.steps[i]
+        nxt := new(JVal)
+        found := false
+        if st.is_idx {
+            n := 0
+            m := cur.child
+            for m != nil {
+                if n == st.idx {
+                    nxt = m
+                    found = true
+                    break
+                }
+                n = n + 1
+                m = m.next
+            }
+        } else {
+            m := cur.child
+            for m != nil {
+                if m.key == st.name {
+                    nxt = m
+                    found = true
+                }
+                m = m.next
+            }
+        }
+        if !found {
+            return ""
+        }
+        cur = nxt
+        i = i + 1
+    }
+    if cur.kind == 3 {
+        return cur.s
+    }
+    return ""
+}
+
+fn jnum_at(root: ref JVal, p: JPath) -> str {
+    // same walk, returns raw lexeme for kind 2
+    cur := root
+    i := 0
+    for i < len(p.steps) {
+        st := p.steps[i]
+        nxt := new(JVal)
+        found := false
+        if st.is_idx {
+            n := 0
+            m := cur.child
+            for m != nil {
+                if n == st.idx {
+                    nxt = m
+                    found = true
+                    break
+                }
+                n = n + 1
+                m = m.next
+            }
+        } else {
+            m := cur.child
+            for m != nil {
+                if m.key == st.name {
+                    nxt = m
+                    found = true
+                }
+                m = m.next
+            }
+        }
+        if !found {
+            return ""
+        }
+        cur = nxt
+        i = i + 1
+    }
+    if cur.kind == 2 {
+        return cur.s
+    }
+    return ""
+}
+
+fn jbool_at(root: ref JVal, p: JPath) -> int {
+    // 1 true, 0 false, -1 not-a-bool/missing
+    cur := root
+    i := 0
+    for i < len(p.steps) {
+        st := p.steps[i]
+        nxt := new(JVal)
+        found := false
+        if st.is_idx {
+            n := 0
+            m := cur.child
+            for m != nil {
+                if n == st.idx {
+                    nxt = m
+                    found = true
+                    break
+                }
+                n = n + 1
+                m = m.next
+            }
+        } else {
+            m := cur.child
+            for m != nil {
+                if m.key == st.name {
+                    nxt = m
+                    found = true
+                }
+                m = m.next
+            }
+        }
+        if !found {
+            return -1
+        }
+        cur = nxt
+        i = i + 1
+    }
+    if cur.kind == 1 {
+        if cur.b {
+            return 1
+        }
+        return 0
+    }
+    return -1
+}
+
+// ---------- JSONPath AST ----------
+
+// sel kinds
+let SK_NAME = 0
+let SK_WILD = 1
+let SK_INDEX = 2
+let SK_SLICE = 3
+let SK_FILTER = 4
+
+struct JPSel {
+    kind: int,
+    name: str,
+    idx: int,
+    has_start: bool, has_end: bool, has_step: bool,
+    s_start: int, s_end: int, s_step: int,
+    filt: own FExpr,
+    next: own JPSel,
+}
+
+struct JPSeg {
+    desc: bool,
+    sels: own JPSel,
+    next: own JPSeg,
+}
+
+struct JPQuery {
+    root: bool,
+    segs: own JPSeg,
+    singular: bool,
+}
+
+// FExpr kinds
+let FE_OR = 1
+let FE_AND = 2
+let FE_NOT = 3
+let FE_CMP = 4
+let FE_TEST = 5
+let FE_NTEST = 6
+let FE_FUNC = 7
+let FE_QRY = 8
+let FE_LIT = 9
+
+// result types
+let RT_VALUE = 1
+let RT_NODES = 2
+let RT_LOGICAL = 3
+
+// function ids
+let FN_LENGTH = 1
+let FN_COUNT = 2
+let FN_VALUE = 3
+let FN_MATCH = 4
+let FN_SEARCH = 5
+
+// cmp ops
+let OP_EQ = 1
+let OP_NE = 2
+let OP_LT = 3
+let OP_LE = 4
+let OP_GT = 5
+let OP_GE = 6
+
+struct FExpr {
+    kind: int,
+    next: own FExpr,
+    l: own FExpr,
+    r: own FExpr,
+    q: own JPQuery,
+    vlit: own JVal,
+    fargs: own FArg,
+    fn: int,
+    cmp: int,
+    rtype: int,
+}
+
+struct FArg {
+    expr: own FExpr,
+    next: own FArg,
+    rtype: int,
+}
+
+// ---------- JSONPath parser ----------
+
+struct PCur { s: str, pos: int, err: int }
+
+fn pperr(p: mut PCur, msg: str) {
+    if p.err == 0 {
+        p.err = 1
+    }
+}
+
+fn pij_get(p: mut PCur) -> int {
+    if p.pos >= len(p.s) {
+        return -1
+    }
+    c := byteat(p.s, p.pos)
+    p.pos = p.pos + 1
+    return c
+}
+
+fn pij_peek(p: ref PCur, off: int) -> int {
+    i := p.pos + off
+    if i >= len(p.s) {
+        return -1
+    }
+    return byteat(p.s, i)
+}
+
+fn pij_skip(p: mut PCur) {
+    for p.pos < len(p.s) {
+        c := byteat(p.s, p.pos)
+        if c == 32 || c == 9 || c == 10 || c == 13 {
+            p.pos = p.pos + 1
+        } else {
+            return
+        }
+    }
+}
+
+fn pij_is_blank(c: int) -> bool {
+    return c == 32 || c == 9 || c == 10 || c == 13
+}
+
+fn pij_ident_start(c: int) -> bool {
+    return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95 || c >= 128
+}
+
+fn pij_ident_char(c: int) -> bool {
+    return pij_ident_start(c) || (c >= 48 && c <= 57)
+}
+
+fn pij_is_dig(c: int) -> bool { return c >= 48 && c <= 57 }
+
+// scan_shorthand — member-name-shorthand ident at cursor.
+fn pij_scan_ident(p: mut PCur) -> str {
+    start := p.pos
+    for p.pos < len(p.s) {
+        c := byteat(p.s, p.pos)
+        if pij_ident_char(c) {
+            p.pos = p.pos + 1
+        } else {
+            break
+        }
+    }
+    return substr(p.s, start, p.pos)
+}
+
+// scan_int_tok — optional '-' + digits (JSONPath integer token).
+// Sets err on leading-zero / missing digits.
+fn pij_scan_int(p: mut PCur) -> str {
+    start := p.pos
+    if pij_peek(p, 0) == 45 {
+        p.pos = p.pos + 1
+    }
+    if p.pos >= len(p.s) || !pij_is_dig(byteat(p.s, p.pos)) {
+        pperr(p, "expected integer")
+        return ""
+    }
+    if byteat(p.s, p.pos) == 48 {
+        p.pos = p.pos + 1
+        if p.pos < len(p.s) && pij_is_dig(byteat(p.s, p.pos)) {
+            pperr(p, "invalid integer: leading zero")
+            return ""
+        }
+    } else {
+        for p.pos < len(p.s) && pij_is_dig(byteat(p.s, p.pos)) {
+            p.pos = p.pos + 1
+        }
+    }
+    // a '.'/'e'/'E' right after makes this a number token — invalid
+    // in selector position (upstream lexes it `number`, not `integer`)
+    if p.pos < len(p.s) {
+        c := byteat(p.s, p.pos)
+        if c == 46 || c == 101 || c == 69 {
+            pperr(p, "expected integer")
+            return ""
+        }
+    }
+    return substr(p.s, start, p.pos)
+}
+
+// parse_path_int — ±(2^53-1) range, "-0" rejected (parsePathInt).
+fn pij_path_int(tok: str, p: mut PCur) -> int {
+    if tok == "-0" {
+        pperr(p, "invalid integer path value \"-0\"")
+        return 0
+    }
+    [v, e] = strconv.atoi(tok)
+    if e != nil {
+        pperr(p, "cannot parse integer")
+        return 0
+    }
+    if v > 9007199254740991 || v < -9007199254740991 {
+        pperr(p, "integer path value out of range")
+        return 0
+    }
+    return v
+}
+
+// bracket string escapes: \' \" \\ \/ \b \f \n \r \t \uXXXX —
+// only the matching quote may be escaped (unescape() parity).
+fn pij_str_escape(p: mut PCur, q: int, out: []byte) -> []byte {
+    // returns [out', 1 ok / 0 error]; consumes the escape after backslash
+    if p.pos >= len(p.s) {
+        pperr(p, "unterminated string")
+        return out
+    }
+    e := byteat(p.s, p.pos)
+    p.pos = p.pos + 1
+    if e == q || e == 92 || e == 47 {
+        return push(out, e)
+    }
+    if e == 98 {
+        return push(out, 8)
+    }
+    if e == 102 {
+        return push(out, 12)
+    }
+    if e == 110 {
+        return push(out, 10)
+    }
+    if e == 114 {
+        return push(out, 13)
+    }
+    if e == 116 {
+        return push(out, 9)
+    }
+    if e == 117 {
+        cp := jhex4(p.s, p.pos)
+        if cp < 0 {
+            pperr(p, "invalid unicode escape")
+            return out
+        }
+        p.pos = p.pos + 4
+        es := utf8.encode(cp)
+        eb := es as []byte
+        i := 0
+        for i < len(eb) {
+            out = push(out, eb[i])
+            i = i + 1
+        }
+        return out
+    }
+    pperr(p, "invalid escape")
+    return out
+}
+
+// pij_scan_qstring — '...' or "..." member name; returns text.
+fn pij_scan_qstring(p: mut PCur) -> str {
+    q := pij_get(p)
+    out := mkslice(byte, 0)
+    for p.pos < len(p.s) {
+        c := byteat(p.s, p.pos)
+        if c == q {
+            p.pos = p.pos + 1
+            return out as str
+        }
+        if c == 92 {
+            p.pos = p.pos + 1
+            out = pij_str_escape(p, q, out)
+            if p.err != 0 {
+                return ""
+            }
+            continue
+        }
+        if c < 32 {
+            pperr(p, "unterminated string")
+            return ""
+        }
+        out = push(out, c)
+        p.pos = p.pos + 1
+    }
+    pperr(p, "unterminated string")
+    return ""
+}
+
+// ---------- filter expression parser ----------
+
+fn pij_parse_or(p: mut PCur) -> [own FExpr, err] {
+    [first, e1] = pij_parse_and(p)
+    if e1 != nil {
+        return nil, e1
+    }
+    ornode := new(FExpr)
+    ornode.kind = FE_OR
+    ornode.l = first
+    pij_skip(p)
+    for pij_peek(p, 0) == 124 { // '|'
+        p.pos = p.pos + 1
+        if pij_peek(p, 0) != 124 {
+            pperr(p, "expected '|' but found other")
+            return nil, errors.new("jsonpath: expected ||")
+        }
+        p.pos = p.pos + 1
+        [a2, e2] = pij_parse_and(p)
+        if e2 != nil {
+            return nil, e2
+        }
+        // append to OR's AND chain via next
+        tail := ornode.l
+        for tail.next != nil {
+            tail = tail.next
+        }
+        tail.next = a2
+        pij_skip(p)
+    }
+    return ornode, nil
+}
+
+fn pij_parse_and(p: mut PCur) -> [own FExpr, err] {
+    [first, e1] = pij_parse_basic(p)
+    if e1 != nil {
+        return nil, e1
+    }
+    andnode := new(FExpr)
+    andnode.kind = FE_AND
+    andnode.l = first
+    pij_skip(p)
+    for pij_peek(p, 0) == 38 { // '&'
+        p.pos = p.pos + 1
+        if pij_peek(p, 0) != 38 {
+            pperr(p, "expected '&' but found other")
+            return nil, errors.new("jsonpath: expected &&")
+        }
+        p.pos = p.pos + 1
+        [b2, e2] = pij_parse_basic(p)
+        if e2 != nil {
+            return nil, e2
+        }
+        tail := andnode.l
+        for tail.next != nil {
+            tail = tail.next
+        }
+        tail.next = b2
+        pij_skip(p)
+    }
+    return andnode, nil
+}
+
+// literal kinds for filter literals
+let FLIT_STR = 3
+let FLIT_NUM = 2
+let FLIT_BOOL = 1
+let FLIT_NULL = 0
+
+// pij_parse_literal — string/number/true/false/null -> F_LIT.
+fn pij_parse_literal(p: mut PCur) -> [own FExpr, err] {
+    c := pij_peek(p, 0)
+    lit := new(JVal)
+    if c == 34 || c == 39 {
+        // reuse qstring scanner (quote char already peeked)
+        s := pij_scan_qstring(p)
+        if p.err != 0 {
+            return nil, errors.new("jsonpath: bad string literal")
+        }
+        lit.kind = FLIT_STR
+        lit.s = s
+    } else if c == 116 { // true
+        if pij_peek(p, 1) == 114 && pij_peek(p, 2) == 117 && pij_peek(p, 3) == 101 {
+            p.pos = p.pos + 4
+            lit.kind = FLIT_BOOL
+            lit.b = true
+        } else {
+            pperr(p, "bad literal")
+            return nil, errors.new("jsonpath: bad literal")
+        }
+    } else if c == 102 { // false
+        if pij_peek(p, 1) == 97 && pij_peek(p, 2) == 108 && pij_peek(p, 3) == 115 && pij_peek(p, 4) == 101 {
+            p.pos = p.pos + 5
+            lit.kind = FLIT_BOOL
+            lit.b = false
+        } else {
+            pperr(p, "bad literal")
+            return nil, errors.new("jsonpath: bad literal")
+        }
+    } else if c == 110 { // null
+        if pij_peek(p, 1) == 117 && pij_peek(p, 2) == 108 && pij_peek(p, 3) == 108 {
+            p.pos = p.pos + 4
+            lit.kind = FLIT_NULL
+        } else {
+            pperr(p, "bad literal")
+            return nil, errors.new("jsonpath: bad literal")
+        }
+    } else if c == 45 || pij_is_dig(c) {
+        tok := pij_scan_fltok(p)
+        if p.err != 0 {
+            return nil, errors.new("jsonpath: bad number literal")
+        }
+        lit.kind = FLIT_NUM
+        lit.s = tok
+    } else {
+        pperr(p, "expected literal")
+        return nil, errors.new("jsonpath: expected literal")
+    }
+    e := new(FExpr)
+    e.kind = FE_LIT
+    e.vlit = lit
+    e.rtype = RT_VALUE
+    return e, nil
+}
+
+// pij_scan_fltok — JSON number token (integer or decimal/exponent).
+fn pij_scan_fltok(p: mut PCur) -> str {
+    start := p.pos
+    if pij_peek(p, 0) == 45 {
+        p.pos = p.pos + 1
+    }
+    if p.pos >= len(p.s) || !pij_is_dig(byteat(p.s, p.pos)) {
+        pperr(p, "bad number")
+        return ""
+    }
+    if byteat(p.s, p.pos) == 48 {
+        p.pos = p.pos + 1
+        if p.pos < len(p.s) && pij_is_dig(byteat(p.s, p.pos)) {
+            pperr(p, "bad number: leading zero")
+            return ""
+        }
+    } else {
+        for p.pos < len(p.s) && pij_is_dig(byteat(p.s, p.pos)) {
+            p.pos = p.pos + 1
+        }
+    }
+    if p.pos < len(p.s) && byteat(p.s, p.pos) == 46 {
+        p.pos = p.pos + 1
+        d0 := p.pos
+        for p.pos < len(p.s) && pij_is_dig(byteat(p.s, p.pos)) {
+            p.pos = p.pos + 1
+        }
+        if p.pos == d0 {
+            pperr(p, "bad number: no fraction digits")
+            return ""
+        }
+    }
+    if p.pos < len(p.s) && (byteat(p.s, p.pos) == 101 || byteat(p.s, p.pos) == 69) {
+        p.pos = p.pos + 1
+        if p.pos < len(p.s) && (byteat(p.s, p.pos) == 43 || byteat(p.s, p.pos) == 45) {
+            p.pos = p.pos + 1
+        }
+        d0 := p.pos
+        for p.pos < len(p.s) && pij_is_dig(byteat(p.s, p.pos)) {
+            p.pos = p.pos + 1
+        }
+        if p.pos == d0 {
+            pperr(p, "bad number: no exponent digits")
+            return ""
+        }
+    }
+    return substr(p.s, start, p.pos)
+}
+
+// pij_query_singular — every segment non-descendant, exactly one
+// name/index selector (spec.Segment.isSingular + PathQuery.Singular).
+fn jp_is_singular(q: ref JPQuery) -> bool {
+    if q == nil {
+        return false
+    }
+    s := q.segs
+    for s != nil {
+        if s.desc || s.sels == nil || s.sels.next != nil {
+            return false
+        }
+        sel := s.sels
+        if sel.kind != SK_NAME && sel.kind != SK_INDEX {
+            return false
+        }
+        s = s.next
+    }
+    return true
+}
+
+// pij_parse_query — full segment grammar; first char '@' or '$'
+// already consumed. root=true for '$'.
+fn pij_parse_query(p: mut PCur, root: bool) -> [own JPQuery, err] {
+    q := new(JPQuery)
+    q.root = root
+    q.singular = true
+    for true {
+        pij_skip(p)
+        c := pij_peek(p, 0)
+        if c == 91 { // '['
+            p.pos = p.pos + 1
+            [sels, se] = pij_parse_selectors(p)
+            if se != nil {
+                return nil, se
+            }
+            seg := new(JPSeg)
+            seg.desc = false
+            seg.sels = sels
+            // append
+            if q.segs == nil {
+                q.segs = seg
+            } else {
+                t := q.segs
+                for t.next != nil {
+                    t = t.next
+                }
+                t.next = seg
+            }
+        } else if c == 46 { // '.'
+            p.pos = p.pos + 1
+            if pij_peek(p, 0) == 46 {
+                // '..' descendant
+                p.pos = p.pos + 1
+                [sels2, se2] = pij_parse_descendant(p)
+                if se2 != nil {
+                    return nil, se2
+                }
+                seg2 := new(JPSeg)
+                seg2.desc = true
+                seg2.sels = sels2
+                if q.segs == nil {
+                    q.segs = seg2
+                } else {
+                    t2 := q.segs
+                    for t2.next != nil {
+                        t2 = t2.next
+                    }
+                    t2.next = seg2
+                }
+                q.singular = false
+            } else {
+                sel := new(JPSel)
+                c2 := pij_peek(p, 0)
+                if c2 == 42 { // '*'
+                    p.pos = p.pos + 1
+                    sel.kind = SK_WILD
+                    q.singular = false
+                } else if pij_ident_start(c2) {
+                    sel.kind = SK_NAME
+                    sel.name = pij_scan_ident(p)
+                } else {
+                    pperr(p, "expected member name or *")
+                    return nil, errors.new("jsonpath: expected member name")
+                }
+                seg3 := new(JPSeg)
+                seg3.desc = false
+                seg3.sels = sel
+                if q.segs == nil {
+                    q.segs = seg3
+                } else {
+                    t3 := q.segs
+                    for t3.next != nil {
+                        t3 = t3.next
+                    }
+                    t3.next = seg3
+                }
+            }
+        } else {
+            break
+        }
+    }
+    return q, nil
+}
+
+// pij_parse_descendant — after '..': '[' selectors | ident | '*'.
+fn pij_parse_descendant(p: mut PCur) -> [own JPSel, err] {
+    c := pij_peek(p, 0)
+    if c == 91 {
+        p.pos = p.pos + 1
+        return pij_parse_selectors(p)
+    }
+    sel := new(JPSel)
+    if c == 42 {
+        p.pos = p.pos + 1
+        sel.kind = SK_WILD
+        return sel, nil
+    }
+    if pij_ident_start(c) {
+        sel.kind = SK_NAME
+        sel.name = pij_scan_ident(p)
+        return sel, nil
+    }
+    pperr(p, "expected descendant selector")
+    return nil, errors.new("jsonpath: expected descendant selector")
+}
+
+// pij_parse_selectors — comma-separated selectors inside [ ].
+fn pij_parse_selectors(p: mut PCur) -> [own JPSel, err] {
+    let head: own JPSel = nil
+    for true {
+        pij_skip(p)
+        c := pij_peek(p, 0)
+        sel := new(JPSel)
+        if c == 63 { // '?'
+            p.pos = p.pos + 1
+            [f, fe] = pij_parse_or(p)
+            if fe != nil {
+                return nil, fe
+            }
+            sel.kind = SK_FILTER
+            sel.filt = f
+        } else if c == 42 { // '*'
+            p.pos = p.pos + 1
+            sel.kind = SK_WILD
+        } else if c == 34 || c == 39 {
+            sel.kind = SK_NAME
+            sel.name = pij_scan_qstring(p)
+            if p.err != 0 {
+                return nil, errors.new("jsonpath: bad member name")
+            }
+        } else if c == 58 { // ':' slice with empty start
+            p.pos = p.pos + 1
+            sel.kind = SK_SLICE
+            [sl, se] = pij_parse_slice_rest(p, sel, true)
+            if se != nil {
+                return nil, se
+            }
+            sel = sl
+        } else if c == 45 || pij_is_dig(c) {
+            tok := pij_scan_int(p)
+            if p.err != 0 {
+                return nil, errors.new("jsonpath: bad index")
+            }
+            pij_skip(p)
+            if pij_peek(p, 0) == 58 { // ':' → slice
+                p.pos = p.pos + 1
+                sel.kind = SK_SLICE
+                sel.has_start = true
+                sel.s_start = pij_path_int(tok, p)
+                [sl2, se2] = pij_parse_slice_rest(p, sel, false)
+                if se2 != nil {
+                    return nil, se2
+                }
+                sel = sl2
+            } else {
+                sel.kind = SK_INDEX
+                sel.idx = pij_path_int(tok, p)
+            }
+        } else {
+            pperr(p, "expected selector")
+            return nil, errors.new("jsonpath: expected selector")
+        }
+        if head == nil {
+            head = sel
+        } else {
+            t := head
+            for t.next != nil {
+                t = t.next
+            }
+            t.next = sel
+        }
+        // after selector: ',' continues, ']' ends
+        pij_skip(p)
+        c2 := pij_peek(p, 0)
+        if c2 == 44 {
+            p.pos = p.pos + 1
+            continue
+        }
+        if c2 == 93 {
+            p.pos = p.pos + 1
+            return head, nil
+        }
+        pperr(p, "expected ',' or ']'")
+        return nil, errors.new("jsonpath: expected ',' or ']'")
+    }
+}
+
+// pij_parse_slice_rest — after "start:" or ":" parse end/step ints
+// until ']' or ','. sel already has kind=SK_SLICE.
+fn pij_parse_slice_rest(p: mut PCur, sel: own JPSel, start_empty: bool) -> [own JPSel, err] {
+    // components: end then optional :step — positionally args[1],args[2]
+    // per upstream parseSlice (the consumed ':' already passed args[0]).
+    comp := 1
+    for comp < 3 {
+        pij_skip(p)
+        c := pij_peek(p, 0)
+        if c == 93 || c == 44 {
+            return sel, nil
+        }
+        if c == 58 {
+            p.pos = p.pos + 1
+            comp = comp + 1
+        } else if c == 45 || pij_is_dig(c) {
+            tok := pij_scan_int(p)
+            if p.err != 0 {
+                return nil, errors.new("jsonpath: bad slice index")
+            }
+            v := pij_path_int(tok, p)
+            if comp == 1 {
+                sel.has_end = true
+                sel.s_end = v
+            } else if comp == 2 {
+                sel.has_step = true
+                sel.s_step = v
+            }
+        } else {
+            pperr(p, "expected slice part")
+            return nil, errors.new("jsonpath: expected slice part")
+        }
+        pij_skip(p)
+        c2 := pij_peek(p, 0)
+        if c2 == 93 || c2 == 44 {
+            return sel, nil
+        }
+    }
+    return sel, nil
+}
+
+// ---------- filter expression parser (cont.) ----------
+
+// pij_parse_func — function call after ident; '(' must IMMEDIATELY
+// follow the name (upstream checks lex.r=='(' with no blank skip).
+fn pij_parse_func(p: mut PCur, name: str) -> [own FExpr, err] {
+    fid := 0
+    if name == "length" {
+        fid = FN_LENGTH
+    } else if name == "count" {
+        fid = FN_COUNT
+    } else if name == "value" {
+        fid = FN_VALUE
+    } else if name == "match" {
+        fid = FN_MATCH
+    } else if name == "search" {
+        fid = FN_SEARCH
+    } else {
+        pperr(p, "unknown function")
+        return nil, errors.new("jsonpath: unknown function " + name + "()")
+    }
+    if pij_peek(p, 0) != 40 {
+        pperr(p, "expected (")
+        return nil, errors.new("jsonpath: expected (")
+    }
+    p.pos = p.pos + 1
+    // args
+    let ah: own FArg = nil
+    nargs := 0
+    for true {
+        pij_skip(p)
+        c := pij_peek(p, 0)
+        if c == 41 { // ')'
+            p.pos = p.pos + 1
+            break
+        }
+        arg := new(FArg)
+        [ae, ee] = pij_parse_func_arg(p)
+        if ee != nil {
+            return nil, ee
+        }
+        art := ae.rtype
+        arg.expr = ae
+        arg.rtype = art
+        if ah == nil {
+            ah = arg
+        } else {
+            t := ah
+            for t.next != nil {
+                t = t.next
+            }
+            t.next = arg
+        }
+        nargs = nargs + 1
+        pij_skip(p)
+        c2 := pij_peek(p, 0)
+        if c2 == 44 {
+            p.pos = p.pos + 1
+            continue
+        }
+        if c2 == 41 {
+            p.pos = p.pos + 1
+            break
+        }
+        pperr(p, "expected ',' or ')'")
+        return nil, errors.new("jsonpath: expected ',' or ')'")
+    }
+    // arity + type validation (registry validators)
+    rt := RT_VALUE
+    if fid == FN_LENGTH {
+        if nargs != 1 || ah.rtype != RT_VALUE {
+            pperr(p, "length() expects 1 value arg")
+            return nil, errors.new("jsonpath: length() expects 1 value argument")
+        }
+        rt = RT_VALUE
+    } else if fid == FN_COUNT || fid == FN_VALUE {
+        if nargs != 1 || (ah.rtype != RT_VALUE && ah.rtype != RT_NODES) {
+            pperr(p, "bad args")
+            return nil, errors.new("jsonpath: bad function arguments")
+        }
+        rt = RT_VALUE
+    } else {
+        // match/search: 2 value args, logical result
+        a2 := ah.next
+        if nargs != 2 || ah.rtype != RT_VALUE || a2 == nil || a2.rtype != RT_VALUE {
+            pperr(p, "bad args")
+            return nil, errors.new("jsonpath: bad function arguments")
+        }
+        rt = RT_LOGICAL
+    }
+    f := new(FExpr)
+    f.kind = FE_FUNC
+    f.fn = fid
+    f.fargs = ah
+    f.rtype = rt
+    return f, nil
+}
+
+// pij_parse_func_arg — literal | query | nested func | logical expr.
+fn pij_parse_func_arg(p: mut PCur) -> [own FExpr, err] {
+    c := pij_peek(p, 0)
+    if c == 34 || c == 39 || c == 45 || pij_is_dig(c) {
+        return pij_parse_literal(p)
+    }
+    if c == 116 || c == 102 || c == 110 {
+        // could be true/false/null literal OR identifier — literal wins
+        // when the full keyword matches (upstream lexes keywords as
+        // literal tokens, idents otherwise).
+        if (c == 116 && pij_peek(p, 1) == 114 && pij_peek(p, 2) == 117 && pij_peek(p, 3) == 101) ||
+           (c == 102 && pij_peek(p, 1) == 97 && pij_peek(p, 2) == 108 && pij_peek(p, 3) == 115 && pij_peek(p, 4) == 101) ||
+           (c == 110 && pij_peek(p, 1) == 117 && pij_peek(p, 2) == 108 && pij_peek(p, 3) == 108) {
+            return pij_parse_literal(p)
+        }
+    }
+    if c == 64 || c == 36 { // '@' or '$'
+        p.pos = p.pos + 1
+        [q, qe] = pij_parse_query(p, c == 36)
+        if qe != nil {
+            return nil, qe
+        }
+        sg := jp_is_singular(q)
+        e := new(FExpr)
+        e.kind = FE_QRY
+        e.q = q
+        e.rtype = RT_NODES
+        if sg {
+            e.rtype = RT_VALUE
+        }
+        return e, nil
+    }
+    if pij_ident_start(c) {
+        name := pij_scan_ident(p)
+        // function requires '(' IMMEDIATELY after name? upstream
+        // parseFunctionArgs → identifier → skipBlankSpace check '(' —
+        // args allow blank before '('.
+        pij_skip(p)
+        if pij_peek(p, 0) == 40 {
+            [f, fe] = pij_parse_func(p, name)
+            if fe != nil {
+                return nil, fe
+            }
+            return f, nil
+        }
+        pperr(p, "expected function call")
+        return nil, errors.new("jsonpath: expected function call")
+    }
+    if c == 33 || c == 40 { // '!' or '(' → logical-or expr arg
+        [lo, le] = pij_parse_or(p)
+        if le != nil {
+            return nil, le
+        }
+        // wrap: mark rtype logical on a copy — the OR node itself
+        // evaluates to bool; tag via rtype field.
+        lo.rtype = RT_LOGICAL
+        return lo, nil
+    }
+    pperr(p, "expected argument")
+    return nil, errors.new("jsonpath: expected argument")
+}
+
+// pij_parse_comparable — right side of a comparison: literal |
+// singular query | value function.
+fn pij_parse_comparable(p: mut PCur) -> [own FExpr, err] {
+    pij_skip(p)
+    c := pij_peek(p, 0)
+    if c == 34 || c == 39 || c == 45 || pij_is_dig(c) || c == 116 || c == 102 || c == 110 {
+        // literal (keyword check inside literal parser)
+        return pij_parse_literal(p)
+    }
+    if c == 64 || c == 36 {
+        p.pos = p.pos + 1
+        [q, qe] = pij_parse_singular_query(p, c == 36)
+        if qe != nil {
+            return nil, qe
+        }
+        e := new(FExpr)
+        e.kind = FE_QRY
+        e.q = q
+        e.rtype = RT_VALUE
+        return e, nil
+    }
+    if pij_ident_start(c) {
+        name := pij_scan_ident(p)
+        if pij_peek(p, 0) != 40 {
+            pperr(p, "expected (")
+            return nil, errors.new("jsonpath: expected function call")
+        }
+        [f, fe] = pij_parse_func(p, name)
+        if fe != nil {
+            return nil, fe
+        }
+        if f.rtype == RT_LOGICAL {
+            pperr(p, "cannot compare logical function")
+            return nil, errors.new("jsonpath: cannot compare result of logical function")
+        }
+        return f, nil
+    }
+    pperr(p, "expected comparable")
+    return nil, errors.new("jsonpath: expected comparable")
+}
+
+// pij_parse_singular_query — '.'name / ['name'] / ["name"] / [int]
+// segments only (parseSingularQuery).
+fn pij_parse_singular_query(p: mut PCur, root: bool) -> [own JPQuery, err] {
+    q := new(JPQuery)
+    q.root = root
+    q.singular = true
+    for true {
+        c := pij_peek(p, 0)
+        if c == 91 { // '['
+            p.pos = p.pos + 1
+            pij_skip(p)
+            c2 := pij_peek(p, 0)
+            sel := new(JPSel)
+            if c2 == 34 || c2 == 39 {
+                sel.kind = SK_NAME
+                sel.name = pij_scan_qstring(p)
+                if p.err != 0 {
+                    return nil, errors.new("jsonpath: bad member name")
+                }
+            } else if c2 == 45 || pij_is_dig(c2) {
+                tok := pij_scan_int(p)
+                if p.err != 0 {
+                    return nil, errors.new("jsonpath: bad index")
+                }
+                sel.kind = SK_INDEX
+                sel.idx = pij_path_int(tok, p)
+            } else {
+                pperr(p, "expected name or index")
+                return nil, errors.new("jsonpath: expected name or index")
+            }
+            pij_skip(p)
+            if pij_peek(p, 0) != 93 {
+                pperr(p, "expected ]")
+                return nil, errors.new("jsonpath: expected ]")
+            }
+            p.pos = p.pos + 1
+            seg := new(JPSeg)
+            seg.desc = false
+            seg.sels = sel
+            if q.segs == nil {
+                q.segs = seg
+            } else {
+                t := q.segs
+                for t.next != nil {
+                    t = t.next
+                }
+                t.next = seg
+            }
+        } else if c == 46 { // '.'
+            p.pos = p.pos + 1
+            c3 := pij_peek(p, 0)
+            if !pij_ident_start(c3) {
+                pperr(p, "expected member name")
+                return nil, errors.new("jsonpath: expected member name")
+            }
+            name := pij_scan_ident(p)
+            sel2 := new(JPSel)
+            sel2.kind = SK_NAME
+            sel2.name = name
+            seg2 := new(JPSeg)
+            seg2.desc = false
+            seg2.sels = sel2
+            if q.segs == nil {
+                q.segs = seg2
+            } else {
+                t2 := q.segs
+                for t2.next != nil {
+                    t2 = t2.next
+                }
+                t2.next = seg2
+            }
+        } else {
+            break
+        }
+    }
+    return q, nil
+}
+
+// pij_parse_comp_op — = == != < <= > >= (single = / ! require '=')
+fn pij_parse_comp_op(p: mut PCur) -> int {
+    c := pij_get(p)
+    if c == 61 { // '='
+        if pij_peek(p, 0) == 61 {
+            p.pos = p.pos + 1
+            return OP_EQ
+        }
+        pperr(p, "invalid comparison operator")
+        return 0
+    }
+    if c == 33 { // '!'
+        if pij_peek(p, 0) == 61 {
+            p.pos = p.pos + 1
+            return OP_NE
+        }
+        pperr(p, "invalid comparison operator")
+        return 0
+    }
+    if c == 60 { // '<'
+        if pij_peek(p, 0) == 61 {
+            p.pos = p.pos + 1
+            return OP_LE
+        }
+        return OP_LT
+    }
+    if c == 62 { // '>'
+        if pij_peek(p, 0) == 61 {
+            p.pos = p.pos + 1
+            return OP_GE
+        }
+        return OP_GT
+    }
+    pperr(p, "invalid comparison operator")
+    return 0
+}
+
+// pij_parse_basic — one basic-expr.
+fn pij_parse_basic(p: mut PCur) -> [own FExpr, err] {
+    pij_skip(p)
+    c := pij_peek(p, 0)
+    if c == 33 { // '!'
+        p.pos = p.pos + 1
+        pij_skip(p)
+        c2 := pij_peek(p, 0)
+        if c2 == 40 { // '('
+            p.pos = p.pos + 1
+            [sub, se] = pij_parse_or(p)
+            if se != nil {
+                return nil, se
+            }
+            pij_skip(p)
+            if pij_peek(p, 0) != 41 {
+                pperr(p, "expected )")
+                return nil, errors.new("jsonpath: expected )")
+            }
+            p.pos = p.pos + 1
+            n := new(FExpr)
+            n.kind = FE_NOT
+            n.l = sub
+            return n, nil
+        }
+        if pij_ident_start(c2) {
+            name := pij_scan_ident(p)
+            if pij_peek(p, 0) != 40 {
+                pperr(p, "expected (")
+                return nil, errors.new("jsonpath: expected function call")
+            }
+            [f, fe] = pij_parse_func(p, name)
+            if fe != nil {
+                return nil, fe
+            }
+            n2 := new(FExpr)
+            n2.kind = FE_NOT
+            n2.l = f
+            return n2, nil
+        }
+        // non-existence: '!path'
+        if c2 == 64 || c2 == 36 {
+            p.pos = p.pos + 1
+            [q, qe] = pij_parse_query(p, c2 == 36)
+            if qe != nil {
+                return nil, qe
+            }
+            nx := new(FExpr)
+            nx.kind = FE_NTEST
+            nx.q = q
+            return nx, nil
+        }
+        pperr(p, "expected path after !")
+        return nil, errors.new("jsonpath: expected path after !")
+    }
+    if c == 40 { // '('
+        p.pos = p.pos + 1
+        [sub2, se2] = pij_parse_or(p)
+        if se2 != nil {
+            return nil, se2
+        }
+        pij_skip(p)
+        if pij_peek(p, 0) != 41 {
+            pperr(p, "expected )")
+            return nil, errors.new("jsonpath: expected )")
+        }
+        p.pos = p.pos + 1
+        return sub2, nil
+    }
+    if c == 34 || c == 39 || c == 45 || pij_is_dig(c) || c == 116 || c == 102 || c == 110 {
+        // literal — MUST be followed by a comparison op
+        [lit, le] = pij_parse_literal(p)
+        if le != nil {
+            return nil, le
+        }
+        pij_skip(p)
+        op := pij_parse_comp_op(p)
+        if op == 0 {
+            pperr(p, "expected comparison")
+            return nil, errors.new("jsonpath: expected comparison operator")
+        }
+        [right, re] = pij_parse_comparable(p)
+        if re != nil {
+            return nil, re
+        }
+        cmp := new(FExpr)
+        cmp.kind = FE_CMP
+        cmp.cmp = op
+        cmp.l = lit
+        cmp.r = right
+        return cmp, nil
+    }
+    if c == 64 || c == 36 { // '@' or '$'
+        p.pos = p.pos + 1
+        [q2, qe2] = pij_parse_query(p, c == 36)
+        if qe2 != nil {
+            return nil, qe2
+        }
+        sing := jp_is_singular(q2)
+        if sing {
+            pij_skip(p)
+            c3 := pij_peek(p, 0)
+            if c3 == 61 || c3 == 33 || c3 == 60 || c3 == 62 {
+                op2 := pij_parse_comp_op(p)
+                [left2, _le2] = pij_qry_expr(q2, true)
+                [right2, re2] = pij_parse_comparable(p)
+                if re2 != nil {
+                    return nil, re2
+                }
+                cmp2 := new(FExpr)
+                cmp2.kind = FE_CMP
+                cmp2.cmp = op2
+                cmp2.l = left2
+                cmp2.r = right2
+                return cmp2, nil
+            }
+        }
+        t := new(FExpr)
+        t.kind = FE_TEST
+        t.q = q2
+        return t, nil
+    }
+    if pij_ident_start(c) {
+        name2 := pij_scan_ident(p)
+        // function requires '(' IMMEDIATELY after name (no blank skip)
+        if pij_peek(p, 0) != 40 {
+            pperr(p, "unexpected identifier")
+            return nil, errors.new("jsonpath: unexpected identifier")
+        }
+        [f2, fe2] = pij_parse_func(p, name2)
+        if fe2 != nil {
+            return nil, fe2
+        }
+        if f2.rtype == RT_LOGICAL {
+            return f2, nil
+        }
+        // value function must be compared
+        pij_skip(p)
+        op3 := pij_parse_comp_op(p)
+        if op3 == 0 {
+            pperr(p, "missing comparison to function result")
+            return nil, errors.new("jsonpath: missing comparison to function result")
+        }
+        [right3, re3] = pij_parse_comparable(p)
+        if re3 != nil {
+            return nil, re3
+        }
+        cmp3 := new(FExpr)
+        cmp3.kind = FE_CMP
+        cmp3.cmp = op3
+        cmp3.l = f2
+        cmp3.r = right3
+        return cmp3, nil
+    }
+    pperr(p, "unexpected token")
+    return nil, errors.new("jsonpath: unexpected token in filter")
+}
+
+// pij_qry_expr wraps a query as an operand FExpr.
+fn pij_qry_expr(q: own JPQuery, singular: bool) -> [own FExpr, err] {
+    e := new(FExpr)
+    e.kind = FE_QRY
+    e.q = q
+    if singular {
+        e.rtype = RT_VALUE
+    } else {
+        e.rtype = RT_NODES
+    }
+    return e, nil
+}
+
+// ---------- query entry ----------
+
+// parse_path parses a normalized ($-rooted) JSONPath into JPQuery.
+fn parse_path(text: str) -> [own JPQuery, err] {
+    p := new(PCur{s: text, pos: 0, err: 0})
+    c := pij_get(p)
+    if c != 36 { // '$'
+        pperr(p, "path must start with $")
+        return nil, errors.new("jsonpath: path must start with $")
+    }
+    [q, e] = pij_parse_query(p, true)
+    if e != nil {
+        return nil, e
+    }
+    pij_skip(p)
+    if p.pos != len(p.s) {
+        pperr(p, "trailing characters")
+        return nil, errors.new("jsonpath: trailing characters")
+    }
+    return q, nil
+}
+
+// capture_path — upstream capturePath(): trim, shorthand prefix,
+// then full RFC 9535 parse.
+fn capture_path(path: str) -> [own JPQuery, err] {
+    t := path
+    // TrimSpace (ASCII whitespace — upstream trims unicode too;
+    // JSONPath blanks are ASCII anyway)
+    lo := 0
+    for lo < len(t) && pij_is_blank(byteat(t, lo)) {
+        lo = lo + 1
+    }
+    hi := len(t)
+    for hi > lo && pij_is_blank(byteat(t, hi - 1)) {
+        hi = hi - 1
+    }
+    t = substr(t, lo, hi)
+    if len(t) == 0 {
+        return nil, errors.new("empty path")
+    }
+    c := byteat(t, 0)
+    norm := t
+    if c == 36 {
+        // as-is
+    } else if c == 91 {
+        norm = "$" + t
+    } else if pij_ident_start(c) {
+        norm = "$." + t
+    } else {
+        return nil, errors.new("invalid path \"" + t + "\": start with $, [ or a member name")
+    }
+    return parse_path(norm)
+}
+
+// ---------- evaluator ----------
+
+// PVal — filter operand value (spec.PathValue analog).
+// kind: 0 nodes (paths), 1 value, 2 logical, 3 missing/nil.
+struct PVal {
+    kind: int,
+    paths: []JPath,
+    vpath: JPath,     // doc-node value
+    vis_lit: bool,    // literal scalar instead of doc node
+    vkind: int,       // literal jkind
+    ls: str, lb: bool,
+    log: bool,
+}
+
+fn pv_missing() -> PVal {
+    return PVal{kind: 3, paths: nil, vpath: JPath{steps: nil}, vis_lit: false, vkind: -1, ls: "", lb: false, log: false}
+}
+
+fn pv_nodes(paths: []JPath) -> PVal {
+    return PVal{kind: 0, paths: paths, vpath: JPath{steps: nil}, vis_lit: false, vkind: -1, ls: "", lb: false, log: false}
+}
+
+fn pv_value_path(p: JPath) -> PVal {
+    return PVal{kind: 1, paths: nil, vpath: p, vis_lit: false, vkind: -1, ls: "", lb: false, log: false}
+}
+
+fn pv_value_lit(j: ref JVal) -> PVal {
+    return PVal{kind: 1, paths: nil, vpath: JPath{steps: nil}, vis_lit: true, vkind: j.kind, ls: j.s, lb: j.b, log: false}
+}
+
+fn pv_logical(b: bool) -> PVal {
+    return PVal{kind: 2, paths: nil, vpath: JPath{steps: nil}, vis_lit: false, vkind: -1, ls: "", lb: false, log: b}
+}
+
+// pv_jkind — JSON kind of a value operand (-1 missing/non-value).
+fn pv_jkind(pv: PVal, root: ref JVal) -> int {
+    if pv.kind != 1 {
+        return -1
+    }
+    if pv.vis_lit {
+        return pv.vkind
+    }
+    return jwalk(root, pv.vpath)
+}
+
+fn pv_str(pv: PVal, root: ref JVal) -> str {
+    if pv.kind != 1 {
+        return ""
+    }
+    if pv.vis_lit {
+        if pv.vkind == 3 {
+            return pv.ls
+        }
+        return ""
+    }
+    if jwalk(root, pv.vpath) == 3 {
+        return jstr_at(root, pv.vpath)
+    }
+    return ""
+}
+
+fn pv_numlex(pv: PVal, root: ref JVal) -> str {
+    if pv.kind != 1 {
+        return ""
+    }
+    if pv.vis_lit {
+        if pv.vkind == 2 {
+            return pv.ls
+        }
+        return ""
+    }
+    if jwalk(root, pv.vpath) == 2 {
+        return jnum_at(root, pv.vpath)
+    }
+    return ""
+}
+
+fn pv_bool(pv: PVal, root: ref JVal) -> int {
+    if pv.kind != 1 {
+        return -1
+    }
+    if pv.vis_lit {
+        if pv.vkind == 1 {
+            if pv.lb {
+                return 1
+            }
+            return 0
+        }
+        return -1
+    }
+    return jbool_at(root, pv.vpath)
+}
+
+struct F64 { v: float, ok: bool }
+
+// jnum_f64 — strict-ish float for a number lexeme; overflow (|v|>max)
+// counts as non-numeric like upstream json.Number.Float64 ErrRange.
+fn jnum_f64(lex: str) -> F64 {
+    [f, fe] = strconv.parsefloat(lex)
+    if fe != nil || f != f {
+        return F64{v: 0.0, ok: false}
+    }
+    return F64{v: f, ok: true}
+}
+
+fn pv_f64(pv: PVal, root: ref JVal) -> F64 {
+    if pv_jkind(pv, root) != 2 {
+        return F64{v: 0.0, ok: false}
+    }
+    return jnum_f64(pv_numlex(pv, root))
+}
+
+// ---------- query evaluation ----------
+
+// jq_eval — evaluate query from `cur` (relative) or doc root ($).
+fn jq_eval(q: ref JPQuery, cur: JPath, root: ref JVal) -> []JPath {
+    start := cur
+    if q.root {
+        start = JPath{steps: nil}
+    }
+    paths := mkslice(JPath, 0)
+    paths = push(paths, start)
+    seg := q.segs
+    for seg != nil {
+        paths = jseg_eval(seg, paths, root)
+        seg = seg.next
+    }
+    return paths
+}
+
+fn jseg_eval(seg: ref JPSeg, ins: []JPath, root: ref JVal) -> []JPath {
+    out := mkslice(JPath, 0)
+    i := 0
+    for i < len(ins) {
+        if seg.desc {
+            cands := jdesc_paths(root, ins[i])
+            j := 0
+            for j < len(cands) {
+                out = jsel_union_eval(seg.sels, cands[j], out, root)
+                j = j + 1
+            }
+        } else {
+            out = jsel_union_eval(seg.sels, ins[i], out, root)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn jsel_union_eval(sels: ref JPSel, ip: JPath, out: []JPath, root: ref JVal) -> []JPath {
+    s := sels
+    for s != nil {
+        out = jsel_apply(s, ip, out, root)
+        s = s.next
+    }
+    return out
+}
+
+fn jsel_apply(sel: ref JPSel, ip: JPath, out: []JPath, root: ref JVal) -> []JPath {
+    if sel.kind == SK_NAME {
+        // last-wins member exists?
+        kids := jchild_paths(root, ip)
+        j := 0
+        for j < len(kids) {
+            st := kids[j].steps[len(kids[j].steps) - 1]
+            if !st.is_idx && st.name == sel.name {
+                return push(out, kids[j])
+            }
+            j = j + 1
+        }
+        return out
+    }
+    if sel.kind == SK_WILD {
+        kids2 := jchild_paths(root, ip)
+        j2 := 0
+        for j2 < len(kids2) {
+            out = push(out, kids2[j2])
+            j2 = j2 + 1
+        }
+        return out
+    }
+    if sel.kind == SK_INDEX {
+        if jwalk(root, ip) != 5 {
+            return out
+        }
+        kids3 := jchild_paths(root, ip)
+        n := sel.idx
+        if n < 0 {
+            n = len(kids3) + n
+        }
+        if n >= 0 && n < len(kids3) {
+            return push(out, kids3[n])
+        }
+        return out
+    }
+    if sel.kind == SK_SLICE {
+        if jwalk(root, ip) != 5 {
+            return out
+        }
+        kids4 := jchild_paths(root, ip)
+        L := len(kids4)
+        step := 1
+        if sel.has_step {
+            step = sel.s_step
+        }
+        if step == 0 {
+            return out
+        }
+        // Slice() defaults + Bounds (spec/selector.go port)
+        start_d := 0
+        end_d := 0
+        if step < 0 {
+            start_d = 4611686018427387903
+            end_d = -4611686018427387903
+        } else {
+            end_d = 4611686018427387903
+        }
+        start := start_d
+        if sel.has_start {
+            start = sel.s_start
+        }
+        end := end_d
+        if sel.has_end {
+            end = sel.s_end
+        }
+        // normalize: negative i -> L+i
+        if start < 0 {
+            start = L + start
+        }
+        if end < 0 {
+            end = L + end
+        }
+        lo := 0
+        hi := 0
+        if step > 0 {
+            lo = start
+            if lo > L {
+                lo = L
+            }
+            if lo < 0 {
+                lo = 0
+            }
+            hi = end
+            if hi > L {
+                hi = L
+            }
+            if hi < 0 {
+                hi = 0
+            }
+            i3 := lo
+            for i3 < hi {
+                out = push(out, kids4[i3])
+                i3 = i3 + step
+            }
+        } else {
+            lo = end
+            if lo > L - 1 {
+                lo = L - 1
+            }
+            if lo < -1 {
+                lo = -1
+            }
+            hi = start
+            if hi > L - 1 {
+                hi = L - 1
+            }
+            if hi < -1 {
+                hi = -1
+            }
+            i4 := hi
+            for lo < i4 {
+                out = push(out, kids4[i4])
+                i4 = i4 + step
+            }
+        }
+        return out
+    }
+    if sel.kind == SK_FILTER {
+        kids5 := jchild_paths(root, ip)
+        j5 := 0
+        for j5 < len(kids5) {
+            if feval_bool(sel.filt, kids5[j5], root) {
+                out = push(out, kids5[j5])
+            }
+            j5 = j5 + 1
+        }
+        return out
+    }
+    return out
+}
+
+// ---------- filter evaluation ----------
+
+// feval_bool — logical-position expr -> bool.
+fn feval_bool(e: ref FExpr, cur: JPath, root: ref JVal) -> bool {
+    if e == nil {
+        return false
+    }
+    if e.kind == FE_OR {
+        a := e.l
+        for a != nil {
+            if feval_bool(a, cur, root) {
+                return true
+            }
+            a = a.next
+        }
+        return false
+    }
+    if e.kind == FE_AND {
+        b := e.l
+        for b != nil {
+            if !feval_bool(b, cur, root) {
+                return false
+            }
+            b = b.next
+        }
+        return true
+    }
+    if e.kind == FE_NOT {
+        return !feval_bool(e.l, cur, root)
+    }
+    if e.kind == FE_CMP {
+        lp := foperand(e.l, cur, root)
+        rp := foperand(e.r, cur, root)
+        return fcmp_eval(e.cmp, lp, rp, root)
+    }
+    if e.kind == FE_TEST {
+        return len(jq_eval(e.q, cur, root)) > 0
+    }
+    if e.kind == FE_NTEST {
+        return len(jq_eval(e.q, cur, root)) == 0
+    }
+    if e.kind == FE_FUNC {
+        pv := ffunc_eval(e, cur, root)
+        return pv_truthy(pv, root)
+    }
+    return false
+}
+
+// foperand — operand-position expr -> PVal.
+fn foperand(e: ref FExpr, cur: JPath, root: ref JVal) -> PVal {
+    if e == nil {
+        return pv_missing()
+    }
+    if e.kind == FE_LIT {
+        if e.vlit == nil {
+            return pv_missing()
+        }
+        return pv_value_lit(e.vlit)
+    }
+    if e.kind == FE_QRY {
+        paths := jq_eval(e.q, cur, root)
+        if e.rtype == RT_VALUE {
+            // singular: 0 or 1 node
+            if len(paths) == 1 {
+                return pv_value_path(paths[0])
+            }
+            return pv_missing()
+        }
+        return pv_nodes(paths)
+    }
+    if e.kind == FE_FUNC {
+        return ffunc_eval(e, cur, root)
+    }
+    if e.kind == FE_OR || e.kind == FE_AND || e.kind == FE_NOT || e.kind == FE_CMP || e.kind == FE_TEST || e.kind == FE_NTEST {
+        // logical expr used as operand -> logical PVal
+        return pv_logical(feval_bool(e, cur, root))
+    }
+    return pv_missing()
+}
+
+// pv_truthy — FuncExpr.testFilter / ValueType.testFilter parity.
+fn pv_truthy(pv: PVal, root: ref JVal) -> bool {
+    if pv.kind == 0 {
+        return len(pv.paths) > 0
+    }
+    if pv.kind == 2 {
+        return pv.log
+    }
+    if pv.kind != 1 {
+        return false
+    }
+    k := pv_jkind(pv, root)
+    if k == 0 {
+        return false
+    }
+    if k == 1 {
+        return pv_bool(pv, root) == 1
+    }
+    if k == 2 {
+        // json.Number: Float64 ok -> f!=0; err -> true
+        f := pv_f64(pv, root)
+        if !f.ok {
+            return true
+        }
+        return f.v != 0.0
+    }
+    // str/obj/arr -> default true (even empty string!)
+    return true
+}
+
+// ---------- functions ----------
+
+// ffunc_eval — registry function eval -> PVal.
+fn ffunc_eval(e: ref FExpr, cur: JPath, root: ref JVal) -> PVal {
+    fid := e.fn
+    // gather args
+    args := mkslice(PVal, 0)
+    a := e.fargs
+    for a != nil {
+        args = push(args, foperand(a.expr, cur, root))
+        a = a.next
+    }
+    if fid == FN_LENGTH {
+        if len(args) != 1 {
+            return pv_missing()
+        }
+        av := args[0]
+        k := pv_jkind(av, root)
+        if k < 0 {
+            return pv_missing()
+        }
+        if k == 3 {
+            s := pv_str(av, root)
+            return pv_num_result(utf8.runelen(s))
+        }
+        if k == 5 {
+            return pv_num_result(len(jchild_paths(root, av.vpath)))
+        }
+        if k == 4 {
+            return pv_num_result(len(jchild_paths(root, av.vpath)))
+        }
+        return pv_missing()
+    }
+    if fid == FN_COUNT {
+        if len(args) != 1 {
+            return pv_missing()
+        }
+        av2 := args[0]
+        if av2.kind == 0 {
+            return pv_num_result(len(av2.paths))
+        }
+        if av2.kind == 1 {
+            // singular query as nodes: 0 or 1
+            return pv_num_result(1)
+        }
+        return pv_num_result(0)
+    }
+    if fid == FN_VALUE {
+        if len(args) != 1 {
+            return pv_missing()
+        }
+        av3 := args[0]
+        if av3.kind == 0 {
+            if len(av3.paths) == 1 {
+                return pv_value_path(av3.paths[0])
+            }
+            return pv_missing()
+        }
+        if av3.kind == 1 {
+            return av3
+        }
+        return pv_missing()
+    }
+    // match / search
+    if len(args) != 2 {
+        return pv_logical(false)
+    }
+    s0 := args[0]
+    s1 := args[1]
+    if pv_jkind(s0, root) != 3 || pv_jkind(s1, root) != 3 {
+        return pv_logical(false)
+    }
+    subj := pv_str(s0, root)
+    pat := pv_str(s1, root)
+    rp := regex_prepare(pat, fid == FN_MATCH)
+    if rp == nil {
+        return pv_logical(false)
+    }
+    return pv_logical(rp.matchstr(subj))
+}
+
+fn pv_num_result(n: int) -> PVal {
+    j := jnumv(itoa(n))
+    return pv_value_lit(j)
+}
+
+// regex_prepare — compile pattern with '.'->[^\n\r] rewrite and
+// \A..\z anchors for match(); nil on compile failure.
+fn regex_prepare(pat: str, anchored: bool) -> own regexp.Re {
+    rw := regex_dot_rewrite(pat)
+    full := rw
+    if anchored {
+        full = "\\A" + rw + "\\z"
+    }
+    [re, e] = regexp.compile(full)
+    if e != nil {
+        return nil
+    }
+    return new(re)
+}
+
+// regex_dot_rewrite — unescaped '.' outside char classes -> [^\n\r].
+fn regex_dot_rewrite(pat: str) -> str {
+    out := mkslice(byte, 0)
+    inclass := false
+    esc := false
+    i := 0
+    for i < len(pat) {
+        c := byteat(pat, i)
+        if esc {
+            out = push(out, 92)
+            out = push(out, c)
+            esc = false
+            i = i + 1
+            continue
+        }
+        if c == 92 {
+            esc = true
+            i = i + 1
+            continue
+        }
+        if c == 91 {
+            inclass = true
+        } else if c == 93 {
+            inclass = false
+        }
+        if c == 46 && !inclass {
+            out = bpush(out, "[^\\n\\r]")
+        } else {
+            out = push(out, c)
+        }
+        i = i + 1
+    }
+    if esc {
+        out = push(out, 92)
+    }
+    return out as str
+}
+
+// ---------- comparisons (spec/op.go parity) ----------
+
+// pv_deep_eq — structural equality for container values (doc paths).
+fn jpath_deep_eq(root: ref JVal, pa: JPath, pb: JPath) -> bool {
+    ka := jwalk(root, pa)
+    kb := jwalk(root, pb)
+    if ka != kb {
+        return false
+    }
+    if ka < 0 {
+        return true
+    }
+    if ka == 0 {
+        return true
+    }
+    if ka == 1 {
+        return jbool_at(root, pa) == jbool_at(root, pb)
+    }
+    if ka == 2 {
+        la := jnum_at(root, pa)
+        lb := jnum_at(root, pb)
+        fa := jnum_f64(la)
+        fb := jnum_f64(lb)
+        if fa.ok && fb.ok {
+            return fa.v == fb.v
+        }
+        return la == lb
+    }
+    if ka == 3 {
+        return jstr_at(root, pa) == jstr_at(root, pb)
+    }
+    if ka == 5 {
+        ca := jchild_paths(root, pa)
+        cb := jchild_paths(root, pb)
+        if len(ca) != len(cb) {
+            return false
+        }
+        i := 0
+        for i < len(ca) {
+            if !jpath_deep_eq(root, ca[i], cb[i]) {
+                return false
+            }
+            i = i + 1
+        }
+        return true
+    }
+    // object: same unique key set + recursive values
+    ka2 := jchild_paths(root, pa)
+    kb2 := jchild_paths(root, pb)
+    if len(ka2) != len(kb2) {
+        return false
+    }
+    i2 := 0
+    for i2 < len(ka2) {
+        // find matching key in B (unique keys already)
+        key := ""
+        st := ka2[i2].steps[len(ka2[i2].steps) - 1]
+        if st.is_idx {
+            return false
+        }
+        key = st.name
+        found := false
+        j2 := 0
+        for j2 < len(kb2) {
+            st2 := kb2[j2].steps[len(kb2[j2].steps) - 1]
+            if !st2.is_idx && st2.name == key {
+                if !jpath_deep_eq(root, ka2[i2], kb2[j2]) {
+                    return false
+                }
+                found = true
+            }
+            j2 = j2 + 1
+        }
+        if !found {
+            return false
+        }
+        i2 = i2 + 1
+    }
+    return true
+}
+
+// pv_eq — valueEqualTo parity.
+fn pv_eq(a: PVal, b: PVal, root: ref JVal) -> bool {
+    if a.kind == 3 && b.kind == 3 {
+        return true
+    }
+    if a.kind != 1 || b.kind != 1 {
+        return false
+    }
+    ka := pv_jkind(a, root)
+    kb := pv_jkind(b, root)
+    if ka == 2 && kb == 2 {
+        fa := pv_f64(a, root)
+        fb := pv_f64(b, root)
+        if fa.ok && fb.ok {
+            return fa.v == fb.v
+        }
+        return pv_numlex(a, root) == pv_numlex(b, root)
+    }
+    if ka != kb || ka < 0 {
+        return false
+    }
+    if ka == 0 {
+        return true
+    }
+    if ka == 1 {
+        return pv_bool(a, root) == pv_bool(b, root)
+    }
+    if ka == 3 {
+        return pv_str(a, root) == pv_str(b, root)
+    }
+    // containers: both must be doc paths (literals can't be containers)
+    if a.vis_lit || b.vis_lit {
+        return false
+    }
+    return jpath_deep_eq(root, a.vpath, b.vpath)
+}
+
+// pv_less — valueLessThan parity (numeric or string only).
+fn pv_less(a: PVal, b: PVal, root: ref JVal) -> bool {
+    ka := pv_jkind(a, root)
+    kb := pv_jkind(b, root)
+    if ka == 2 && kb == 2 {
+        fa := pv_f64(a, root)
+        fb := pv_f64(b, root)
+        if fa.ok && fb.ok {
+            return fa.v < fb.v
+        }
+        return false
+    }
+    if ka == 3 && kb == 3 {
+        return pv_str(a, root) < pv_str(b, root)
+    }
+    return false
+}
+
+// pv_same_type — valCompType parity for our value-only operands.
+fn pv_same_type(a: PVal, b: PVal, root: ref JVal) -> bool {
+    ka := pv_jkind(a, root)
+    kb := pv_jkind(b, root)
+    if ka < 0 || kb < 0 {
+        return false
+    }
+    return ka == kb
+}
+
+fn fcmp_eval(op: int, l: PVal, r: PVal, root: ref JVal) -> bool {
+    if op == OP_EQ {
+        return pv_eq(l, r, root)
+    }
+    if op == OP_NE {
+        return !pv_eq(l, r, root)
+    }
+    if op == OP_LT {
+        return pv_same_type(l, r, root) && pv_less(l, r, root)
+    }
+    if op == OP_LE {
+        return pv_same_type(l, r, root) && (pv_less(l, r, root) || pv_eq(l, r, root))
+    }
+    if op == OP_GT {
+        return pv_same_type(l, r, root) && !pv_less(l, r, root) && !pv_eq(l, r, root)
+    }
+    if op == OP_GE {
+        return pv_same_type(l, r, root) && !pv_less(l, r, root)
+    }
+    return false
+}
+
+// ---------- public API ----------
+
+// is_ident — upstream isIdentifier: [A-Za-z_][A-Za-z0-9_]*
+fn is_ident(name: str) -> bool {
+    if len(name) == 0 {
+        return false
+    }
+    c0 := byteat(name, 0)
+    if !((c0 >= 65 && c0 <= 90) || (c0 >= 97 && c0 <= 122) || c0 == 95) {
+        return false
+    }
+    i := 1
+    for i < len(name) {
+        c := byteat(name, i)
+        if !((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 95) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// validate — ValidateCaptures parity: sorted-name order not needed
+// for validity; first error returned.
+fn validate(captures: []model.KV) -> err {
+    // upstream iterates sorted map keys — deterministic first error
+    sorted := sort_captures(captures)
+    i := 0
+    for i < len(sorted) {
+        c := sorted[i]
+        if !is_ident(c.name) {
+            return errors.new("capture \"" + c.name + "\": invalid variable name")
+        }
+        [_, pe] = capture_path(c.value)
+        if pe != nil {
+            return errors.new("capture " + c.name + ": " + errors.msg(pe))
+        }
+        i = i + 1
+    }
+    return nil
+}
+
+// sort_captures — copy sorted by name (upstream iterates sorted map
+// keys for deterministic first-error).
+fn sort_captures(captures: []model.KV) -> []model.KV {
+    out := mkslice(model.KV, 0)
+    i := 0
+    for i < len(captures) {
+        out = push(out, captures[i])
+        i = i + 1
+    }
+    // insertion sort by name
+    i = 1
+    for i < len(out) {
+        v := out[i]
+        j := i - 1
+        for j >= 0 && out[j].name > v.name {
+            out[j + 1] = out[j]
+            j = j - 1
+        }
+        out[j + 1] = v
+        i = i + 1
+    }
+    return out
+}
+
+// capture_values — CaptureValues parity. Returns name/value pairs
+// (enabled=true) in sorted-name order; all-or-nothing.
+fn capture_values(captures: []model.KV, body: []byte) -> [[]model.KV, err] {
+    let out: []model.KV = nil
+    if len(captures) == 0 {
+        return out, nil
+    }
+    ve := validate(captures)
+    if ve != nil {
+        return nil, ve
+    }
+    bodystr := body as str
+    [doc, je] = jparse(bodystr)
+    if je != nil {
+        return nil, errors.new("captures require a valid JSON response body")
+    }
+    sorted := sort_captures(captures)
+    i := 0
+    for i < len(sorted) {
+        c := sorted[i]
+        [q, qe] = capture_path(c.value)
+        if qe != nil {
+            return nil, errors.new("capture " + c.name + ": " + errors.msg(qe))
+        }
+        matches := jq_eval(q, JPath{steps: nil}, doc)
+        if len(matches) != 1 {
+            return nil, errors.new("capture " + c.name + ": path \"" + c.value + "\" matched " + itoa(len(matches)) + " values; expected exactly one")
+        }
+        mp := matches[0]
+        kind := jwalk(doc, mp)
+        val := ""
+        if kind == 3 {
+            val = jstr_at(doc, mp)
+        } else if kind == 2 {
+            val = jnum_at(doc, mp)
+        } else if kind == 1 {
+            if jbool_at(doc, mp) == 1 {
+                val = "true"
+            } else {
+                val = "false"
+            }
+        } else if kind == 0 || kind < 0 {
+            val = "null"
+        } else {
+            val = jemit_path(doc, mp)
+        }
+        out = push(out, model.KV{name: c.name, value: val, enabled: true})
+        i = i + 1
+    }
+    return out, nil
+}
+
+// jemit_path — compact JSON emit of the node at path (jemit parity
+// without a ref return).
+fn jemit_path(root: ref JVal, p: JPath) -> str {
+    b := mkslice(byte, 0)
+    b = jemit_path_into(root, p, b)
+    return b as str
+}
+
+fn jemit_path_into(root: ref JVal, p: JPath, b: []byte) -> []byte {
+    kind := jwalk(root, p)
+    if kind < 0 || kind == 0 {
+        return bpush(b, "null")
+    }
+    if kind == 1 {
+        if jbool_at(root, p) == 1 {
+            return bpush(b, "true")
+        }
+        return bpush(b, "false")
+    }
+    if kind == 2 {
+        return bpush(b, jnum_at(root, p))
+    }
+    if kind == 3 {
+        b = push(b, 34)
+        b = jesc_into(b, jstr_at(root, p))
+        return push(b, 34)
+    }
+    kids := jchild_paths(root, p)
+    if kind == 4 {
+        b = push(b, 123)
+    } else {
+        b = push(b, 91)
+    }
+    i := 0
+    for i < len(kids) {
+        if i > 0 {
+            b = push(b, 44)
+        }
+        if kind == 4 {
+            // member key = last step name
+            st := kids[i].steps[len(kids[i].steps) - 1]
+            b = push(b, 34)
+            b = jesc_into(b, st.name)
+            b = push(b, 34)
+            b = push(b, 58)
+        }
+        b = jemit_path_into(root, kids[i], b)
+        i = i + 1
+    }
+    if kind == 4 {
+        return push(b, 125)
+    }
+    return push(b, 93)
+}

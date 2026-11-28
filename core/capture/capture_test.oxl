@@ -1,0 +1,167 @@
+package capture
+import "std/testing"
+import "github.com/oxidean/oxttp/core/model"
+
+fn cap1(name: str, path: str) -> model.KV {
+    return model.KV{name: name, value: path, enabled: true}
+}
+
+fn mkcaps() -> []model.KV {
+    return mkslice(model.KV, 0)
+}
+
+fn one(body: str, path: str) -> [str, err] {
+    caps := mkcaps()
+    caps = push(caps, cap1("V", path))
+    [out, e] = capture_values(caps, body as []byte)
+    if e != nil {
+        return "", e
+    }
+    return out[0].value, nil
+}
+
+fn expect_val(body: str, path: str, want: str) {
+    [v, e] = one(body, path)
+    testing.expect(e == nil, "path " + path)
+    testing.expect_streq(v, want, "path " + path)
+}
+
+fn expect_err(body: str, path: str) {
+    [_, e] = one(body, path)
+    testing.expect(e != nil, "path " + path + " must fail")
+}
+
+fn test_capture_values_basic() {
+    body := ("{\"data\":{\"id\":\"abc\",\"n\":42,\"ok\":true,\"nil\":null}}") as []byte
+    caps := mkcaps()
+    caps = push(caps, cap1("S", "data.id"))
+    caps = push(caps, cap1("N", "$.data.n"))
+    caps = push(caps, cap1("B", "$.data.ok"))
+    caps = push(caps, cap1("Z", "$.data.nil"))
+    [out, e] = capture_values(caps, body)
+    testing.expect(e == nil, "capture_values err")
+    testing.expect_eq(len(out), 4, "count")
+    // sorted by name: B,N,S,Z
+    testing.expect_streq(out[0].value, "true", "bool")
+    testing.expect_streq(out[1].value, "42", "num lexeme")
+    testing.expect_streq(out[2].value, "abc", "str unquoted")
+    testing.expect_streq(out[3].value, "null", "null")
+}
+
+fn test_capture_number_lexeme() {
+    expect_val("{\"x\":1.50e2}", "$.x", "1.50e2")
+    expect_val("{\"x\":-0.25}", "$.x", "-0.25")
+}
+
+fn test_capture_compact_json() {
+    expect_val("{\"o\":{\"a\":1,\"b\":[true,null]},\"arr\":[1,  \"x\"]}", "$.o", "{\"a\":1,\"b\":[true,null]}")
+    expect_val("{\"o\":{\"a\":1},\"arr\":[1,  \"x\"]}", "$.arr", "[1,\"x\"]")
+}
+
+fn test_capture_exactly_one() {
+    expect_err("{\"items\":[{\"id\":1},{\"id\":2}]}", "$.items[*].id")
+    expect_err("{\"a\":1}", "$.missing")
+}
+
+fn test_capture_all_or_nothing() {
+    body := ("{\"a\":1}") as []byte
+    caps := mkcaps()
+    caps = push(caps, cap1("OK", "$.a"))
+    caps = push(caps, cap1("BAD", "$.nope"))
+    [out, e] = capture_values(caps, body)
+    testing.expect(e != nil, "err")
+    testing.expect_eq(len(out), 0, "no partial values")
+}
+
+fn test_capture_bad_json() {
+    caps := mkcaps()
+    caps = push(caps, cap1("X", "$.a"))
+    [_, e] = capture_values(caps, "not json" as []byte)
+    testing.expect(e != nil, "bad body")
+}
+
+fn test_capture_empty() {
+    [out, e] = capture_values(nil, "{}" as []byte)
+    testing.expect(e == nil, "empty ok")
+    testing.expect_eq(len(out), 0, "empty")
+}
+
+fn test_validate_names() {
+    bad := mkcaps()
+    bad = push(bad, cap1("1BAD", "$.a"))
+    bad = push(bad, cap1("ok", "$.a"))
+    testing.expect(validate(bad) != nil, "digit-leading name")
+    good := mkcaps()
+    good = push(good, cap1("_ok", "$.a"))
+    good = push(good, cap1("A1", "$.a"))
+    testing.expect(validate(good) == nil, "valid names")
+}
+
+fn test_validate_paths() {
+    b1 := mkcaps()
+    b1 = push(b1, cap1("X", "$.a["))
+    testing.expect(validate(b1) != nil, "unclosed bracket")
+    b2 := mkcaps()
+    b2 = push(b2, cap1("X", ""))
+    testing.expect(validate(b2) != nil, "empty path")
+}
+
+// ---------- selector coverage ----------
+
+fn test_shorthand() {
+    expect_val("{\"a\":{\"b\":7}}", "a.b", "7")
+    expect_val("{\"a\":[9,8]}", "a[0]", "9")
+    expect_err("{\"a\":[9,8]}", "$[0]") // root is object -> no match
+}
+
+fn test_index_neg_slice() {
+    expect_val("[10,20,30]", "$[-1]", "30")
+    expect_val("[10,20,30,40]", "$[1:2]", "20")
+    expect_val("[10,20,30,40]", "$[-1:]", "40")
+    expect_err("[10,20,30,40]", "$[1:3]")
+    expect_err("[10,20,30,40]", "$[::-1]")
+    expect_err("[10,20,30,40]", "$[::2]")
+    expect_val("{\"a\":[1,2,3]}", "$.a[0:1]", "1")
+}
+
+fn test_wildcard() {
+    expect_err("{\"a\":{\"x\":1},\"b\":{\"x\":2}}", "$.*.x")
+    expect_val("{\"only\":{\"x\":9}}", "$.*.x", "9")
+    expect_err("{\"a\":[1,2]}", "$.a[*]")
+}
+
+fn test_union() {
+    expect_val("{\"a\":{\"x\":1}}", "$['a'].x", "1")
+    expect_err("{\"a\":1,\"b\":2,\"c\":3}", "$['a','c']")
+}
+
+fn test_descendant() {
+    expect_val("{\"x\":{\"y\":{\"id\":5}}}", "$..id", "5")
+    expect_err("{\"a\":[{\"id\":1},{\"id\":2}]}", "$..id")
+}
+
+fn test_filters() {
+    body := "{\"items\":[{\"id\":1,\"price\":5},{\"id\":2,\"price\":15},{\"id\":3,\"price\":25}]}"
+    expect_val(body, "$.items[?(@.price<10)].id", "1")
+    expect_val(body, "$.items[?(@.id==2)].price", "15")
+    expect_val(body, "$.items[?(@.id!=2 && @.price>10)].id", "3")
+    expect_err(body, "$.items[?(@.price>10 || @.id==1)].id")
+    caps := mkcaps()
+    caps = push(caps, cap1("V", "$.items[?(!(@.price<20))].id"))
+    [o3, e3] = capture_values(caps, body as []byte)
+    testing.expect(e3 == nil, "not")
+    testing.expect_streq(o3[0].value, "3", "not result")
+    expect_val("{\"a\":[{\"b\":1}]}", "$.a[?(!@.c)]", "{\"b\":1}")
+    expect_val("{\"items\":[{\"s\":\"abc\"}]}", "$.items[?('abc' == @.s)].s", "abc")
+    expect_val("{\"items\":[{\"p\":1.5}]}", "$.items[?(@.p<2)].p", "1.5")
+}
+
+fn test_functions() {
+    body := "{\"items\":[{\"n\":\"abc\",\"t\":[1,2]},{\"n\":\"xyz\",\"t\":[1]}]}"
+    expect_val(body, "$.items[?(length(@.t)>1)].n", "abc")
+    expect_val(body, "$.items[?(match(@.n, \"a.*\"))].n", "abc")
+    expect_val(body, "$.items[?(search(@.n, \"b\"))].n", "abc")
+    expect_val(body, "$.items[?(match(@.n, \"x.*\"))].n", "xyz")
+    expect_val("{\"items\":[{\"id\":1,\"tags\":[\"a\",\"b\"]},{\"id\":2,\"tags\":[\"c\"]}]}", "$.items[?(count(@.tags[*])==2)].id", "1")
+    expect_val("{\"items\":[{\"id\":1,\"t\":[\"x\"]},{\"id\":2,\"t\":[\"y\",\"z\"]}]}", "$.items[?('x' == value(@.t[*]))].id", "1")
+}

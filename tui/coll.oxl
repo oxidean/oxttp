@@ -8,6 +8,7 @@ package main
 import "std/errors"
 import "std/os"
 import "std/encoding/json"
+import "github.com/oxidean/oxttp/core/capture"
 import "github.com/oxidean/oxttp/core/collection"
 import "github.com/oxidean/oxttp/core/env"
 import "github.com/oxidean/oxttp/core/http"
@@ -1208,6 +1209,23 @@ fn install_resp(a: mut App, resp: model.Resp, req_url: str) {
         if nid != 0 {
             a.history[len(a.history) - 1].id = nid
             a.history[len(a.history) - 1].persisted = true
+        }
+    }
+    // response captures (corpus §6.4 / upstream captureResponse):
+    // evaluated on every completed response — any HTTP status —
+    // against the request snapshot that produced it. All-or-
+    // nothing: a failure toasts a warning and publishes nothing;
+    // success upserts session vars (highest env layer).
+    if a.pending_preq != nil && len(a.pending_preq.captures) > 0 {
+        [cvals, ce] = capture.capture_values(a.pending_preq.captures, resp.body)
+        if ce != nil {
+            a.toast(1, "Couldn't capture response: " + errors.msg(ce))
+        } else {
+            ci := 0
+            for ci < len(cvals) {
+                session_set(a, cvals[ci].name, cvals[ci].value)
+                ci = ci + 1
+            }
         }
     }
     a.pending_preq = nil
