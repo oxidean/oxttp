@@ -4,6 +4,9 @@ work_item_id: WI-0020
 run_id: run_1795852420640_4742aa
 kind: clarification
 question: human merge approval required for WI-0020 after its PR is green and review-complete
-status: pending
+status: answered
+answer: 'Approved — PR #26 merged to main as 099facb (green CI on 0a247ac, substitute review APPROVE_WITH_NITS, no open threads). Ship it.'
 created_by: ox-agent
+answered_by: Jesse
 created_at: "2026-11-28T07:53:55Z"
+answered_at: "2026-11-28T15:22:34Z"
