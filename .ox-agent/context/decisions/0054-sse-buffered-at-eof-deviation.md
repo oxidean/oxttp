@@ -54,6 +54,10 @@ Secondary decisions folded in:
   recorded deviation.
 - CLI `run --json` emits `streamError` and the `events` array when
   present.
+- Message-row timestamps render UTC rather than upstream local time:
+  oxl std/time exposes unix timestamps but no local-zone conversion.
+  The `HH:MM:SS.mmm` shape is preserved; zone conversion is deferred
+  until the standard library exposes local time.
 
 ## Consequences
 

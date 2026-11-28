@@ -24,7 +24,9 @@ watched/unwatched distinction.
   `finish_roundtrip` `sset`s it to 0 when the response is
   `text/event-stream` (method != HEAD), before body reads begin. All
   reads through the same `bufio.Reader` see the lift — buffered bytes
-  are preserved, no reader rebuild.
+  are preserved, no reader rebuild. A zero deadline also clears the
+  socket receive timeout already installed by header reads; without
+  that, a quiet SSE stream would still hit the stale timeout.
 - The lift is **unconditional** (TUI and `run` alike): a deviation
   from upstream's watched-only lift, folded into ADR-0054's D1/D6 —
   a headless infinite SSE stream now runs until close/cap rather than
@@ -36,8 +38,9 @@ watched/unwatched distinction.
   compression (raw >64 MiB decoding to <64 MiB) truncates early —
   recorded deviation D5.
 - h2: `h2_exchange` keeps its int deadline — SSE over negotiated h2
-  parses events but does not lift the timeout (D6). Cleartext h2c and
-  HTTP/1.1 both lift.
+  parses events but does not lift the timeout (D6). This applies to
+  both negotiated TLS h2 and cleartext prior-knowledge h2c; only the
+  HTTP/1.1 path lifts.
 - Event parsing lives in `core/http/sse.oxl` as a pure function
   `parse_sse(body: []byte) -> [events, stream_error]`
   shared by h1 and h2 paths; seed/terminal events match upstream.
