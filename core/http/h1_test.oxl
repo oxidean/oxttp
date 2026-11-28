@@ -913,6 +913,20 @@ fn test_pick_proxy_go_units() {
     [p4, e4] = pick_proxy_go(r3, "http", "example.org", "80")
     testing.expect(e4 == nil, "bad env proxy not an error")
     testing.expect_eq(len(p4), 0, "bad env proxy dropped")
+    // malformed ports and whitespace-padded values are not rescued
+    // into a different proxy host; whitespace is significant in Go.
+    r3b := rq("GET", "http://example.org/")
+    r3b.proxy_go = true
+    r3b.proxy_env = one("http_proxy=host:bad")
+    [p4b, e4b] = pick_proxy_go(r3b, "http", "example.org", "80")
+    testing.expect(e4b == nil, "bad-port env proxy not an error")
+    testing.expect_eq(len(p4b), 0, "bad-port env proxy dropped")
+    r3c := rq("GET", "http://example.org/")
+    r3c.proxy_go = true
+    r3c.proxy_env = one("http_proxy=  px:1  ")
+    [p4c, e4c] = pick_proxy_go(r3c, "http", "example.org", "80")
+    testing.expect(e4c == nil, "whitespace env proxy not an error")
+    testing.expect_eq(len(p4c), 0, "whitespace env proxy dropped")
     // CGI: usable http_proxy on an http hop errors BEFORE no_proxy
     r4 := rq("GET", "http://example.org/")
     r4.proxy_go = true

@@ -12,14 +12,18 @@ capture both cases of `HTTP_PROXY`/`HTTPS_PROXY` plus `ALL_PROXY`, skip
 `HTTP_PROXY` under CGI, and feed the transport's reqwest-style matcher.
 That was the wrong upstream contract. Posting is a Go application; its
 environment proxy behavior comes from `golang.org/x/net/http/httpproxy`
-and `net/http`'s `ProxyFromEnvironment` shape:
+and `net/http`'s `ProxyFromEnvironment` shape. The compatibility target
+is the version pinned by upstream Posting's `go.mod`/`go.sum`,
+`golang.org/x/net v0.57.0` (not later master-branch behavior):
 
 - only `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` exist — there is no
   `ALL_PROXY` in Go `httpproxy`;
 - `getEnvAny` prefers uppercase when both cases are present and
   non-empty, with lowercase as fallback;
-- schemeless proxy values are retried as `http://host[:port]`; unusable
-  values are dropped rather than surfaced as parse errors;
+- schemeless proxy values are retried as `http://host[:port]`; values
+  that cannot resolve to a usable proxy are dropped rather than surfaced
+  as parse errors in this implementation, and no collection-layer trim or
+  normalization is applied before that decision;
 - any raw non-empty `REQUEST_METHOD` (including whitespace) marks CGI.
   Go does not silently delete `HTTP_PROXY`; it errors before using it
   for an `http:` hop, ahead of `NO_PROXY` bypass;
@@ -41,10 +45,12 @@ split.
    resolver used by the xh CLI.
 2. `collection.proxy_pick` canonicalizes TUI/posting env capture to
    lowercase `https_proxy=`/`http_proxy=` pairs using uppercase-first
-   precedence, normalizes schemeless values to `http://`, ignores
-   `ALL_PROXY`, passes `NO_PROXY` through, and sets `cgi` from the raw
-   `REQUEST_METHOD` value. `plan_req` substitutes `options.proxy_url`
-   before calling it.
+   precedence, ignores `ALL_PROXY`, passes raw proxy values and
+   `NO_PROXY` through without trimming or scheme normalization, and
+   sets `cgi` from the raw `REQUEST_METHOD` value. Raw values matter:
+   Go `getEnvAny`/`parseProxy` do not trim, and pre-normalizing a
+   schemeless value would apply the `http://` retry twice. `plan_req`
+   substitutes `options.proxy_url` before calling it.
 3. `core/http` implements `pick_proxy_go`/`no_proxy_match_go` as the
    Go-mode resolver, including the CGI send-time error and per-hop
    host:port matching.
